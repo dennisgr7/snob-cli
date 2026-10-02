@@ -6,9 +6,15 @@ name: Release
 # A tag is the only trigger. Everything a release consists of is derived from
 # it, so publishing one is `git tag v0.2.0 && git push origin v0.2.0` and
 # nothing else.
+#
+# `workflow_dispatch` is the same release started by hand on a tag
+# (`gh workflow run Release --ref v0.5.0`), for when a tag's push event never
+# reaches Actions. Started on a branch, `check` refuses it: the ref is not a
+# version.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
