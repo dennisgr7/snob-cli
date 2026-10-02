@@ -9,17 +9,17 @@ class Snob < Formula
     # There is no macOS Intel build; see the note in .github/workflows/ci.yml.
     depends_on arch: :arm64
     url "https://github.com/dennisgr7/snob-cli/releases/download/v0.5.0/snob-v0.5.0-aarch64-apple-darwin.tar.gz"
-    sha256 "b5cebfd61c12d10dd2007b149c84c5bf4878b8cbf039c37f55e4dc12f012e267"
+    sha256 "917d20553f20d7bac02b4a5f3d37b5c96e394b620ad491964221e912bcf78433"
   end
 
   on_linux do
     on_intel do
       url "https://github.com/dennisgr7/snob-cli/releases/download/v0.5.0/snob-v0.5.0-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "30b6f8f3b794316716ef48b814ddebf4f643c521a41d00f6252251948ad0faf2"
+      sha256 "bf2015638381c3a91f215ee0c180f91d721bcd0a6474d9ecf7c65acbfaadffec"
     end
     on_arm do
       url "https://github.com/dennisgr7/snob-cli/releases/download/v0.5.0/snob-v0.5.0-aarch64-unknown-linux-musl.tar.gz"
-      sha256 "e7b02f669d9a2e1a277cef862f5a07fa9cc7f79d8d41fecae1e77b2926a26fb7"
+      sha256 "cdabe60ed2e4945e625669475368aad8c95d567adbaeb0030e14c8c4fcf10616"
     end
   end
 

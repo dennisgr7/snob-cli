@@ -6,12 +6,12 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/dennisgr7/snob-cli/releases/download/v0.5.0/snob-v0.5.0-x86_64-pc-windows-msvc.zip",
-            "hash": "6d77cd313d9af6d30c2615798179cc3d0f2dbd0e9ab976c812c7b5831095d3ba",
+            "hash": "c235f36550640be424e393c7369cd610b0add10936b3b53d9cec852e330cc7d6",
             "extract_dir": "snob-v0.5.0-x86_64-pc-windows-msvc"
         },
         "arm64": {
             "url": "https://github.com/dennisgr7/snob-cli/releases/download/v0.5.0/snob-v0.5.0-aarch64-pc-windows-msvc.zip",
-            "hash": "4938d7cf8ff4b0781435e62b056aa6fdb9f157ee23140882ed7d8e100ae6b01b",
+            "hash": "864172ec095f7dba6849a0bce8558f2d23c1e766bdef2a4c47f2093f833b240a",
             "extract_dir": "snob-v0.5.0-aarch64-pc-windows-msvc"
         }
     },
