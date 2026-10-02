@@ -1,0 +1,371 @@
+name: Release
+
+# Actions are pinned to a commit, not to a tag; `.github/dependabot.yml` says
+# why, and is what moves the pins.
+
+# A tag is the only trigger. Everything a release consists of is derived from
+# it, so publishing one is `git tag v0.2.0 && git push origin v0.2.0` and
+# nothing else.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Inside the checkout on purpose, and it is what makes the build independent
+  # of where it ran. Absolute paths reach the binary from two places -- the
+  # sources being compiled and the registry the dependencies were unpacked into
+  # -- and the second is normally in the home directory, which differs per
+  # runner and per operating system. Moved under the workspace, one
+  # `--remap-path-prefix` covers both. Nothing is cached here anyway; the `build`
+  # job deliberately has no cache, for the reason written at that step.
+  CARGO_HOME: ${{ github.workspace }}/.cargo-home
+
+# Read-only unless a job asks for more, and two of them do: `publish` creates
+# the release and `packaging` pushes the manifests. Without this the rest
+# inherit whatever the repository defaults to, which on a repository that has
+# not been switched over is read-write -- and `build` is the job that runs
+# every dependency's build script, so it is the last one that should hold a
+# token it never uses.
+permissions:
+  contents: read
+
+jobs:
+  # Runs before anything is built. A tag that disagrees with the manifest is a
+  # release nobody can interpret later -- and once a tag is pushed, correcting
+  # it means deleting a public ref.
+  check:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The whole history, because the ancestry check below needs it, and
+          # no credentials left behind in `.git/config`: nothing in this job
+          # pushes, and a token a step never uses is one it cannot misuse.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A tag can be pushed at any commit, and nothing else in this workflow
+      # runs a single test -- the suite is CI's job, and CI runs on branches.
+      # So without this, `git tag v9.9.9 && git push` on a commit that was
+      # never merged, never tested and never reviewed publishes a release.
+      - name: The tag must be on a commit that reached main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME is not an ancestor of main; releases come from main"
+            exit 1
+          fi
+
+      - name: The tag and the manifest must agree
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The first `version` in the root manifest is the workspace one, which
+          # every crate inherits.
+          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$version" != "$manifest" ]; then
+            echo "::error::tag $GITHUB_REF_NAME says $version, Cargo.toml says $manifest"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # No fail-fast: one target failing should not hide whether the others
+      # would have worked.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+          # musl rather than gnu, so the binary carries no glibc version
+          # requirement and installs on any distribution. See ci.yml.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          # The same five as CI, and no x86_64-apple-darwin, for the reason
+          # documented in ci.yml.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      # `rustup`, not the action's `targets:` input: ci.yml's build job says
+      # why at the same step.
+      - name: The target, on the toolchain this repository pins
+        run: rustup target add ${{ matrix.target }}
+      # **No build cache here, deliberately**, though CI has one. An Actions
+      # cache has no authenticated separation between refs and every run holds
+      # a token that can write to it, so a cache is an input to the shipped
+      # binary that no reviewed diff covers -- which is the primitive used
+      # against Angular's release infrastructure. CI can have one because
+      # nothing it produces is published.
+
+      # Two builds of one tag have to produce the same bytes, and an absolute
+      # path baked into the binary is the difference that is easiest to miss.
+      #
+      # **Not `RUSTFLAGS`.** That variable *replaces* `.cargo/config.toml`
+      # rather than adding to it, so exporting it here would silently drop
+      # `+crt-static` and `/Brepro` and both Windows binaries would go back to
+      # needing the Visual C++ redistributable -- with nothing failing until
+      # somebody's machine could not launch it. A second config file is the
+      # shape that works: cargo reads `$CARGO_HOME/config.toml` as well as the
+      # repository's and **joins** the `rustflags` arrays.
+      #
+      # A TOML literal string, single-quoted, because the Windows path is full
+      # of backslashes and a basic string would eat them.
+      - name: Make the build independent of where it ran
+        shell: bash
+        run: |
+          mkdir -p "$CARGO_HOME"
+          cat >> "$CARGO_HOME/config.toml" <<'EOF'
+          [target.'cfg(all())']
+          rustflags = ['--remap-path-prefix=${{ github.workspace }}=/snob']
+          EOF
+
+      # rusqlite compiles SQLite from C, which a musl target cannot do without
+      # a musl C compiler.
+      - name: musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p snob-cli
+
+      # Every runner here is native, so this really runs the binary being
+      # shipped rather than checking that a file exists.
+      - name: Check the binary runs
+        run: cargo run --release --locked --target ${{ matrix.target }} -p snob-cli -- --version
+
+      # Two archive formats because the platforms disagree about what is
+      # ordinary: a .tar.gz keeps the executable bit that a .zip would lose on
+      # Unix, and Windows opens a .zip with nothing installed.
+      #
+      # Both hold a directory rather than loose files, so unpacking in the
+      # wrong place leaves one folder to delete instead of four files to find.
+      # The binaries are reproducible; the archives were not, and an archive
+      # nobody can rebuild byte for byte makes the binary inside it unverifiable
+      # too. Both formats embed a modification time, so both are given one: the
+      # committer date of the tagged commit, which is derived from the tag like
+      # everything else in this workflow rather than being a wall clock.
+      #
+      # The `.deb` needs nothing -- `cargo-deb` is already reproducible.
+      - name: Package
+        shell: bash
+        # Through `env`, never interpolated into the script. `check` proves
+        # the value is the literal in Cargo.toml at an ancestor of main, so
+        # this is not exploitable today -- but that is a content check
+        # guarding a shell-injection shape, and the workflow already does it
+        # the right way for `$GITHUB_REF_NAME`.
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="snob-v$VERSION-$TARGET"
+          # The tag's own commit date. `%ct` is seconds since the epoch, which
+          # is what every tool below wants.
+          epoch=$(git log -1 --format=%ct)
+          mkdir -p "staging/$name"
+          cp README.md LICENSE "staging/$name/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/snob.exe" "staging/$name/"
+            # Compress-Archive rather than 7z: it ships with PowerShell, and
+            # the Windows on ARM image cannot be assumed to carry 7-Zip.
+            #
+            # It stores each entry's LastWriteTime, and there is no flag for
+            # that, so the times are set on the files first. A zip's DOS
+            # timestamp has two-second resolution, so the value is rounded down
+            # to an even second here rather than left for the format to round
+            # unpredictably.
+            even=$(( epoch - epoch % 2 ))
+            (cd staging && powershell -NoProfile -Command \
+              "\$stamp = [DateTimeOffset]::FromUnixTimeSeconds($even).UtcDateTime; \
+               Get-ChildItem -Recurse '$name' | ForEach-Object { \$_.LastWriteTimeUtc = \$stamp }; \
+               Compress-Archive -Path '$name' -DestinationPath '../$name.zip'")
+          else
+            cp "target/${{ matrix.target }}/release/snob" "staging/$name/"
+            # --sort=name so the order does not depend on the filesystem,
+            # --mtime so it does not depend on when this ran, and --owner/--group
+            # so it does not depend on who the runner is. gzip -n because gzip
+            # writes its own timestamp into the header as well, which is the one
+            # everybody forgets.
+            #
+            # Those flags are GNU tar's, and macOS ships BSD tar as `tar` --
+            # which refuses --sort=name outright. The runner image carries GNU
+            # tar as `gtar`, so that name is preferred wherever it exists. The
+            # fallback to plain `tar` is for Linux, where it is GNU; a macOS
+            # host without gtar still fails loudly on the first flag rather
+            # than quietly building an archive whose bytes depend on the
+            # filesystem, which is the reproducibility this step exists for.
+            tar="$(command -v gtar || command -v tar)"
+            "$tar" --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+              -C staging -cf - "$name" | gzip -n > "$name.tar.gz"
+          fi
+
+      # A .deb as well on Linux, so Debian and Ubuntu get an install that their
+      # own package manager can undo. --no-build reuses the binary just built
+      # and tested rather than compiling a second, unverified one.
+      - name: Debian package
+        if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          # Pinned to the version ci.yml checks the package with.
+          cargo install cargo-deb@3.7.0 --locked
+          cargo deb --no-build --no-strip -p snob-cli \
+            --target "$TARGET" \
+            --output "snob-v$VERSION-$TARGET.deb"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            snob-v*.zip
+            snob-v*.tar.gz
+            snob-v*.deb
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      # The only writes this workflow needs anywhere.
+      contents: write
+      # For the attestation below: the OIDC token it is signed with, and the
+      # two stores it is written to. Scoped to this job on purpose -- `build`
+      # is the job that runs every dependency's build script, and it is the
+      # last one that should be able to sign anything.
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # One file rather than one per archive: `sha256sum -c SHA256SUMS
+      # --ignore-missing` then verifies whatever the user downloaded without
+      # them having to know which line belongs to it.
+      - name: Checksums
+        working-directory: artifacts
+        run: sha256sum snob-v* | tee SHA256SUMS
+
+      # What a checksum file cannot say is who produced it. This binds every
+      # archive's digest to this repository, this workflow and this commit,
+      # signed through Sigstore, so `gh attestation verify` answers a
+      # question `sha256sum -c` cannot: not "is this the file the release page
+      # lists" but "did this file come out of this pipeline".
+      #
+      # `subject-checksums` reads the file the step above already wrote, so
+      # there is no second list of artifacts to keep in step with the first.
+      - name: Attest what was built
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-checksums: artifacts/SHA256SUMS
+
+      - name: Release notes
+        run: |
+          cat > notes.md <<'EOF'
+          Download the archive for your system, unpack it, and put `snob`
+          anywhere on your `PATH`. It sends its requests from a Chrome, Edge,
+          Brave or Chromium installed on the machine; there is nothing else to
+          install.
+
+          Verify a download with `sha256sum -c SHA256SUMS --ignore-missing` on
+          Linux or macOS, or `Get-FileHash` on Windows, and where it was built
+          with `gh attestation verify <archive> --repo dennisgr7/snob-cli`.
+          EOF
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes-file notes.md \
+            artifacts/*
+
+  # Homebrew and Scoop both read a plain repository, so the formula and the
+  # manifest live beside the code and are updated by the release that made them
+  # true. Keeping them in repositories of their own would mean a token with
+  # write access somewhere else, which is a secret to store and rotate for no
+  # benefit anybody can see.
+  packaging:
+    name: Point the packages at the new version
+    needs: [check, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # main, not the tag: a tag is a detached head and there would be no
+      # branch to push the result to.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+
+      - name: Render
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          curl -fsSL -o /tmp/SHA256SUMS \
+            "https://github.com/${{ github.repository }}/releases/download/$GITHUB_REF_NAME/SHA256SUMS"
+          # Invoked through bash rather than run directly. The executable bit
+          # is set in the index, but git on Windows does not track file modes
+          # by default, so an edit from there can quietly drop it again -- and
+          # this job is the last one in a release, where the failure is most
+          # expensive to discover.
+          bash packaging/render.sh "$VERSION" /tmp/SHA256SUMS
+
+      - name: Commit
+        run: |
+          if git diff --quiet -- Formula bucket packaging/winget; then
+            echo "the packages already point at this version"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula bucket packaging/winget
+          git commit -m "Point the formula and the manifest at $GITHUB_REF_NAME"
+          sha=$(git rev-parse HEAD)
+
+          # main first, and on its own. Two refspecs in one push are not
+          # atomic, so a rejected second one leaves the first already landed --
+          # and this job checks out main, so HEAD:dev is rejected as a
+          # non-fast-forward whenever dev holds commits main does not, which is
+          # dev's ordinary state between releases.
+          git push origin "$sha:refs/heads/main"
+
+          # dev, where there is one, gets the change carried onto its own
+          # history rather than main's laid over it. If that conflicts, the
+          # release has still succeeded and only this needs a hand, so it warns
+          # instead of failing.
+          if ! git ls-remote --exit-code --heads origin dev > /dev/null; then
+            echo "the manifests are on main; there is no dev branch"
+            exit 0
+          fi
+          git fetch origin dev
+          git checkout -B dev origin/dev
+          if git cherry-pick "$sha" && git push origin dev; then
+            echo "the manifests are on main and dev"
+          else
+            git cherry-pick --abort || true
+            echo "::warning::the manifests landed on main only; carry them to dev by hand"
+          fi

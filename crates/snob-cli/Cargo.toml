@@ -1,0 +1,146 @@
+[package]
+name = "snob-cli"
+description = "Instagram CLI client with extra utilities, media downloads and output ready for AI agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "snob"
+path = "src/main.rs"
+
+# A build that can be driven end to end without Instagram.
+#
+# Off by default: `cargo build --release` produces a binary with neither the
+# flags nor the code behind them. `cargo test --features testing` is what turns
+# them on, and `crates/snob-cli/tests/sandbox.rs` is what they are for.
+[features]
+default = ["xlsx"]
+# The `.xlsx` export and the `zip` crate behind it. On by default, and the
+# released binary carries it; what the feature buys is that somebody building
+# from source can leave it out -- `rust_xlsxwriter` and `zopfli` are the
+# largest single feature cost in the tree, ~498 KiB for one of five formats,
+# and six crates that nothing else here pulls in. `commands::import` opens the
+# export zip through the same feature, being the only other reader of `zip`;
+# without it the import still reads the folder the zip was extracted into.
+xlsx = ["dep:rust_xlsxwriter", "dep:zip"]
+testing = ["snob-ig/testing"]
+
+[dependencies]
+snob-core.workspace = true
+snob-store.workspace = true
+snob-ig.workspace = true
+clap.workspace = true
+# `net` and `io-util` for the loopback page `headless::identity` serves for
+# one question and for the owner's socket and named pipe (`owner::socket`);
+# both were already compiled in through reqwest. `sync` for the
+# channels `cdp::connection`'s dispatcher answers callers on -- also already
+# compiled in, through hyper, and named here because this crate uses it
+# directly.
+tokio = { workspace = true, features = ["net", "io-util", "sync"] }
+anyhow.workspace = true
+serde_json.workspace = true
+# Already in the tree through snob-core, so this costs no extra compilation.
+# Used for one derive: the envelope `cdp::reply_to` reads the message id off
+# without building the whole document.
+serde.workspace = true
+console.workspace = true
+# Keys for the interactive views, and the terminal modes around them (raw mode,
+# alternate screen, bracketed paste). Reading stays here rather than in ratatui
+# because ratatui only writes; the reasoning is on `ui::browser::input`. Costs
+# no new crate here -- comfy-table already compiles it; see the workspace
+# manifest.
+crossterm.workspace = true
+# The interactive views' renderer: browsers and the profile card fullscreen,
+# the menu inline. The feature choices are on the workspace manifest.
+ratatui.workspace = true
+opener.workspace = true
+indicatif.workspace = true
+supports-hyperlinks.workspace = true
+# `custom_styling` is what makes the width calculation look past the escape
+# sequences an OSC 8 link puts around a username.
+comfy-table = { workspace = true, features = ["custom_styling"] }
+csv.workspace = true
+rust_xlsxwriter = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# So a typed sessionid does not sit in freed memory after the prompt that read
+# it.
+zeroize.workspace = true
+# Already in the tree through snob-ig, where it jitters the pace between
+# requests. Used here for the same reason at a larger scale: `snob watch` moves
+# each scheduled run a little later, so the walks do not start on the same
+# second every day. Not a security decision, so the fast generator is the right
+# one — but the roll is made here and handed to `schedule::wake_at`, which
+# reads no randomness of its own and can therefore be tested.
+fastrand.workspace = true
+# The monitor's webhook address is parsed and inspected before anything is
+# posted to it, and `Url::host()` is what tells an IPv6 loopback from a domain
+# -- the string form keeps the brackets the syntax requires, so `[::1]` does
+# not parse as an address. The tests also point the client at a mock server
+# with it.
+url.workspace = true
+# Already in the tree through snob-store. The tab's guard reads a paused
+# request's form, which the browser may hand over in base64 pieces
+# (`headless::guard`).
+base64.workspace = true
+
+# Launching the browser with the debugging protocol on a pipe. Windows needs the
+# handle-inheritance blob and the job object; Unix needs `dup2`. Neither is
+# reachable through `std::process::Command`, and the reasoning is in
+# `src/pipe.rs`.
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+# What `tests/common/tab.rs` sends with: a tab with no browser behind it, on
+# the fake Instagram. Already in the tree through snob-ig.
+reqwest.workspace = true
+tempfile.workspace = true
+# Only so the test for `--tls-extra-root` can check its predicate against a real
+# certificate as well as against rejections: one that refuses everything also
+# passes a test made only of rejections. Pure data, so it builds on every target
+# including the one where narrowing is refused.
+webpki-root-certs.workspace = true
+
+# Enough for `apt install ./snob-*.deb` to work and `apt remove snob` to undo
+# it. A signed apt repository would be the other half, and it needs a GPG key
+# that only the maintainer can hold, so the loose package is what can be built
+# without one. The maintainer address is the GitHub noreply one on purpose.
+[package.metadata.deb]
+name = "snob"
+maintainer = "dennisgr7 <70021856+dennisgr7@users.noreply.github.com>"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+# Recommended rather than required: every request is sent from one of these
+# (`headless`), but `SNOB_NO_BROWSER=1` runs without, and a hard dependency
+# would pull a browser onto a server whose owner chose that. Debian's and
+# Ubuntu's Chromium names first, then the vendors' own repositories.
+recommends = "chromium | chromium-browser | google-chrome-stable | microsoft-edge-stable | brave-browser"
+# **This paragraph makes a claim three other places make**: `packaging/render.sh`
+# renders it into the winget manifest, `crates/snob-ig/src/lib.rs` states the
+# rule for a reader of the code, and `README.md` says it in prose. There is no
+# generator over the four, so if one of them moves, all four move.
+extended-description = """
+Walks an Instagram account's followers and following, crosses them, and reports \
+who does not follow you back, who you never followed back, and who you and \
+somebody else both know. Almost all of it reads: it changes exactly two things, \
+one account per command and after asking, which are following an account and \
+unfollowing one. It never blocks, never removes a follower, and never marks a \
+story as seen."""
+assets = [
+    ["target/release/snob", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/snob/README.md", "644"],
+]
+
+[lints]
+workspace = true

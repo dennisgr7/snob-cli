@@ -1,0 +1,154 @@
+use anyhow::Result;
+use snob_core::Pk;
+use snob_store::paths::{self, AccountPaths, AppPaths};
+use snob_store::registry::Registry;
+use snob_store::secrets::SecretStore;
+
+use crate::cli::LogoutArgs;
+use crate::exit::ExitCode;
+use crate::ui;
+
+/// Deletes the session and the browser profile of `account`, the account
+/// resolved for this run, or of every account with `--all` or with none
+/// resolved.
+///
+/// The accounts' data stays, and so do their places in the registry, as
+/// accounts with no session: logging out is not forgetting.
+pub async fn run(
+    args: LogoutArgs,
+    secrets: SecretStore,
+    paths: &AppPaths,
+    account: Option<AccountPaths>,
+) -> Result<ExitCode> {
+    let everyone = Registry::known_accounts(paths);
+    // With no account resolved every one found goes, sessions and profiles
+    // alike: a registry that is gone must not leave the sessions behind while
+    // the profiles are swept.
+    let all = args.all || account.is_none();
+    let leaving: Vec<Pk> = match &account {
+        Some(account) if !all => vec![account.pk()],
+        _ => everyone.clone(),
+    };
+    // Every profile there is when no other account's is to be kept: with
+    // `--all` or no account resolved, and where there is no other account. A
+    // login's unfinished profile and one nobody could be named for hold live
+    // sessions too, and nothing else would ever clear them.
+    let sweep = all || everyone.len() <= 1;
+    // A browser still running on a profile about to go would write into it
+    // as it went, or keep Windows from removing it. Only the profiles going:
+    // another account's browser is left to the commands using it.
+    crate::owner::release(paths, if sweep { None } else { account.map(|a| a.pk()) }).await;
+    let stores: Vec<_> = leaving
+        .iter()
+        .map(|pk| secrets.session_of(&paths.account(*pk)))
+        .collect();
+    // Read through the store, which owns what counts as a stored session and why
+    // — a corrupt credential is still a credential. `purge::survey` asks the same
+    // question the same way.
+    let had_session = stores.iter().any(|s| s.something_is_stored());
+    // Not `?`. A keyring that refuses must not take the browser profiles with
+    // it: each holds a logged-in session too, and `purge` already refuses to
+    // let one locked item hold the rest back for exactly this reason. Every
+    // session is tried, and the first refusal is carried to the end and
+    // returned there.
+    let mut removal = Ok(());
+    for store in &stores {
+        let deleted = store.delete();
+        if removal.is_ok() {
+            removal = deleted;
+        }
+    }
+
+    match (&removal, had_session) {
+        (Ok(()), true) => {
+            crate::ui::say!("Session deleted.");
+            // Worth saying: nothing was closed on Instagram's side, because
+            // that would be a write and snob does not write.
+            ui::info(
+                "The session is still active on Instagram. To really close it, use\n\
+                 \"Active sessions\" in the app's settings.",
+            );
+        }
+        (Ok(()), false) => crate::ui::say!("There was no session stored."),
+        // Nothing is claimed here. What refused says so itself, printed by
+        // `main`, and "the session is still active on Instagram" would read as
+        // though the local copy were the part that had gone.
+        (Err(_), _) => {}
+    }
+
+    // **Always.** The browser profile is where every request is sent from
+    // (`headless/`), so it holds the live session — kept current by the
+    // browser, fresher than the stored copy — and a logout that left it would
+    // leave the session on the machine while saying it had gone.
+    // `--purge-profile` is accepted and changes nothing.
+    let _ = args.purge_profile;
+    let profiles = if sweep {
+        crate::headless::profile::every_profile(paths)
+    } else {
+        leaving
+            .iter()
+            .map(|pk| paths.browser_profile_for(*pk))
+            .collect()
+    };
+    let mut deleted = false;
+    let mut profile_failure = None;
+    for profile in profiles {
+        if !profile.exists() {
+            continue;
+        }
+        // Guarded like every other recursive delete in the tool. The path
+        // comes from `directories` rather than from anything typed, but that
+        // is exactly the case the guard is for: a `ProjectDirs` that resolved
+        // oddly is what turns "remove the browser profile" into something far
+        // worse, and `purge` treats this check as mandatory.
+        if !paths::is_safe_to_remove(&profile) {
+            ui::warn(&format!(
+                "{} is too close to the root to remove; delete it by hand",
+                profile.display()
+            ));
+            continue;
+        }
+        // Collected rather than `?`-ed, for the same reason `removal` above
+        // is: one refusal must not decide the other, and a keyring that also
+        // refused is still said at the end. A browser still open on a profile
+        // makes this fail — another snob mid-run — and one the owner closed
+        // a moment ago is let go of patiently.
+        match paths::remove_tree_patiently(&profile) {
+            Ok(()) => deleted = true,
+            Err(e) => {
+                profile_failure.get_or_insert((profile, e));
+            }
+        }
+    }
+    if deleted {
+        if sweep {
+            crate::ui::say!("Browser profiles deleted.");
+        } else {
+            crate::ui::say!("Browser profile deleted.");
+        }
+    }
+
+    // After the profiles, so that one refusal does not decide the other. There
+    // is no documented exit code for "a local delete was refused", and neither
+    // 3 nor 5 would be true, so this becomes the generic failure.
+    //
+    // The credential goes first when both refused: a browser profile left
+    // behind is a housekeeping failure, and a session left in the keyring is a
+    // failure at the only thing this command exists for. The other is still
+    // said out loud rather than swallowed.
+    if removal.is_err()
+        && let Some((profile, io)) = &profile_failure
+    {
+        ui::warn(&format!(
+            "{} could not be removed either: {io}",
+            profile.display()
+        ));
+    }
+    removal?;
+    if let Some((profile, e)) = profile_failure {
+        return Err(
+            anyhow::Error::new(e).context(format!("{} could not be removed", profile.display()))
+        );
+    }
+    Ok(ExitCode::Ok)
+}

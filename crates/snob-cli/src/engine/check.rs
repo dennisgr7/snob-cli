@@ -1,0 +1,829 @@
+//! What a configured monitor would find if it ran now.
+//!
+//! `snob watch setup` asked its questions and wrote a file, and everything that
+//! could be wrong with the answers was discovered later, in an unattended run
+//! nobody was watching: a session that had gone, an account name with a typo, a
+//! webhook whose token the receiver rejects, a schedule the file accepts and the
+//! scheduler refuses. Each of those is cheap to find out while somebody is still
+//! there, and expensive to find out from a log a week later — if anyone reads
+//! it.
+//!
+//! **This writes nothing and can be repeated.** It takes `&App`, so it cannot
+//! reach the `&mut Store` that recording needs — the same guard
+//! [`super::watch::from_store`] rests on — and it walks no list. That is not
+//! tidiness: it is meant to be usable as a monitoring probe, and a probe that
+//! spends a walk every time it is polled is worse than no probe.
+//!
+//! What it does spend is bounded and named: one request per configured
+//! account for its counters, and, without a browser, one to check the
+//! session. From the browser the session is checked off the tab's document
+//! for nothing. A `POST` to the user's own
+//! webhook is not an Instagram request at all.
+//!
+//! It returns facts. What the sentence says is `commands::watch::say`'s
+//! question, and whether a monitoring system should go red about it is
+//! `commands::watch::status`'s.
+
+use snob_core::{Epoch, Pk};
+use snob_store::secrets::SecretStore;
+use snob_store::store::snapshots;
+use snob_store::store::watch as watch_store;
+
+use crate::exit::ExitCode;
+use snob_core::watch::schedule::{self, Schedule};
+use snob_store::config::WatchConfig;
+
+use crate::app::{App, Held};
+
+/// How a single check came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Verdict {
+    /// It would work.
+    Ok,
+    /// It would work, but something about it will surprise somebody.
+    Warned,
+    /// A scheduled run would not do what the configuration says.
+    Failed,
+}
+
+impl Verdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warned => "warning",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// What a command exits with after reaching this verdict.
+    ///
+    /// One mapping for `check`, `status` and `status --json`, so the three
+    /// exit alike on identical state, which a probe cannot be asked to work
+    /// around.
+    ///
+    /// **`Warned` exits zero, deliberately.** A monitor with no baseline yet
+    /// will work; it just has nothing to say on its first run, and one sitting
+    /// out a cooldown is working too. If a probe ever wants to tell a warning
+    /// from a clean run without reading the JSON, this is the one line to
+    /// change — and the README's exit table is what it costs.
+    pub fn exit_code(self) -> ExitCode {
+        match self {
+            Self::Failed => ExitCode::Error,
+            Self::Ok | Self::Warned => ExitCode::Ok,
+        }
+    }
+}
+
+/// One thing that was checked.
+///
+/// `problem` says what is wrong and never how it reads.
+/// `commands::watch::say::problem_line` turns it into the sentence, the same
+/// way that module turns a [`super::watch::Skipped`] into one.
+#[derive(Debug, Clone)]
+pub struct Checked {
+    pub what: What,
+    pub verdict: Verdict,
+    pub problem: Option<Problem>,
+}
+
+/// What is wrong with something that was checked.
+///
+/// Variants rather than sentences: the words are `commands::watch::say`'s, so
+/// `check`'s terminal output and its `--json` are two renderings of one
+/// answer.
+///
+/// [`Problem::Foreign`] carries text this program did not write — what the
+/// schedule parser refused, what Instagram answered, what the user's own
+/// receiver said — because inventing a sentence for those would lose the only
+/// detail that identifies the cause. It is one variant among twelve rather
+/// than a reason for the other eleven to be strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Problem {
+    /// There is no `watch.toml`, so a bare `snob watch` has nothing to run on.
+    NothingConfigured,
+    /// The schedule is well formed and names no moment that exists. `0 0 31 2
+    /// *` is the standing example.
+    NeverFires,
+    /// The scheduler refused the file, and said why. The text is the
+    /// scheduler's.
+    Unbuildable(String),
+    /// Nothing was asked about this, because the account is in cooldown, its
+    /// own or the brake on every account. Turning that into words is
+    /// `report`'s job, like every other date the tool prints.
+    InCooldown { held: Held },
+    /// An unattended run may not read this account, which is a fact about the
+    /// file and not about the network. `in_cooldown` is the line for an account
+    /// a cooldown also stopped anything else being checked about — the same
+    /// condition, with one clause more.
+    NoRecordedConsent { in_cooldown: bool },
+    /// The session did not answer, so nothing could be asked about anybody.
+    SessionSilent,
+    /// There is no session at all.
+    NoSession,
+    /// The session carries no username and Instagram did not name the account
+    /// either, so there is nothing to ask the profile endpoint with.
+    NoUsername,
+    /// The id came from search, which carries no counters — so this run cannot
+    /// tell a truncated list from a complete one.
+    CountersUnknowable,
+    /// Nothing has been reported on yet, so the first scheduled run has nothing
+    /// to compare against and will say nothing.
+    FirstRunLaysTheBaseline,
+    /// `--no-webhook`, so the address was checked and not used.
+    NotPosted,
+    /// Whatever the schedule parser, the store, Instagram or the user's own
+    /// server said, carried through unchanged.
+    Foreign(String),
+}
+
+/// What was checked, and what was learned about it.
+#[derive(Debug, Clone)]
+pub enum What {
+    /// No `watch.toml` at all, so there is nothing else to check.
+    NotConfigured,
+    /// The schedule, and the next few moments it fires at.
+    Schedule { next: Vec<Epoch> },
+    /// The session, and which backend the secret store landed on.
+    Session {
+        viewer: Option<String>,
+        backend: &'static str,
+    },
+    /// One configured account.
+    Account {
+        /// As the file spells it. `None` is the session's own account.
+        target: Option<String>,
+        pk: Option<Pk>,
+        followers: Option<u64>,
+        following: Option<u64>,
+        /// Whether an unattended run may read it, which for somebody else's
+        /// account means a recorded answer.
+        may_run_unattended: bool,
+    },
+    /// The address a report would be posted to.
+    Webhook {
+        destination: String,
+        status: Option<u16>,
+        signed: bool,
+    },
+    /// Whether there is anything to compare the first scheduled run against.
+    Baseline {
+        /// When the newest capture of each list was taken. Empty means none.
+        taken_at: Vec<(snob_core::model::ListKind, Epoch)>,
+    },
+}
+
+/// Everything that was checked, in the order it was checked.
+#[derive(Debug, Clone, Default)]
+pub struct CheckReport {
+    pub checked: Vec<Checked>,
+}
+
+impl CheckReport {
+    /// The worst verdict in it, which is what the exit code is made of.
+    pub fn verdict(&self) -> Verdict {
+        self.checked
+            .iter()
+            .map(|c| c.verdict)
+            .max()
+            .unwrap_or(Verdict::Ok)
+    }
+
+    /// Whether anything in here says the first scheduled run would have nothing
+    /// to compare against.
+    ///
+    /// Two readers, one derivation. [`baseline_of`] gives the line its warning
+    /// and the sentence explaining why a first run says nothing, and `setup`
+    /// decides from it whether to offer to take the first capture. The line
+    /// explains the state and the offer is what ends it, so narrowing one
+    /// without the other would explain a first run nobody was offered a way
+    /// out of.
+    pub fn wants_a_baseline(&self) -> bool {
+        self.checked.iter().any(|c| wants_a_baseline(&c.what))
+    }
+
+    fn push(&mut self, what: What, verdict: Verdict, problem: Option<Problem>) {
+        self.checked.push(Checked {
+            what,
+            verdict,
+            problem,
+        });
+    }
+}
+
+/// How many upcoming moments to work out, so somebody can recognize their own
+/// schedule in them. Three is enough to tell "every Monday" from "every day".
+const MOMENTS_SHOWN: usize = 3;
+
+/// Checks the schedule alone, which needs no session and no network.
+///
+/// Separate because it is the half that still has an answer on a machine with no
+/// session at all, and because it is what catches a file the scheduler would
+/// refuse at every run — `config::parse` reads TOML and a schema number, not
+/// what the values mean.
+pub fn schedule_of(schedule: &Schedule, now: Epoch) -> Checked {
+    let mut next = Vec::new();
+    let mut at = now;
+    for _ in 0..MOMENTS_SHOWN {
+        match schedule::next_after(schedule, Some(at), at, &chrono::Local) {
+            Some(moment) if moment > at => {
+                next.push(moment);
+                at = moment;
+            }
+            _ => break,
+        }
+    }
+
+    let verdict = if next.is_empty() {
+        Verdict::Failed
+    } else {
+        Verdict::Ok
+    };
+    let problem = next.is_empty().then_some(Problem::NeverFires);
+
+    Checked {
+        what: What::Schedule { next },
+        verdict,
+        problem,
+    }
+}
+
+/// Everything that can be checked without a session.
+/// `schedule` is what building one out of the configuration produced: `None`
+/// when there was no configuration to build from, and `Err` when there was and
+/// the scheduler refused it, which fails the verdict rather than exiting 0
+/// about a monitor that cannot start.
+pub fn without_a_session(
+    configured: Option<&WatchConfig>,
+    schedule: Option<&Result<Schedule, String>>,
+    now: Epoch,
+) -> CheckReport {
+    let mut report = CheckReport::default();
+
+    if configured.is_none() {
+        report.push(
+            What::NotConfigured,
+            Verdict::Warned,
+            Some(Problem::NothingConfigured),
+        );
+    }
+
+    match schedule {
+        Some(Ok(schedule)) => report.checked.push(schedule_of(schedule, now)),
+        Some(Err(why)) => report.push(
+            What::Schedule { next: Vec::new() },
+            Verdict::Failed,
+            Some(Problem::Unbuildable(why.clone())),
+        ),
+        None => {}
+    }
+
+    report
+}
+
+/// The session, the accounts and the baselines.
+///
+/// One request for the session and one per account, and nothing is written.
+pub async fn with_a_session(
+    app: &App,
+    secrets: &SecretStore,
+    watched: &[super::watch::Watched],
+    report: &mut CheckReport,
+) {
+    // **Nothing is spent during a cooldown**, and this is the one request path
+    // in the tool that did not say so. `Pacer::clear_to_send` charged the
+    // budget without ever reading the `cooldowns` table — every other caller
+    // gated explicitly — so a command built to be polled was knocking on a door
+    // Instagram had just closed, once per configured account, on whatever
+    // interval a monitoring system polls at.
+    //
+    // `Pacer::clear` reads the table now, so this gate is no longer the only
+    // thing standing here. It stays because the two answer differently and this
+    // one is the answer a person wants: the backstop refuses with an error, and
+    // what somebody running `check` needs is the line below — a warning that
+    // says how long is left and lets the rest of the report be produced.
+    //
+    // Reported rather than skipped in silence: a cooldown is exactly the sort
+    // of thing somebody running `check` wants to be told about, and it lifts on
+    // its own, so it is a warning rather than a failure.
+    match app.held() {
+        Ok(Some(held)) => {
+            report.checked.push(waiting_out(
+                What::Session {
+                    viewer: app.viewer().username.clone(),
+                    backend: secrets.backend().as_str(),
+                },
+                held.clone(),
+            ));
+            for account in watched {
+                report.checked.push(not_asked_about(account, held.clone()));
+            }
+            return;
+        }
+        Ok(None) => {}
+        // The budget itself is unreadable. That is worth a line, and it is not
+        // a reason to go and spend anyway.
+        Err(e) => {
+            report.checked.push(Checked {
+                what: What::Session {
+                    viewer: app.viewer().username.clone(),
+                    backend: secrets.backend().as_str(),
+                },
+                verdict: Verdict::Failed,
+                problem: Some(Problem::Foreign(e.to_string())),
+            });
+            return;
+        }
+    }
+
+    let session = match app.client().validate().await {
+        Ok(()) => Checked {
+            what: What::Session {
+                viewer: app.viewer().username.clone(),
+                backend: secrets.backend().as_str(),
+            },
+            verdict: Verdict::Ok,
+            problem: None,
+        },
+        Err(e) => Checked {
+            what: What::Session {
+                viewer: app.viewer().username.clone(),
+                backend: secrets.backend().as_str(),
+            },
+            verdict: Verdict::Failed,
+            problem: Some(Problem::Foreign(crate::report::what_instagram_said(&e))),
+        },
+    };
+    let session_works = session.verdict == Verdict::Ok;
+    report.checked.push(session);
+
+    for (asked, account) in watched.iter().enumerate() {
+        // Asked again before every account, because one of them can earn a
+        // cooldown while this loop is running.
+        //
+        // The gate above answers for the moment `check` started, and
+        // `account_of` folds any error — a 429, a challenge, `feedback_required`
+        // — into a `Failed` line rather than propagating, so the loop used to
+        // walk straight on to the next account and knock again. What that costs
+        // is not the extra requests, it is the escalation ladder:
+        // `start_cooldown` doubles whenever the previous one was set inside
+        // twenty-four hours, so one `check` over three accounts turns a
+        // two-hour throttle into eight, and over five into the daily cap. From
+        // the command advertised as safe to point a probe at.
+        if asked > 0
+            && let Ok(Some(held)) = app.held()
+        {
+            for remaining in &watched[asked..] {
+                report
+                    .checked
+                    .push(not_asked_about(remaining, held.clone()));
+            }
+            return;
+        }
+
+        // The baseline is asked about with the id this check just resolved, so
+        // it is the same account the scheduled run would compare.
+        //
+        // Handed back beside the line rather than taken out of it. Reading it
+        // back meant a `match` on `What` with a catch-all arm that cannot fire,
+        // three lines under the `What::Account` that had just been built — so a
+        // variant added to `What`, or an arm over there that came to answer with
+        // something else, would silently stop pushing the baseline check, and
+        // take its first-run warning and `setup`'s offer to lay a baseline down
+        // with it. No compile error, and no failing test: the report would
+        // simply be one line shorter.
+        let (checked, pk) = account_of(app, account, session_works).await;
+        report.checked.push(checked);
+        if let Some(pk) = pk {
+            report.checked.push(baseline_of(app, pk));
+        }
+    }
+}
+
+/// The line something gets when a cooldown means it was not asked about.
+///
+/// Warned rather than Failed: a cooldown lifts on its own, and it is exactly
+/// the sort of thing somebody running `check` wants to be told rather than have
+/// skipped in silence.
+fn waiting_out(what: What, held: Held) -> Checked {
+    Checked {
+        what,
+        verdict: Verdict::Warned,
+        problem: Some(Problem::InCooldown { held }),
+    }
+}
+
+/// The same, for an account — except for the one thing a cooldown has nothing
+/// to do with.
+///
+/// Whether an unattended run may read this account is a fact about the
+/// configuration file. It is decided before any request, no cooldown affects
+/// it, and `commands::watch` refuses to **start** without it. Reporting it as a
+/// warning because a cooldown happened to be standing made `check` exit 0 about
+/// a monitor that cannot run at all — from the command whose whole job is to
+/// answer that question before a run does.
+fn not_asked_about(account: &super::watch::Watched, held: Held) -> Checked {
+    let may_run_unattended = account.may_run_unattended();
+    let what = What::Account {
+        target: account.name().map(str::to_string),
+        pk: None,
+        followers: None,
+        following: None,
+        may_run_unattended,
+    };
+
+    if may_run_unattended {
+        return waiting_out(what, held);
+    }
+    Checked {
+        what,
+        verdict: Verdict::Failed,
+        problem: Some(Problem::NoRecordedConsent { in_cooldown: true }),
+    }
+}
+
+/// One configured account: does it resolve, may an unattended run read it, and
+/// what do its counters say.
+///
+/// The id comes back beside the line rather than only inside it.
+/// `with_a_session` needs it to ask about the baseline, and it read it back out
+/// of the `What::Account` this function had just built — through a catch-all
+/// that cannot fire, which is the shape that stops being true quietly. Handed
+/// back, the compiler is what keeps the two in step.
+async fn account_of(
+    app: &App,
+    watched: &super::watch::Watched,
+    ask: bool,
+) -> (Checked, Option<Pk>) {
+    let target = watched.name().map(str::to_string);
+    let may_run_unattended = watched.may_run_unattended();
+
+    let mut what = What::Account {
+        target: target.clone(),
+        pk: None,
+        followers: None,
+        following: None,
+        may_run_unattended,
+    };
+
+    // A session that does not work cannot answer about anybody, and asking
+    // would spend a request to learn what the line above already said.
+    if !ask {
+        return (
+            Checked {
+                what,
+                verdict: Verdict::Warned,
+                problem: Some(Problem::SessionSilent),
+            },
+            None,
+        );
+    }
+
+    let name = match &target {
+        Some(name) => name.clone(),
+        None => match &app.viewer().username {
+            Some(name) => name.clone(),
+            // The session carries an id and no name, so the account has to be
+            // resolved before anything can be asked about it.
+            //
+            // The comment here used to say `validate` above had "just done for
+            // free" exactly that, and it had not. Without a browser `validate`
+            // requests `/api/v1/friendships/{id}/following/?count=1`, which
+            // names no account, and it takes `&self`, so it could not have
+            // stored a name if it had learned one. This arm answered `Ok` for an account it
+            // had never resolved — and because `with_a_session` takes the pk out
+            // of the `What::Account` it returns and finds `None`, `baseline_of`
+            // was skipped for it too. Two checks reported as passed without
+            // being made, on a line indistinguishable from the one printed when
+            // they were.
+            //
+            // Reachable and persistent rather than a corner case:
+            // `snob login --paste` during a cooldown stores the session without
+            // validating it, so the name stays empty, and only `whoami` ever
+            // fills it in. Nothing on a headless machine runs `whoami`.
+            //
+            // `resolve_username` and not `whoami`, which calls `validate()`
+            // first: without a browser that would spend a second request on
+            // every ordinary user to repeat the check three lines above. This
+            // one is spent only by a session with no name yet, and `cli.rs`
+            // names it in the cost; from the browser neither is spent.
+            None => match app.client().resolve_username(app.viewer().pk).await {
+                Ok(Some(name)) => name,
+                // Instagram answered and carried no username. Nothing more can
+                // be asked, and a run is not stopped by it — a run resolves its
+                // own target — so this is the warning it is, not a failure.
+                Ok(None) => {
+                    return (
+                        Checked {
+                            what,
+                            verdict: Verdict::Warned,
+                            problem: Some(Problem::NoUsername),
+                        },
+                        None,
+                    );
+                }
+                Err(e) => {
+                    return (
+                        Checked {
+                            what,
+                            verdict: Verdict::Failed,
+                            problem: Some(Problem::Foreign(crate::report::what_instagram_said(&e))),
+                        },
+                        None,
+                    );
+                }
+            },
+        },
+    };
+
+    // The own account's pk is the session's, and a third party's is known
+    // once a list walked here named it; a check writes nothing, so without
+    // one every poll pays the lookup again.
+    let known = match &target {
+        None => Some(app.viewer().pk),
+        Some(_) => crate::engine::target::known_pk(app, &name).ok().flatten(),
+    };
+    match app.client().profile_named(&name, known).await {
+        Ok(profile) => {
+            what = What::Account {
+                target,
+                pk: Some(profile.id),
+                followers: profile.follower_count(),
+                following: profile.following_count(),
+                may_run_unattended,
+            };
+            // Counters that cannot be known are the preflight's own subject.
+            // Half of what `check` is for is finding the truncation wall before
+            // six hours of walking, and that check is a comparison against the
+            // declared size — so on an account whose profile Instagram will not
+            // serve, and whose id therefore came from search, the preflight can
+            // no longer make the promise it exists to make. A warning rather
+            // than a failure: the run would still work, and only what would
+            // stop one reaches the exit code.
+            let counters_unknown = !profile.counters_are_knowable();
+            let verdict = if !may_run_unattended {
+                Verdict::Failed
+            } else if counters_unknown {
+                Verdict::Warned
+            } else {
+                Verdict::Ok
+            };
+            let problem = if !may_run_unattended {
+                Some(Problem::NoRecordedConsent { in_cooldown: false })
+            } else if counters_unknown {
+                Some(Problem::CountersUnknowable)
+            } else {
+                None
+            };
+            (
+                Checked {
+                    what,
+                    verdict,
+                    problem,
+                },
+                Some(profile.id),
+            )
+        }
+        Err(e) => (
+            Checked {
+                what,
+                verdict: Verdict::Failed,
+                problem: Some(Problem::Foreign(crate::report::what_instagram_said(&e))),
+            },
+            None,
+        ),
+    }
+}
+
+/// What the preflight message calls itself, in the header and in the body.
+///
+/// One constant so the two cannot disagree. A preflight is never queued, so it
+/// never goes through `event_for`, which keeps them agreeing for reports.
+pub const PREFLIGHT_EVENT: &str = "watch.preflight";
+
+/// Posts one message to the address a report would go to.
+///
+/// The only way to know a webhook works is to use it. A parsed URL says nothing
+/// about whether the host resolves, the certificate verifies, the path is
+/// registered or the token is the one the receiver wants — and every one of
+/// those turns into a queued report and a retry schedule six hours later,
+/// discovered from `status` if anybody looks.
+///
+/// It carries the configured headers and the configured signature, because a
+/// preflight that skipped either would be checking a request nobody makes.
+/// `event` is `watch.preflight`, so a receiver can branch on it exactly as it
+/// branches on the rest, and **nothing is queued**: this is not a report, so
+/// there is nothing to retry and nothing to deduplicate.
+pub async fn webhook_of(
+    client: &crate::watch::webhook::WebhookClient,
+    destination: String,
+    signed: bool,
+    run_id: &str,
+    body: &str,
+) -> Checked {
+    use crate::watch::webhook::Attempt;
+
+    // Built inside each arm, because the status differs; `describe_check`
+    // builds its "{destination} answered {code}" sentence out of both fields.
+    match client.post(body, PREFLIGHT_EVENT, run_id, 1).await {
+        Attempt::Delivered { status } => Checked {
+            what: What::Webhook {
+                destination,
+                status: Some(status),
+                signed,
+            },
+            verdict: Verdict::Ok,
+            problem: None,
+        },
+        // **The code the far end answered with is carried through**, so a
+        // probe can tell "404, the workflow is not registered" from "the host
+        // does not resolve". The error is the far end's own text, never a
+        // `Debug` rendering: the words are `say`'s.
+        other => Checked {
+            what: What::Webhook {
+                destination,
+                status: other.status(),
+                signed,
+            },
+            verdict: Verdict::Failed,
+            problem: Some(Problem::Foreign(other.error().to_string())),
+        },
+    }
+}
+
+/// The one test of "there is nothing to compare against yet".
+///
+/// A list counts only once a mark says it was reported on, which is what
+/// [`reported_baseline`] puts into `taken_at` — so two captures nobody has ever
+/// reported on are still no baseline, whichever of the two readers is asking.
+fn wants_a_baseline(what: &What) -> bool {
+    matches!(what, What::Baseline { taken_at } if taken_at.len() < 2)
+}
+
+/// When the capture a run would compare against was taken, if there is one.
+///
+/// **Asked of `watch_marks`, not of the newest capture.** A run compares against
+/// what was last *reported*, as AGENTS.md states. One `snob followers` and one
+/// `snob following`, the two commands the README leads with, leave two
+/// complete captures and no mark, and that is still a first run with nothing
+/// to compare against.
+///
+/// The moment is the marked capture's rather than the newest one's, for the same
+/// reason: a `snob followers` run after the last report leaves a newer capture
+/// no comparison will use, and printing its date would name a baseline that is
+/// not the baseline.
+///
+/// `find_usable` and not `find`, so a marked capture that retention took or that
+/// turns out incomplete answers `None` and the list correctly stops counting it.
+fn reported_baseline(
+    app: &App,
+    pk: Pk,
+    kind: snob_core::model::ListKind,
+) -> Result<Option<Epoch>, snob_store::store::StoreError> {
+    let Some(id) = watch_store::mark(app.db().conn(), pk, kind)?.and_then(|m| m.snapshot_id) else {
+        return Ok(None);
+    };
+    Ok(snapshots::find_usable(app.db().conn(), id)?.map(|s| s.taken_at.unwrap_or_default()))
+}
+
+/// Whether there is anything for the first scheduled run to compare against.
+///
+/// A first run is a `Basis::Baseline`: it reports nothing, by design, and
+/// somebody who has just set the monitor up reads that as broken. Saying so here
+/// is cheaper than explaining it afterwards.
+pub fn baseline_of(app: &App, pk: Pk) -> Checked {
+    let mut taken_at = Vec::new();
+    for kind in [
+        snob_core::model::ListKind::Followers,
+        snob_core::model::ListKind::Following,
+    ] {
+        match reported_baseline(app, pk, kind) {
+            Ok(Some(at)) => taken_at.push((kind, at)),
+            Ok(None) => {}
+            Err(e) => {
+                return Checked {
+                    what: What::Baseline { taken_at },
+                    verdict: Verdict::Warned,
+                    problem: Some(Problem::Foreign(e.to_string())),
+                };
+            }
+        }
+    }
+
+    let what = What::Baseline { taken_at };
+    let wants = wants_a_baseline(&what);
+    Checked {
+        what,
+        verdict: if wants { Verdict::Warned } else { Verdict::Ok },
+        problem: wants.then_some(Problem::FirstRunLaysTheBaseline),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A schedule the scheduler refuses is reported, not omitted.
+    ///
+    /// Without a schedule line `verdict()`, `max().unwrap_or(Ok)`, would exit
+    /// 0 about a file that kills `snob watch` at `schedule_from` on every
+    /// invocation. The `NotConfigured` warning does not cover it, because a
+    /// file exists.
+    #[test]
+    fn a_schedule_the_scheduler_refuses_is_reported_rather_than_omitted() {
+        let configured = snob_store::config::parse(
+            "schema = 1\nevery = \"5m\"\n",
+            std::path::Path::new("watch.toml"),
+        )
+        .expect("config::parse reads TOML and a schema number, not what the values mean");
+        let refused: Result<Schedule, String> = Err("5m is too often".to_string());
+
+        let report =
+            without_a_session(Some(&configured), Some(&refused), Epoch::new(1_700_000_000));
+
+        assert_eq!(report.verdict(), Verdict::Failed);
+        assert_eq!(report.checked.len(), 1, "{:?}", report.checked);
+        assert!(
+            matches!(
+                &report.checked[0].problem,
+                Some(Problem::Unbuildable(why)) if why.contains("5m is too often")
+            ),
+            "the line has to carry what the scheduler said: {:?}",
+            report.checked
+        );
+    }
+
+    /// One verdict, one code, whichever command asked and in whichever format.
+    #[test]
+    fn a_verdict_decides_one_exit_code() {
+        assert_eq!(Verdict::Failed.exit_code(), ExitCode::Error);
+
+        // A monitor with no baseline yet will work; it just has nothing to say
+        // on its first run, and one sitting out a cooldown is working too.
+        assert_eq!(Verdict::Warned.exit_code(), ExitCode::Ok);
+        assert_eq!(Verdict::Ok.exit_code(), ExitCode::Ok);
+    }
+
+    /// The moments a schedule names, worked out through the evaluator that
+    /// actually decides them.
+    ///
+    /// Not recomputed here in any other way, and that is the point: a preflight
+    /// with arithmetic of its own would be checking a schedule nobody runs.
+    #[test]
+    fn a_schedule_names_the_moments_it_will_fire_at() {
+        let schedule = Schedule::every(Duration::from_secs(6 * 3_600)).unwrap();
+        let checked = schedule_of(&schedule, Epoch::new(1_700_000_000));
+
+        assert_eq!(checked.verdict, Verdict::Ok);
+        let What::Schedule { next } = checked.what else {
+            panic!("a schedule check is about a schedule");
+        };
+        assert_eq!(next.len(), MOMENTS_SHOWN);
+        assert!(
+            next.windows(2).all(|pair| pair[1] > pair[0]),
+            "they have to be in the future and in order: {next:?}"
+        );
+    }
+
+    /// A calendar that never fires is the one answer worth a red line before
+    /// anything is scheduled at all. `0 0 31 2 *` is the standing example:
+    /// there is no thirty-first of February.
+    #[test]
+    fn a_schedule_that_never_fires_is_a_failure_rather_than_a_wait() {
+        let schedule = Schedule::cron("0 0 31 2 *").unwrap();
+        let checked = schedule_of(&schedule, Epoch::new(1_700_000_000));
+
+        assert_eq!(checked.verdict, Verdict::Failed);
+        assert!(checked.problem.is_some());
+    }
+
+    /// A machine with no `watch.toml` is not broken, but a bare `snob watch`
+    /// there has no schedule to run on, and saying so is the whole job.
+    #[test]
+    fn nothing_configured_is_reported_rather_than_passed_over() {
+        let report = without_a_session(None, None, Epoch::new(1_700_000_000));
+
+        assert_eq!(report.verdict(), Verdict::Warned);
+        assert!(matches!(
+            report.checked.first().map(|c| &c.what),
+            Some(What::NotConfigured)
+        ));
+    }
+
+    /// The exit code is made of the worst line, so one failure among healthy
+    /// ones is still a failure.
+    #[test]
+    fn the_verdict_is_the_worst_of_them() {
+        let mut report = CheckReport::default();
+        assert_eq!(
+            report.verdict(),
+            Verdict::Ok,
+            "nothing checked is not a fail"
+        );
+
+        report.push(What::NotConfigured, Verdict::Ok, None);
+        report.push(What::NotConfigured, Verdict::Failed, None);
+        report.push(What::NotConfigured, Verdict::Warned, None);
+        assert_eq!(report.verdict(), Verdict::Failed);
+    }
+}

@@ -1,0 +1,38 @@
+name: Supply chain
+
+# Actions are pinned to a commit, not to a tag; `.github/dependabot.yml` says
+# why, and is what moves the pins.
+
+# Its own file because of the schedule. `on:` is a property of the workflow, not
+# of a job, so a weekly cron in ci.yml would start every job in ci.yml -- the
+# test matrix and the five-target build, every Monday, for a check that
+# compiles nothing. `if:` guards on each job would have to be remembered by
+# whoever adds the next one; a file whose only triggers are the ones this check
+# needs cannot drift that way.
+#
+# The schedule is the point rather than a convenience: an advisory published on
+# a Tuesday would otherwise turn somebody's unrelated Wednesday pull request red
+# for the first time. Finding it on a timer means it is already known about by
+# then.
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  # Reads Cargo.lock against the advisory database. It compiles nothing and runs
+  # in well under a minute.
+  supply-chain:
+    name: Advisories and sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check advisories sources licenses

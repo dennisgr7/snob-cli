@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: dennisgr7.snob
+PackageVersion: 0.5.0
+PackageLocale: en-US
+Publisher: dennisgr7
+PublisherUrl: https://github.com/dennisgr7
+PackageName: snob
+PackageUrl: https://github.com/dennisgr7/snob-cli
+License: MIT
+LicenseUrl: https://github.com/dennisgr7/snob-cli/blob/main/LICENSE
+ShortDescription: "Instagram CLI client with extra utilities, media downloads and output ready for AI agents"
+Description: |-
+  Walks an Instagram account's followers and following, crosses them, and
+  reports who does not follow you back, who you never followed back, and who
+  you and somebody else both know. Almost all of it reads: it changes exactly
+  two things, one account per command and after asking, which are following an
+  account and unfollowing one. It never blocks, never removes a follower, and
+  never marks a story as seen.
+Tags:
+  - instagram
+  - cli
+  - followers
+  - unfollowers
+ReleaseNotesUrl: https://github.com/dennisgr7/snob-cli/releases/tag/v0.5.0
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
