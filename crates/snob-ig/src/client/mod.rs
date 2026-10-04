@@ -155,6 +155,17 @@ pub fn point_every_client_at(base: Url) -> Result<(), Url> {
     SANDBOX_BASE.set(base)
 }
 
+/// The site a client built now points at: Instagram, or in a testing build
+/// the server [`point_every_client_at`] named. What a [`CdnClient`] built
+/// with no `IgClient` behind it judges an address against.
+pub fn site() -> Url {
+    #[cfg(feature = "testing")]
+    if let Some(base) = SANDBOX_BASE.get() {
+        return base.clone();
+    }
+    Url::parse(BASE_URL).expect("BASE_URL parses")
+}
+
 impl IgClient {
     pub fn new(session: Session, pacer: Pacer) -> Result<Self, IgError> {
         // Read here rather than at each call site, because `login::validate`

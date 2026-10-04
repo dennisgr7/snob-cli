@@ -66,6 +66,11 @@ pub async fn run(args: PfpArgs, store: SecretStore, paths: &AccountPaths) -> Res
     let rendered = Rendered::Bytes(picture.bytes);
 
     match args.output {
+        // `-o -`: standard output, said, and refused on a terminal.
+        Some(path) if output::is_stdout(&path) => {
+            output::one_file_to_stdout(1)?;
+            output::write_rendered(&rendered, None)?;
+        }
         // The user named it, so replacing what is there is their call.
         Some(path) => output::write_rendered(&rendered, Some(&path))?,
         // A JPEG dumped into a terminal is unreadable noise, so on a terminal

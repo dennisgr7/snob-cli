@@ -287,6 +287,86 @@ pub fn write_rendered(rendered: &Rendered, destination: Option<&Path>) -> Result
     write_bytes(rendered.as_bytes(), destination)
 }
 
+/// Whether `-o` named standard output: `-o -`.
+pub fn is_stdout(path: &Path) -> bool {
+    path.as_os_str() == "-"
+}
+
+/// The checks before a downloaded file goes to standard output: exactly one
+/// file, and a reader that is not a terminal, where the bytes of a JPEG or an
+/// MP4 are noise that can leave it in a state somebody has to reset.
+///
+/// Asked before anything is fetched, so a refusal costs nothing.
+pub fn one_file_to_stdout(files: usize) -> Result<()> {
+    use std::io::IsTerminal;
+    if files != 1 {
+        return Err(anyhow!(
+            "-o - writes one file to standard output, and this is {files}; name a \
+             directory with -o for several"
+        ));
+    }
+    if std::io::stdout().is_terminal() {
+        return Err(anyhow!(
+            "-o - writes the file itself to standard output, which is a terminal here; \
+             redirect it to a file or pipe it into another program"
+        ));
+    }
+    Ok(())
+}
+
+/// Standard output as the sink of a streamed download, which a reader that
+/// left ends quietly, as [`write_stdout`] treats one.
+///
+/// Written through [`std::io::Stdout`] on each chunk rather than held
+/// locked, because a download's sink has to be `Send` and a lock is not.
+/// What has gone out before a failure cannot be taken back: the run exits
+/// non-zero and says so on standard error, and the reader has a prefix.
+#[derive(Default)]
+pub struct StdoutSink {
+    closed: bool,
+}
+
+impl StdoutSink {
+    /// What the download came to: a reader that left is not a failure, and
+    /// anything else that went wrong is, flush included.
+    pub fn finish<T, E: Into<anyhow::Error>>(mut self, result: Result<T, E>) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        result.map_err(Into::into)?;
+        match std::io::Write::flush(&mut self) {
+            Ok(()) => Ok(()),
+            Err(_) if self.closed => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context("could not write the file")),
+        }
+    }
+}
+
+impl std::io::Write for StdoutSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = std::io::stdout().write(buf);
+        self.note(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let flushed = std::io::stdout().flush();
+        self.note(flushed)
+    }
+}
+
+impl StdoutSink {
+    /// Remembers a reader that left, and hands the answer on: the download
+    /// stops at the error, and [`Self::finish`] reads why.
+    fn note<T>(&mut self, result: std::io::Result<T>) -> std::io::Result<T> {
+        if let Err(e) = &result
+            && e.kind() == std::io::ErrorKind::BrokenPipe
+        {
+            self.closed = true;
+        }
+        result
+    }
+}
+
 /// The result, on standard output, for a reader that may have left.
 ///
 /// Not `.ok()` on either call. Standard output is line-buffered, so at this

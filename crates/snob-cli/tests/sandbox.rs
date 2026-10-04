@@ -2977,3 +2977,196 @@ async fn status_makes_no_database() {
     assert_eq!(json(&out)["budget"]["requests"]["left"], 2_001);
     assert!(!db.exists(), "status made a database");
 }
+
+/// `-o -` writes the one file itself to standard output and says nothing
+/// about where it went: a post's item, a story.
+#[tokio::test]
+async fn one_file_goes_to_standard_output_with_a_dash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_post(&instagram).await;
+    with_downloadable_stories(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = here(&tmp);
+
+    let link = format!("https://www.instagram.com/p/{POST_CODE}/");
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["post", &link, "-d", "2", "-o", "-"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"\x00\x00\x00\x18ftypisom a clip");
+    assert!(!stderr(&out).contains("Saved"), "{}", stderr(&out));
+
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["stories", "me", "-d", "1", "-o", "-"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"\xff\xd8\xff\xe0 a picture");
+
+    assert_eq!(
+        std::fs::read_dir(&here).unwrap().count(),
+        0,
+        "a file named - or anything else was written"
+    );
+}
+
+/// `-o -` takes one file: several are refused before any is fetched, and
+/// nothing reaches standard output.
+#[tokio::test]
+async fn standard_output_takes_one_file_and_refuses_several() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_post(&instagram).await;
+    with_downloadable_stories(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = here(&tmp);
+
+    let link = format!("https://www.instagram.com/p/{POST_CODE}/");
+    for args in [
+        vec!["post", link.as_str(), "-d", "all", "-o", "-"],
+        vec!["stories", "me", "-d", "all", "-o", "-"],
+    ] {
+        let out = snob_from(&here, tmp.path(), &instagram, &args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert!(stderr(&out).contains("-o -"), "{}", stderr(&out));
+    }
+    let media = instagram
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/big.jpg" || r.url.path() == "/clip.mp4")
+        .count();
+    assert_eq!(media, 0, "a refused download fetched a file");
+}
+
+/// `fetch` needs nobody signed in: the file comes from the CDN, and no
+/// database, session or browser profile is made for it.
+#[tokio::test]
+async fn fetch_downloads_a_cdn_file_with_no_account() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = MockServer::start().await;
+    serve_media(&instagram).await;
+    let here = here(&tmp);
+
+    let clip = format!("{}/clip.mp4", instagram.uri());
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["fetch", &clip, "--user-agent", UA, "-o", "-"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"\x00\x00\x00\x18ftypisom a clip");
+
+    let picture = format!("{}/big.jpg?oh=signed", instagram.uri());
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["fetch", &picture, "--user-agent", UA, "-o", "face.jpg"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read(here.join("face.jpg")).unwrap(),
+        b"\xff\xd8\xff\xe0 a picture"
+    );
+
+    let requests = instagram.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "only the two files were asked for");
+    for request in &requests {
+        assert!(request.headers.get("cookie").is_none());
+        assert_eq!(request.headers.get("user-agent").unwrap(), UA);
+    }
+    let accounts = snob_store::paths::AppPaths::rooted_at(tmp.path())
+        .data_dir()
+        .join("accounts");
+    assert!(!accounts.exists(), "fetch made an account's directory");
+}
+
+/// An address off the CDN is refused before anything is sent or created.
+#[tokio::test]
+async fn fetch_refuses_an_address_off_the_cdn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = MockServer::start().await;
+    let here = here(&tmp);
+    for address in [
+        "https://evil.test/x.jpg",
+        "http://scontent.cdninstagram.com/x.jpg",
+        "file:///etc/passwd",
+    ] {
+        let out = snob_from(
+            &here,
+            tmp.path(),
+            &instagram,
+            &["fetch", address, "--user-agent", UA, "-o", "x.jpg"],
+        );
+        assert_eq!(out.status.code(), Some(1), "{address}: {}", stderr(&out));
+    }
+    assert!(!here.join("x.jpg").exists());
+    assert!(instagram.received_requests().await.unwrap().is_empty());
+}
+
+/// An expired signed address is said to be one.
+#[tokio::test]
+async fn fetch_says_an_expired_address_is_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&instagram)
+        .await;
+    let here = here(&tmp);
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &[
+            "fetch",
+            &format!("{}/old.jpg", instagram.uri()),
+            "--user-agent",
+            UA,
+            "-o",
+            "old.jpg",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("expires"), "{}", stderr(&out));
+    assert!(
+        !here.join("old.jpg").exists(),
+        "a refused file was left behind"
+    );
+}
+
+/// A reader that leaves halfway through a file ends the run quietly.
+#[tokio::test]
+async fn fetch_to_a_reader_that_left_is_not_a_failure() {
+    use std::process::Stdio;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(url_path("/large.mp4"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 4 << 20]))
+        .mount(&instagram)
+        .await;
+    let large = format!("{}/large.mp4", instagram.uri());
+    let mut child = command(tmp.path(), Some(&instagram))
+        .args(["fetch", &large, "--user-agent", UA, "-o", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("the binary finishes");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!said.contains("panicked"), "{said}");
+    assert_eq!(out.status.code(), Some(0), "{said}");
+}

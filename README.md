@@ -77,6 +77,7 @@ snob highlights someone 2 -d all # save everything in its second highlight
 snob posts someone               # the posts on its grid
 snob post <link> -d all          # one post by its link, every photo and video in it
 snob reel <link> -d all          # the same for a reel
+snob fetch <cdn-address>         # one file by its address, no account needed
 snob follow someone
 snob unfollow someone
 snob watch                       # keep watching on a schedule, report changes
@@ -96,6 +97,8 @@ can read:
   and `status`.
 - `snob status --budget` says what can still be sent today, for no request, and
   exits 5 while the account is cooling down.
+- `-o -` writes a single downloaded file to standard output, as in
+  `snob reel <link> -d 1 -o - | ffmpeg -i - ...`.
 - `--no-interactive` always prints. Down a pipe this is the default, and the
   default format is JSON.
 - `-y` answers the one confirmation a command may ask, in advance.

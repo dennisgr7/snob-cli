@@ -408,6 +408,14 @@ async fn download_entries(
     let numbers = media::numbers_of(selection, tray.entries.len(), |number| {
         no_such_highlight(tray, number)
     })?;
+    // A whole highlight is as many files as it holds, which is not known
+    // until it is read: refused before that read rather than after it.
+    if destination.is_some_and(crate::output::is_stdout) {
+        return Err(anyhow::anyhow!(
+            "-o - writes one file to standard output, and a whole highlight may hold \
+             several; name one of its items, as in \"snob highlights someone 2 -d 1 -o -\""
+        ));
+    }
 
     let mut failed: Vec<String> = Vec::new();
     let mut not_tried: &[usize] = &[];

@@ -58,7 +58,9 @@ Commands (`crates/snob-cli/src/cli.rs` is the source of truth; `snob --help` and
   `account list`, `account use`, `logout` (`--all`), `purge` (`--account`,
   `--dry-run`).
 - Lists: `unfollowers`, `fans`, `friends`, `followers`, `following`, `scan`.
-- One account: `profile`, `pfp`, `stories`, `highlights`, `posts`.
+- One account: `profile`, `pfp`, `stories`, `highlights`, `posts`. Their `-o -`
+  writes one downloaded file to standard output.
+- One file of the CDN by its address, with no account: `fetch`.
 - One post: `post` (alias `reel`), by its link or its code.
 - The only two writes: `follow`, `unfollow`.
 - The monitor: `watch` (the scheduled loop), `watch once`, `watch diff`,
@@ -310,7 +312,9 @@ Two rules keep it that way:
   `snob status` opens the account's database and `shared.db` with
   `open_existing` and reads the budget with `rate_budget::state`, which charges
   nothing (an `App` would create the database and refresh the session, and a
-  report must not write).
+  report must not write); `snob fetch` builds a `CdnClient` and nothing else (a
+  known CDN address needs no account, so it takes no session, budget or
+  browser, and works with nobody signed in).
 
 **Everything that acts as an account goes through `account::resolve`, and no query
 opens another account's database.** An account's database and session file are

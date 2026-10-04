@@ -524,6 +524,18 @@ pub(crate) async fn download(
     files: Vec<Named>,
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
+    if destination.is_some_and(output::is_stdout) {
+        output::one_file_to_stdout(files.len())?;
+        let file = &files[0];
+        let url = file
+            .url
+            .as_deref()
+            .ok_or_else(|| anyhow!("{} has no downloadable version", file.what))?;
+        let mut sink = output::StdoutSink::default();
+        let streamed = client.download_to(url, file.cap, &mut sink).await;
+        sink.finish(streamed)?;
+        return Ok(ExitCode::Ok);
+    }
     if let ([file], Some(path)) = (files.as_slice(), destination)
         && !path.is_dir()
     {

@@ -109,6 +109,7 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
         | Command::Logout(_)
         | Command::Purge(_)
         | Command::Pfp(_)
+        | Command::Fetch(_)
         | Command::Follow(_)
         | Command::Unfollow(_)
         | Command::BrowserOwner => false,
@@ -267,9 +268,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // The single-account layout moves under its account before anything reads
     // it, with no browser of an older layout's owner still writing into it.
     // Not for `purge`, which removes it whole and must work when the move
-    // cannot, nor for `import`, which reads an export and stores nothing.
-    if !matches!(cli.command, Command::Purge(_) | Command::Import(_))
-        && snob_store::layout::pending(&paths)
+    // cannot, nor for `import` and `fetch`, which store nothing.
+    if !matches!(
+        cli.command,
+        Command::Purge(_) | Command::Import(_) | Command::Fetch(_)
+    ) && snob_store::layout::pending(&paths)
     {
         snob_cli::owner::quit(&paths).await;
         let settled = snob_store::layout::settle(&paths, &store)?;
@@ -415,6 +418,21 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
         }
         Command::Watch(args) => commands::watch::run(args, store, paths, resolved()?).await,
         Command::Import(command) => commands::import::run(command),
+        Command::Fetch(args) => {
+            // Only the User-Agent is read off the account, and only when one
+            // was not given; a registry or session that will not read is no
+            // reason not to fetch a public file.
+            let account_ua = || {
+                let account = resolved().ok().flatten()?;
+                let session = session(&account).load().ok().flatten()?;
+                Some(session.user_agent)
+            };
+            let user_agent = match args.user_agent.clone() {
+                Some(given) => Some(given),
+                None => account_ua(),
+            };
+            commands::fetch::run(args, user_agent).await
+        }
         // Answered at the top.
         Command::BrowserOwner => Ok(ExitCode::Ok),
     }

@@ -392,6 +392,21 @@ pub enum Command {
     )]
     Post(PostArgs),
 
+    /// Download a picture or a video from Instagram's CDN by its address
+    #[command(
+        after_help = "For an address already known, such as one a listing's JSON gives: \
+                      the file is fetched from the CDN with no session, no request to \
+                      Instagram and nothing charged to any account's budget, and works with \
+                      nobody signed in. Only addresses on cdninstagram.com and fbcdn.net are \
+                      fetched. They are signed and expire after a while; a refused one has to \
+                      be asked for again, with \"snob post\" or the listing it came from.\n\n\
+                      The User-Agent sent is --user-agent, then the signed-in account's, then \
+                      the installed browser's. With no -o the file goes to standard output \
+                      down a pipe, and into the working directory under the address's own \
+                      file name at a terminal."
+    )]
+    Fetch(FetchArgs),
+
     /// Follow an account
     #[command(
         after_help = "One account per run, on purpose: what Instagram acts on is a burst of \
@@ -503,6 +518,20 @@ pub struct WhoamiArgs {
 
     #[command(flatten)]
     pub output: StatusOutputArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FetchArgs {
+    /// The file's address on Instagram's CDN
+    pub url: String,
+
+    /// Destination file; "-" for standard output
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// The User-Agent to send, instead of the account's or the browser's
+    #[arg(long, value_name = "STRING")]
+    pub user_agent: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1162,7 +1191,7 @@ pub struct PfpArgs {
     /// Account whose profile picture to download
     pub target: String,
 
-    /// Destination file
+    /// Destination file; "-" for standard output
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
 
@@ -1279,7 +1308,7 @@ pub struct MediaActionArgs {
     pub no_interactive: bool,
 
     /// Where a download goes. A directory when several are saved, a file when
-    /// one is.
+    /// one is; "-" writes one file to standard output, for a pipe.
     // Refused beside `-i` rather than accepted and ignored: the browser's own
     // D saves into the working directory, one item at a time, and has nowhere
     // to take a path from. `pfp` draws the same line.
@@ -1303,6 +1332,8 @@ impl MediaActionArgs {
             .is_none()
             .then_some(self.output.as_deref())
             .flatten()
+            // `-o -` is standard output, where a listing goes anyway.
+            .filter(|path| !crate::output::is_stdout(path))
     }
 
     /// Whether this run takes the terminal over. The order is
