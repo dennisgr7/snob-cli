@@ -1,18 +1,18 @@
 {
-    "version": "0.5.0",
+    "version": "0.6.0",
     "description": "Instagram CLI client with extra utilities, media downloads and output ready for AI agents",
     "homepage": "https://github.com/dennisgr7/snob-cli",
     "license": "MIT",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/dennisgr7/snob-cli/releases/download/v0.5.0/snob-v0.5.0-x86_64-pc-windows-msvc.zip",
-            "hash": "c235f36550640be424e393c7369cd610b0add10936b3b53d9cec852e330cc7d6",
-            "extract_dir": "snob-v0.5.0-x86_64-pc-windows-msvc"
+            "url": "https://github.com/dennisgr7/snob-cli/releases/download/v0.6.0/snob-v0.6.0-x86_64-pc-windows-msvc.zip",
+            "hash": "d52a068a84f5d58fa5047d68d01e220ce8d985721512ec19070f78af31e6be60",
+            "extract_dir": "snob-v0.6.0-x86_64-pc-windows-msvc"
         },
         "arm64": {
-            "url": "https://github.com/dennisgr7/snob-cli/releases/download/v0.5.0/snob-v0.5.0-aarch64-pc-windows-msvc.zip",
-            "hash": "864172ec095f7dba6849a0bce8558f2d23c1e766bdef2a4c47f2093f833b240a",
-            "extract_dir": "snob-v0.5.0-aarch64-pc-windows-msvc"
+            "url": "https://github.com/dennisgr7/snob-cli/releases/download/v0.6.0/snob-v0.6.0-aarch64-pc-windows-msvc.zip",
+            "hash": "0e85b3d957d30134752cd64944a09fb20a3fb50f6f80692ec00a4195d868fa6c",
+            "extract_dir": "snob-v0.6.0-aarch64-pc-windows-msvc"
         }
     },
     "bin": "snob.exe",
