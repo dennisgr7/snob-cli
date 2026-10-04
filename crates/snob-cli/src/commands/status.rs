@@ -284,7 +284,19 @@ impl Found<'_> {
                 field("Account", &who),
                 field(
                     "Session",
-                    &format!("{}, in the {}; {checked}", s.origin, self.storage),
+                    &format!(
+                        "{}, kept in {}; {checked}",
+                        match s.origin {
+                            snob_core::session::SessionOrigin::Browser => {
+                                "signed in through the browser"
+                            }
+                            snob_core::session::SessionOrigin::Paste => "pasted by hand",
+                        },
+                        match self.storage {
+                            "keyring" => "the system keyring",
+                            _ => "a file",
+                        }
+                    ),
                 ),
             ]);
         }
@@ -313,10 +325,16 @@ impl Found<'_> {
                 row(
                     "Writes",
                     &format!(
-                        "{} of {} in a row; the next {}",
+                        "{} of {} in a row{}",
                         b.writes.left,
                         b.writes.most,
-                        self.when(b.next_write_at)
+                        // Said only when the next one waits: on the write
+                        // bucket, or on the reads a write pays as well.
+                        if b.next_write_at > self.now {
+                            format!("; the next {}", self.when(b.next_write_at))
+                        } else {
+                            String::new()
+                        }
                     ),
                 ),
                 row(
