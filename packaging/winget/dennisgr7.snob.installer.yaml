@@ -1,23 +1,23 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
 PackageIdentifier: dennisgr7.snob
-PackageVersion: 0.5.0
+PackageVersion: 0.6.0
 InstallerType: zip
 NestedInstallerType: portable
 Commands:
   - snob
-ReleaseDate: 2026-08-24
+ReleaseDate: 2026-10-04
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/dennisgr7/snob-cli/releases/download/v0.5.0/snob-v0.5.0-x86_64-pc-windows-msvc.zip
-    InstallerSha256: C235F36550640BE424E393C7369CD610B0ADD10936B3B53D9CEC852E330CC7D6
+    InstallerUrl: https://github.com/dennisgr7/snob-cli/releases/download/v0.6.0/snob-v0.6.0-x86_64-pc-windows-msvc.zip
+    InstallerSha256: D52A068A84F5D58FA5047D68D01E220CE8D985721512EC19070F78AF31E6BE60
     NestedInstallerFiles:
-      - RelativeFilePath: snob-v0.5.0-x86_64-pc-windows-msvc\snob.exe
+      - RelativeFilePath: snob-v0.6.0-x86_64-pc-windows-msvc\snob.exe
         PortableCommandAlias: snob
   - Architecture: arm64
-    InstallerUrl: https://github.com/dennisgr7/snob-cli/releases/download/v0.5.0/snob-v0.5.0-aarch64-pc-windows-msvc.zip
-    InstallerSha256: 864172EC095F7DBA6849A0BCE8558F2D23C1E766BDEF2A4C47F2093F833B240A
+    InstallerUrl: https://github.com/dennisgr7/snob-cli/releases/download/v0.6.0/snob-v0.6.0-aarch64-pc-windows-msvc.zip
+    InstallerSha256: 0E85B3D957D30134752CD64944A09FB20A3FB50F6F80692EC00A4195D868FA6C
     NestedInstallerFiles:
-      - RelativeFilePath: snob-v0.5.0-aarch64-pc-windows-msvc\snob.exe
+      - RelativeFilePath: snob-v0.6.0-aarch64-pc-windows-msvc\snob.exe
         PortableCommandAlias: snob
 ManifestType: installer
 ManifestVersion: 1.6.0
