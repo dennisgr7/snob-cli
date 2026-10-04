@@ -74,7 +74,11 @@ clap = { version = "4", features = ["derive", "env"] }
 # so `params![pk]` does not compile whatever this feature says, and
 # `store::pk_to_sql` / `pk_from_sql` are the only road. The feature stays off
 # for everything else in the schema that is counted rather than identified.
-rusqlite = { version = "0.40", features = ["bundled"] }
+# `backup` is SQLite's own online backup, a few lines of bindings and no
+# dependency: `snob status` reads a database an older snob left by copying it
+# into memory and migrating the copy, since migrating the file would be a
+# write (`store::read_only`).
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 rusqlite_migration = "2.6"
 fastrand = "2.5"
 chrono = "0.4"

@@ -81,6 +81,14 @@ use snob_core::budget::RateBudget;
 /// paths, rather than in pages no browser asks for.
 pub const ACCOUNTS_PER_PAGE: u32 = 12;
 
+/// The fewest the app gets back on a page that is not the last: eight of the
+/// [`ACCOUNTS_PER_PAGE`] it asks for.
+///
+/// Not a pacing number and nothing waits on it: it is what an estimate of a
+/// walk takes as its most pages (`--dry-run`), since a list read at eight a
+/// page takes half as many pages again as one read at twelve.
+pub const ACCOUNTS_PER_PAGE_FEWEST: u32 = 8;
+
 /// The wait between the pages of one action, in milliseconds, drawn anew
 /// each time: one to three seconds.
 ///

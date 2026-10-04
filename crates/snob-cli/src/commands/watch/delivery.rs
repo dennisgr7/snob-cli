@@ -111,7 +111,7 @@ fn plan(
     //
     // Compared by origin rather than by string, so a path or a query on the same
     // host is still the same destination. The project already has the pattern:
-    // `IgClient::check_downloadable` exists so the CDN cannot be handed a
+    // `CdnClient::check_downloadable` exists so the CDN cannot be handed a
     // credential meant for somewhere else.
     //
     // **An origin there is nothing to compare against is not a match.** Two

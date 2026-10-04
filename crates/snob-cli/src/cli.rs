@@ -268,16 +268,21 @@ pub enum Command {
 
     /// Where the account stands: session, request budget, cooldown, lists, monitor
     #[command(
-        after_help = "Read from what is stored here; nothing is sent and nothing is written. \
-                      With no section named, all of them; --budget, --cooldown, --session, \
-                      --lists and --watch narrow it to those.\n\n\
+        after_help = "Read from what is stored here; nothing is sent and nothing stored is \
+                      changed, not even a database an older snob left, which is read as the \
+                      current one without being migrated. With no section named, all of \
+                      them; --budget, --cooldown, --session, --lists and --watch narrow it \
+                      to those.\n\n\
                       It exits 5 while the account is in cooldown, whatever sections were \
                       asked for, so \"snob status --budget && snob scan\" runs the scan only \
                       when it may send; 3 with no session; 0 otherwise.\n\n\
-                      The budget counts what goes out now without a wait: the pace allows \
-                      twenty-one requests in a row, the day about two thousand, and writes \
-                      three in a row and then one every fifteen minutes. Lists read at most \
-                      2,000 accounts in any 24 hours, 1,000 for a week after a push-back."
+                      The budget counts what goes out now without a wait, which is the \
+                      smaller of two buckets every request pays: the pace allows twenty-one \
+                      requests in a row, the day about two thousand. Writes go three in a \
+                      row and then one every fifteen minutes. Lists read at most 2,000 \
+                      accounts in any 24 hours, 1,000 for a week after a push-back. In \
+                      --json a moment something may happen again is rounded up to its \
+                      second."
     )]
     Status(StatusArgs),
 
@@ -570,6 +575,23 @@ pub struct StatusSections {
     pub watch: bool,
 }
 
+impl StatusSections {
+    /// The JSON keys of the sections this run shows, in the order it shows
+    /// them.
+    pub fn names(&self) -> Vec<&'static str> {
+        [
+            (self.session, "session"),
+            (self.budget, "budget"),
+            (self.cooldown, "cooldown"),
+            (self.lists, "lists"),
+            (self.watch, "watch"),
+        ]
+        .into_iter()
+        .filter_map(|(shown, name)| shown.then_some(name))
+        .collect()
+    }
+}
+
 impl StatusArgs {
     /// The sections named, or every one when none was.
     pub fn sections(&self) -> StatusSections {
@@ -663,7 +685,7 @@ pub struct ListArgs {
 
     /// Trim the output to the first N accounts. Saves no requests: --max-pages
     /// is what does that.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", conflicts_with = "dry_run")]
     pub limit: Option<usize>,
 
     #[command(flatten)]
@@ -805,7 +827,8 @@ pub struct OutputArgs {
     #[arg(long, value_enum)]
     pub format: Option<Format>,
 
-    /// Write the result to a file instead of standard output
+    /// Write the result to a file instead of standard output ("-" is
+    /// standard output)
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     pub path: Option<PathBuf>,
 }
@@ -890,7 +913,17 @@ pub struct WalkArgs {
 
     /// Say what the walks would cost, against what today has left, and send
     /// nothing
-    #[arg(long, conflicts_with = "offline")]
+    // Refused beside every flag it would ignore: it asks nothing (`-y`),
+    // draws no bar, opens no view, and lists nobody to filter. `--limit` says
+    // the same on its own side, since `scan` has none. `--format` and `-o`
+    // stay, for the estimate's own two forms (`commands::dry_run`).
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "offline", "yes", "no_progress", "interactive", "no_interactive",
+            "hide", "only", "no_verified", "exclude_list",
+        ]
+    )]
     pub dry_run: bool,
 
     #[command(flatten)]
@@ -1161,7 +1194,8 @@ pub struct ProfileArgs {
     #[arg(long, value_enum)]
     pub format: Option<ProfileFormat>,
 
-    /// Write the result to a file instead of standard output
+    /// Write the result to a file instead of standard output ("-" is
+    /// standard output)
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
 
@@ -1314,7 +1348,8 @@ pub struct MediaActionArgs {
     pub no_interactive: bool,
 
     /// Where a download goes. A directory when several are saved, a file when
-    /// one is; "-" writes one file to standard output, for a pipe.
+    /// one is; "-" writes one file to standard output, for a pipe. Without
+    /// -d, the listing's file, "-" being standard output
     // Refused beside `-i` rather than accepted and ignored: the browser's own
     // D saves into the working directory, one item at a time, and has nowhere
     // to take a path from. `pfp` draws the same line.
@@ -1340,6 +1375,27 @@ impl MediaActionArgs {
             .flatten()
             // `-o -` is standard output, where a listing goes anyway.
             .filter(|path| !crate::output::is_stdout(path))
+    }
+
+    /// How many files `-d` names, at least, before the listing is read: the
+    /// count of the numbers given, or `None` for `all` or no `-d`. What
+    /// `output::stdout_download_ahead` refuses `-o -` on before a request.
+    pub fn files_named(&self) -> Option<usize> {
+        match self.selection()? {
+            DownloadSelection::These(numbers) => Some(numbers.len()),
+            DownloadSelection::All => None,
+        }
+    }
+
+    /// Refuses, before anything is asked of Instagram, a download to `-o -`
+    /// that the command line already says cannot go there: standard output
+    /// is a terminal, or the numbers given name several files. Only with a
+    /// download asked for; a listing goes to standard output as it is.
+    pub fn refuse_stdout_download_early(&self) -> anyhow::Result<()> {
+        if self.selection().is_none() {
+            return Ok(());
+        }
+        crate::output::stdout_download_ahead(self.output.as_deref(), self.files_named())
     }
 
     /// Whether this run takes the terminal over. The order is

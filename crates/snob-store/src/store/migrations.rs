@@ -25,7 +25,7 @@ use std::sync::LazyLock;
 use rusqlite_migration::{M, Migrations};
 
 /// Every migration, in the order they are applied.
-const CHAIN: [&str; 12] = [
+pub(crate) const CHAIN: [&str; 12] = [
     include_str!("sql/001_initial.sql"),
     include_str!("sql/002_watch.sql"),
     include_str!("sql/003_deliveries.sql"),

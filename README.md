@@ -98,8 +98,8 @@ can read:
 - `snob status --budget` says what can still be sent today, for no request, and
   exits 5 while the account is cooling down. `--dry-run` on a list command says
   what its walks would cost against that, and sends nothing.
-- `-o -` writes a single downloaded file to standard output, as in
-  `snob reel <link> -d 1 -o - | ffmpeg -i - ...`.
+- `-o -` is standard output: a list as with no `-o`, and a single downloaded
+  file, as in `snob reel <link> -d 1 -o - | ffmpeg -i - ...`.
 - `--no-interactive` always prints. Down a pipe this is the default, and the
   default format is JSON.
 - `-y` answers the one confirmation a command may ask, in advance.

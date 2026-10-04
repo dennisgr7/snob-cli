@@ -421,17 +421,23 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
         Command::Fetch(args) => {
             // Only the User-Agent is read off the account, and only when one
             // was not given; a registry or session that will not read is no
-            // reason not to fetch a public file.
-            let account_ua = || {
-                let account = resolved().ok().flatten()?;
-                let session = session(&account).load().ok().flatten()?;
-                Some(session.user_agent)
+            // reason not to fetch a public file. An account named with
+            // --account or SNOB_ACCOUNT that is not signed in here is a
+            // mistake to say, though, not one to pass over.
+            let account_ua = || -> anyhow::Result<Option<String>> {
+                let account = match resolved() {
+                    Ok(Some(account)) => account,
+                    Ok(None) => return Ok(None),
+                    Err(e) if named => return Err(e),
+                    Err(_) => return Ok(None),
+                };
+                Ok(session(&account)
+                    .load()
+                    .ok()
+                    .flatten()
+                    .map(|session| session.user_agent))
             };
-            let user_agent = match args.user_agent.clone() {
-                Some(given) => Some(given),
-                None => account_ua(),
-            };
-            commands::fetch::run(args, user_agent).await
+            commands::fetch::run(args, account_ua).await
         }
         // Answered at the top.
         Command::BrowserOwner => Ok(ExitCode::Ok),

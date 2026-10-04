@@ -557,16 +557,20 @@ pub fn refused_ask(ask: &Ask) -> Option<String> {
 }
 
 /// Why the tab must not fetch `url` as an asset of the site at `origin`: it
-/// is neither on Instagram's CDN nor the site itself, which is how a test
-/// serves one from its own server, nor served over HTTPS. The one copy of
-/// where a file may come from: the client asks it before it asks the tab,
-/// and the tab asks it again before it fetches, whoever sent the intent.
+/// is neither on Instagram's CDN nor a test's own server, nor served over
+/// HTTPS. The one copy of where a file may come from: the client asks it
+/// before it asks the tab, and the tab asks it again before it fetches,
+/// whoever sent the intent.
 ///
 /// **HTTPS, and one of the two hosts Instagram serves media from** (the
 /// leading dot is what stops `evilcdninstagram.com` matching), or exactly the
-/// site's own scheme, host and port: on host alone that exception would be
-/// live against the real site, and `http://www.instagram.com:8080/x` would be
-/// fetched in the clear.
+/// site's own scheme, host and port when the site is not Instagram, which is
+/// how a test serves a file from its own server. Matched whole, since on host
+/// alone it would let `http://127.0.0.1:9/x` through beside a test on another
+/// port; and never for Instagram itself, where it would make every address on
+/// instagram.com a "download": `snob fetch` takes its address from whoever
+/// typed it, and the site's API is not a file to be read unpaced and outside
+/// the allowlist.
 pub fn refused_asset(origin: &str, url: &str) -> Option<String> {
     const CDN_HOSTS: [&str; 2] = ["cdninstagram.com", "fbcdn.net"];
 
@@ -579,8 +583,10 @@ pub fn refused_asset(origin: &str, url: &str) -> Option<String> {
     let Ok(url) = Url::parse(url) else {
         return Some("a download from an address that does not parse".into());
     };
+    let instagram = |host: &str| host == "instagram.com" || host.ends_with(".instagram.com");
     if Url::parse(origin).is_ok_and(|origin| {
-        origin.scheme() == url.scheme()
+        !origin.host_str().is_some_and(instagram)
+            && origin.scheme() == url.scheme()
             && origin.host_str() == url.host_str()
             && origin.port_or_known_default() == url.port_or_known_default()
     }) {

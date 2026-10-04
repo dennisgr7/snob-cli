@@ -23,7 +23,7 @@ use crate::client_hints::ClientHints;
 use crate::error::IgError;
 use crate::pace::CancelToken;
 
-use super::transport::{MAX_HOPS, build_client, read_capped_bytes, stream_capped};
+use super::transport::{MAX_HOPS, build_cdn_client, read_capped_bytes, stream_capped};
 
 /// Ceiling on a downloaded asset. A profile picture tops out at 1080x1080 and
 /// lands far below this; the cap exists so that a redirect to something else
@@ -35,6 +35,22 @@ pub(super) const MAX_ASSET_BYTES: usize = 8 * 1024 * 1024;
 /// to as well.
 pub(super) fn serves_pictures(base: &Url, url: &Url) -> bool {
     crate::allowlist::refused_asset(base.as_str(), url.as_str()).is_none()
+}
+
+/// [`CdnClient::check_downloadable`], for a caller that has the site's address
+/// and no reason to build a client: the tab's path judges the address before
+/// it asks the tab, and only needs the `CdnClient` when the tab cannot fetch.
+pub(super) fn check_downloadable(base: &Url, url: &Url) -> Result<(), IgError> {
+    if serves_pictures(base, url) {
+        return Ok(());
+    }
+    Err(IgError::Unexpected {
+        status: 0,
+        body: format!(
+            "the picture URL points somewhere pictures do not come from: {}",
+            url.host_str().unwrap_or("nowhere")
+        ),
+    })
 }
 
 /// Redirects for an asset: every hop held to the same rule as the first.
@@ -73,7 +89,7 @@ impl CdnClient {
     /// CDN answer as it would to that browser, and it names nobody.
     pub fn new(user_agent: &str, base: Url, cancel: CancelToken) -> Result<Self, IgError> {
         Ok(Self {
-            http: build_client(user_agent, cdn_policy(base.clone()))?,
+            http: build_cdn_client(user_agent, cdn_policy(base.clone()))?,
             accept_encoding: ClientHints::from_user_agent(user_agent).accept_encoding,
             base,
             cancel,
@@ -155,16 +171,7 @@ impl CdnClient {
     /// every hop after it to, which is the point of the rule being one
     /// function.
     pub fn check_downloadable(&self, url: &Url) -> Result<(), IgError> {
-        if serves_pictures(&self.base, url) {
-            return Ok(());
-        }
-        Err(IgError::Unexpected {
-            status: 0,
-            body: format!(
-                "the picture URL points somewhere pictures do not come from: {}",
-                url.host_str().unwrap_or("nowhere")
-            ),
-        })
+        check_downloadable(&self.base, url)
     }
 
     /// The GET behind every download: checked, unpaced, and refused on a

@@ -263,8 +263,10 @@ impl BaselineCost {
     }
 }
 
-/// Adds up what the preflight learned about every account it checked.
-fn baseline_cost(report: &crate::engine::check::CheckReport) -> BaselineCost {
+/// Adds up what the preflight learned about every account it checked, its
+/// requests as they go out from the browser or, with `browser` false,
+/// directly.
+fn baseline_cost(report: &crate::engine::check::CheckReport, browser: bool) -> BaselineCost {
     use crate::engine::check::What;
 
     let mut cost = BaselineCost {
@@ -291,7 +293,7 @@ fn baseline_cost(report: &crate::engine::check::CheckReport) -> BaselineCost {
                 cost.following += b;
                 use crate::engine::walk::{pages_to_walk, requests_to_walk};
                 cost.pages += pages_to_walk(*a) + pages_to_walk(*b);
-                cost.requests += requests_to_walk(*a) + requests_to_walk(*b);
+                cost.requests += requests_to_walk(*a, browser) + requests_to_walk(*b, browser);
             }
             _ => cost.uncounted += 1,
         }
@@ -340,7 +342,9 @@ async fn offer_the_baseline(
     ui::info(&format!(
         "There is no capture to compare against yet, so the first scheduled run \
          will lay one down and report nothing.\n{}",
-        baseline_cost(report).sentence()
+        // From the browser unless this run says otherwise, as the monitor's
+        // own runs will send them.
+        baseline_cost(report, snob_ig::client::page::a_client_would_use_a_page()).sentence()
     ));
     if !ui::confirm("Take the first capture now?", false)? {
         ui::info("Left for the first scheduled run, which will report nothing and say so.");
@@ -825,7 +829,7 @@ evry = \"6h\"
         let both = CheckReport {
             checked: vec![account(Some(512), Some(340)), account(Some(88), Some(12))],
         };
-        let cost = baseline_cost(&both);
+        let cost = baseline_cost(&both, true);
         assert_eq!(
             (cost.accounts, cost.followers, cost.following),
             (2, 600, 352),
@@ -858,7 +862,7 @@ evry = \"6h\"
         let partial = CheckReport {
             checked: vec![account(Some(512), Some(340)), account(None, None)],
         };
-        let cost = baseline_cost(&partial);
+        let cost = baseline_cost(&partial, true);
         assert_eq!((cost.accounts, cost.uncounted), (2, 1));
         assert_eq!((cost.pages, cost.requests), (72, 146));
         assert!(
@@ -879,8 +883,8 @@ evry = \"6h\"
             following,
             pages: crate::engine::walk::pages_to_walk(followers)
                 + crate::engine::walk::pages_to_walk(following),
-            requests: crate::engine::walk::requests_to_walk(followers)
-                + crate::engine::walk::requests_to_walk(following),
+            requests: crate::engine::walk::requests_to_walk(followers, true)
+                + crate::engine::walk::requests_to_walk(following, true),
             uncounted: 0,
         };
 

@@ -493,7 +493,7 @@ pub(crate) async fn download_named(
 
     // Several in flight rather than one after another. The CDN is a different
     // host with its own limits and is deliberately not paced (the reasoning
-    // is on `IgClient::download_capped`), the client to it carries nothing
+    // is on `CdnClient::download_capped`), the client to it carries nothing
     // that names the account, and the connection is HTTP/2 -- so three
     // stories share one TCP+TLS connection instead of each waiting its own
     // round trip. Three is what a browser does when it opens a tray, and

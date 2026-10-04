@@ -81,7 +81,7 @@ const SESSION_SCOPE: &str = "session";
 /// constant is not lowered to let the extra request through. The
 /// navigation before a list and the reads that open a profile are a few
 /// requests an action, which the tolerance absorbs.
-const PACE_EMISSION_MS: i64 = 3_830;
+pub const PACE_EMISSION_MS: i64 = 3_830;
 /// Burst tolerance of the pace bucket: twenty requests.
 ///
 /// Twenty emissions, deliberately: it is what lets a sitting at the walker's
@@ -93,11 +93,11 @@ const PACE_EMISSION_MS: i64 = 3_830;
 /// `a_sitting_at_two_seconds_a_step_fits_the_pace_bucket` with them; a
 /// narrower tolerance would start pacing an ordinary sitting, which is a
 /// design change rather than a tuning.
-const PACE_BURST_MS: i64 = PACE_EMISSION_MS * 20;
+pub const PACE_BURST_MS: i64 = PACE_EMISSION_MS * 20;
 
 /// Daily ceiling of roughly two thousand requests.
-const DAILY_EMISSION_MS: i64 = 43_200;
-const DAILY_BURST_MS: i64 = 86_400_000;
+pub const DAILY_EMISSION_MS: i64 = 43_200;
+pub const DAILY_BURST_MS: i64 = 86_400_000;
 
 /// Sustained pace of **writes**: one follow or unfollow every fifteen minutes,
 /// which is ninety-six a day if somebody keeps it up around the clock.
@@ -554,6 +554,18 @@ impl BudgetState {
     /// How many more accounts the day holds.
     pub fn accounts_left(&self) -> u64 {
         self.accounts_ceiling.saturating_sub(self.accounts_read)
+    }
+
+    /// How many requests go out from now without a wait: every one pays both
+    /// the pace and the day, so the smaller of the two.
+    pub fn requests_now(&self) -> u32 {
+        self.pace.left.min(self.daily.left)
+    }
+
+    /// When the next request goes without a wait: the later of the two
+    /// buckets it pays, each of which says now while it has one left.
+    pub fn next_request_at(&self) -> EpochMs {
+        self.pace.free_at.max(self.daily.free_at)
     }
 }
 
@@ -1447,7 +1459,7 @@ mod tests {
         let (tmp, [a, b, c]) = three_accounts();
         a.start_cooldown("429", Duration::from_secs(3600)).unwrap();
         let long = b.start_cooldown("429", Duration::from_secs(7200)).unwrap();
-        let shared = Shared::open_existing(&crate::paths::AppPaths::rooted_at(tmp.path()))
+        let shared = Shared::read_existing(&crate::paths::AppPaths::rooted_at(tmp.path()))
             .unwrap()
             .unwrap();
         let now = now_ms();

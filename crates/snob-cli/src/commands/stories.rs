@@ -44,6 +44,7 @@ use crate::output::Presentation;
 use crate::ui;
 
 pub async fn run(args: StoriesArgs, store: SecretStore, paths: &AccountPaths) -> Result<ExitCode> {
+    args.action.refuse_stdout_download_early()?;
     let app = common::reader(&store, paths, args.action.interactive, false)?;
     let typed = common::target_or_own(&app, args.target.as_deref()).await?;
 

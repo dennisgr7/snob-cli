@@ -22,8 +22,9 @@
 //! - [`write`] -- the follow and the unfollow, and nothing else. One file, so
 //!   that the rule about which function may send a method other than GET can
 //!   be checked by opening it.
-//! - [`media`] -- the CDN half: where a picture is allowed to come from, and
-//!   the download that carries nothing identifying.
+//! - [`cdn`] -- the CDN half: where a picture is allowed to come from, and
+//!   the download that carries nothing identifying; [`media`], which of the
+//!   tab and that client fetches a file.
 //! - [`page`] -- the browser tab every request to Instagram is sent from by
 //!   default, and the allowlist wrapped around it.
 //! - [`ask`] -- what the client asks that tab for by name rather than by
@@ -202,7 +203,8 @@ impl IgClient {
     /// The CDN client, built the first time a picture is downloaded.
     ///
     /// Everything the policy needs is already a field, so nothing has to be
-    /// captured at construction time, and only `pfp` pays for building it.
+    /// captured at construction time, and only a download the tab does not
+    /// fetch pays for building it.
     pub(in crate::client) fn cdn(&self) -> Result<&CdnClient, IgError> {
         if let Some(cdn) = self.cdn.get() {
             return Ok(cdn);

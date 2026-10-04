@@ -31,17 +31,30 @@ pub fn pages_to_walk(accounts: u64) -> u64 {
     accounts.div_ceil(ACCOUNTS_PER_REQUEST).max(1)
 }
 
-/// About how many requests walking `pages` takes: from the browser, the
-/// navigation that opens the list, and each page followed by its
-/// `show_many`, as the app sends them; without it, one a page.
-pub fn requests_for_pages(pages: u64, browser: bool) -> u64 {
-    if browser { 1 + 2 * pages } else { pages }
+/// The most pages a list of `accounts` may take: the app gets as few as
+/// [`snob_ig::pace::ACCOUNTS_PER_PAGE_FEWEST`] of the twelve it asks for.
+pub fn pages_to_walk_at_most(accounts: u64) -> u64 {
+    accounts
+        .div_ceil(u64::from(snob_ig::pace::ACCOUNTS_PER_PAGE_FEWEST))
+        .max(1)
 }
 
-/// About how many requests walking a list of `accounts` takes, as the
-/// browser sends them, which is how requests go out unless told otherwise.
-pub fn requests_to_walk(accounts: u64) -> u64 {
-    requests_for_pages(pages_to_walk(accounts), true)
+/// About how many requests walking `pages` takes: from the browser, the
+/// navigation that opens the list, and each page followed by its
+/// `show_many`, as the app sends them; without it, one a page. No page is
+/// no request: a walk capped at none stops before the navigation.
+pub fn requests_for_pages(pages: u64, browser: bool) -> u64 {
+    match pages {
+        0 => 0,
+        pages if browser => 1 + 2 * pages,
+        pages => pages,
+    }
+}
+
+/// About how many requests walking a list of `accounts` takes, from the
+/// browser or not as `browser` says.
+pub fn requests_to_walk(accounts: u64, browser: bool) -> u64 {
+    requests_for_pages(pages_to_walk(accounts), browser)
 }
 
 /// Walks the list, resuming an interrupted one when there is a usable one.

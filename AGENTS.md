@@ -59,9 +59,14 @@ Commands (`crates/snob-cli/src/cli.rs` is the source of truth; `snob --help` and
   `--dry-run`).
 - Lists: `unfollowers`, `fans`, `friends`, `followers`, `following`, `scan`.
   `--dry-run` on any of them estimates the walks out of what is stored
-  (`engine::estimate`) and sends nothing: no resolution, no consent asked.
-- One account: `profile`, `pfp`, `stories`, `highlights`, `posts`. Their `-o -`
-  writes one downloaded file to standard output.
+  (`engine::estimate`, the pacer run forward on paper) and sends nothing and
+  writes nothing: no resolution, no consent asked, and every flag it would
+  ignore refused.
+- One account: `profile`, `pfp`, `stories`, `highlights`, `posts`.
+- `-o -` is standard output everywhere: a listing or a document goes there as
+  with no `-o` (never to a file named `-`), and a download (`pfp`, `-d`) writes
+  its one file there, refused before any request when the command line already
+  names several or standard output is a terminal.
 - One file of the CDN by its address, with no account: `fetch`.
 - One post: `post` (alias `reel`), by its link or its code.
 - The only two writes: `follow`, `unfollow`.
@@ -106,7 +111,7 @@ a normal change.
     `OutputArgs`, `WalkArgs`) hold this structurally: a flag a command would
     ignore is refused by clap rather than warned about.
   - **`--json` is for a status object; `--format` is for a document.** `whoami`,
-    `account list` and the `watch` subcommands take `--json`; everything that
+    `status`, `account list` and the `watch` subcommands take `--json`; everything that
     prints a thing a person reads takes `--format`, with an enum narrowed to the
     forms it has.
   - **Interactivity is detected, and said beats detected.** The full-screen
@@ -311,12 +316,15 @@ Two rules keep it that way:
   through `app::pacer_saying_a_line`; the monitor's run, scheduled loop and
   `status` call `Store::open_existing` directly (a connection is not held across
   a day-long sleep); `purge --account` and the scheduled loop open `shared.db`;
-  `snob status` opens the account's database and `shared.db` with
-  `open_existing` and reads the budget with `rate_budget::state`, which charges
-  nothing (an `App` would create the database and refresh the session, and a
-  report must not write); `snob fetch` builds a `CdnClient` and nothing else (a
-  known CDN address needs no account, so it takes no session, budget or
-  browser, and works with nobody signed in).
+  `snob status` and `--dry-run` read the account's database and `shared.db`
+  with `read_existing` (`store::read_only`: no migration in place, no
+  checkpoint, `query_only`) and the budget with `rate_budget::state`, which
+  charges nothing (an `App` would create the database, migrate it, settle the
+  day's retention and refresh the session, and a report must not write);
+  `snob fetch` builds a `CdnClient` and nothing else (a known CDN address
+  needs no account, so it sends no session, pays no budget and starts no
+  browser, and works with nobody signed in; the stored session is read only
+  for its User-Agent, when `--user-agent` does not give one).
 
 **Everything that acts as an account goes through `account::resolve`, and no query
 opens another account's database.** An account's database and session file are
@@ -568,7 +576,7 @@ caller has to remember. The reasoning is in the doc-comment at each location.
 | A write's shape: not replayed by a redirect, no CSRF token no send, not resent after an ambiguous answer | `redirect::Policy::none()`; `IgError::NoCsrfToken`; `client::write::worth_rediscovering` |
 | A 429 or push-back puts the account in cooldown; a text 5xx from the edge proxy is not one | `IgClient::classify_and_record`; `headless::listen::heard`; `error::push_back` |
 | A push-back on two accounts within the hour pauses all | `budget::common_brake` over `shared.db` |
-| Only Instagram's CDN is downloaded from | `IgClient::check_downloadable`; `graphql::is_bundle` |
+| Only Instagram's CDN is downloaded from, never instagram.com itself | `allowlist::refused_asset` (through `CdnClient::check_downloadable` and the tab); `graphql::is_bundle` |
 | A name is filtered before anything draws it; a name in a URL is encoded, never filtered | `model::printable`, `report::filtered`; `model::in_a_path` |
 | An account id, a moment and a count cannot be confused | `snob_core::{Pk, Epoch, EpochMs}` newtypes; `Pk` implements neither `ToSql` nor `FromSql` |
 | The credential cannot be printed and clears itself | `secret::Secret` |
@@ -581,7 +589,7 @@ caller has to remember. The reasoning is in the doc-comment at each location.
 | A queued report goes only to the address it was made for; credentials configured for one origin are not sent to another | `watch_deliveries.destination`; `delivery::plan` |
 | The session cannot reach the user's webhook | `WebhookClient::new` takes no `Session` |
 | The schedule reads no clock | `schedule::next_after` takes `now` |
-| A file named by a server is created, never written over | `output::create_new` |
+| A file named by a server is created, never written over; one the user named is replaced only by a whole file | `output::create_new`; `output::Replacing` |
 | The data directory is limited to this user; no deletion near the root | `paths::create_private_dir`; `paths::is_safe_to_remove`, `AppPaths::owned_dirs` |
 | No request is sent after the user asks to stop; a write in flight is the one thing Ctrl+C does not abandon | `Pacer::clear_to_send` reads the token first; `IgClient::post`, `ask_page` for `Ask::Write` |
 | The reader leaving is not an error | `ui::say!` (`println!` panics on a closed pipe) |

@@ -2,14 +2,17 @@
 //!
 //! **Sends nothing and writes nothing.** It is the question somebody asks
 //! before a heavy walk, and it must not cost what it reports on: no request,
-//! no budget, no browser, and no database brought into being for an account
-//! that has none yet.
+//! no budget, no browser, no database brought into being for an account that
+//! has none yet, and nothing in one that has changed. The one move it shares
+//! with every command is `main`'s, of a data directory a much older snob left
+//! in its single-account layout; without it there is no account here to
+//! report on.
 //!
 //! One of the listed exceptions to "commands take an App": an `App` would
 //! create the database, refresh the User-Agent and settle the day's retention,
-//! each a write. It opens the account's database with
-//! [`Store::open_existing`], as `watch status` does, and `shared.db` the same
-//! way.
+//! each a write. It reads the account's database with
+//! [`Store::read_existing`], and `shared.db` the same way, which neither
+//! migrates the file nor checkpoints its log.
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -34,25 +37,31 @@ pub fn run(
     account: Option<AccountPaths>,
 ) -> Result<ExitCode> {
     let viewer = report::acting_as().map(|viewer| viewer.json());
-    let session_store = account.as_ref().map(|account| secrets.session_of(account));
-    let session = match &session_store {
-        Some(store) => store.load()?,
+    // Where the session was found, not where this run would put a new one:
+    // on a machine with no keyring, `login` fell back to the file, and every
+    // later run reads it from there.
+    let located = match &account {
+        Some(account) => secrets.session_of(account).load_located()?,
         None => None,
     };
-    let (Some(session), Some(session_store), Some(account)) = (session, session_store, account)
-    else {
+    let (Some((session, storage)), Some(account)) = (located, account) else {
         eprintln!("No session stored. Run \"snob login\".");
         if args.output.json {
-            crate::ui::say!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "error": {
-                        "code": ExitCode::NoSession.as_str(),
-                        "message": "no session is stored on this computer",
-                    },
-                    "viewer": viewer,
-                }))?
+            // Every section asked for is there and null, as `whoami` gives
+            // every field with no session, beside the error.
+            let mut out = serde_json::Map::new();
+            for key in args.sections().names() {
+                out.insert(key.into(), Value::Null);
+            }
+            out.insert(
+                "error".into(),
+                json!({
+                    "code": ExitCode::NoSession.as_str(),
+                    "message": "no session is stored on this computer",
+                }),
             );
+            out.insert("viewer".into(), viewer.unwrap_or(Value::Null));
+            crate::ui::say!("{}", serde_json::to_string_pretty(&Value::Object(out))?);
         }
         return Ok(ExitCode::NoSession);
     };
@@ -60,11 +69,11 @@ pub fn run(
     let now = snob_core::clock::now_ms();
     // An account that has never sent anything has no database, and its
     // budget is at rest: read over an empty one rather than making its file.
-    let store = match Store::open_existing(&account)? {
+    let store = match Store::read_existing(&account)? {
         Some(store) => store,
         None => Store::in_memory()?,
     };
-    let shared = Shared::open_existing(paths).unwrap_or_else(|e| {
+    let shared = Shared::read_existing(paths).unwrap_or_else(|e| {
         tracing::debug!(error = %e, "shared.db could not be read; no brake is reported");
         None
     });
@@ -98,7 +107,7 @@ pub fn run(
     let found = Found {
         sections,
         session: &session,
-        storage: session_store.backend().as_str(),
+        storage: storage.as_str(),
         budget: &budget,
         held,
         braked: &braked,
@@ -174,7 +183,9 @@ struct Found<'a> {
 
 impl Found<'_> {
     /// Every value a stable token or a number; moments in seconds, as
-    /// `whoami` gives them.
+    /// `whoami` gives them. A moment something may happen again (`until`,
+    /// `free_at`, `next_*_at`) is rounded up to its second, so a script that
+    /// waits until it is not a second early.
     fn json(&self) -> Value {
         let mut out = serde_json::Map::new();
         if self.sections.session {
@@ -192,14 +203,16 @@ impl Found<'_> {
         }
         if self.sections.budget {
             let b = self.budget;
-            let bucket = |s: &BucketState| json!({ "left": s.left, "most": s.most, "free_at": s.free_at.to_epoch() });
+            let bucket = |s: &BucketState| json!({ "left": s.left, "most": s.most, "free_at": s.free_at.to_epoch_not_before() });
             out.insert(
                 "budget".into(),
                 json!({
-                    "requests": bucket(&b.daily),
+                    "requests_now": b.requests_now(),
+                    "next_request_at": b.next_request_at().to_epoch_not_before(),
                     "pace": bucket(&b.pace),
+                    "day": bucket(&b.daily),
                     "writes": bucket(&b.writes),
-                    "next_write_at": b.next_write_at.to_epoch(),
+                    "next_write_at": b.next_write_at.to_epoch_not_before(),
                     "accounts_read": b.accounts_read,
                     "accounts_ceiling": b.accounts_ceiling,
                     "accounts_left": b.accounts_left(),
@@ -209,23 +222,22 @@ impl Found<'_> {
         if self.sections.cooldown {
             let last = self.budget.last_cooldown.as_ref().map(|c| {
                 json!({
-                    "until": c.until.to_epoch(),
+                    "until": c.until.to_epoch_not_before(),
                     "set_at": c.set_at.to_epoch(),
                     "reason": c.reason,
                     "strikes": c.strikes,
-                    "escalates_until": c.escalates_until().to_epoch(),
+                    "escalates_until": c.escalates_until().to_epoch_not_before(),
                 })
             });
-            let brake = self
-                .budget
-                .brake
-                .as_ref()
-                .map(|b| json!({ "until": b.until.to_epoch(), "accounts": b.accounts }));
+            let brake =
+                self.budget.brake.as_ref().map(
+                    |b| json!({ "until": b.until.to_epoch_not_before(), "accounts": b.accounts }),
+                );
             out.insert(
                 "cooldown".into(),
                 json!({
                     "active": self.held.is_some(),
-                    "until": self.held.map(EpochMs::to_epoch),
+                    "until": self.held.map(EpochMs::to_epoch_not_before),
                     "last": last,
                     "brake": brake,
                 }),
@@ -307,10 +319,13 @@ impl Found<'_> {
                 row(
                     "Requests",
                     &format!(
-                        "{} of {} without a wait{}",
-                        b.daily.left,
-                        b.daily.most,
-                        self.free_again(&b.daily)
+                        "{} now without a wait{}",
+                        b.requests_now(),
+                        if b.requests_now() == 0 {
+                            format!(", the next {}", self.when(b.next_request_at()))
+                        } else {
+                            String::new()
+                        }
                     ),
                 ),
                 row(
@@ -320,6 +335,15 @@ impl Found<'_> {
                         b.pace.left,
                         b.pace.most,
                         self.free_again(&b.pace)
+                    ),
+                ),
+                row(
+                    "Today",
+                    &format!(
+                        "{} of {}{}",
+                        b.daily.left,
+                        b.daily.most,
+                        self.free_again(&b.daily)
                     ),
                 ),
                 row(
@@ -441,12 +465,12 @@ impl Found<'_> {
         }
     }
 
-    /// "now", or the moment.
+    /// "now", or the moment, rounded up to its second as the JSON's is.
     fn when(&self, at: EpochMs) -> String {
         if at <= self.now {
             "now".to_string()
         } else {
-            report::stored_on(at.to_epoch())
+            report::stored_on(at.to_epoch_not_before())
         }
     }
 }
@@ -501,7 +525,11 @@ mod tests {
         let out = found.json();
         let keys: Vec<&String> = out.as_object().unwrap().keys().collect();
         assert_eq!(keys, vec!["budget"]);
-        assert_eq!(out["budget"]["requests"]["left"], 2_001);
+        assert_eq!(out["budget"]["day"]["left"], 2_001);
+        assert_eq!(
+            out["budget"]["requests_now"], 21,
+            "the pace binds before the day does"
+        );
         assert_eq!(out["budget"]["accounts_left"], 2_000);
         assert!(found.text().starts_with("Budget"));
     }

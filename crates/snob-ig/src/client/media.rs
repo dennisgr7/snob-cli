@@ -121,7 +121,7 @@ impl IgClient {
     /// heard, and Ctrl+C, stop the download.
     async fn asset_from_the_page(&self, url: &str, cap: usize) -> Result<Option<Vec<u8>>, IgError> {
         let url = Url::parse(url)?;
-        self.cdn()?.check_downloadable(&url)?;
+        super::cdn::check_downloadable(&self.base, &url)?;
         if self.page.is_none() || is_video(&url) {
             return Ok(None);
         }
@@ -488,8 +488,9 @@ mod tests {
         assert_eq!(bytes, b"direct");
     }
 
-    /// What may be fetched is one rule for both paths, with the site's own
-    /// address the one exception, matched whole.
+    /// What may be fetched is one rule for both paths, with a test's own
+    /// server the one exception, matched whole. Instagram's own site is not a
+    /// CDN: an address on it is the API, read unpaced if it were let through.
     #[test]
     fn the_tab_and_the_client_hold_a_file_to_one_rule() {
         use crate::allowlist::refused_asset;
@@ -499,7 +500,6 @@ mod tests {
             "https://scontent.cdninstagram.com/v/a.jpg",
             "https://instagram.flpa4-1.fna.fbcdn.net/v/a.jpg",
             "https://cdninstagram.com/a.jpg",
-            "https://www.instagram.com/a.jpg",
         ] {
             assert_eq!(refused_asset(site, allowed), None, "{allowed}");
         }
@@ -507,6 +507,9 @@ mod tests {
             "http://scontent.cdninstagram.com/a.jpg",
             "https://evilcdninstagram.com/a.jpg",
             "https://fbcdn.net.evil.test/a.jpg",
+            "https://www.instagram.com/a.jpg",
+            "https://www.instagram.com/api/v1/users/web_profile_info/?username=x",
+            "https://i.instagram.com/api/v1/users/1/info/",
             "http://www.instagram.com/a.jpg",
             "https://www.instagram.com:8443/a.jpg",
             "file:///etc/passwd",
@@ -624,13 +627,15 @@ mod tests {
         assert_eq!(client.download_capped(&url, 64).await.unwrap().len(), 64);
     }
 
-    /// The exception that lets a test serve a picture over plain HTTP matches
-    /// scheme, host and port: on host alone it would be live against the real
-    /// base URL, ahead of the https check.
+    /// The exception that lets a test serve a picture from its own server is
+    /// never live against the real base URL: not on another scheme or port,
+    /// and not on the site itself, whose addresses are the API.
     #[test]
     fn the_test_server_exception_does_not_open_a_hole_in_production() {
         let production = Url::parse(BASE_URL).unwrap();
         for refused in [
+            "https://www.instagram.com/pic.jpg",
+            "https://www.instagram.com/api/v1/users/web_profile_info/?username=x",
             "http://www.instagram.com/pic.jpg",
             "http://www.instagram.com:8080/pic.jpg",
             "https://www.instagram.com:8443/pic.jpg",
