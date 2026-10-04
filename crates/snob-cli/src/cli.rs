@@ -213,6 +213,7 @@ pub(crate) fn signing_secret(value: &str) -> Result<String, String> {
 const EXAMPLES: &str = "\
 Examples:
   snob login                          store your session, once
+  snob status --budget                what you can still send today, for no request
   snob unfollowers                    who does not follow you back
   snob profile someone                their page: counts, bio, who you both know
   snob scan someone                   the full picture of another account
@@ -236,7 +237,8 @@ Exit codes:
       again unchanged will not help
   3   no session, or the stored one no longer works -- run \"snob login\"
   4   Instagram wants the account verified -- open the address it prints
-  5   Instagram is throttling, or the account is in cooldown -- wait
+  5   Instagram is throttling, or the account is in cooldown and nothing was
+      sent -- wait; \"snob status\" says until when
   130 stopped by you: Ctrl+C, or a confirmation not given -- including with
       no terminal to ask at, where -y confirms in advance
 
@@ -263,6 +265,21 @@ pub enum Command {
 
     /// Show which account you are authenticated as
     Whoami(WhoamiArgs),
+
+    /// Where the account stands: session, request budget, cooldown, lists, monitor
+    #[command(
+        after_help = "Read from what is stored here; nothing is sent and nothing is written. \
+                      With no section named, all of them; --budget, --cooldown, --session, \
+                      --lists and --watch narrow it to those.\n\n\
+                      It exits 5 while the account is in cooldown, whatever sections were \
+                      asked for, so \"snob status --budget && snob scan\" runs the scan only \
+                      when it may send; 3 with no session; 0 otherwise.\n\n\
+                      The budget counts what goes out now without a wait: the pace allows \
+                      twenty-one requests in a row, the day about two thousand, and writes \
+                      three in a row and then one every fifteen minutes. Lists read at most \
+                      2,000 accounts in any 24 hours, 1,000 for a week after a push-back."
+    )]
+    Status(StatusArgs),
 
     /// List the accounts signed in here, and pick the one commands act as
     #[command(
@@ -486,6 +503,66 @@ pub struct WhoamiArgs {
 
     #[command(flatten)]
     pub output: StatusOutputArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct StatusArgs {
+    /// The session: which account, where it is stored, when it was last checked
+    #[arg(long)]
+    pub session: bool,
+
+    /// The request budget: what goes out now without a wait, and accounts read today
+    #[arg(long)]
+    pub budget: bool,
+
+    /// The cooldown: whether one stands, until when and why, and the last one
+    #[arg(long)]
+    pub cooldown: bool,
+
+    /// Your lists as stored: when each was last walked, and a walk left to resume
+    #[arg(long)]
+    pub lists: bool,
+
+    /// The monitor's last run on each account it watches from this one
+    #[arg(long)]
+    pub watch: bool,
+
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
+}
+
+/// Which parts of `snob status` a run asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusSections {
+    pub session: bool,
+    pub budget: bool,
+    pub cooldown: bool,
+    pub lists: bool,
+    pub watch: bool,
+}
+
+impl StatusArgs {
+    /// The sections named, or every one when none was.
+    pub fn sections(&self) -> StatusSections {
+        let named = StatusSections {
+            session: self.session,
+            budget: self.budget,
+            cooldown: self.cooldown,
+            lists: self.lists,
+            watch: self.watch,
+        };
+        if named.session || named.budget || named.cooldown || named.lists || named.watch {
+            named
+        } else {
+            StatusSections {
+                session: true,
+                budget: true,
+                cooldown: true,
+                lists: true,
+                watch: true,
+            }
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]

@@ -80,6 +80,7 @@ snob reel <link> -d all          # the same for a reel
 snob follow someone
 snob unfollow someone
 snob watch                       # keep watching on a schedule, report changes
+snob status                      # budget left, cooldown, stored lists; sends nothing
 ```
 
 On a terminal most commands open a full-screen view you move through with the
@@ -91,7 +92,10 @@ Every command can print instead of opening a view, in a stable form a program
 can read:
 
 - `--format json|ndjson|csv|xlsx|md|table` and `-o <file>` for anything that
-  prints a list or a document; `--json` for status commands such as `whoami`.
+  prints a list or a document; `--json` for status commands such as `whoami`
+  and `status`.
+- `snob status --budget` says what can still be sent today, for no request, and
+  exits 5 while the account is cooling down.
 - `--no-interactive` always prints. Down a pipe this is the default, and the
   default format is JSON.
 - `-y` answers the one confirmation a command may ask, in advance.

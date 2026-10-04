@@ -13,6 +13,7 @@ pub mod profile;
 pub mod purge;
 pub mod scan;
 pub mod sets;
+pub mod status;
 pub mod stories;
 pub mod watch;
 pub mod whoami;

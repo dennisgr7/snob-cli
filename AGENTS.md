@@ -54,6 +54,7 @@ Commands (`crates/snob-cli/src/cli.rs` is the source of truth; `snob --help` and
 `snob <command> --help` print it):
 
 - Session and accounts: `login` (`--paste`, `--browser`, `--add`), `whoami`,
+  `status` (`--session`, `--budget`, `--cooldown`, `--lists`, `--watch`),
   `account list`, `account use`, `logout` (`--all`), `purge` (`--account`,
   `--dry-run`).
 - Lists: `unfollowers`, `fans`, `friends`, `followers`, `following`, `scan`.
@@ -305,7 +306,11 @@ Two rules keep it that way:
   directly (it reports on a session that may be dead) but still takes its budget
   through `app::pacer_saying_a_line`; the monitor's run, scheduled loop and
   `status` call `Store::open_existing` directly (a connection is not held across
-  a day-long sleep); `purge --account` and the scheduled loop open `shared.db`.
+  a day-long sleep); `purge --account` and the scheduled loop open `shared.db`;
+  `snob status` opens the account's database and `shared.db` with
+  `open_existing` and reads the budget with `rate_budget::state`, which charges
+  nothing (an `App` would create the database and refresh the session, and a
+  report must not write).
 
 **Everything that acts as an account goes through `account::resolve`, and no query
 opens another account's database.** An account's database and session file are

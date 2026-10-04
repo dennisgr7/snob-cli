@@ -2875,3 +2875,105 @@ async fn purging_one_account_leaves_the_other() {
     let unknown = snob(tmp.path(), None, &["--account", "other", "purge", "--yes"]);
     assert_eq!(unknown.status.code(), Some(1), "{}", stderr(&unknown));
 }
+
+/// `status` with no session says so, in both shapes, and exits 3.
+#[test]
+fn status_with_no_session_exits_three() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = snob(tmp.path(), None, &["status", "--json"]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert_eq!(json(&out)["error"]["code"], "no_session");
+}
+
+/// Signed in and at rest: the whole budget, every section, exit 0, and not
+/// one request to the fake Instagram.
+#[tokio::test]
+async fn status_reports_the_budget_and_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let before = instagram.received_requests().await.unwrap().len();
+
+    let out = snob(tmp.path(), Some(&instagram), &["status", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let said = json(&out);
+    for section in ["session", "budget", "cooldown", "lists", "watch"] {
+        assert!(said.get(section).is_some(), "{section} missing: {said}");
+    }
+    assert_eq!(said["session"]["pk"], PK.get());
+    assert_eq!(said["budget"]["writes"]["left"], 3);
+    assert_eq!(said["budget"]["accounts_left"], 2_000);
+    assert_eq!(said["cooldown"]["active"], false);
+    assert_eq!(
+        said["lists"]["followers"]["taken_at"],
+        serde_json::Value::Null
+    );
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["status", "--budget", "--json"],
+    );
+    let said = json(&out);
+    let keys: Vec<&String> = said.as_object().unwrap().keys().collect();
+    assert_eq!(keys, vec!["budget", "viewer"]);
+
+    let text = snob(tmp.path(), Some(&instagram), &["status"]);
+    assert!(text.status.success(), "{}", stderr(&text));
+    assert!(stdout(&text).contains("Requests"), "{}", stdout(&text));
+
+    assert_eq!(
+        instagram.received_requests().await.unwrap().len(),
+        before,
+        "status sent a request"
+    );
+}
+
+/// In a cooldown it says until when and why, and exits 5 whatever section
+/// was asked for, so a script can ask "may I send" with any of them.
+#[tokio::test]
+async fn status_in_a_cooldown_exits_five_and_says_why() {
+    use snob_core::budget::RateBudget;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let paths = snob_store::paths::AppPaths::rooted_at(tmp.path()).account(PK);
+    snob_store::store::rate_budget::SqliteRateBudget::open(&paths)
+        .unwrap()
+        .start_cooldown("429", std::time::Duration::from_secs(3600))
+        .unwrap();
+
+    let out = snob(tmp.path(), Some(&instagram), &["status", "--json"]);
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
+    let said = json(&out);
+    assert_eq!(said["cooldown"]["active"], true);
+    assert_eq!(said["cooldown"]["last"]["reason"], "429");
+    assert_eq!(said["cooldown"]["last"]["strikes"], 1);
+    assert!(said["cooldown"]["until"].as_i64().is_some());
+    assert_eq!(said["budget"]["accounts_ceiling"], 1_000);
+
+    let out = snob(tmp.path(), Some(&instagram), &["status", "--lists"]);
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
+}
+
+/// A signed-in account with no database is reported at rest, and none is
+/// made for it.
+#[tokio::test]
+async fn status_makes_no_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let db = database(tmp.path());
+    for suffix in ["", "-wal", "-shm"] {
+        let file = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
+        if file.exists() {
+            std::fs::remove_file(file).unwrap();
+        }
+    }
+
+    let out = snob(tmp.path(), None, &["status", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(json(&out)["budget"]["requests"]["left"], 2_001);
+    assert!(!db.exists(), "status made a database");
+}

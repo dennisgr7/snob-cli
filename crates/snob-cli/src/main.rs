@@ -91,6 +91,7 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
             Format::Json
         ),
         Command::Whoami(args) => args.output.json,
+        Command::Status(args) => args.output.json,
         Command::Account(AccountCommand::List(args)) => args.output.json,
         // It takes no format flag and answers in JSON down a pipe, the way
         // `commands::import::run` decides it.
@@ -361,6 +362,7 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
             commands::login::run(args, store, paths, renewing, named).await
         }
         Command::Whoami(args) => commands::whoami::run(args, store, resolved()?).await,
+        Command::Status(args) => commands::status::run(args, &store, paths, resolved()?),
         Command::Logout(args) => {
             let account = if args.all { None } else { resolved()? };
             commands::logout::run(args, store, paths, account).await

@@ -372,6 +372,17 @@ impl SqliteRateBudget {
         burst: i64,
         now: EpochMs,
     ) -> Result<i64, RateBudgetError> {
+        Ok(decide(Self::stored_tat(conn, bucket, now)?, now, emission, burst).1)
+    }
+
+    /// The theoretical instant `bucket` holds at `now`, as the next charge
+    /// would read it: `now` for a bucket never charged, and for one written
+    /// by a clock that has since gone backwards.
+    fn stored_tat(
+        conn: &Connection,
+        bucket: &str,
+        now: EpochMs,
+    ) -> Result<EpochMs, RateBudgetError> {
         let row: Option<(EpochMs, EpochMs)> = conn
             .query_row(
                 "SELECT tat_ms, updated_at_ms FROM rate_budget WHERE bucket = ?1",
@@ -391,24 +402,57 @@ impl SqliteRateBudget {
             Some((tat, _)) => tat,
             None => now,
         };
-        Ok(decide(stored_tat, now, emission, burst).1)
+        Ok(stored_tat)
+    }
+
+    /// What `bucket` would let through at `now` without a wait, and when the
+    /// next one goes without one. Charges nothing.
+    fn bucket_state(
+        conn: &Connection,
+        bucket: &str,
+        emission: i64,
+        burst: i64,
+        now: EpochMs,
+    ) -> Result<BucketState, RateBudgetError> {
+        let tat = Self::stored_tat(conn, bucket, now)?.max(now);
+        // Request `k` from here waits nothing while `tat + k * emission` is
+        // no further ahead of `now` than the tolerance: `decide`, unrolled.
+        let room = now.get() + burst - tat.get();
+        let left = if room < 0 { 0 } else { room / emission + 1 };
+        let wait = decide(tat, now, emission, burst).1;
+        Ok(BucketState {
+            left: u32::try_from(left).unwrap_or(u32::MAX),
+            most: u32::try_from(burst / emission + 1).unwrap_or(u32::MAX),
+            free_at: now + Duration::from_millis(wait.max(0) as u64),
+        })
     }
 
     /// The daily ceiling on accounts in force now, from when the last
     /// push-back was. See [`snob_core::budget::accounts_per_day`].
     fn accounts_ceiling(conn: &Connection, now: EpochMs) -> Result<u64, RateBudgetError> {
-        let last_push_back: Option<EpochMs> = conn
-            .query_row(
-                "SELECT set_at_ms FROM cooldowns WHERE scope = ?1",
-                params![SESSION_SCOPE],
-                |row| Ok(EpochMs::new(row.get(0)?)),
-            )
-            .optional()
-            .map_err(budget_err)?;
+        let last_push_back = Self::last_cooldown(conn)?.map(|c| c.set_at);
         Ok(u64::from(snob_core::budget::accounts_per_day(
             last_push_back,
             now,
         )))
+    }
+
+    /// The account's last cooldown as it was written down, ended or not.
+    fn last_cooldown(conn: &Connection) -> Result<Option<CooldownRecord>, RateBudgetError> {
+        conn.query_row(
+            "SELECT until_ms, set_at_ms, reason, strikes FROM cooldowns WHERE scope = ?1",
+            params![SESSION_SCOPE],
+            |row| {
+                Ok(CooldownRecord {
+                    until: EpochMs::new(row.get(0)?),
+                    set_at: EpochMs::new(row.get(1)?),
+                    reason: row.get(2)?,
+                    strikes: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(budget_err)
     }
 
     /// What was read in the last day, oldest first, as `(at_ms, accounts)`.
@@ -435,6 +479,117 @@ impl SqliteRateBudget {
             .collect::<Result<_, _>>()
             .map_err(budget_err)
     }
+}
+
+/// A cooldown as the table holds it: the last one written, whether or not it
+/// has ended. It is never deleted, because when it was set decides the day's
+/// ceiling for a week and whether the next push-back escalates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CooldownRecord {
+    pub until: EpochMs,
+    pub set_at: EpochMs,
+    /// What Instagram said, as `start_cooldown` was told it.
+    pub reason: String,
+    /// How many push-backs in a row, each within a day of the last.
+    pub strikes: u32,
+}
+
+impl CooldownRecord {
+    /// When it ends, if it still stands at `now`. Checked against `set_at`
+    /// too: if the clock went backwards the cooldown still stands even though
+    /// `until` looks past.
+    pub fn standing_at(&self, now: EpochMs) -> Option<EpochMs> {
+        (now < self.until || now < self.set_at).then_some(self.until)
+    }
+
+    /// Until when a push-back would escalate this one instead of starting
+    /// over.
+    pub fn escalates_until(&self) -> EpochMs {
+        self.set_at + Duration::from_millis(MAX_COOLDOWN_MS as u64)
+    }
+}
+
+/// One bucket, read and not charged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketState {
+    /// How many requests it lets through from now without a wait.
+    pub left: u32,
+    /// How many it lets through from rest.
+    pub most: u32,
+    /// When the next one goes without a wait: now, while `left` is not zero.
+    pub free_at: EpochMs,
+}
+
+/// The whole budget of one account at one moment, read and not charged:
+/// what `snob status` reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetState {
+    /// The pace bucket, which every request pays.
+    pub pace: BucketState,
+    /// The daily bucket, which every request pays.
+    pub daily: BucketState,
+    /// The write bucket, which a follow or an unfollow pays on top.
+    pub writes: BucketState,
+    /// When a write would go without a wait: the latest of the three buckets
+    /// it pays.
+    pub next_write_at: EpochMs,
+    /// Accounts read off lists in the last 24 hours.
+    pub accounts_read: u64,
+    /// The ceiling on them in force now.
+    pub accounts_ceiling: u64,
+    /// The last cooldown written down, ended or not.
+    pub last_cooldown: Option<CooldownRecord>,
+    /// The brake on every account, if one stands.
+    pub brake: Option<Brake>,
+}
+
+impl BudgetState {
+    /// When this account may send again, if it may not now: its own cooldown
+    /// or the brake, whichever ends later, as [`RateBudget::cooldown`] says.
+    pub fn held_until(&self, now: EpochMs) -> Option<EpochMs> {
+        let own = self.last_cooldown.as_ref().and_then(|c| c.standing_at(now));
+        own.max(self.brake.as_ref().map(|b| b.until))
+    }
+
+    /// How many more accounts the day holds.
+    pub fn accounts_left(&self) -> u64 {
+        self.accounts_ceiling.saturating_sub(self.accounts_read)
+    }
+}
+
+/// The budget of the account whose database `conn` is, at `now`, with the
+/// brake read from `shared` when there is one. **Charges nothing and writes
+/// nothing**: every value is what the next charge would read.
+///
+/// The escape hatch is not consulted: this reports what is written down,
+/// and a cooldown being ignored does not make it any less there.
+pub fn state(
+    conn: &Connection,
+    shared: Option<&Shared>,
+    now: EpochMs,
+) -> Result<BudgetState, RateBudgetError> {
+    let bucket =
+        |name, emission, burst| SqliteRateBudget::bucket_state(conn, name, emission, burst, now);
+    let pace = bucket(PACE_BUCKET, PACE_EMISSION_MS, PACE_BURST_MS)?;
+    let daily = bucket(DAILY_BUCKET, DAILY_EMISSION_MS, DAILY_BURST_MS)?;
+    let writes = bucket(WRITE_BUCKET, WRITE_EMISSION_MS, WRITE_BURST_MS)?;
+    let brake = match shared {
+        Some(shared) => common_brake(&shared.pushbacks(now).map_err(budget_err)?, now),
+        None => None,
+    };
+    Ok(BudgetState {
+        pace,
+        daily,
+        writes,
+        next_write_at: pace.free_at.max(daily.free_at).max(writes.free_at),
+        accounts_read: SqliteRateBudget::accounts_read_today(conn, now)?
+            .iter()
+            .map(|(_, n)| n)
+            .sum(),
+        accounts_ceiling: SqliteRateBudget::accounts_ceiling(conn, now)?,
+        last_cooldown: SqliteRateBudget::last_cooldown(conn)?,
+        brake,
+    })
 }
 
 impl RateBudget for SqliteRateBudget {
@@ -538,23 +693,8 @@ impl RateBudget for SqliteRateBudget {
             return Ok(None);
         }
 
-        let row: Option<(EpochMs, EpochMs)> = self
-            .conn()
-            .query_row(
-                "SELECT until_ms, set_at_ms FROM cooldowns WHERE scope = ?1",
-                params![SESSION_SCOPE],
-                |row| Ok((EpochMs::new(row.get(0)?), EpochMs::new(row.get(1)?))),
-            )
-            .optional()
-            .map_err(budget_err)?;
-
         let now = now_ms();
-        let own = match row {
-            // Also checked against `set_at_ms`: if the clock went backwards the
-            // cooldown still stands even though `until_ms` looks past.
-            Some((until, set_at)) if now < until || now < set_at => Some(until),
-            _ => None,
-        };
+        let own = Self::last_cooldown(&self.conn())?.and_then(|c| c.standing_at(now));
         // Whichever ends later: the account's own, or the brake on all of them.
         let brake = self.brake_at(now)?.map(|brake| brake.until);
         Ok(own.max(brake))
@@ -1179,6 +1319,142 @@ mod tests {
             .query_row("SELECT count(*) FROM account_reads", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    /// Everything the state reads, as rows, to check that reading it wrote
+    /// nothing.
+    fn rows(b: &SqliteRateBudget) -> Vec<String> {
+        let conn = b.conn();
+        let mut all = Vec::new();
+        for table in ["rate_budget", "cooldowns", "account_reads"] {
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+                .unwrap();
+            let width = statement.column_count();
+            let mut rows = statement.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let cells: Vec<String> = (0..width)
+                    .map(|i| format!("{:?}", row.get_ref(i).unwrap()))
+                    .collect();
+                all.push(format!("{table}: {}", cells.join(", ")));
+            }
+        }
+        all
+    }
+
+    /// From rest the buckets hold what their constants say: twenty-one, two
+    /// thousand and one, three. Each read is one less of the first two, a
+    /// write one less of all three, and none of this is a charge.
+    #[test]
+    fn the_state_counts_what_is_left_and_spends_nothing() {
+        let (_tmp, b) = temp_budget();
+        let now = now_ms();
+        let fresh = state(&b.conn(), None, now).unwrap();
+        assert_eq!((fresh.pace.left, fresh.pace.most), (21, 21));
+        assert_eq!((fresh.daily.left, fresh.daily.most), (2_001, 2_001));
+        assert_eq!((fresh.writes.left, fresh.writes.most), (3, 3));
+        assert_eq!(fresh.pace.free_at, now);
+        assert_eq!(fresh.next_write_at, now);
+        assert_eq!((fresh.accounts_read, fresh.accounts_ceiling), (0, 2_000));
+        assert_eq!(fresh.last_cooldown, None);
+        assert_eq!(fresh.held_until(now), None);
+
+        for _ in 0..5 {
+            b.reserve().unwrap();
+        }
+        b.reserve_write().unwrap();
+        b.spend_accounts(36).unwrap();
+        let before = rows(&b);
+        let now = now_ms();
+        let spent = state(&b.conn(), None, now).unwrap();
+        assert_eq!(rows(&b), before, "reading the state wrote something");
+
+        // The bucket refills in real time, so a slow machine may have earned
+        // one back in between: the count is at most what was left, and no
+        // more than one emission's worth above it.
+        assert!((15..=16).contains(&spent.pace.left), "{:?}", spent.pace);
+        assert!(
+            (1_995..=1_996).contains(&spent.daily.left),
+            "{:?}",
+            spent.daily
+        );
+        assert_eq!(spent.writes.left, 2);
+        assert_eq!((spent.accounts_read, spent.accounts_left()), (36, 1_964));
+    }
+
+    /// Past the tolerance nothing is left, and the next one is free one wait
+    /// from now: the wait `reserve` would hand back.
+    #[test]
+    fn a_spent_bucket_says_when_it_frees_up() {
+        let (_tmp, b) = temp_budget();
+        for _ in 0..3 {
+            b.reserve_write().unwrap();
+        }
+        let now = now_ms();
+        let spent = state(&b.conn(), None, now).unwrap();
+        assert_eq!(spent.writes.left, 0);
+        let wait = spent.writes.free_at - now;
+        assert!(wait > 800_000 && wait <= 900_000, "{wait}");
+        assert_eq!(spent.next_write_at, spent.writes.free_at);
+        assert!(spent.pace.left > 0, "reads are not held up by writes");
+    }
+
+    /// A bucket written by a clock that has since gone backwards reads as
+    /// rest, as the next charge would treat it.
+    #[test]
+    fn a_bucket_from_the_future_reads_as_rest() {
+        let (_tmp, b) = temp_budget();
+        let ahead = now_ms().get() + 3_600_000;
+        b.conn()
+            .execute(
+                "INSERT INTO rate_budget (bucket, tat_ms, emission_ms, burst_ms, updated_at_ms)
+                 VALUES ('pace', ?1, 3830, 76600, ?1)",
+                params![ahead + 10_000_000],
+            )
+            .unwrap();
+        assert_eq!(state(&b.conn(), None, now_ms()).unwrap().pace.left, 21);
+    }
+
+    /// The reason and the strikes are read back, and a cooldown that has
+    /// ended is still reported as the last one, without holding anything.
+    #[test]
+    fn the_last_cooldown_is_read_back_with_its_reason_and_strikes() {
+        let (_tmp, b) = temp_budget();
+        b.start_cooldown("429", Duration::from_secs(3600)).unwrap();
+        let until = b
+            .start_cooldown("feedback_required", Duration::from_secs(3600))
+            .unwrap();
+        let now = now_ms();
+        let held = state(&b.conn(), None, now).unwrap();
+        let last = held.last_cooldown.clone().unwrap();
+        assert_eq!(
+            (last.reason.as_str(), last.strikes),
+            ("feedback_required", 2)
+        );
+        assert_eq!(held.held_until(now), Some(until));
+        assert_eq!(held.accounts_ceiling, 1_000, "a push-back halves the day");
+
+        let later = until + Duration::from_secs(1);
+        let ended = state(&b.conn(), None, later).unwrap();
+        assert_eq!(ended.held_until(later), None);
+        assert_eq!(ended.last_cooldown, Some(last));
+    }
+
+    /// The brake on every account is read from `shared.db`, and holds an
+    /// account that was never pushed back on.
+    #[test]
+    fn the_state_reports_the_brake_on_every_account() {
+        let (tmp, [a, b, c]) = three_accounts();
+        a.start_cooldown("429", Duration::from_secs(3600)).unwrap();
+        let long = b.start_cooldown("429", Duration::from_secs(7200)).unwrap();
+        let shared = Shared::open_existing(&crate::paths::AppPaths::rooted_at(tmp.path()))
+            .unwrap()
+            .unwrap();
+        let now = now_ms();
+        let held = state(&c.conn(), Some(&shared), now).unwrap();
+        assert_eq!(held.last_cooldown, None);
+        assert_eq!(held.held_until(now), Some(long));
+        assert_eq!(held.brake.unwrap().accounts, vec![Pk::new(1), Pk::new(2)]);
     }
 
     /// Proves the budget really is shared between connections, which is what
