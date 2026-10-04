@@ -68,11 +68,12 @@ pub fn walked_name(app: &App, typed: Option<&str>, pk: Pk) -> Result<Option<Stri
 }
 
 /// About how many requests walking these lists of `pk` again takes as
-/// another account: one to find the account, and the pages of each list by
-/// the counter this account last polled, or by how many its walk found.
+/// another account: one to find the account, and each list's walk
+/// (`engine::walk::requests_to_walk`) by the counter this account last
+/// polled, or by how many its walk found.
 pub fn rewalk_cost(app: &App, pk: Pk, lists: &[(ListKind, usize)]) -> Result<u32> {
     let counted = snob_store::store::accounts::find(app.db().conn(), pk)?;
-    let pages: u64 = lists
+    let walks: u64 = lists
         .iter()
         .map(|&(kind, found)| {
             let accounts = counted
@@ -82,7 +83,7 @@ pub fn rewalk_cost(app: &App, pk: Pk, lists: &[(ListKind, usize)]) -> Result<u32
             engine::walk::requests_to_walk(accounts)
         })
         .sum();
-    Ok(u32::try_from(1 + pages).unwrap_or(u32::MAX))
+    Ok(u32::try_from(1 + walks).unwrap_or(u32::MAX))
 }
 
 /// Walks a list view's lists again as the account `to` it switched to: the
@@ -139,7 +140,7 @@ pub fn no_session() -> anyhow::Error {
 /// Here and not in `engine`, so the engine knows nothing about clap: this is
 /// the one place the parser's structs are read for what the engine needs.
 /// Two commands carry a walk, and both become the same query.
-fn query(target: &Option<String>, walk: &WalkArgs) -> engine::ListQuery {
+pub(crate) fn query(target: &Option<String>, walk: &WalkArgs) -> engine::ListQuery {
     engine::ListQuery {
         target: target.clone(),
         yes: walk.consent.yes,
@@ -670,8 +671,12 @@ mod tests {
         );
         let them = Pk::new(42);
         let lists = [(ListKind::Followers, 60), (ListKind::Following, 10)];
-        // Nothing polled: 60 and 10 accounts are five pages of twelve and one.
-        assert_eq!(rewalk_cost(&app, them, &lists).unwrap(), 1 + 5 + 1);
+        // Nothing polled: 60 and 10 accounts are five pages of twelve and
+        // one, each list opened and each page followed by its `show_many`.
+        assert_eq!(
+            rewalk_cost(&app, them, &lists).unwrap(),
+            1 + (1 + 2 * 5) + (1 + 2)
+        );
 
         let user = User {
             pk: them,
@@ -684,7 +689,10 @@ mod tests {
         snob_store::store::users::upsert(app.db().conn(), &user).unwrap();
         snob_store::store::accounts::upsert(app.db().conn(), them, false).unwrap();
         snob_store::store::accounts::record_poll(app.db().conn(), them, Some(500), None).unwrap();
-        assert_eq!(rewalk_cost(&app, them, &lists).unwrap(), 1 + 42 + 1);
+        assert_eq!(
+            rewalk_cost(&app, them, &lists).unwrap(),
+            1 + (1 + 2 * 42) + (1 + 2)
+        );
     }
 
     /// `--same-day` is the one flag that reads past the day's accounts, and

@@ -888,6 +888,11 @@ pub struct WalkArgs {
     #[arg(long, conflicts_with = "offline")]
     pub same_day: bool,
 
+    /// Say what the walks would cost, against what today has left, and send
+    /// nothing
+    #[arg(long, conflicts_with = "offline")]
+    pub dry_run: bool,
+
     #[command(flatten)]
     pub progress: ProgressArgs,
 
@@ -907,6 +912,7 @@ impl Default for WalkArgs {
             no_resume: false,
             max_pages: None,
             same_day: false,
+            dry_run: false,
             progress: ProgressArgs::default(),
             consent: ConsentArgs::default(),
         }

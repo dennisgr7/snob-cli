@@ -3170,3 +3170,126 @@ async fn fetch_to_a_reader_that_left_is_not_a_failure() {
     assert!(!said.contains("panicked"), "{said}");
     assert_eq!(out.status.code(), Some(0), "{said}");
 }
+
+/// `--dry-run` says what the walks would cost, against what today has left,
+/// and sends nothing: before anything is stored, and after.
+#[tokio::test]
+async fn a_dry_run_estimates_and_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let before = instagram.received_requests().await.unwrap().len();
+
+    // Nothing stored yet: your own lists are known by nothing here.
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["unfollowers", "--dry-run", "--format", "json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let said = json(&out);
+    assert_eq!(said["dry_run"], true);
+    assert_eq!(said["to_find"], 0, "your own account needs no finding");
+    let lists: Vec<&str> = said["lists"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["list"].as_str().unwrap())
+        .collect();
+    assert_eq!(lists, ["followers", "following"], "the order it walks them");
+    let status = json(&snob(
+        tmp.path(),
+        Some(&instagram),
+        &["status", "--budget", "--json"],
+    ));
+    assert_eq!(
+        said["requests_left"], status["budget"]["requests"]["left"],
+        "what is left is what status says"
+    );
+    assert_eq!(
+        instagram.received_requests().await.unwrap().len(),
+        before,
+        "a dry run sent a request"
+    );
+
+    // Walked once, the lists are stored and fresh: a range, one poll at
+    // the least.
+    let out = snob(tmp.path(), Some(&instagram), &["scan", "--format", "json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let before = instagram.received_requests().await.unwrap().len();
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["scan", "--dry-run", "--format", "json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let said = json(&out);
+    assert_eq!(said["lists"][0]["fate"], "reused_unless_moved", "{said}");
+    assert_eq!(said["lists"][0]["size"], 3, "{said}");
+    assert_eq!(said["requests"]["least"], 1, "{said}");
+    assert!(said["requests"]["most"].as_u64().unwrap() > 1, "{said}");
+
+    let text = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["followers", "--dry-run", "--refresh", "--format", "table"],
+    );
+    assert!(text.status.success(), "{}", stderr(&text));
+    assert!(
+        stdout(&text).contains("nothing was sent"),
+        "{}",
+        stdout(&text)
+    );
+    assert!(stdout(&text).contains("a walk"), "{}", stdout(&text));
+    assert_eq!(
+        instagram.received_requests().await.unwrap().len(),
+        before,
+        "a dry run sent a request"
+    );
+}
+
+/// Somebody else's lists: no consent is asked, since nothing is enumerated,
+/// and an account never seen here is said to be of unknown size.
+#[tokio::test]
+async fn a_dry_run_of_a_stranger_asks_nothing_and_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let before = instagram.received_requests().await.unwrap().len();
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["followers", "someone", "--dry-run", "--format", "json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let said = json(&out);
+    // The sandbox reaches its fake without a browser, where finding an
+    // account is one read; from the browser it is the profile's five.
+    assert_eq!(said["to_find"], 1, "{said}");
+    assert_eq!(said["lists"][0]["fate"], "unknown", "{said}");
+    assert_eq!(
+        instagram.received_requests().await.unwrap().len(),
+        before,
+        "a dry run sent a request"
+    );
+}
+
+/// In a cooldown a dry run says so and exits 5, as `status` does.
+#[tokio::test]
+async fn a_dry_run_in_a_cooldown_exits_five() {
+    use snob_core::budget::RateBudget;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let paths = snob_store::paths::AppPaths::rooted_at(tmp.path()).account(PK);
+    snob_store::store::rate_budget::SqliteRateBudget::open(&paths)
+        .unwrap()
+        .start_cooldown("429", std::time::Duration::from_secs(3600))
+        .unwrap();
+
+    let out = snob(tmp.path(), Some(&instagram), &["fans", "--dry-run"]);
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
+    assert!(stdout(&out).contains("cooldown"), "{}", stdout(&out));
+}

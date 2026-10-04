@@ -192,9 +192,12 @@ struct BaselineCost {
     accounts: usize,
     followers: u64,
     following: u64,
-    /// Roughly how many requests they come to, accumulated per account rather
+    /// Roughly how many pages they come to, accumulated per account rather
     /// than by dividing the totals: each account pages separately, so the
-    /// rounding belongs to each of them.
+    /// rounding belongs to each of them. What the sittings count.
+    pages: u64,
+    /// The requests those pages take, with what goes out beside them
+    /// (`engine::walk::requests_to_walk`).
     requests: u64,
     /// How many accounts the preflight could not read counters for. An account
     /// it could not ask about — a cooldown standing, or Instagram naming
@@ -229,7 +232,7 @@ impl BaselineCost {
     /// the sitting's rests past it (`pace::PAGES_PER_SITTING`), and more than
     /// a day past the day's accounts (`budget::accounts_per_day`).
     ///
-    /// The rests are counted over all the requests, as the walk counts its
+    /// The rests are counted over all the pages, as the walk counts its
     /// sitting across every account it reads, and the ceiling is the usual
     /// one: after a push-back, or with accounts already read today, the walk
     /// waits for the day sooner, which the sentence says as "roughly".
@@ -237,10 +240,10 @@ impl BaselineCost {
         use snob_ig::pace::{ACCOUNTS_PER_PAGE, PAGES_PER_SITTING};
 
         let per_sitting = u64::from(PAGES_PER_SITTING);
-        if self.requests <= per_sitting {
+        if self.pages <= per_sitting {
             return "a few minutes".to_string();
         }
-        let rests = (self.requests - 1) / per_sitting;
+        let rests = (self.pages - 1) / per_sitting;
         let rests = format!(
             "{rests} pause{} of five to fifteen minutes, one about every {} accounts",
             plural(rests as usize),
@@ -268,6 +271,7 @@ fn baseline_cost(report: &crate::engine::check::CheckReport) -> BaselineCost {
         accounts: 0,
         followers: 0,
         following: 0,
+        pages: 0,
         requests: 0,
         uncounted: 0,
     };
@@ -285,8 +289,9 @@ fn baseline_cost(report: &crate::engine::check::CheckReport) -> BaselineCost {
             (Some(a), Some(b)) => {
                 cost.followers += a;
                 cost.following += b;
-                cost.requests += crate::engine::walk::requests_to_walk(*a)
-                    + crate::engine::walk::requests_to_walk(*b);
+                use crate::engine::walk::{pages_to_walk, requests_to_walk};
+                cost.pages += pages_to_walk(*a) + pages_to_walk(*b);
+                cost.requests += requests_to_walk(*a) + requests_to_walk(*b);
             }
             _ => cost.uncounted += 1,
         }
@@ -827,9 +832,14 @@ evry = \"6h\"
             "every account the walk covers, not the first one with counters on it"
         );
         assert_eq!(
-            cost.requests,
+            cost.pages,
             72 + 9,
             "counted per account, because each of them pages on its own"
+        );
+        assert_eq!(
+            cost.requests,
+            146 + 20,
+            "each list opened, and each page followed by its show_many"
         );
 
         let sentence = cost.sentence();
@@ -837,7 +847,7 @@ evry = \"6h\"
         assert!(sentence.contains("2 accounts"), "{sentence}");
         assert!(
             sentence.ends_with(
-                "roughly 81 requests, with 2 pauses of five to fifteen minutes, \
+                "roughly 166 requests, with 2 pauses of five to fifteen minutes, \
                  one about every 480 accounts."
             ),
             "eighty-one pages fill two sittings: {sentence}"
@@ -850,7 +860,7 @@ evry = \"6h\"
         };
         let cost = baseline_cost(&partial);
         assert_eq!((cost.accounts, cost.uncounted), (2, 1));
-        assert_eq!(cost.requests, 72);
+        assert_eq!((cost.pages, cost.requests), (72, 146));
         assert!(
             cost.sentence().contains("could not be counted"),
             "{}",
@@ -867,6 +877,8 @@ evry = \"6h\"
             accounts: 1,
             followers,
             following,
+            pages: crate::engine::walk::pages_to_walk(followers)
+                + crate::engine::walk::pages_to_walk(following),
             requests: crate::engine::walk::requests_to_walk(followers)
                 + crate::engine::walk::requests_to_walk(following),
             uncounted: 0,
@@ -874,14 +886,14 @@ evry = \"6h\"
 
         let one_sitting = cost(300, 180).sentence();
         assert!(
-            one_sitting.ends_with("roughly 40 requests, a few minutes."),
+            one_sitting.ends_with("roughly 82 requests, a few minutes."),
             "{one_sitting}"
         );
 
         let one_rest = cost(300, 192).sentence();
         assert!(
             one_rest.ends_with(
-                "roughly 41 requests, with 1 pause of five to fifteen minutes, \
+                "roughly 84 requests, with 1 pause of five to fifteen minutes, \
                  one about every 480 accounts."
             ),
             "{one_rest}"
@@ -890,7 +902,7 @@ evry = \"6h\"
         let past_the_day = cost(1_800, 600).sentence();
         assert!(
             past_the_day.contains(
-                "roughly 200 requests, over more than a day, since at most 2000 accounts \
+                "roughly 402 requests, over more than a day, since at most 2000 accounts \
                  are read in a day, and 4 pauses"
             ),
             "{past_the_day}"

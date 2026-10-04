@@ -25,9 +25,23 @@ use crate::engine::{ListOutcome, ListQuery, Provenance};
 /// an estimate, labeled as one.
 const ACCOUNTS_PER_REQUEST: u64 = snob_ig::pace::ACCOUNTS_PER_PAGE as u64;
 
-/// About how many requests walking a list of `accounts` takes.
+/// About how many pages a list of `accounts` is: at least one, since an
+/// empty list is still asked for.
+pub fn pages_to_walk(accounts: u64) -> u64 {
+    accounts.div_ceil(ACCOUNTS_PER_REQUEST).max(1)
+}
+
+/// About how many requests walking `pages` takes: from the browser, the
+/// navigation that opens the list, and each page followed by its
+/// `show_many`, as the app sends them; without it, one a page.
+pub fn requests_for_pages(pages: u64, browser: bool) -> u64 {
+    if browser { 1 + 2 * pages } else { pages }
+}
+
+/// About how many requests walking a list of `accounts` takes, as the
+/// browser sends them, which is how requests go out unless told otherwise.
 pub fn requests_to_walk(accounts: u64) -> u64 {
-    accounts.div_ceil(ACCOUNTS_PER_REQUEST)
+    requests_for_pages(pages_to_walk(accounts), true)
 }
 
 /// Walks the list, resuming an interrupted one when there is a usable one.

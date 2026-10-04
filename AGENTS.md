@@ -58,6 +58,8 @@ Commands (`crates/snob-cli/src/cli.rs` is the source of truth; `snob --help` and
   `account list`, `account use`, `logout` (`--all`), `purge` (`--account`,
   `--dry-run`).
 - Lists: `unfollowers`, `fans`, `friends`, `followers`, `following`, `scan`.
+  `--dry-run` on any of them estimates the walks out of what is stored
+  (`engine::estimate`) and sends nothing: no resolution, no consent asked.
 - One account: `profile`, `pfp`, `stories`, `highlights`, `posts`. Their `-o -`
   writes one downloaded file to standard output.
 - One file of the CDN by its address, with no account: `fetch`.

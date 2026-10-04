@@ -96,7 +96,8 @@ can read:
   prints a list or a document; `--json` for status commands such as `whoami`
   and `status`.
 - `snob status --budget` says what can still be sent today, for no request, and
-  exits 5 while the account is cooling down.
+  exits 5 while the account is cooling down. `--dry-run` on a list command says
+  what its walks would cost against that, and sends nothing.
 - `-o -` writes a single downloaded file to standard output, as in
   `snob reel <link> -d 1 -o - | ffmpeg -i - ...`.
 - `--no-interactive` always prints. Down a pipe this is the default, and the

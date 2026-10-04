@@ -1,5 +1,6 @@
 pub mod account;
 pub mod common;
+pub mod dry_run;
 pub mod fetch;
 pub mod follow;
 pub mod highlights;
