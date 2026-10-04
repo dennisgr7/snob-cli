@@ -922,14 +922,25 @@ async fn a_list_of_thirty_walks_in_three_pages_of_twelve() {
     );
     assert!(world.audit(&server, &[]).await.is_empty());
 
-    assert_eq!(snob_cli::engine::walk::requests_to_walk(30), 3);
+    // Three pages, as the walk above asked for them: the navigation, and
+    // each page with its `show_many`.
+    assert_eq!(snob_cli::engine::walk::pages_to_walk(30), 3);
+    assert_eq!(
+        snob_cli::engine::walk::requests_to_walk(30, true),
+        1 + 2 * 3
+    );
     let cost = snob_cli::commands::common::rewalk_cost(
         &app,
         Pk::new(ig::SOMEONE),
         &[(ListKind::Followers, 30)],
     )
     .unwrap();
-    assert_eq!(cost, 1 + 3, "the account, then three pages");
+    assert!(app.client().has_page());
+    assert_eq!(
+        cost,
+        4 + 7,
+        "the account found by its profile, then the list"
+    );
 }
 
 /// An account that follows `me`, on top of the ten the world starts with:

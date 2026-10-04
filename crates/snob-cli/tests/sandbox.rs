@@ -2875,3 +2875,613 @@ async fn purging_one_account_leaves_the_other() {
     let unknown = snob(tmp.path(), None, &["--account", "other", "purge", "--yes"]);
     assert_eq!(unknown.status.code(), Some(1), "{}", stderr(&unknown));
 }
+
+/// `status` with no session says so, in both shapes, and exits 3.
+#[test]
+fn status_with_no_session_exits_three() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = snob(tmp.path(), None, &["status", "--json"]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    let said = json(&out);
+    assert_eq!(said["error"]["code"], "no_session");
+    for section in ["session", "budget", "cooldown", "lists", "watch"] {
+        assert_eq!(said[section], serde_json::Value::Null, "{said}");
+    }
+    let out = snob(tmp.path(), None, &["status", "--budget", "--json"]);
+    let said = json(&out);
+    assert!(
+        said.get("budget").is_some() && said.get("lists").is_none(),
+        "{said}"
+    );
+}
+
+/// Signed in and at rest: the whole budget, every section, exit 0, and not
+/// one request to the fake Instagram.
+#[tokio::test]
+async fn status_reports_the_budget_and_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let before = instagram.received_requests().await.unwrap().len();
+
+    let out = snob(tmp.path(), Some(&instagram), &["status", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let said = json(&out);
+    for section in ["session", "budget", "cooldown", "lists", "watch"] {
+        assert!(said.get(section).is_some(), "{section} missing: {said}");
+    }
+    assert_eq!(said["session"]["pk"], PK.get());
+    assert_eq!(
+        said["session"]["storage"], "file",
+        "where the session was found, which a sandbox keeps in a file"
+    );
+    assert_eq!(said["budget"]["writes"]["left"], 3);
+    assert_eq!(said["budget"]["accounts_left"], 2_000);
+    assert_eq!(said["cooldown"]["active"], false);
+    assert_eq!(
+        said["lists"]["followers"]["taken_at"],
+        serde_json::Value::Null
+    );
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["status", "--budget", "--json"],
+    );
+    let said = json(&out);
+    let keys: Vec<&String> = said.as_object().unwrap().keys().collect();
+    assert_eq!(keys, vec!["budget", "viewer"]);
+
+    let text = snob(tmp.path(), Some(&instagram), &["status"]);
+    assert!(text.status.success(), "{}", stderr(&text));
+    assert!(stdout(&text).contains("Requests"), "{}", stdout(&text));
+
+    assert_eq!(
+        instagram.received_requests().await.unwrap().len(),
+        before,
+        "status sent a request"
+    );
+}
+
+/// In a cooldown it says until when and why, and exits 5 whatever section
+/// was asked for, so a script can ask "may I send" with any of them.
+#[tokio::test]
+async fn status_in_a_cooldown_exits_five_and_says_why() {
+    use snob_core::budget::RateBudget;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let paths = snob_store::paths::AppPaths::rooted_at(tmp.path()).account(PK);
+    snob_store::store::rate_budget::SqliteRateBudget::open(&paths)
+        .unwrap()
+        .start_cooldown("429", std::time::Duration::from_secs(3600))
+        .unwrap();
+
+    let out = snob(tmp.path(), Some(&instagram), &["status", "--json"]);
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
+    let said = json(&out);
+    assert_eq!(said["cooldown"]["active"], true);
+    assert_eq!(said["cooldown"]["last"]["reason"], "429");
+    assert_eq!(said["cooldown"]["last"]["strikes"], 1);
+    assert!(said["cooldown"]["until"].as_i64().is_some());
+    assert_eq!(said["budget"]["accounts_ceiling"], 1_000);
+
+    let out = snob(tmp.path(), Some(&instagram), &["status", "--lists"]);
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
+}
+
+/// A signed-in account with no database is reported at rest, and none is
+/// made for it.
+#[tokio::test]
+async fn status_makes_no_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let db = database(tmp.path());
+    for suffix in ["", "-wal", "-shm"] {
+        let file = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
+        if file.exists() {
+            std::fs::remove_file(file).unwrap();
+        }
+    }
+
+    let out = snob(tmp.path(), None, &["status", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(json(&out)["budget"]["day"]["left"], 2_001);
+    assert_eq!(json(&out)["budget"]["requests_now"], 21);
+    assert!(!db.exists(), "status made a database");
+}
+
+/// `-o -` writes the one file itself to standard output and says nothing
+/// about where it went: a post's item, a story.
+#[tokio::test]
+async fn one_file_goes_to_standard_output_with_a_dash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_post(&instagram).await;
+    with_downloadable_stories(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = here(&tmp);
+
+    let link = format!("https://www.instagram.com/p/{POST_CODE}/");
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["post", &link, "-d", "2", "-o", "-"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"\x00\x00\x00\x18ftypisom a clip");
+    assert!(!stderr(&out).contains("Saved"), "{}", stderr(&out));
+
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["stories", "me", "-d", "1", "-o", "-"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"\xff\xd8\xff\xe0 a picture");
+
+    assert_eq!(
+        std::fs::read_dir(&here).unwrap().count(),
+        0,
+        "a file named - or anything else was written"
+    );
+}
+
+/// `-o -` takes one file: several are refused before any is fetched, and
+/// nothing reaches standard output.
+#[tokio::test]
+async fn standard_output_takes_one_file_and_refuses_several() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_post(&instagram).await;
+    with_downloadable_stories(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = here(&tmp);
+
+    let link = format!("https://www.instagram.com/p/{POST_CODE}/");
+    for args in [
+        vec!["post", link.as_str(), "-d", "all", "-o", "-"],
+        vec!["stories", "me", "-d", "all", "-o", "-"],
+    ] {
+        let out = snob_from(&here, tmp.path(), &instagram, &args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert!(stderr(&out).contains("-o -"), "{}", stderr(&out));
+    }
+    let media = instagram
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/big.jpg" || r.url.path() == "/clip.mp4")
+        .count();
+    assert_eq!(media, 0, "a refused download fetched a file");
+}
+
+/// `fetch` needs nobody signed in: the file comes from the CDN, and no
+/// database, session or browser profile is made for it.
+#[tokio::test]
+async fn fetch_downloads_a_cdn_file_with_no_account() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = MockServer::start().await;
+    serve_media(&instagram).await;
+    let here = here(&tmp);
+
+    let clip = format!("{}/clip.mp4", instagram.uri());
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["fetch", &clip, "--user-agent", UA, "-o", "-"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"\x00\x00\x00\x18ftypisom a clip");
+
+    let picture = format!("{}/big.jpg?oh=signed", instagram.uri());
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["fetch", &picture, "--user-agent", UA, "-o", "face.jpg"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read(here.join("face.jpg")).unwrap(),
+        b"\xff\xd8\xff\xe0 a picture"
+    );
+
+    let requests = instagram.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "only the two files were asked for");
+    for request in &requests {
+        assert!(request.headers.get("cookie").is_none());
+        assert_eq!(request.headers.get("user-agent").unwrap(), UA);
+    }
+    let accounts = snob_store::paths::AppPaths::rooted_at(tmp.path())
+        .data_dir()
+        .join("accounts");
+    assert!(!accounts.exists(), "fetch made an account's directory");
+}
+
+/// An address off the CDN is refused before anything is sent or created.
+#[tokio::test]
+async fn fetch_refuses_an_address_off_the_cdn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = MockServer::start().await;
+    let here = here(&tmp);
+    for address in [
+        "https://evil.test/x.jpg",
+        "http://scontent.cdninstagram.com/x.jpg",
+        "file:///etc/passwd",
+        // Instagram's own site is not its CDN: an address on it is the API.
+        "https://www.instagram.com/api/v1/users/web_profile_info/?username=someone",
+    ] {
+        let out = snob_from(
+            &here,
+            tmp.path(),
+            &instagram,
+            &["fetch", address, "--user-agent", UA, "-o", "x.jpg"],
+        );
+        assert_eq!(out.status.code(), Some(1), "{address}: {}", stderr(&out));
+    }
+    assert!(!here.join("x.jpg").exists());
+    assert!(instagram.received_requests().await.unwrap().is_empty());
+}
+
+/// A download that fails does not take the file the user named with it: a
+/// good earlier copy stays as it was, and no scratch file is left beside it.
+#[tokio::test]
+async fn fetch_keeps_the_named_file_when_the_download_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(url_path("/old.jpg"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&instagram)
+        .await;
+    serve_media(&instagram).await;
+    let here = here(&tmp);
+    std::fs::write(here.join("keep.jpg"), b"a good earlier copy").unwrap();
+
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &[
+            "fetch",
+            &format!("{}/old.jpg", instagram.uri()),
+            "--user-agent",
+            UA,
+            "-o",
+            "keep.jpg",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read(here.join("keep.jpg")).unwrap(),
+        b"a good earlier copy"
+    );
+    let names: Vec<String> = std::fs::read_dir(&here)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["keep.jpg"], "a scratch file was left behind");
+
+    // One that arrives whole replaces it.
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &[
+            "fetch",
+            &format!("{}/big.jpg", instagram.uri()),
+            "--user-agent",
+            UA,
+            "-o",
+            "keep.jpg",
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read(here.join("keep.jpg")).unwrap(),
+        b"\xff\xd8\xff\xe0 a picture"
+    );
+}
+
+/// `-o -` on a listing prints it, as no `-o` down a pipe does, and never
+/// writes a file named `-`.
+#[tokio::test]
+async fn a_listing_with_a_dash_goes_to_standard_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_stories(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = here(&tmp);
+
+    let out = snob_from(&here, tmp.path(), &instagram, &["stories", "me", "-o", "-"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let listed = json(&out);
+    assert_eq!(listed["stories"].as_array().unwrap().len(), 2, "{listed}");
+    assert!(!stderr(&out).contains("Written to"), "{}", stderr(&out));
+
+    assert_eq!(
+        std::fs::read_dir(&here).unwrap().count(),
+        0,
+        "a file named - or anything else was written"
+    );
+}
+
+/// `-o -` with numbers that name several files is refused before anything
+/// is asked of Instagram.
+#[tokio::test]
+async fn several_files_to_standard_output_are_refused_before_a_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_downloadable_stories(&instagram).await;
+    with_downloadable_highlights(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = here(&tmp);
+    let before = instagram.received_requests().await.unwrap().len();
+
+    for args in [
+        vec!["stories", "me", "-d", "1,2", "-o", "-"],
+        vec!["highlights", "me", "-d", "1", "-o", "-"],
+    ] {
+        let out = snob_from(&here, tmp.path(), &instagram, &args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
+        assert!(stderr(&out).contains("-o -"), "{}", stderr(&out));
+    }
+    assert_eq!(
+        instagram.received_requests().await.unwrap().len(),
+        before,
+        "a refused -o - asked Instagram something"
+    );
+}
+
+/// `--dry-run` refuses what it would ignore, and the forms it has not got,
+/// before anything is read or written.
+#[tokio::test]
+async fn a_dry_run_refuses_what_it_would_ignore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let here = here(&tmp);
+
+    for flags in [
+        &["-y"][..],
+        &["--no-progress"],
+        &["--no-interactive"],
+        &["--hide", "verified"],
+        &["--limit", "3"],
+    ] {
+        let mut args = vec!["followers", "--dry-run"];
+        args.extend_from_slice(flags);
+        let out = snob_from(&here, tmp.path(), &instagram, &args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+    }
+    for args in [
+        vec!["followers", "--dry-run", "--format", "csv"],
+        vec!["followers", "--dry-run", "-o", "list.xlsx"],
+    ] {
+        let out = snob_from(&here, tmp.path(), &instagram, &args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
+    }
+    assert_eq!(std::fs::read_dir(&here).unwrap().count(), 0);
+
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["followers", "--dry-run", "--format", "ndjson"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).lines().count(), 1, "{}", stdout(&out));
+}
+
+/// A dry run writes nothing: no database is made for an account that has
+/// none, as `status` makes none.
+#[tokio::test]
+async fn a_dry_run_makes_no_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let db = database(tmp.path());
+    for suffix in ["", "-wal", "-shm"] {
+        let file = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
+        if file.exists() {
+            std::fs::remove_file(file).unwrap();
+        }
+    }
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["unfollowers", "--dry-run", "--format", "json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(json(&out)["sends_now"], true);
+    assert!(!db.exists(), "a dry run made a database");
+}
+
+/// An expired signed address is said to be one.
+#[tokio::test]
+async fn fetch_says_an_expired_address_is_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&instagram)
+        .await;
+    let here = here(&tmp);
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &[
+            "fetch",
+            &format!("{}/old.jpg", instagram.uri()),
+            "--user-agent",
+            UA,
+            "-o",
+            "old.jpg",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("expires"), "{}", stderr(&out));
+    assert!(
+        !here.join("old.jpg").exists(),
+        "a refused file was left behind"
+    );
+}
+
+/// A reader that leaves halfway through a file ends the run quietly.
+#[tokio::test]
+async fn fetch_to_a_reader_that_left_is_not_a_failure() {
+    use std::process::Stdio;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(url_path("/large.mp4"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 4 << 20]))
+        .mount(&instagram)
+        .await;
+    let large = format!("{}/large.mp4", instagram.uri());
+    let mut child = command(tmp.path(), Some(&instagram))
+        .args(["fetch", &large, "--user-agent", UA, "-o", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("the binary finishes");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!said.contains("panicked"), "{said}");
+    assert_eq!(out.status.code(), Some(0), "{said}");
+}
+
+/// `--dry-run` says what the walks would cost, against what today has left,
+/// and sends nothing: before anything is stored, and after.
+#[tokio::test]
+async fn a_dry_run_estimates_and_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let before = instagram.received_requests().await.unwrap().len();
+
+    // Nothing stored yet: your own lists are known by nothing here.
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["unfollowers", "--dry-run", "--format", "json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let said = json(&out);
+    assert_eq!(said["dry_run"], true);
+    assert_eq!(said["to_find"], 0, "your own account needs no finding");
+    let lists: Vec<&str> = said["lists"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["list"].as_str().unwrap())
+        .collect();
+    assert_eq!(lists, ["followers", "following"], "the order it walks them");
+    let status = json(&snob(
+        tmp.path(),
+        Some(&instagram),
+        &["status", "--budget", "--json"],
+    ));
+    assert_eq!(
+        said["requests_left"], status["budget"]["day"]["left"],
+        "what is left is what status says"
+    );
+    assert_eq!(
+        instagram.received_requests().await.unwrap().len(),
+        before,
+        "a dry run sent a request"
+    );
+
+    // Walked once, the lists are stored and fresh: a range, one poll at
+    // the least.
+    let out = snob(tmp.path(), Some(&instagram), &["scan", "--format", "json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let before = instagram.received_requests().await.unwrap().len();
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["scan", "--dry-run", "--format", "json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let said = json(&out);
+    assert_eq!(said["lists"][0]["fate"], "reused_unless_moved", "{said}");
+    assert_eq!(said["lists"][0]["size"], 3, "{said}");
+    assert_eq!(said["requests"]["least"], 1, "{said}");
+    assert!(said["requests"]["most"].as_u64().unwrap() > 1, "{said}");
+
+    let text = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["followers", "--dry-run", "--refresh", "--format", "table"],
+    );
+    assert!(text.status.success(), "{}", stderr(&text));
+    assert!(
+        stdout(&text).contains("nothing was sent"),
+        "{}",
+        stdout(&text)
+    );
+    assert!(stdout(&text).contains("a walk"), "{}", stdout(&text));
+    assert_eq!(
+        instagram.received_requests().await.unwrap().len(),
+        before,
+        "a dry run sent a request"
+    );
+}
+
+/// Somebody else's lists: no consent is asked, since nothing is enumerated,
+/// and an account never seen here is said to be of unknown size.
+#[tokio::test]
+async fn a_dry_run_of_a_stranger_asks_nothing_and_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let before = instagram.received_requests().await.unwrap().len();
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["followers", "someone", "--dry-run", "--format", "json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let said = json(&out);
+    // The sandbox reaches its fake without a browser, where finding an
+    // account is one read; from the browser it is the profile's five.
+    assert_eq!(said["to_find"], 1, "{said}");
+    assert_eq!(said["lists"][0]["fate"], "unknown", "{said}");
+    assert_eq!(
+        instagram.received_requests().await.unwrap().len(),
+        before,
+        "a dry run sent a request"
+    );
+}
+
+/// In a cooldown a dry run says so and exits 5, as `status` does.
+#[tokio::test]
+async fn a_dry_run_in_a_cooldown_exits_five() {
+    use snob_core::budget::RateBudget;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let paths = snob_store::paths::AppPaths::rooted_at(tmp.path()).account(PK);
+    snob_store::store::rate_budget::SqliteRateBudget::open(&paths)
+        .unwrap()
+        .start_cooldown("429", std::time::Duration::from_secs(3600))
+        .unwrap();
+
+    let out = snob(tmp.path(), Some(&instagram), &["fans", "--dry-run"]);
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
+    assert!(stdout(&out).contains("cooldown"), "{}", stdout(&out));
+}

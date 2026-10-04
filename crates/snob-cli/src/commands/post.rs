@@ -40,6 +40,7 @@ pub async fn run(args: PostArgs, store: SecretStore, paths: &AccountPaths) -> Re
             format!("{e}: give a post's or a reel's link"),
         )
     })?;
+    args.action.refuse_stdout_download_early()?;
     let app = common::reader(&store, paths, args.action.interactive, false)?;
     let browses = args.action.browses(
         args.list.format.is_some(),

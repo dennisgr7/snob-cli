@@ -115,6 +115,18 @@ impl Store {
         }
     }
 
+    /// The account's database **for a report**: read, and nothing stored
+    /// changed. `None` when it has none.
+    ///
+    /// [`Store::open_existing`] migrates a database from an older snob, and
+    /// compacts it after, and its last connection checkpoints the log into
+    /// the file when it closes: three writes, which a command that says it
+    /// writes nothing must not make. See [`read_only`].
+    pub fn read_existing(paths: &AccountPaths) -> Result<Option<Self>, StoreError> {
+        let conn = read_only(&paths.db_file(), &migrations::MIGRATIONS, migrations::COUNT)?;
+        Ok(conn.map(|conn| Self { conn }))
+    }
+
     pub fn open_at(path: &Path) -> Result<Self, StoreError> {
         Self::opened(Connection::open(path)?, path)
     }
@@ -304,6 +316,67 @@ fn configure(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The database at `path`, opened to be read and never changed: `None` when
+/// there is no file, and never one created.
+///
+/// - **Nothing written through it**: `query_only` refuses any statement
+///   that would, and the connection does not checkpoint the log into the
+///   file when it closes, which the last connection otherwise does.
+/// - **A schema from an older snob is not migrated in place.** It is copied
+///   into memory and brought up to date there, so the report reads what the
+///   newest schema says; the file itself is migrated by the next command
+///   that writes, as ever.
+/// - One from a newer snob is refused, as every open refuses it.
+pub(crate) fn read_only(
+    path: &Path,
+    migrations: &Migrations<'_>,
+    known: usize,
+) -> Result<Option<Connection>, StoreError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    // Opened read-write, not `SQLITE_OPEN_READ_ONLY`: a read-only connection
+    // cannot set up the WAL index when the log files are absent, which is
+    // how a database another connection closed cleanly is left.
+    // `query_only` is what keeps it from writing.
+    let flags = rusqlite::OpenFlags::default().difference(rusqlite::OpenFlags::SQLITE_OPEN_CREATE);
+    let conn = match Connection::open_with_flags(path, flags) {
+        Ok(conn) => conn,
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::CannotOpen && !path.exists() =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    conn.busy_timeout(Duration::from_millis(5_000))?;
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )?;
+    conn.pragma_update(None, "trusted_schema", "OFF")?;
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    conn.pragma_update(None, "query_only", "ON")?;
+    reject_newer_schema(&conn, path, known)?;
+    if usize::try_from(user_version(&conn)?).is_ok_and(|found| found == known) {
+        return Ok(Some(conn));
+    }
+
+    let mut copy = Connection::open_in_memory()?;
+    // Every page in one step: the copy is of a quiet file, and a step that
+    // met a writer is retried after the pause.
+    rusqlite::backup::Backup::new(&conn, &mut copy)?.run_to_completion(
+        i32::MAX,
+        Duration::from_millis(50),
+        None,
+    )?;
+    drop(conn);
+    configure(&copy)?;
+    migrate(&mut copy, migrations)?;
+    copy.pragma_update(None, "query_only", "ON")?;
+    Ok(Some(copy))
+}
+
 /// Refuses a database written by a **newer** build, before the migration runner
 /// says so in its own words; [`StoreError::SchemaFromNewerSnob`] says why.
 ///
@@ -471,6 +544,55 @@ mod tests {
 
         drop(Store::open(&account).unwrap());
         assert!(Store::open_existing(&account).unwrap().is_some());
+    }
+
+    /// Reading for a report changes nothing in the file: not a database at
+    /// the current schema, which refuses a write through it, and not one an
+    /// older snob left, which is read migrated without being migrated.
+    #[test]
+    fn a_report_reads_the_database_and_leaves_it_as_it_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = crate::paths::AppPaths::rooted_at(tmp.path()).account(Pk::new(42));
+        assert!(Store::read_existing(&account).unwrap().is_none());
+        assert!(!account.dir().exists(), "nothing was created for it");
+
+        // Two migrations short of the current schema, as an older snob left it.
+        account.ensure_dirs().unwrap();
+        let path = account.db_file();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            configure(&conn).unwrap();
+            let older = Migrations::new(
+                migrations::CHAIN[..migrations::COUNT - 2]
+                    .iter()
+                    .map(|sql| rusqlite_migration::M::up(sql))
+                    .collect(),
+            );
+            migrate(&mut conn, &older).unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        let read = Store::read_existing(&account).unwrap().unwrap();
+        assert_eq!(
+            user_version(read.conn()).unwrap() as usize,
+            migrations::COUNT,
+            "the report reads the current schema"
+        );
+        drop(read);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the file was changed"
+        );
+
+        drop(Store::open(&account).unwrap());
+        let read = Store::read_existing(&account).unwrap().unwrap();
+        assert!(
+            read.remember("key", "value").is_err(),
+            "a write went through a report's connection"
+        );
     }
 
     /// A database from a newer snob says so, rather than letting the migration

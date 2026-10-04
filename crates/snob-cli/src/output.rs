@@ -63,8 +63,8 @@ impl Presentation {
     /// `FORCE_HYPERLINK` and `NO_COLOR` are honored by the two crates behind
     /// this, so neither variable is read here.
     pub fn detect(destination: Option<&Path>) -> Self {
-        let interactive =
-            destination.is_none() && std::io::IsTerminal::is_terminal(&std::io::stdout());
+        let interactive = file_named(destination).is_none()
+            && std::io::IsTerminal::is_terminal(&std::io::stdout());
         Self {
             interactive,
             hyperlinks: interactive && supports_hyperlinks::on(supports_hyperlinks::Stream::Stdout),
@@ -98,6 +98,7 @@ impl Rendered {
 /// The extension matters so `-o list.csv` with no `--format` does not write
 /// one name per line into a file named like a spreadsheet.
 pub fn effective_format(requested: Option<Format>, destination: Option<&Path>) -> Format {
+    let destination = file_named(destination);
     if let Some(format) = requested {
         return format;
     }
@@ -132,6 +133,7 @@ fn format_from_extension(path: &Path) -> Option<Format> {
 /// Refuses up front what would only fail once the walk had already been paid
 /// for. Called before the first request, never after.
 pub fn check_destination(format: Format, destination: Option<&Path>) -> Result<()> {
+    let destination = file_named(destination);
     // Before the walk, like every other refusal here: a build without the
     // feature still parses `--format xlsx` and still reads the extension, so
     // the answer has to be given here and not after the requests were spent.
@@ -226,7 +228,7 @@ pub fn write(
 /// copy the whole thing once more -- up to the story ceiling -- for a writer
 /// that only reads a borrowed slice. `Rendered` stays for what is rendered.
 pub fn write_bytes(bytes: &[u8], destination: Option<&Path>) -> Result<()> {
-    match destination {
+    match file_named(destination) {
         Some(path) => {
             std::fs::write(path, bytes)
                 .with_context(|| format!("could not write {}", path.display()))?;
@@ -281,10 +283,244 @@ pub fn create_new(path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("could not create {}", path.display()))
 }
 
+/// A download into a path the user named with `-o`, which replaces what is
+/// there only once the whole file has arrived.
+///
+/// The bytes go to `.<name>.<pid>.part` beside it and are renamed over it at
+/// [`Replacing::commit`]; anything short of that removes the `.part` and
+/// leaves the path as it was. Truncating the path first, and removing it on a
+/// failure, lost a good earlier copy to an expired address, and removed
+/// whatever the user had named, `/dev/null` included.
+///
+/// A path that exists and is neither a file nor a directory (a device, a
+/// pipe) is written to in place: it cannot be renamed over, and it is not a
+/// copy of anything to keep. A link is followed, so the file it points at is
+/// the one replaced and the link stays a link.
+pub struct Replacing {
+    /// `None` once closed, which Windows wants before a rename or a removal.
+    file: Option<std::fs::File>,
+    /// The scratch file, until it is committed or abandoned; `None` when
+    /// writing in place.
+    part: Option<PathBuf>,
+    path: PathBuf,
+}
+
+impl Replacing {
+    pub fn open(path: &Path) -> Result<Self> {
+        let not_written = |e: std::io::Error| anyhow!("could not write {}: {e}", path.display());
+        let existing = std::fs::metadata(path).ok();
+        if existing.as_ref().is_some_and(std::fs::Metadata::is_dir) {
+            return Err(anyhow!(
+                "{} is a directory; -o names the file this one download goes to",
+                path.display()
+            ));
+        }
+        if existing.as_ref().is_some_and(|meta| !meta.is_file()) {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(not_written)?;
+            return Ok(Self {
+                file: Some(file),
+                part: None,
+                path: path.to_path_buf(),
+            });
+        }
+        let target = match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                std::fs::canonicalize(path).map_err(not_written)?
+            }
+            _ => path.to_path_buf(),
+        };
+        let name = target
+            .file_name()
+            .ok_or_else(|| anyhow!("{} names no file", path.display()))?
+            .to_string_lossy()
+            .into_owned();
+        let dir = match target.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let part = dir.join(format!(".{name}.{}.part", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+            .map_err(not_written)?;
+        // What the user had there keeps its permissions: the replacement is a
+        // new file, and a private one should not come back readable by all.
+        if let Some(meta) = existing {
+            let _ = std::fs::set_permissions(&part, meta.permissions());
+        }
+        Ok(Self {
+            file: Some(file),
+            part: Some(part),
+            path: target,
+        })
+    }
+
+    /// Where the bytes go until [`Replacing::commit`].
+    pub fn file(&mut self) -> &mut std::fs::File {
+        self.file.as_mut().expect("open until committed or dropped")
+    }
+
+    /// Puts the finished file in place of the path.
+    pub fn commit(mut self) -> Result<()> {
+        let mut file = self.file.take().expect("open until committed or dropped");
+        let Some(part) = self.part.take() else {
+            return file
+                .flush()
+                .with_context(|| format!("could not finish writing {}", self.path.display()));
+        };
+        let synced = file.sync_all();
+        drop(file);
+        let finished = synced
+            .with_context(|| format!("could not finish writing {}", self.path.display()))
+            .and_then(|()| {
+                std::fs::rename(&part, &self.path)
+                    .with_context(|| format!("could not move into place {}", self.path.display()))
+            });
+        if finished.is_err() {
+            let _ = std::fs::remove_file(&part);
+        }
+        finished
+    }
+}
+
+impl Drop for Replacing {
+    /// Not committed: the path is left as it was.
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if let Some(part) = self.part.take() {
+            let _ = std::fs::remove_file(part);
+        }
+    }
+}
+
 /// Writes an already-rendered result to the destination, with the same
 /// file-vs-stdout behavior every command shares.
 pub fn write_rendered(rendered: &Rendered, destination: Option<&Path>) -> Result<()> {
     write_bytes(rendered.as_bytes(), destination)
+}
+
+/// Whether `-o` named standard output: `-o -`.
+pub fn is_stdout(path: &Path) -> bool {
+    path.as_os_str() == "-"
+}
+
+/// The file a destination names, or `None` for standard output: no `-o`, or
+/// `-o -`.
+///
+/// Every function here that takes a destination reads it through this, so a
+/// listing or a document given `-o -` is printed as it would be with no `-o`,
+/// and never written to a file named `-` (`-o ./-` still is). Where `-o -`
+/// differs from no `-o` at all is decided before this: it asks for the
+/// printed form, not the full-screen view, and a download with it goes to
+/// standard output rather than into the working directory.
+pub fn file_named(destination: Option<&Path>) -> Option<&Path> {
+    destination.filter(|path| !is_stdout(path))
+}
+
+/// The checks before a downloaded file goes to standard output: exactly one
+/// file, and a reader that is not a terminal, where the bytes of a JPEG or an
+/// MP4 are noise that can leave it in a state somebody has to reset.
+///
+/// Asked before any file is fetched, so a refusal costs no download; what
+/// the command line alone answers is asked before anything at all
+/// ([`stdout_download_ahead`]).
+pub fn one_file_to_stdout(files: usize) -> Result<()> {
+    if files != 1 {
+        return Err(several_to_stdout(files));
+    }
+    no_terminal_for_a_file()
+}
+
+/// [`one_file_to_stdout`] as far as the command line answers it, before a
+/// single request: whether standard output is a terminal, and whether the
+/// numbers given (`-d 1,3`) already name more than one file. `at_least` is
+/// that count, a lower bound since a post can hold several; `None` when only
+/// the listing will tell (`-d all`). Nothing is refused when `-o` is not `-`.
+pub fn stdout_download_ahead(destination: Option<&Path>, at_least: Option<usize>) -> Result<()> {
+    if !destination.is_some_and(is_stdout) {
+        return Ok(());
+    }
+    if let Some(files) = at_least
+        && files > 1
+    {
+        return Err(several_to_stdout(files));
+    }
+    no_terminal_for_a_file()
+}
+
+fn several_to_stdout(files: usize) -> anyhow::Error {
+    anyhow!(
+        "-o - writes one file to standard output, and this is {files}; name a \
+         directory with -o for several"
+    )
+}
+
+fn no_terminal_for_a_file() -> Result<()> {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        return Err(anyhow!(
+            "-o - writes the file itself to standard output, which is a terminal here; \
+             redirect it to a file or pipe it into another program"
+        ));
+    }
+    Ok(())
+}
+
+/// Standard output as the sink of a streamed download, which a reader that
+/// left ends quietly, as [`write_stdout`] treats one.
+///
+/// Written through [`std::io::Stdout`] on each chunk rather than held
+/// locked, because a download's sink has to be `Send` and a lock is not.
+/// What has gone out before a failure cannot be taken back: the run exits
+/// non-zero and says so on standard error, and the reader has a prefix.
+#[derive(Default)]
+pub struct StdoutSink {
+    closed: bool,
+}
+
+impl StdoutSink {
+    /// What the download came to: a reader that left is not a failure, and
+    /// anything else that went wrong is, flush included.
+    pub fn finish<T, E: Into<anyhow::Error>>(mut self, result: Result<T, E>) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        result.map_err(Into::into)?;
+        match std::io::Write::flush(&mut self) {
+            Ok(()) => Ok(()),
+            Err(_) if self.closed => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context("could not write the file")),
+        }
+    }
+}
+
+impl std::io::Write for StdoutSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = std::io::stdout().write(buf);
+        self.note(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let flushed = std::io::stdout().flush();
+        self.note(flushed)
+    }
+}
+
+impl StdoutSink {
+    /// Remembers a reader that left, and hands the answer on: the download
+    /// stops at the error, and [`Self::finish`] reads why.
+    fn note<T>(&mut self, result: std::io::Result<T>) -> std::io::Result<T> {
+        if let Err(e) = &result
+            && e.kind() == std::io::ErrorKind::BrokenPipe
+        {
+            self.closed = true;
+        }
+        result
+    }
 }
 
 /// The result, on standard output, for a reader that may have left.

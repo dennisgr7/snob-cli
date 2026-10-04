@@ -245,6 +245,10 @@ pub(crate) async fn download_selected(
     no_such: impl Fn(usize) -> anyhow::Error,
 ) -> Result<ExitCode> {
     let numbers = numbers_of(selection, items.len(), &no_such)?;
+    let to_stdout = destination.is_some_and(output::is_stdout);
+    if to_stdout {
+        output::one_file_to_stdout(numbers.len())?;
+    }
     let [number] = numbers[..] else {
         return download_many(client, stem_base, items.to_vec(), numbers, destination).await;
     };
@@ -255,6 +259,11 @@ pub(crate) async fn download_selected(
         .and_then(|i| items.get(i))
         .ok_or_else(|| no_such(number))?;
     match destination {
+        // `-o -`: the file itself, and nothing said about where it went.
+        Some(_) if to_stdout => {
+            let bytes = bytes_of(&client, story).await?;
+            output::write_bytes(&bytes, None)?;
+        }
         // The user named it, so replacing what is there is their call -- and
         // so is downloading it again. Held whole: a named destination may be
         // anywhere.
@@ -484,7 +493,7 @@ pub(crate) async fn download_named(
 
     // Several in flight rather than one after another. The CDN is a different
     // host with its own limits and is deliberately not paced (the reasoning
-    // is on `IgClient::download_capped`), the client to it carries nothing
+    // is on `CdnClient::download_capped`), the client to it carries nothing
     // that names the account, and the connection is HTTP/2 -- so three
     // stories share one TCP+TLS connection instead of each waiting its own
     // round trip. Three is what a browser does when it opens a tray, and

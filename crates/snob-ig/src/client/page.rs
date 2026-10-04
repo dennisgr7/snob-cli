@@ -265,6 +265,13 @@ pub fn send_every_request_from(factory: PageFactory) -> Result<(), PageFactory> 
     FACTORY.set(factory)
 }
 
+/// Whether a client built now would send from a browser page, as
+/// [`super::IgClient::has_page`] would answer once built: for a command that
+/// reports what a run would cost and builds no client (`--dry-run`).
+pub fn a_client_would_use_a_page() -> bool {
+    FACTORY.get().is_some() && (super::is_instagram(&super::site()) || used_off_instagram())
+}
+
 /// The page a client for `session` should use, when one was set up.
 pub(crate) fn page_for(session: &Session) -> Option<Arc<dyn Page>> {
     FACTORY.get().map(|factory| allowlisted(factory(session)))

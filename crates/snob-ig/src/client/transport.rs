@@ -6,7 +6,7 @@
 //! [`Answer`] is what it hands back for [`IgClient::decode`] to read.
 //!
 //! What a request *says* about itself is in [`super::headers`]. The CDN's own
-//! rules are in [`super::media`] rather than here, because they are the
+//! rules are in [`super::cdn`] rather than here, because they are the
 //! opposite rules: an asset request has to be allowed to move between hosts
 //! and an API call must not. Keeping the two apart is what stops the looser of
 //! them governing the requests that carry the credentials.
@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use url::Url;
 
 use crate::error::IgError;
+use crate::http::Deadline;
 
 use super::IgClient;
 use super::headers::Surface;
@@ -27,9 +28,10 @@ use super::headers::Surface;
 /// process uses.
 pub(super) const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
 
-/// How long a single request may take end to end, and how long the connection
-/// itself may take to come up. Generous: the walk's own pacing is what keeps
-/// requests apart, and these are only here so that nothing waits forever.
+/// How long a single request may take end to end (for a file off the CDN, how
+/// long it may go without a byte), and how long the connection itself may take
+/// to come up. Generous: the walk's own pacing is what keeps requests apart,
+/// and these are only here so that nothing waits forever.
 pub(super) const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -75,7 +77,24 @@ pub(super) fn build_client(
         user_agent,
         redirect,
         CONNECT_TIMEOUT,
-        REQUEST_TIMEOUT,
+        Deadline::Whole(REQUEST_TIMEOUT),
+        &crate::http::chosen_trust(),
+    )?
+    .build()?)
+}
+
+/// [`build_client`] for files off the CDN: the same trust and connection
+/// rules, and a limit on the wait for the next bytes rather than on the whole
+/// download (see [`Deadline::BetweenReads`]).
+pub(super) fn build_cdn_client(
+    user_agent: &str,
+    redirect: reqwest::redirect::Policy,
+) -> Result<reqwest::Client, IgError> {
+    Ok(crate::http::builder(
+        user_agent,
+        redirect,
+        CONNECT_TIMEOUT,
+        Deadline::BetweenReads(REQUEST_TIMEOUT),
         &crate::http::chosen_trust(),
     )?
     .build()?)

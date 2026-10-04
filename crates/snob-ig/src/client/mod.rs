@@ -22,8 +22,9 @@
 //! - [`write`] -- the follow and the unfollow, and nothing else. One file, so
 //!   that the rule about which function may send a method other than GET can
 //!   be checked by opening it.
-//! - [`media`] -- the CDN half: where a picture is allowed to come from, and
-//!   the download that carries nothing identifying.
+//! - [`cdn`] -- the CDN half: where a picture is allowed to come from, and
+//!   the download that carries nothing identifying; [`media`], which of the
+//!   tab and that client fetches a file.
 //! - [`page`] -- the browser tab every request to Instagram is sent from by
 //!   default, and the allowlist wrapped around it.
 //! - [`ask`] -- what the client asks that tab for by name rather than by
@@ -31,6 +32,7 @@
 //! - [`posts`] -- a profile's posts, one post, and its comments.
 
 mod ask;
+mod cdn;
 mod headers;
 mod media;
 pub mod page;
@@ -42,6 +44,7 @@ mod write;
 #[cfg(test)]
 pub(crate) mod harness;
 
+pub use self::cdn::CdnClient;
 pub use self::posts::PostsPage;
 pub use self::read::Direction;
 
@@ -57,7 +60,6 @@ use crate::client_hints::ClientHints;
 use crate::error::{IgError, classify, refused};
 use crate::pace::{Pace, Pacer};
 
-use self::media::cdn_policy;
 use self::transport::{Answer, api_policy, build_client, same_origin};
 
 pub struct IgClient {
@@ -65,7 +67,7 @@ pub struct IgClient {
     /// session, and follows no redirect on its own: see [`api_policy`].
     api: reqwest::Client,
     /// Talks to the CDN. Carries nothing that identifies the account, and
-    /// every hop has to be somewhere pictures come from.
+    /// every hop has to be somewhere pictures come from: see [`CdnClient`].
     ///
     /// Two clients rather than one because the two have opposite rules: the
     /// API request must not leave instagram.com, and the asset request has to
@@ -73,11 +75,11 @@ pub struct IgClient {
     /// redirect policy, so sharing it meant the looser of the two governed the
     /// requests carrying the credentials.
     ///
-    /// Built on first use, which is `snob pfp` and nothing else. A
+    /// Built on first use, which is a download and nothing else. A
     /// `reqwest::Client` is a connection pool and a TLS configuration — the
     /// platform trust store is read to assemble one — and every other command
     /// paid for that on the startup path to never send a request through it.
-    cdn: OnceLock<reqwest::Client>,
+    cdn: OnceLock<CdnClient>,
     base: Url,
     session: Session,
     /// Reserving budget lives here rather than in each caller, so a request
@@ -154,6 +156,17 @@ pub fn point_every_client_at(base: Url) -> Result<(), Url> {
     SANDBOX_BASE.set(base)
 }
 
+/// The site a client built now points at: Instagram, or in a testing build
+/// the server [`point_every_client_at`] named. What a [`CdnClient`] built
+/// with no `IgClient` behind it judges an address against.
+pub fn site() -> Url {
+    #[cfg(feature = "testing")]
+    if let Some(base) = SANDBOX_BASE.get() {
+        return base.clone();
+    }
+    Url::parse(BASE_URL).expect("BASE_URL parses")
+}
+
 impl IgClient {
     pub fn new(session: Session, pacer: Pacer) -> Result<Self, IgError> {
         // Read here rather than at each call site, because `login::validate`
@@ -190,12 +203,17 @@ impl IgClient {
     /// The CDN client, built the first time a picture is downloaded.
     ///
     /// Everything the policy needs is already a field, so nothing has to be
-    /// captured at construction time, and only `pfp` pays for building it.
-    pub(in crate::client) fn cdn(&self) -> Result<&reqwest::Client, IgError> {
+    /// captured at construction time, and only a download the tab does not
+    /// fetch pays for building it.
+    pub(in crate::client) fn cdn(&self) -> Result<&CdnClient, IgError> {
         if let Some(cdn) = self.cdn.get() {
             return Ok(cdn);
         }
-        let built = build_client(&self.session.user_agent, cdn_policy(self.base.clone()))?;
+        let built = CdnClient::new(
+            &self.session.user_agent,
+            self.base.clone(),
+            self.pacer.cancel_token().clone(),
+        )?;
         Ok(self.cdn.get_or_init(|| built))
     }
 

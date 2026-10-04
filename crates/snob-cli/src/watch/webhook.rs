@@ -5,7 +5,7 @@
 //! the client under it is built by `snob_ig::http::plain`, which has no
 //! argument to pass a credential through. The destination is a host somebody
 //! typed into a configuration file; sending Instagram's cookie there would be
-//! the same failure `IgClient::check_downloadable` exists to prevent for the
+//! the same failure `CdnClient::check_downloadable` exists to prevent for the
 //! CDN, one crate up.
 //!
 //! Two smaller rules follow from the same place. Redirects are not followed at

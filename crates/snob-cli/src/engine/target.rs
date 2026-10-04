@@ -9,9 +9,9 @@
 use anyhow::Result;
 use snob_core::Pk;
 use snob_core::model::ListKind;
-use snob_store::store::{accounts, users};
+use snob_store::store::{Store, accounts, users};
 
-use crate::app::App;
+use crate::app::{App, Viewer};
 use crate::engine::ListQuery;
 
 #[derive(Debug, Clone)]
@@ -54,9 +54,14 @@ pub fn clean(typed: &str) -> &str {
 /// through `printable` because it is drawn on a terminal and `clean` only
 /// strips the at sign.
 pub fn label(app: &App, typed: Option<&str>) -> String {
+    label_for(app.viewer(), typed)
+}
+
+/// [`label`] for a caller with no `App`, such as `--dry-run`.
+pub fn label_for(viewer: &Viewer, typed: Option<&str>) -> String {
     match typed {
         Some(raw) => format!("@{}", snob_core::model::printable(clean(raw))),
-        None => app.viewer().label(),
+        None => viewer.label(),
     }
 }
 
@@ -65,8 +70,13 @@ pub fn label(app: &App, typed: Option<&str>) -> String {
 /// lets a profile be read by pk without first asking whose the name is.
 /// Only a hint, which the profile's answer confirms (`profile_named`).
 pub fn known_pk(app: &App, typed: &str) -> Result<Option<Pk>> {
+    known_pk_in(app.viewer(), app.db(), typed)
+}
+
+/// [`known_pk`] for a caller with no `App`: the viewer and the database it
+/// reads, which a report opens without writing (`--dry-run`).
+pub fn known_pk_in(viewer: &Viewer, db: &Store, typed: &str) -> Result<Option<Pk>> {
     let name = clean(typed);
-    let viewer = app.viewer();
     if viewer
         .username
         .as_deref()
@@ -74,7 +84,7 @@ pub fn known_pk(app: &App, typed: &str) -> Result<Option<Pk>> {
     {
         return Ok(Some(viewer.pk));
     }
-    Ok(users::pk_named(app.db().conn(), name)?)
+    Ok(users::pk_named(db.conn(), name)?)
 }
 
 /// [`known_pk`] for a read of `target`, or with none of the viewer's own

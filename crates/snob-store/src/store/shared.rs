@@ -53,6 +53,18 @@ impl Shared {
         Ok(Self { conn })
     }
 
+    /// `shared.db` for a command that only reports: read, never created and
+    /// nothing in it changed (`store::read_only`). `None` when there is no
+    /// file yet, which is before any account's budget was first opened, or
+    /// when the file is from a newer snob.
+    pub fn read_existing(paths: &AppPaths) -> Result<Option<Self>, StoreError> {
+        match super::read_only(&paths.shared_db_file(), &MIGRATIONS, CHAIN.len()) {
+            Ok(conn) => Ok(conn.map(|conn| Self { conn })),
+            Err(StoreError::SchemaFromNewerSnob { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Records a push-back on `pk`, and forgets the ones too old to matter.
     pub fn record(
         &self,
