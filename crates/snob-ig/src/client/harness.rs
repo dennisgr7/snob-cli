@@ -416,6 +416,14 @@ pub(super) fn spending_client(page: Arc<dyn Page>) -> (IgClient, Arc<Counting>) 
     (built(NOWHERE, pacer, false).through(page), budget)
 }
 
+/// A client of `server` whose budget counts what it is charged, for a test
+/// that has to show a request cost nothing.
+pub(super) fn counting_client_of(server: &MockServer) -> (IgClient, Arc<Counting>) {
+    let budget = Arc::new(Counting::default());
+    let pacer = Pacer::new(Arc::clone(&budget) as Arc<dyn RateBudget>);
+    (built(&server.uri(), pacer, false), budget)
+}
+
 /// An address nothing listens on, for a client that must not send.
 pub(super) const NOWHERE: &str = "http://127.0.0.1:9/";
 

@@ -31,6 +31,7 @@
 //! - [`posts`] -- a profile's posts, one post, and its comments.
 
 mod ask;
+mod cdn;
 mod headers;
 mod media;
 pub mod page;
@@ -42,6 +43,7 @@ mod write;
 #[cfg(test)]
 pub(crate) mod harness;
 
+pub use self::cdn::CdnClient;
 pub use self::posts::PostsPage;
 pub use self::read::Direction;
 
@@ -57,7 +59,6 @@ use crate::client_hints::ClientHints;
 use crate::error::{IgError, classify, refused};
 use crate::pace::{Pace, Pacer};
 
-use self::media::cdn_policy;
 use self::transport::{Answer, api_policy, build_client, same_origin};
 
 pub struct IgClient {
@@ -65,7 +66,7 @@ pub struct IgClient {
     /// session, and follows no redirect on its own: see [`api_policy`].
     api: reqwest::Client,
     /// Talks to the CDN. Carries nothing that identifies the account, and
-    /// every hop has to be somewhere pictures come from.
+    /// every hop has to be somewhere pictures come from: see [`CdnClient`].
     ///
     /// Two clients rather than one because the two have opposite rules: the
     /// API request must not leave instagram.com, and the asset request has to
@@ -73,11 +74,11 @@ pub struct IgClient {
     /// redirect policy, so sharing it meant the looser of the two governed the
     /// requests carrying the credentials.
     ///
-    /// Built on first use, which is `snob pfp` and nothing else. A
+    /// Built on first use, which is a download and nothing else. A
     /// `reqwest::Client` is a connection pool and a TLS configuration — the
     /// platform trust store is read to assemble one — and every other command
     /// paid for that on the startup path to never send a request through it.
-    cdn: OnceLock<reqwest::Client>,
+    cdn: OnceLock<CdnClient>,
     base: Url,
     session: Session,
     /// Reserving budget lives here rather than in each caller, so a request
@@ -191,11 +192,15 @@ impl IgClient {
     ///
     /// Everything the policy needs is already a field, so nothing has to be
     /// captured at construction time, and only `pfp` pays for building it.
-    pub(in crate::client) fn cdn(&self) -> Result<&reqwest::Client, IgError> {
+    pub(in crate::client) fn cdn(&self) -> Result<&CdnClient, IgError> {
         if let Some(cdn) = self.cdn.get() {
             return Ok(cdn);
         }
-        let built = build_client(&self.session.user_agent, cdn_policy(self.base.clone()))?;
+        let built = CdnClient::new(
+            &self.session.user_agent,
+            self.base.clone(),
+            self.pacer.cancel_token().clone(),
+        )?;
         Ok(self.cdn.get_or_init(|| built))
     }
 
