@@ -1,0 +1,45 @@
+---
+import Terminal from '@/components/Terminal.astro';
+import { AGENTS } from '@/lib/content';
+
+/** The same answer twice: the view a person moves through, and the JSON a program reads. */
+---
+
+<div class="grid gap-6 lg:grid-cols-2">
+  <div>
+    <p class="mb-2 font-mono text-xs text-muted"># on a terminal</p>
+    <Terminal label="The unfollowers view on a terminal" lines={AGENTS.human} />
+  </div>
+  <div>
+    <p class="mb-2 font-mono text-xs text-muted"># down a pipe</p>
+    <Terminal label="The same list as JSON, down a pipe" lines={AGENTS.machine} />
+  </div>
+</div>
+<div class="mt-12 grid gap-10 md:grid-cols-2">
+  <div>
+    <h3 class="font-mono text-sm font-bold">Flags for scripts</h3>
+    <dl class="mt-4 space-y-3 text-sm">
+      {
+        AGENTS.flags.map((item) => (
+          <div>
+            <dt class="font-mono text-text">{item.flag}</dt>
+            <dd class="text-muted">{item.means}</dd>
+          </div>
+        ))
+      }
+    </dl>
+  </div>
+  <div>
+    <h3 class="font-mono text-sm font-bold">Exit codes</h3>
+    <dl class="mt-4 grid grid-cols-[3.5rem_1fr] gap-x-4 gap-y-2 text-sm">
+      {
+        AGENTS.exitCodes.map((item) => (
+          <>
+            <dt class="font-mono text-accent">{item.code}</dt>
+            <dd class="text-muted">{item.means}</dd>
+          </>
+        ))
+      }
+    </dl>
+  </div>
+</div>

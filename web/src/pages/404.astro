@@ -1,0 +1,13 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import Cursor from '@/components/Cursor.astro';
+import { SITE } from '@/lib/site';
+---
+
+<BaseLayout title={`Page not found · ${SITE.name}`} description="This page does not exist." noindex>
+  <div class="mx-auto max-w-page px-4 py-24 sm:px-6">
+    <p class="font-mono text-sm text-muted">404</p>
+    <h1 class="mt-3 font-mono text-hero font-bold">Page <span class="whitespace-nowrap">not found<Cursor /></span></h1>
+    <p class="mt-6"><a href="/">Back to the home page</a></p>
+  </div>
+</BaseLayout>

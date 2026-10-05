@@ -30,3 +30,9 @@ updates:
     # The lockfile is what ships, so an update has to be a reviewed change to
     # it rather than a manifest range widening under everybody.
     versioning-strategy: lockfile-only
+  # The website's packages. pnpm's own 24-hour quarantine
+  # (`web/pnpm-workspace.yaml`) holds on top of Dependabot's cooldown.
+  - package-ecosystem: npm
+    directory: "/web"
+    schedule:
+      interval: weekly

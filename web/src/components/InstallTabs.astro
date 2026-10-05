@@ -1,0 +1,124 @@
+---
+import CopyButton from '@/components/CopyButton.astro';
+import Terminal from '@/components/Terminal.astro';
+import { HERO_TAB, INSTALL, type InstallBlock } from '@/lib/content';
+
+/**
+ * Every way to install. Without JavaScript the methods follow one another,
+ * each under its own heading; the page script turns the hidden tab list on
+ * and shows one panel at a time.
+ */
+
+/** The systems each tab is the first choice for, read by the script. */
+const firstFor = (id: string) =>
+  Object.entries(HERO_TAB)
+    .filter(([, tab]) => tab === id)
+    .map(([platform]) => platform)
+    .join(' ');
+---
+
+<div data-install-tabs>
+  <div role="tablist" aria-label="Install methods" hidden class="flex flex-wrap gap-1 border-b border-line font-mono text-sm">
+    {
+      INSTALL.map((method, index) => (
+        <button
+          type="button"
+          role="tab"
+          id={`tab-${method.id}`}
+          data-first-for={firstFor(method.id)}
+          aria-controls={`panel-${method.id}`}
+          aria-selected={index === 0 ? 'true' : 'false'}
+          tabindex={index === 0 ? 0 : -1}
+          class="-mb-px rounded-t-control border border-transparent px-3 py-2 text-muted hover:text-text aria-selected:border-line aria-selected:border-b-bg aria-selected:bg-bg aria-selected:text-text"
+        >
+          {method.name}
+        </button>
+      ))
+    }
+  </div>
+  <div class="space-y-10" data-panels>
+    {
+      INSTALL.map((method) => (
+        <section id={`panel-${method.id}`} aria-labelledby={`heading-${method.id}`} data-panel>
+          <h3 id={`heading-${method.id}`} class="font-mono text-sm font-bold" data-panel-heading>
+            {method.name}
+          </h3>
+          <p class="mt-1 mb-3 text-sm text-muted">
+            {method.note}
+            {'link' in method && method.link && (
+              <>
+                {' '}
+                <a href={method.link.href}>{method.link.label}</a>
+              </>
+            )}
+          </p>
+          <div class="space-y-4">
+            {method.blocks.map((block: InstallBlock) => {
+              const name = block.label ?? method.name;
+              return (
+                <div>
+                  {block.label && <p class="mb-2 font-mono text-xs text-muted">{block.label}</p>}
+                  <Terminal label={`Install: ${name}`} lines={block.commands.map((command) => ({ command }))}>
+                    <CopyButton slot="actions" commands={block.commands} label={`Copy the ${name} install`} />
+                  </Terminal>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      ))
+    }
+  </div>
+</div>
+
+<script>
+  import { browserHints, detectPlatform } from '@/lib/platform';
+
+  // The list turns into tabs: one panel at a time, arrow keys between tabs,
+  // and the tab for this system selected first.
+  const root = document.querySelector<HTMLElement>('[data-install-tabs]');
+  const list = root?.querySelector<HTMLElement>('[role="tablist"]');
+  const tabs = [...(root?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [])];
+  const panels = [...(root?.querySelectorAll<HTMLElement>('[data-panel]') ?? [])];
+
+  if (list && tabs.length > 0 && tabs.length === panels.length) {
+    const select = (index: number, focus: boolean) => {
+      tabs.forEach((tab, i) => {
+        const selected = i === index;
+        tab.setAttribute('aria-selected', String(selected));
+        tab.tabIndex = selected ? 0 : -1;
+        panels[i]!.hidden = !selected;
+      });
+      if (focus) tabs[index]!.focus();
+    };
+
+    panels.forEach((panel, i) => {
+      panel.setAttribute('role', 'tabpanel');
+      panel.setAttribute('aria-labelledby', tabs[i]!.id);
+      panel.tabIndex = 0;
+      panel.querySelector('[data-panel-heading]')?.classList.add('sr-only');
+    });
+    list.hidden = false;
+
+    const last = tabs.length - 1;
+    tabs.forEach((tab, i) => {
+      tab.addEventListener('click', () => select(i, false));
+      tab.addEventListener('keydown', (event) => {
+        const targets: Record<string, number> = {
+          ArrowRight: i === last ? 0 : i + 1,
+          ArrowLeft: i === 0 ? last : i - 1,
+          Home: 0,
+          End: last,
+        };
+        const next = targets[event.key];
+        if (next === undefined) return;
+        event.preventDefault();
+        select(next, true);
+      });
+    });
+
+    const platform = detectPlatform(browserHints());
+    const first = tabs.findIndex((tab) => tab.dataset.firstFor?.split(' ').includes(platform));
+    select(Math.max(first, 0), false);
+  }
+</script>

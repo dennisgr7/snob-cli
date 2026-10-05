@@ -1,0 +1,25 @@
+// The site is a Worker with static assets and no Worker code: Cloudflare serves
+// `dist/` as built, applying `public/_headers`. Workers Builds runs the build
+// from `web/` on every push: `main` deploys, any other branch uploads a version
+// with its own preview URL.
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "snob-web",
+  "compatibility_date": "2026-10-05",
+  "assets": {
+    "directory": "./dist",
+    // `/page` and `/page/` both answer, the second redirected to the first form
+    // Astro writes (`page/index.html`).
+    "html_handling": "auto-trailing-slash",
+    // `dist/404.html`, with a real 404 status.
+    "not_found_handling": "404-page"
+  },
+  // One public host. The custom domain creates its own DNS record and
+  // certificate on deploy. The workers.dev copy stays off; version URLs stay on
+  // for previews and are kept out of search by `_headers`.
+  "routes": [{ "pattern": "snob.dennisgr7.dev", "custom_domain": true }],
+  "workers_dev": false,
+  "preview_urls": true,
+  // No usage data from Wrangler to Cloudflare.
+  "send_metrics": false
+}

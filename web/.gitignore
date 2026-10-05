@@ -1,0 +1,28 @@
+# build output
+dist/
+# generated types
+.astro/
+
+# dependencies
+node_modules/
+
+# logs
+pnpm-debug.log*
+
+# environment variables
+.env
+.env.production
+
+# macOS-specific files
+.DS_Store
+
+# JetBrains settings folder
+.idea/
+
+# Wrangler state and local secrets
+.wrangler/
+.dev.vars*
+
+# Playwright output
+test-results/
+playwright-report/

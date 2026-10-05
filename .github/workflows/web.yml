@@ -1,0 +1,53 @@
+name: Website
+
+# Actions are pinned to a commit, not to a tag; `.github/dependabot.yml` says
+# why, and is what moves the pins.
+
+# Its own file so the paths filter belongs to it alone: `paths` is a property of
+# the trigger, so in ci.yml it would decide for the Rust jobs too. A change that
+# touches nothing under web/ starts nothing here, and one that touches only web/
+# compiles no Rust.
+on:
+  push:
+    branches: [main, dev, web]
+    paths: ["web/**", ".github/workflows/web.yml"]
+  pull_request:
+    paths: ["web/**", ".github/workflows/web.yml"]
+  workflow_dispatch:
+
+# Nothing here writes anything back.
+permissions:
+  contents: read
+
+concurrency:
+  group: web-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: web
+
+jobs:
+  site:
+    name: Check, build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: web/.node-version
+      # A pinned Corepack rather than whichever one this Node bundles: it is what
+      # fetches the pnpm `packageManager` names, and an older one has failed to
+      # verify that download before.
+      - run: |
+          npm install -g corepack@0.36.0
+          corepack enable
+      # Frozen: the lockfile is what was reviewed, so a manifest change without
+      # one fails here instead of resolving something new.
+      - run: pnpm install --frozen-lockfile
+      # The browser is installed on purpose, never by a postinstall script
+      # (`web/pnpm-workspace.yaml` keeps Playwright's out of `allowBuilds`).
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm check
+      - run: pnpm build
+      - run: pnpm test

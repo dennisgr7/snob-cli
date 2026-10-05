@@ -271,6 +271,72 @@ Homebrew formula in `Formula/`, the Scoop manifest in `bucket/` and the winget
 manifests from a release's `SHA256SUMS`; `install.sh` and `install.ps1`), and the
 `.deb` is described in `crates/snob-cli/Cargo.toml` and packages the README.
 
+## The website
+
+`web/` is the project's site, `snob.dennisgr7.dev`: Astro 7, fully static,
+served by Cloudflare as a Worker with static assets and no Worker code
+(`web/wrangler.jsonc`). Workers Builds is connected to the repository with `web/`
+as its root: a push to `main` deploys, any other branch uploads a version with a
+preview URL. It shares nothing with the Rust workspace but the repository and the
+rules above (English, US spelling; `language.rs` reads its `.md`, `.json` and
+`.yaml` too, and skips `pnpm-lock.yaml` by name as a generated file).
+
+- **The look is decided in `web/DESIGN.md`**: who the page is for, the mark, the
+  tokens, the sections and the limits on scripts. Read it before changing anything
+  visual; `/design-system` on the dev server shows every token and component.
+- **The Workers Builds connection** (Workers & Pages, Create, Continue with
+  GitHub, access to this repository only): Worker name `snob-web` (it must match
+  `wrangler.jsonc`), root directory `web`, production branch `main`, build
+  command `pnpm build`, deploy command `pnpm exec wrangler deploy`, non-production
+  branches `pnpm exec wrangler versions upload`. No build variables: Node comes
+  from `web/.node-version`, and the image's older pnpm switches itself to the one
+  `packageManager` names. The custom domain is created by the first deploy, not
+  by hand in DNS; the `dennisgr7.dev` zone has to be in the same Cloudflare
+  account as the Worker.
+- **pnpm only**, run from `web/` (`pnpm install`, `pnpm dev`, `pnpm check`,
+  `pnpm build`; `pnpm preview` serves `dist/` through Wrangler, with the
+  production headers and 404). Wrangler is a pinned dev dependency, so a deploy
+  never runs whatever version `npx` finds that day. The supply-chain policy is `web/pnpm-workspace.yaml`: a 24-hour
+  quarantine on fresh versions, no exotic transitive sources, install scripts
+  blocked except the ones listed in `allowBuilds`, exact versions. A new
+  dependency has to argue for itself, as in the workspace. Node is pinned in
+  `web/.node-version`.
+- **`pnpm check` with 0 errors, 0 warnings, 0 hints, a clean `pnpm build` and a
+  green `pnpm test`** before every commit that touches `web/`. The tests are
+  Playwright's, against the build served by Wrangler as production serves it
+  (headers, 404 status); they need a build first and Chromium, installed on
+  purpose with `pnpm exec playwright install chromium`, never by a postinstall.
+  `.github/workflows/web.yml` runs the same steps on every change under `web/`.
+- **One source for the site's identity**, `web/src/lib/site.ts`: the domain
+  (`site`), the name and the description. The canonical URL, the sitemap, Open
+  Graph, the JSON-LD and the generated `robots.txt` and `llms.txt` all read it.
+  The domain must be the root of a host; under a path, crawlers never find
+  `robots.txt` or `llms.txt`.
+- **The Content Security Policy is the `<meta>` Astro writes** from `security.csp`
+  in `web/astro.config.mjs`, with the hash of every script and style each page
+  runs. No `'unsafe-inline'`, no third-party origins, no inline `style`
+  attributes, and Shiki stays off (it styles inline). `web/public/_headers` adds
+  what a `<meta>` cannot carry (`frame-ancestors`, HSTS, `nosniff`, the referrer
+  and permissions policies, the `llms.txt` link) and keeps version URLs out of
+  search. A response with both policies must satisfy both.
+- **Every page goes through `BaseLayout`**: title, description, canonical, robots,
+  Open Graph, Twitter card and the JSON-LD `@graph` (`web/src/lib/jsonld.ts`,
+  `<` escaped). A new page also gets a line in `llms.txt` and a Markdown twin
+  (`index.md.ts`, `web/src/lib/markdown.ts`); a `noindex` page is kept out of the
+  sitemap in `astro.config.mjs`.
+- **Every word on the page is in `web/src/lib/content.ts`**, which the HTML, the
+  twin and `llms.txt` all read, so `tests/agents.spec.ts` can hold them to each
+  other. Output shown there is what snob prints, with invented accounts; it is
+  checked against the code, not imagined. The release version comes from the
+  workspace `Cargo.toml` at build time. `content.ts` imports with relative `.ts`
+  paths, not `@/`, because `scripts/brand.mjs` loads it under plain Node.
+- **`pnpm brand`** redraws `og.png` and the icons in `web/public/` with
+  Playwright's Chromium and the built Plex files (build first); the images are
+  committed. Run it when the mark, the headline or the domain changes.
+- No client JavaScript unless a feature cannot work without it. Tailwind v4 runs
+  as a Vite plugin with its entry in `web/src/styles/global.css`; there is no
+  `tailwind.config.js`. TypeScript strict, `@/` is `web/src/`.
+
 ## Architecture
 
 Four crates, and the line between the first two is the one worth knowing:

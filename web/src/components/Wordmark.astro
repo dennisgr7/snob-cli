@@ -1,0 +1,22 @@
+---
+/**
+ * The mark: "snob." in Plex Mono bold italic, the period in the accent, the
+ * nose turned up. DESIGN.md says why.
+ */
+interface Props {
+  size?: 'sm' | 'md' | 'lg';
+  class?: string;
+}
+
+const { size = 'md', class: className } = Astro.props;
+
+const sizes = {
+  sm: 'text-lg',
+  md: 'text-2xl',
+  lg: 'text-6xl',
+} as const;
+---
+
+<span class:list={['font-mono font-bold italic tracking-[-0.04em] text-text', sizes[size], className]}
+  >snob<span class="text-accent">.</span></span
+>

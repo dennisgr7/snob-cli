@@ -1,0 +1,78 @@
+---
+import '@/styles/global.css';
+import { Font } from 'astro:assets';
+import Footer from '@/components/Footer.astro';
+import Nav from '@/components/Nav.astro';
+import { SITE } from '@/lib/site';
+import { jsonLd } from '@/lib/jsonld';
+
+interface Props {
+  title: string;
+  description?: string;
+  noindex?: boolean;
+  /** Absolute or root-relative path of the Open Graph image. */
+  ogImage?: string;
+  /** The page's Markdown twin, for agents. */
+  markdownTwin?: string;
+}
+
+const { title, description = SITE.description, noindex = false, ogImage, markdownTwin } = Astro.props;
+
+const canonical = new URL(Astro.url.pathname, Astro.site);
+const ogImageUrl = ogImage ? new URL(ogImage, Astro.site).href : undefined;
+const robots = noindex ? 'noindex, follow' : 'index, follow, max-image-preview:large';
+---
+
+<!doctype html>
+<html lang={SITE.locale}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="robots" content={robots} />
+    <meta name="generator" content={Astro.generator} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content={SITE.themeColor.light} />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content={SITE.themeColor.dark} />
+    <meta name="color-scheme" content="light dark" />
+    {/* Only what the first screen paints: the headline and the text under it. */}
+    <Font cssVariable="--font-plex-mono" preload={[{ weight: 700, style: 'normal' }]} />
+    <Font cssVariable="--font-plex-sans" preload={[{ weight: 400, style: 'normal' }]} />
+    <link rel="sitemap" href="/sitemap-index.xml" />
+    <link rel="describedby" type="text/plain" href="/llms.txt" title="Site index for agents" />
+    {
+      markdownTwin && (
+        <link rel="alternate" type="text/markdown" href={new URL(markdownTwin, Astro.site)} title="This page as Markdown" />
+      )
+    }
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content={SITE.name} />
+    <meta property="og:locale" content={SITE.ogLocale} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    {ogImageUrl && <meta property="og:image" content={ogImageUrl} />}
+    {ogImageUrl && <meta property="og:image:width" content="1200" />}
+    {ogImageUrl && <meta property="og:image:height" content="630" />}
+    {ogImageUrl && <meta property="og:image:alt" content={`${SITE.name}: who doesn't follow you back?`} />}
+    <meta name="twitter:card" content={ogImageUrl ? 'summary_large_image' : 'summary'} />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    {ogImageUrl && <meta name="twitter:image" content={ogImageUrl} />}
+
+    {!noindex && <script is:inline type="application/ld+json" set:html={jsonLd(canonical)} />}
+  </head>
+  <body class="flex min-h-dvh flex-col">
+    <a href="#content" class="skip-link">Skip to content</a>
+    <Nav />
+    <main id="content" tabindex="-1" class="flex-1 focus:outline-none">
+      <slot />
+    </main>
+    <Footer />
+    <p id="announcer" class="sr-only" aria-live="polite"></p>
+  </body>
+</html>

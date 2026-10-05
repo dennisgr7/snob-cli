@@ -1,0 +1,59 @@
+---
+import type { Segment, TerminalLine, Tone } from '@/lib/terminal';
+
+/**
+ * A terminal block: real text a reader can select and an agent can read, in
+ * the TUI's colors. Dark in both themes, as a terminal is. A small block, or
+ * one with a copy button, wraps long lines the way a terminal does; any other
+ * scrolls sideways, which keeps drawn columns lined up.
+ */
+interface Props {
+  /** What the block shows, for a screen reader. */
+  label: string;
+  lines: readonly TerminalLine[];
+  size?: 'sm' | 'md';
+  class?: string;
+}
+
+const { label, lines, size = 'md', class: className } = Astro.props;
+
+const tones: Record<Tone, string> = {
+  plain: '',
+  dim: 'text-term-dim',
+  ok: 'text-term-ok',
+  warn: 'text-term-warn',
+  error: 'text-term-error',
+  info: 'text-term-info',
+  prompt: 'text-term-prompt',
+};
+
+const hasActions = Astro.slots.has('actions');
+
+const segmentsOf = (output: string | Segment[]): Segment[] =>
+  typeof output === 'string' ? [output] : output;
+---
+
+<figure
+  aria-label={label}
+  class:list={[
+    'relative overflow-x-auto rounded-card border border-term-line bg-term-bg text-term-text',
+    size === 'sm' ? 'px-3 py-2.5 text-[0.8125rem]' : 'px-4 py-3.5 text-code',
+    hasActions && 'pr-20',
+    className,
+  ]}
+>
+  <pre class:list={['font-mono leading-[1.65]', (size === 'sm' || hasActions) && 'whitespace-pre-wrap break-words']}><code>{
+    lines.map((line) =>
+      'command' in line ? (
+        <span class="block"><span aria-hidden="true" class="text-term-prompt">$ </span>{line.command}</span>
+      ) : (
+        <span class="block min-h-[1lh]" aria-hidden={line.art ? 'true' : undefined}>{
+          segmentsOf(line.output).map((segment) =>
+            typeof segment === 'string' ? segment : <span class={tones[segment.tone]}>{segment.text}</span>,
+          )
+        }</span>
+      ),
+    )
+  }</code></pre>
+  {hasActions && <div class="absolute top-2 right-2"><slot name="actions" /></div>}
+</figure>

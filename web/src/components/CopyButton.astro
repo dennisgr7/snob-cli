@@ -1,0 +1,58 @@
+---
+/**
+ * Copies a command. It is `hidden` in the HTML and the page script shows it,
+ * because without JavaScript it could not copy anything (DESIGN.md).
+ */
+interface Props {
+  /** The commands, one per line on the clipboard. */
+  commands: readonly string[];
+  /** What is being copied, for a screen reader: "Copy the macOS install". */
+  label: string;
+}
+
+const { commands, label } = Astro.props;
+---
+
+<button
+  type="button"
+  hidden
+  data-copy={JSON.stringify(commands)}
+  aria-label={label}
+  class="rounded-control border border-term-line bg-term-bg px-2 py-1 font-mono text-xs text-term-dim hover:text-term-text"
+>
+  <span data-copy-idle>copy</span><span data-copy-done hidden>copied</span>
+</button>
+
+<script>
+  import { announce } from '@/scripts/announce';
+
+  // Only where the clipboard can be written: elsewhere the buttons stay hidden.
+  if (navigator.clipboard?.writeText) {
+    for (const button of document.querySelectorAll<HTMLButtonElement>('button[data-copy]')) {
+      const idle = button.querySelector<HTMLElement>('[data-copy-idle]');
+      const done = button.querySelector<HTMLElement>('[data-copy-done]');
+      let reset: number | undefined;
+      button.hidden = false;
+      button.addEventListener('click', async () => {
+        try {
+          // JSON in the attribute: the HTML compressor would bend a raw newline.
+          const commands: string[] = JSON.parse(button.dataset.copy ?? '[]');
+          await navigator.clipboard.writeText(commands.join('\n'));
+        } catch {
+          announce('Could not copy. Select the command instead.');
+          return;
+        }
+        if (idle && done) {
+          idle.hidden = true;
+          done.hidden = false;
+          window.clearTimeout(reset);
+          reset = window.setTimeout(() => {
+            idle.hidden = false;
+            done.hidden = true;
+          }, 2000);
+        }
+        announce('Copied');
+      });
+    }
+  }
+</script>
