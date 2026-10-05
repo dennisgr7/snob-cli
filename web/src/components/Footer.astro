@@ -1,0 +1,23 @@
+---
+import Wordmark from '@/components/Wordmark.astro';
+import { SITE } from '@/lib/site';
+
+/** License, sources, the disclaimer, and the one mention of who made it. */
+---
+
+<footer class="border-t border-line">
+  <div
+    class="mx-auto flex max-w-page flex-col gap-4 px-4 py-10 text-sm text-muted sm:flex-row sm:items-center sm:justify-between sm:px-6"
+  >
+    <div class="flex flex-col gap-2">
+      <Wordmark size="sm" />
+      <p>Not affiliated with Instagram or Meta.</p>
+    </div>
+    <ul class="flex flex-wrap gap-x-5 gap-y-2 font-mono">
+      <li><a href={SITE.license} class="text-muted hover:text-text">MIT</a></li>
+      <li><a href={SITE.repository} class="text-muted hover:text-text">GitHub</a></li>
+      <li><a href="/llms.txt" class="text-muted hover:text-text">llms.txt</a></li>
+      <li><a href={SITE.author.url} class="text-muted hover:text-text">by {SITE.author.name}</a></li>
+    </ul>
+  </div>
+</footer>

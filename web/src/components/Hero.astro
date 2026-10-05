@@ -1,0 +1,25 @@
+---
+import Cursor from '@/components/Cursor.astro';
+import InstallHero from '@/components/InstallHero.astro';
+import Terminal from '@/components/Terminal.astro';
+import { HERO, HERO_SAMPLE } from '@/lib/content';
+
+/**
+ * The wink: the question everybody asks, the answer in one sentence, the
+ * install, and the tool beside it. The sketch on the right stands in for the
+ * recording of the TUI until it exists.
+ */
+---
+
+<section aria-labelledby="hero-title" class="mx-auto max-w-page px-4 pt-10 pb-16 sm:px-6 md:pt-20 md:pb-28">
+  <div class="grid items-center gap-12 lg:grid-cols-[1.1fr_1fr]">
+    <div>
+      <h1 id="hero-title" class="font-mono text-hero font-bold">
+        {HERO.title} <span class="whitespace-nowrap"><span class="text-accent">{HERO.accent}</span><Cursor /></span>
+      </h1>
+      <p class="mt-6 max-w-[52ch] text-lg text-muted">{HERO.lead}</p>
+      <InstallHero />
+    </div>
+    <Terminal label="The profile view of an account" lines={HERO_SAMPLE} class="shadow-2xl shadow-black/20" />
+  </div>
+</section>

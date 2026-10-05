@@ -1,0 +1,37 @@
+---
+import CopyButton from '@/components/CopyButton.astro';
+import Terminal from '@/components/Terminal.astro';
+import { HERO_INSTALL, ON_A_PHONE } from '@/lib/content';
+
+/**
+ * The install command for the visitor's system. Every variant is in the HTML,
+ * so an agent reads them all; macOS is the one shown without JavaScript, and
+ * the page script shows the one that fits.
+ */
+const variants = Object.entries(HERO_INSTALL) as [keyof typeof HERO_INSTALL, (typeof HERO_INSTALL)['macos']][];
+---
+
+<div data-install-hero class="mt-8 max-w-xl">
+  {
+    variants.map(([platform, variant]) => (
+      <div data-platform={platform} hidden={platform !== 'macos'}>
+        <p class="mb-2 font-mono text-xs text-muted">{variant.label}</p>
+        <Terminal label={`Install on ${variant.label}`} lines={variant.commands.map((command) => ({ command }))} size="sm">
+          <CopyButton slot="actions" commands={variant.commands} label={`Copy the ${variant.label} install`} />
+        </Terminal>
+      </div>
+    ))
+  }
+  <p data-platform="mobile" hidden class="font-mono text-sm text-muted">{ON_A_PHONE}</p>
+  <p class="mt-3 font-mono text-sm"><a href="#install">other ways ↓</a></p>
+</div>
+
+<script>
+  import { browserHints, detectPlatform } from '@/lib/platform';
+
+  // Shows the variant for this system; the HTML already holds every one.
+  const platform = detectPlatform(browserHints());
+  for (const variant of document.querySelectorAll<HTMLElement>('[data-install-hero] [data-platform]')) {
+    variant.hidden = variant.dataset.platform !== platform;
+  }
+</script>

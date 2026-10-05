@@ -1,0 +1,17 @@
+# Response headers, applied by Cloudflare to every static asset. The Content
+# Security Policy proper is the `<meta>` Astro writes into each page with the
+# hashes of what that page runs (`security.csp` in astro.config.mjs); the policy
+# here only adds what a `<meta>` cannot carry. A response with two policies
+# must satisfy both.
+/*
+  Strict-Transport-Security: max-age=31536000
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+  Content-Security-Policy: frame-ancestors 'none'; object-src 'none'; base-uri 'self'
+  Link: </llms.txt>; rel="llms-txt"
+
+# Version URLs (previews of non-production branches) are never indexed.
+https://:version.:subdomain.workers.dev/*
+  X-Robots-Tag: noindex

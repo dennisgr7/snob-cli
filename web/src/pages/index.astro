@@ -1,0 +1,36 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import FeatureCard from '@/components/FeatureCard.astro';
+import Hero from '@/components/Hero.astro';
+import HumanVsAgent from '@/components/HumanVsAgent.astro';
+import InstallTabs from '@/components/InstallTabs.astro';
+import Section from '@/components/Section.astro';
+import Terminal from '@/components/Terminal.astro';
+import { AGENTS, BEHAVIOR, FEATURES, FEATURES_SECTION, INSTALL_SECTION } from '@/lib/content';
+import { SITE } from '@/lib/site';
+---
+
+<BaseLayout title={`${SITE.name}: who doesn't follow you back, from the terminal`} markdownTwin="/index.md" ogImage="/og.png">
+  <Hero />
+
+  <Section id="features" title={FEATURES_SECTION.title} accent={FEATURES_SECTION.accent} lead={FEATURES_SECTION.lead}>
+    <ul class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      {FEATURES.map((feature) => <FeatureCard name={feature.name} description={feature.description} lines={feature.sample} />)}
+    </ul>
+  </Section>
+
+  <Section id="behavior" title={BEHAVIOR.title} accent={BEHAVIOR.accent} lead={BEHAVIOR.lead}>
+    <div class="grid items-start gap-10 lg:grid-cols-2">
+      <p class="border-l-2 border-accent pl-4 text-muted">{BEHAVIOR.honest}</p>
+      <Terminal label="How snob behaves" lines={BEHAVIOR.checks} />
+    </div>
+  </Section>
+
+  <Section id="agents" title={AGENTS.title} accent={AGENTS.accent} lead={AGENTS.lead}>
+    <HumanVsAgent />
+  </Section>
+
+  <Section id="install" title={INSTALL_SECTION.title} accent={INSTALL_SECTION.accent} lead={INSTALL_SECTION.lead}>
+    <InstallTabs />
+  </Section>
+</BaseLayout>

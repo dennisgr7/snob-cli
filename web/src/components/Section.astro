@@ -1,0 +1,28 @@
+---
+/**
+ * One section of the page: its anchor, a mono headline whose last words carry
+ * the accent, and the shared rhythm.
+ */
+interface Props {
+  id: string;
+  title: string;
+  /** The words after `title` that take the accent. */
+  accent?: string;
+  /** One sentence under the headline. */
+  lead?: string;
+}
+
+const { id, title, accent, lead } = Astro.props;
+---
+
+<section id={id} aria-labelledby={`${id}-title`} class="scroll-mt-8 py-16 md:py-28">
+  <div class="mx-auto max-w-page px-4 sm:px-6">
+    <h2 id={`${id}-title`} class="font-mono text-h2 font-bold">
+      {title}{accent && <span class="text-accent"> {accent}</span>}
+    </h2>
+    {lead && <p class="mt-4 max-w-[62ch] text-muted">{lead}</p>}
+    <div class="mt-10">
+      <slot />
+    </div>
+  </div>
+</section>
