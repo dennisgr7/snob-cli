@@ -213,6 +213,7 @@ pub(crate) fn signing_secret(value: &str) -> Result<String, String> {
 const EXAMPLES: &str = "\
 Examples:
   snob login                          store your session, once
+  snob status --budget                what you can still send today, for no request
   snob unfollowers                    who does not follow you back
   snob profile someone                their page: counts, bio, who you both know
   snob scan someone                   the full picture of another account
@@ -236,7 +237,8 @@ Exit codes:
       again unchanged will not help
   3   no session, or the stored one no longer works -- run \"snob login\"
   4   Instagram wants the account verified -- open the address it prints
-  5   Instagram is throttling, or the account is in cooldown -- wait
+  5   Instagram is throttling, or the account is in cooldown and nothing was
+      sent -- wait; \"snob status\" says until when
   130 stopped by you: Ctrl+C, or a confirmation not given -- including with
       no terminal to ask at, where -y confirms in advance
 
@@ -263,6 +265,26 @@ pub enum Command {
 
     /// Show which account you are authenticated as
     Whoami(WhoamiArgs),
+
+    /// Where the account stands: session, request budget, cooldown, lists, monitor
+    #[command(
+        after_help = "Read from what is stored here; nothing is sent and nothing stored is \
+                      changed, not even a database an older snob left, which is read as the \
+                      current one without being migrated. With no section named, all of \
+                      them; --budget, --cooldown, --session, --lists and --watch narrow it \
+                      to those.\n\n\
+                      It exits 5 while the account is in cooldown, whatever sections were \
+                      asked for, so \"snob status --budget && snob scan\" runs the scan only \
+                      when it may send; 3 with no session; 0 otherwise.\n\n\
+                      The budget counts what goes out now without a wait, which is the \
+                      smaller of two buckets every request pays: the pace allows twenty-one \
+                      requests in a row, the day about two thousand. Writes go three in a \
+                      row and then one every fifteen minutes. Lists read at most 2,000 \
+                      accounts in any 24 hours, 1,000 for a week after a push-back. In \
+                      --json a moment something may happen again is rounded up to its \
+                      second."
+    )]
+    Status(StatusArgs),
 
     /// List the accounts signed in here, and pick the one commands act as
     #[command(
@@ -374,6 +396,21 @@ pub enum Command {
                       most. Listing and downloading a post does not tell the account you looked."
     )]
     Post(PostArgs),
+
+    /// Download a picture or a video from Instagram's CDN by its address
+    #[command(
+        after_help = "For an address already known, such as one a listing's JSON gives: \
+                      the file is fetched from the CDN with no session, no request to \
+                      Instagram and nothing charged to any account's budget, and works with \
+                      nobody signed in. Only addresses on cdninstagram.com and fbcdn.net are \
+                      fetched. They are signed and expire after a while; a refused one has to \
+                      be asked for again, with \"snob post\" or the listing it came from.\n\n\
+                      The User-Agent sent is --user-agent, then the signed-in account's, then \
+                      the installed browser's. With no -o the file goes to standard output \
+                      down a pipe, and into the working directory under the address's own \
+                      file name at a terminal."
+    )]
+    Fetch(FetchArgs),
 
     /// Follow an account
     #[command(
@@ -488,6 +525,97 @@ pub struct WhoamiArgs {
     pub output: StatusOutputArgs,
 }
 
+#[derive(Args, Debug)]
+pub struct FetchArgs {
+    /// The file's address on Instagram's CDN
+    pub url: String,
+
+    /// Destination file; "-" for standard output
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// The User-Agent to send, instead of the account's or the browser's
+    #[arg(long, value_name = "STRING")]
+    pub user_agent: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct StatusArgs {
+    /// The session: which account, where it is stored, when it was last checked
+    #[arg(long)]
+    pub session: bool,
+
+    /// The request budget: what goes out now without a wait, and accounts read today
+    #[arg(long)]
+    pub budget: bool,
+
+    /// The cooldown: whether one stands, until when and why, and the last one
+    #[arg(long)]
+    pub cooldown: bool,
+
+    /// Your lists as stored: when each was last walked, and a walk left to resume
+    #[arg(long)]
+    pub lists: bool,
+
+    /// The monitor's last run on each account it watches from this one
+    #[arg(long)]
+    pub watch: bool,
+
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
+}
+
+/// Which parts of `snob status` a run asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusSections {
+    pub session: bool,
+    pub budget: bool,
+    pub cooldown: bool,
+    pub lists: bool,
+    pub watch: bool,
+}
+
+impl StatusSections {
+    /// The JSON keys of the sections this run shows, in the order it shows
+    /// them.
+    pub fn names(&self) -> Vec<&'static str> {
+        [
+            (self.session, "session"),
+            (self.budget, "budget"),
+            (self.cooldown, "cooldown"),
+            (self.lists, "lists"),
+            (self.watch, "watch"),
+        ]
+        .into_iter()
+        .filter_map(|(shown, name)| shown.then_some(name))
+        .collect()
+    }
+}
+
+impl StatusArgs {
+    /// The sections named, or every one when none was.
+    pub fn sections(&self) -> StatusSections {
+        let named = StatusSections {
+            session: self.session,
+            budget: self.budget,
+            cooldown: self.cooldown,
+            lists: self.lists,
+            watch: self.watch,
+        };
+        if named.session || named.budget || named.cooldown || named.lists || named.watch {
+            named
+        } else {
+            StatusSections {
+                session: true,
+                budget: true,
+                cooldown: true,
+                lists: true,
+                watch: true,
+            }
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum AccountCommand {
     /// The accounts signed in here; * marks the active one
@@ -557,7 +685,7 @@ pub struct ListArgs {
 
     /// Trim the output to the first N accounts. Saves no requests: --max-pages
     /// is what does that.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", conflicts_with = "dry_run")]
     pub limit: Option<usize>,
 
     #[command(flatten)]
@@ -699,7 +827,8 @@ pub struct OutputArgs {
     #[arg(long, value_enum)]
     pub format: Option<Format>,
 
-    /// Write the result to a file instead of standard output
+    /// Write the result to a file instead of standard output ("-" is
+    /// standard output)
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     pub path: Option<PathBuf>,
 }
@@ -782,6 +911,21 @@ pub struct WalkArgs {
     #[arg(long, conflicts_with = "offline")]
     pub same_day: bool,
 
+    /// Say what the walks would cost, against what today has left, and send
+    /// nothing
+    // Refused beside every flag it would ignore: it asks nothing (`-y`),
+    // draws no bar, opens no view, and lists nobody to filter. `--limit` says
+    // the same on its own side, since `scan` has none. `--format` and `-o`
+    // stay, for the estimate's own two forms (`commands::dry_run`).
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "offline", "yes", "no_progress", "interactive", "no_interactive",
+            "hide", "only", "no_verified", "exclude_list",
+        ]
+    )]
+    pub dry_run: bool,
+
     #[command(flatten)]
     pub progress: ProgressArgs,
 
@@ -801,6 +945,7 @@ impl Default for WalkArgs {
             no_resume: false,
             max_pages: None,
             same_day: false,
+            dry_run: false,
             progress: ProgressArgs::default(),
             consent: ConsentArgs::default(),
         }
@@ -1049,7 +1194,8 @@ pub struct ProfileArgs {
     #[arg(long, value_enum)]
     pub format: Option<ProfileFormat>,
 
-    /// Write the result to a file instead of standard output
+    /// Write the result to a file instead of standard output ("-" is
+    /// standard output)
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
 
@@ -1085,7 +1231,7 @@ pub struct PfpArgs {
     /// Account whose profile picture to download
     pub target: String,
 
-    /// Destination file
+    /// Destination file; "-" for standard output
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
 
@@ -1202,7 +1348,8 @@ pub struct MediaActionArgs {
     pub no_interactive: bool,
 
     /// Where a download goes. A directory when several are saved, a file when
-    /// one is.
+    /// one is; "-" writes one file to standard output, for a pipe. Without
+    /// -d, the listing's file, "-" being standard output
     // Refused beside `-i` rather than accepted and ignored: the browser's own
     // D saves into the working directory, one item at a time, and has nowhere
     // to take a path from. `pfp` draws the same line.
@@ -1226,6 +1373,29 @@ impl MediaActionArgs {
             .is_none()
             .then_some(self.output.as_deref())
             .flatten()
+            // `-o -` is standard output, where a listing goes anyway.
+            .filter(|path| !crate::output::is_stdout(path))
+    }
+
+    /// How many files `-d` names, at least, before the listing is read: the
+    /// count of the numbers given, or `None` for `all` or no `-d`. What
+    /// `output::stdout_download_ahead` refuses `-o -` on before a request.
+    pub fn files_named(&self) -> Option<usize> {
+        match self.selection()? {
+            DownloadSelection::These(numbers) => Some(numbers.len()),
+            DownloadSelection::All => None,
+        }
+    }
+
+    /// Refuses, before anything is asked of Instagram, a download to `-o -`
+    /// that the command line already says cannot go there: standard output
+    /// is a terminal, or the numbers given name several files. Only with a
+    /// download asked for; a listing goes to standard output as it is.
+    pub fn refuse_stdout_download_early(&self) -> anyhow::Result<()> {
+        if self.selection().is_none() {
+            return Ok(());
+        }
+        crate::output::stdout_download_ahead(self.output.as_deref(), self.files_named())
     }
 
     /// Whether this run takes the terminal over. The order is

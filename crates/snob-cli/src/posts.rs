@@ -18,7 +18,7 @@
 //! - a link is the post's info alone, and its comments only when they are
 //!   shown;
 //! - the files come from the CDN, which is not paced
-//!   (`IgClient::download_capped` says why), photos fetched by the tab and
+//!   (`CdnClient::download_capped` says why), photos fetched by the tab and
 //!   videos directly, as a play would count.
 //!
 //! **Nothing here tells anybody what was looked at**: the app reports what it
@@ -524,6 +524,18 @@ pub(crate) async fn download(
     files: Vec<Named>,
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
+    if destination.is_some_and(output::is_stdout) {
+        output::one_file_to_stdout(files.len())?;
+        let file = &files[0];
+        let url = file
+            .url
+            .as_deref()
+            .ok_or_else(|| anyhow!("{} has no downloadable version", file.what))?;
+        let mut sink = output::StdoutSink::default();
+        let streamed = client.download_to(url, file.cap, &mut sink).await;
+        sink.finish(streamed)?;
+        return Ok(ExitCode::Ok);
+    }
     if let ([file], Some(path)) = (files.as_slice(), destination)
         && !path.is_dir()
     {
@@ -557,21 +569,16 @@ pub(crate) async fn download(
 }
 
 /// One file into the path the user named, streamed: replaced if it is
-/// there, as `-o` always replaces, and removed again if the download fails
-/// halfway.
+/// there, as `-o` always replaces, but only by a file that arrived whole
+/// (`output::Replacing`); a download that fails halfway leaves it as it was.
 async fn save_to(client: &IgClient, file: &Named, path: &Path) -> Result<()> {
     let url = file
         .url
         .as_deref()
         .ok_or_else(|| anyhow!("{} has no downloadable version", file.what))?;
-    let mut out = std::fs::File::create(path)
-        .map_err(|e| anyhow!("could not write {}: {e}", path.display()))?;
-    if let Err(e) = client.download_to(url, file.cap, &mut out).await {
-        drop(out);
-        let _ = std::fs::remove_file(path);
-        return Err(e.into());
-    }
-    Ok(())
+    let mut out = output::Replacing::open(path)?;
+    client.download_to(url, file.cap, out.file()).await?;
+    out.commit()
 }
 
 /// The files of every item of `posts`, in order.

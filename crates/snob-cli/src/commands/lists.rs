@@ -12,7 +12,7 @@ use snob_store::secrets::SecretStore;
 
 use crate::app::{App, Viewer};
 use crate::cli::ListArgs;
-use crate::commands::common;
+use crate::commands::{common, dry_run};
 use crate::engine::{self, ListOutcome};
 use crate::exit::ExitCode;
 use crate::report;
@@ -25,6 +25,17 @@ pub async fn run(
     paths: &AccountPaths,
     kind: ListKind,
 ) -> Result<ExitCode> {
+    if args.walk.dry_run {
+        let secrets = store.session_of(paths);
+        return dry_run::run(
+            &args.walk,
+            &args.target,
+            &args.output,
+            &secrets,
+            paths,
+            &[kind],
+        );
+    }
     let (filter, destination, browses) = common::prepare(&args.filter, &args.output, &args.browse)?;
 
     let mut app = common::open(&args.walk, &store.session_of(paths), paths)?;

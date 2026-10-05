@@ -1,5 +1,7 @@
 pub mod account;
 pub mod common;
+pub mod dry_run;
+pub mod fetch;
 pub mod follow;
 pub mod highlights;
 pub mod import;
@@ -13,6 +15,7 @@ pub mod profile;
 pub mod purge;
 pub mod scan;
 pub mod sets;
+pub mod status;
 pub mod stories;
 pub mod watch;
 pub mod whoami;

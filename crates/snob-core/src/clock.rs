@@ -119,6 +119,14 @@ impl EpochMs {
     pub const fn to_epoch(self) -> Epoch {
         Epoch(self.0.div_euclid(1_000))
     }
+
+    /// [`EpochMs::to_epoch`] rounded up, for a moment that means "not
+    /// before": the end of a cooldown, when a bucket frees up. Rounded down,
+    /// a script that waits until it would wake up to a second early and be
+    /// refused.
+    pub const fn to_epoch_not_before(self) -> Epoch {
+        Epoch(self.0.div_euclid(1_000) + (self.0.rem_euclid(1_000) > 0) as i64)
+    }
 }
 
 /// The bare number, which is what a JSON value, a label and a log line all want.
@@ -237,6 +245,16 @@ mod tests {
             at,
             "and reads back the same way"
         );
+    }
+
+    /// A "not before" moment never names a second before it.
+    #[test]
+    fn a_moment_not_before_rounds_up_to_the_second() {
+        assert_eq!(EpochMs::new(5_000).to_epoch_not_before(), Epoch::new(5));
+        assert_eq!(EpochMs::new(5_001).to_epoch_not_before(), Epoch::new(6));
+        assert_eq!(EpochMs::new(5_999).to_epoch_not_before(), Epoch::new(6));
+        assert_eq!(EpochMs::new(-1).to_epoch_not_before(), Epoch::new(0));
+        assert_eq!(EpochMs::new(5_999).to_epoch(), Epoch::new(5));
     }
 
     /// The same contract for the rate-control unit. Nothing outside the budget

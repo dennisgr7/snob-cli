@@ -93,6 +93,21 @@ pub(crate) fn chosen_trust() -> Trust {
     TRUST.get().cloned().unwrap_or_default()
 }
 
+/// How long a request may take, which is a different question for an answer
+/// and for a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Deadline {
+    /// The whole request, body included: an API answer or a webhook's reply is
+    /// small, and one that takes longer than this has stalled.
+    Whole(Duration),
+    /// The longest wait for the next bytes, and no limit on the whole: a
+    /// file's length is not known in advance, and a reel of a hundred
+    /// megabytes on a slow link is still arriving at a minute. A total limit
+    /// cut it off halfway, and down a pipe the reader got a prefix. The
+    /// ceiling on its size is what bounds it, and Ctrl+C still stops it.
+    BetweenReads(Duration),
+}
+
 /// The builder every client in this program starts from, the Instagram ones
 /// (`client::transport::build_client`) and the webhook's alike, so a setting
 /// that has to hold for all of them has one place to go.
@@ -112,14 +127,18 @@ pub(crate) fn builder(
     user_agent: &str,
     redirect: reqwest::redirect::Policy,
     connect_timeout: Duration,
-    request_timeout: Duration,
+    deadline: Deadline,
     trust: &Trust,
 ) -> reqwest::Result<reqwest::ClientBuilder> {
     let built = reqwest::Client::builder()
         .user_agent(user_agent.to_string())
         .redirect(redirect)
-        .connect_timeout(connect_timeout)
-        .timeout(request_timeout)
+        .connect_timeout(connect_timeout);
+    let built = match deadline {
+        Deadline::Whole(limit) => built.timeout(limit),
+        Deadline::BetweenReads(limit) => built.read_timeout(limit),
+    };
+    let built = built
         // reqwest drops an idle connection at 90 s, and this tool deliberately
         // waits between requests: the request budget is shared between
         // processes, so a second snob can push a wait out past a minute.
@@ -187,7 +206,7 @@ pub fn plain(
         user_agent,
         redirect,
         CONNECT_TIMEOUT,
-        REQUEST_TIMEOUT,
+        Deadline::Whole(REQUEST_TIMEOUT),
         &Trust::Platform,
     )?
     .build()
@@ -219,7 +238,7 @@ pub fn plain_direct(
         user_agent,
         redirect,
         CONNECT_TIMEOUT,
-        REQUEST_TIMEOUT,
+        Deadline::Whole(REQUEST_TIMEOUT),
         &Trust::Platform,
     )?
     .no_proxy()

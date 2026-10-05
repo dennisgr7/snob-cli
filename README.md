@@ -77,9 +77,11 @@ snob highlights someone 2 -d all # save everything in its second highlight
 snob posts someone               # the posts on its grid
 snob post <link> -d all          # one post by its link, every photo and video in it
 snob reel <link> -d all          # the same for a reel
+snob fetch <cdn-address>         # one file by its address, no account needed
 snob follow someone
 snob unfollow someone
 snob watch                       # keep watching on a schedule, report changes
+snob status                      # budget left, cooldown, stored lists; sends nothing
 ```
 
 On a terminal most commands open a full-screen view you move through with the
@@ -91,7 +93,13 @@ Every command can print instead of opening a view, in a stable form a program
 can read:
 
 - `--format json|ndjson|csv|xlsx|md|table` and `-o <file>` for anything that
-  prints a list or a document; `--json` for status commands such as `whoami`.
+  prints a list or a document; `--json` for status commands such as `whoami`
+  and `status`.
+- `snob status --budget` says what can still be sent today, for no request, and
+  exits 5 while the account is cooling down. `--dry-run` on a list command says
+  what its walks would cost against that, and sends nothing.
+- `-o -` is standard output: a list as with no `-o`, and a single downloaded
+  file, as in `snob reel <link> -d 1 -o - | ffmpeg -i - ...`.
 - `--no-interactive` always prints. Down a pipe this is the default, and the
   default format is JSON.
 - `-y` answers the one confirmation a command may ask, in advance.

@@ -23,6 +23,7 @@ pub const DEFAULT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(
 
 pub mod check;
 pub mod cooldown;
+pub mod estimate;
 pub mod freshness;
 pub mod people;
 pub mod target;

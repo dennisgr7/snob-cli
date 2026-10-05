@@ -91,6 +91,7 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
             Format::Json
         ),
         Command::Whoami(args) => args.output.json,
+        Command::Status(args) => args.output.json,
         Command::Account(AccountCommand::List(args)) => args.output.json,
         // It takes no format flag and answers in JSON down a pipe, the way
         // `commands::import::run` decides it.
@@ -108,6 +109,7 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
         | Command::Logout(_)
         | Command::Purge(_)
         | Command::Pfp(_)
+        | Command::Fetch(_)
         | Command::Follow(_)
         | Command::Unfollow(_)
         | Command::BrowserOwner => false,
@@ -266,9 +268,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // The single-account layout moves under its account before anything reads
     // it, with no browser of an older layout's owner still writing into it.
     // Not for `purge`, which removes it whole and must work when the move
-    // cannot, nor for `import`, which reads an export and stores nothing.
-    if !matches!(cli.command, Command::Purge(_) | Command::Import(_))
-        && snob_store::layout::pending(&paths)
+    // cannot, nor for `import` and `fetch`, which store nothing.
+    if !matches!(
+        cli.command,
+        Command::Purge(_) | Command::Import(_) | Command::Fetch(_)
+    ) && snob_store::layout::pending(&paths)
     {
         snob_cli::owner::quit(&paths).await;
         let settled = snob_store::layout::settle(&paths, &store)?;
@@ -361,6 +365,7 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
             commands::login::run(args, store, paths, renewing, named).await
         }
         Command::Whoami(args) => commands::whoami::run(args, store, resolved()?).await,
+        Command::Status(args) => commands::status::run(args, &store, paths, resolved()?),
         Command::Logout(args) => {
             let account = if args.all { None } else { resolved()? };
             commands::logout::run(args, store, paths, account).await
@@ -413,6 +418,27 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
         }
         Command::Watch(args) => commands::watch::run(args, store, paths, resolved()?).await,
         Command::Import(command) => commands::import::run(command),
+        Command::Fetch(args) => {
+            // Only the User-Agent is read off the account, and only when one
+            // was not given; a registry or session that will not read is no
+            // reason not to fetch a public file. An account named with
+            // --account or SNOB_ACCOUNT that is not signed in here is a
+            // mistake to say, though, not one to pass over.
+            let account_ua = || -> anyhow::Result<Option<String>> {
+                let account = match resolved() {
+                    Ok(Some(account)) => account,
+                    Ok(None) => return Ok(None),
+                    Err(e) if named => return Err(e),
+                    Err(_) => return Ok(None),
+                };
+                Ok(session(&account)
+                    .load()
+                    .ok()
+                    .flatten()
+                    .map(|session| session.user_agent))
+            };
+            commands::fetch::run(args, account_ua).await
+        }
         // Answered at the top.
         Command::BrowserOwner => Ok(ExitCode::Ok),
     }

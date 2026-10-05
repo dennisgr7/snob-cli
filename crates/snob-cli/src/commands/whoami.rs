@@ -19,11 +19,14 @@ pub async fn run(
     let store = account.as_ref().map(|paths| secrets.session_of(paths));
     // The account asked about, whether or not it has a session to report on.
     let viewer = crate::report::acting_as().map(|viewer| viewer.json());
+    // Where the session was found, which is where it is written back and
+    // what is reported: on a machine with no keyring, `login` fell back to
+    // the file, and this run's store would still say the keyring.
     let found = match &store {
-        Some(store) => store.load()?,
+        Some(store) => store.load_located()?,
         None => None,
     };
-    let (Some(mut session), Some(store), Some(paths)) = (found, &store, &account) else {
+    let (Some((mut session, kept_in)), Some(store), Some(paths)) = (found, &store, &account) else {
         eprintln!("No session stored. Run \"snob login\".");
         // `--json` still gets an object, as a session that has *died* does:
         // the two states an automation most wants to tell apart share an exit
@@ -105,7 +108,7 @@ pub async fn run(
                     // and this is the only command that writes it back, so a
                     // silent failure here means every later run pays for the
                     // lookup again and nothing ever says why.
-                    if let Err(e) = store.save(&session) {
+                    if let Err(e) = store.save_in(kept_in, &session) {
                         ui::warn(&format!(
                             "the session could not be updated, so the account name will be \
                              looked up again next time: {e}"
@@ -148,8 +151,8 @@ pub async fn run(
             "pk": session.ds_user_id,
             "username": session.username,
             "origin": session.origin.as_str(),
-            "storage": store.backend().as_str(),
-            "storage_path": store.storage_path(),
+            "storage": kept_in.as_str(),
+            "storage_path": store.path_in(kept_in),
             "created_at": session.created_at,
             "validated_at": session.validated_at,
             "alive": alive,

@@ -289,10 +289,25 @@ pub fn resumable(
 /// does not count "claimed by me" as available: the run that continues the walk
 /// is never this one.
 pub fn is_resumable(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result<bool, StoreError> {
+    Ok(resumable_progress(conn, account_pk, kind)?.is_some())
+}
+
+/// How many accounts the walk the next run would continue has stored so far:
+/// [`is_resumable`]'s question, answered with the count, and asked the same
+/// way, without taking anything. What a cost estimate takes off the list's
+/// size.
+pub fn resumable_progress(
+    conn: &Connection,
+    account_pk: Pk,
+    kind: ListKind,
+) -> Result<Option<u64>, StoreError> {
     let now = now();
     let found: Option<i64> = conn
         .query_row(
-            &format!("SELECT 1 FROM snapshots WHERE {RESUMABLE} LIMIT 1"),
+            &format!(
+                "SELECT member_count FROM snapshots WHERE {RESUMABLE}
+                 ORDER BY started_at DESC, id DESC LIMIT 1"
+            ),
             params![
                 pk_to_sql(account_pk),
                 kind.as_str(),
@@ -305,7 +320,7 @@ pub fn is_resumable(conn: &Connection, account_pk: Pk, kind: ListKind) -> Result
             |row| row.get(0),
         )
         .optional()?;
-    Ok(found.is_some())
+    Ok(found.map(|members| members.max(0) as u64))
 }
 
 /// Whether another process is walking this list right now: a capture not yet

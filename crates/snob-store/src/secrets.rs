@@ -549,7 +549,13 @@ impl SessionStore {
     /// The file path, when the backend is one. Kept apart from `describe` so
     /// that machine-readable output does not have to dig it out of a sentence.
     pub fn storage_path(&self) -> Option<String> {
-        match self.backend {
+        self.path_in(self.backend)
+    }
+
+    /// [`Self::storage_path`] for the backend a session was found in
+    /// ([`Self::load_located`]), which is not always the store's own.
+    pub fn path_in(&self, backend: Backend) -> Option<String> {
+        match backend {
             Backend::Keyring => None,
             Backend::File => Some(self.place.file().display().to_string()),
         }

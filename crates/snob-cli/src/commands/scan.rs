@@ -82,6 +82,17 @@ struct Summary<'a> {
 }
 
 pub async fn run(args: ScanArgs, store: SecretStore, paths: &AccountPaths) -> Result<ExitCode> {
+    if args.walk.dry_run {
+        let secrets = store.session_of(paths);
+        return crate::commands::dry_run::run(
+            &args.walk,
+            &args.target,
+            &args.output,
+            &secrets,
+            paths,
+            &[ListKind::Followers, ListKind::Following],
+        );
+    }
     let (filter, destination, browses) = common::prepare(&args.filter, &args.output, &args.browse)?;
 
     let mut app = common::open(&args.walk, &store.session_of(paths), paths)?;

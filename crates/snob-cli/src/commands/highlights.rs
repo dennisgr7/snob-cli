@@ -25,7 +25,7 @@
 //! more per highlight *opened*, either way — the tray does not carry the
 //! items. Each is paid for inside the client like every other read. Downloads come
 //! from the CDN, a different host that is deliberately not paced; the
-//! reasoning is on `IgClient::download_capped`.
+//! reasoning is on `CdnClient::download_capped`.
 //!
 //! **Reading a highlight does not mark it as seen.** The browser registers a
 //! view of a highlight item through the very mutation it uses for a story,
@@ -101,6 +101,17 @@ pub async fn run(
     store: SecretStore,
     paths: &AccountPaths,
 ) -> Result<ExitCode> {
+    args.action.refuse_stdout_download_early()?;
+    if args.highlight.is_none()
+        && args.action.selection().is_some()
+        && args
+            .action
+            .output
+            .as_deref()
+            .is_some_and(crate::output::is_stdout)
+    {
+        return Err(whole_highlights_to_stdout());
+    }
     let app = common::reader(&store, paths, args.action.interactive, false)?;
     let typed = common::target_or_own(&app, args.target.as_deref()).await?;
 
@@ -389,6 +400,14 @@ pub(crate) fn stem_of(tray: &Tray, number: usize) -> String {
     format!("{}-{number}", printable(&tray.username))
 }
 
+/// Why `-o -` takes no whole highlight: it is as many files as it holds.
+fn whole_highlights_to_stdout() -> anyhow::Error {
+    anyhow::anyhow!(
+        "-o - writes one file to standard output, and a whole highlight may hold \
+         several; name one of its items, as in \"snob highlights someone 2 -d 1 -o -\""
+    )
+}
+
 /// Downloads whole entries: each one fetched and then saved the way
 /// `stories -d all` saves a reel, into one directory.
 ///
@@ -408,6 +427,13 @@ async fn download_entries(
     let numbers = media::numbers_of(selection, tray.entries.len(), |number| {
         no_such_highlight(tray, number)
     })?;
+    // A whole highlight is as many files as it holds, which is not known
+    // until it is read: refused before that read rather than after it. `run`
+    // refuses it before the tray is read too; this is the rule kept where
+    // the download is.
+    if destination.is_some_and(crate::output::is_stdout) {
+        return Err(whole_highlights_to_stdout());
+    }
 
     let mut failed: Vec<String> = Vec::new();
     let mut not_tried: &[usize] = &[];
