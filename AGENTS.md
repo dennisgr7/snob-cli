@@ -271,6 +271,14 @@ preview URL. It shares nothing with the Rust workspace but the repository and th
 rules above (English, US spelling; `language.rs` reads its `.md`, `.json` and
 `.yaml` too, and skips `pnpm-lock.yaml` by name as a generated file).
 
+- **The Workers Builds connection** (Workers & Pages, Create, Continue with
+  GitHub, access to this repository only): Worker name `snob-web` (it must match
+  `wrangler.jsonc`), root directory `web`, production branch `main`, build
+  command `pnpm build`, deploy command `pnpm exec wrangler deploy`, non-production
+  branches `pnpm exec wrangler versions upload`. No build variables: Node comes
+  from `web/.node-version`, and the image's older pnpm switches itself to the one
+  `packageManager` names. The custom domain is created by the first deploy, not
+  by hand in DNS; a specific record wins over the zone's `*` wildcard.
 - **pnpm only**, run from `web/` (`pnpm install`, `pnpm dev`, `pnpm check`,
   `pnpm build`; `pnpm preview` serves `dist/` through Wrangler, with the
   production headers and 404). Wrangler is a pinned dev dependency, so a deploy
