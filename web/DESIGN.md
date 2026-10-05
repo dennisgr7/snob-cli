@@ -73,13 +73,13 @@ handed to Tailwind through `@theme inline`, so a utility such as `bg-bg` or
 - Spacing on Tailwind's 4 px scale. The content is at most 72 rem wide, with a 16 px
   gutter on a phone. Sections breathe 4 to 8 rem vertically.
 - Radius: 6 px on controls, 10 px on cards and terminals. No shadow except under
-  the hero video.
+  the terminal in the hero.
 
 ## Motion
 
 The cursor blinks with `steps()` every 1.1 s; hover changes take 150 ms. Nothing
 moves on scroll. Under `prefers-reduced-motion: reduce` nothing moves at all: the
-cursor stays solid and the hero video does not play.
+cursor stays solid.
 
 ## The page
 
@@ -87,7 +87,8 @@ One page, in this order:
 
 1. **Hero**: the headline *who doesn't follow you back?* in mono with the last word
    in the accent and the cursor after it; one sentence; the install command for the
-   visitor's system with a copy button and "other ways ↓"; the TUI video beside it.
+   visitor's system with a copy button and "other ways ↓"; beside it, a terminal
+   with the profile view of an account.
 2. **What it does**: six cards, one command each, with a small terminal.
 3. **How it behaves**: a light client on purpose, and the honest note the README
    makes: there is no official API, so this is outside Instagram's Terms, and the
@@ -105,9 +106,13 @@ promises nothing the README does not.
 ### Showing the tool
 
 Commands and output are real text in HTML: selectable, copyable, indexed and
-readable by an agent. The only recording is the hero video of the interactive TUI,
-muted and looping, recorded against the test suite's invented Instagram, never a
-real account.
+readable by an agent.
+
+**Planned, not built**: a short recording of the interactive TUI to replace the
+terminal in the hero, muted and looping, recorded against the test suite's invented
+Instagram, never a real account. It would load nothing until it plays, play only
+when the visitor has not asked for reduced motion, and otherwise keep its poster
+with controls. Until it exists there is no `<video>` on the page.
 
 ### Install in the hero
 
@@ -125,8 +130,6 @@ macOS command. "Other ways ↓" always leads to the install section.
 - **Everything works without JavaScript**: the hero shows macOS, the install
   section shows every platform one after another, and the copy buttons stay hidden
   because they could not work.
-- **The video** loads nothing until it plays, and plays only when the visitor has
-  not asked for reduced motion; otherwise its poster stays, with controls.
 - **Accessibility**: a skip link, one `h1`, `header`, `nav`, `main` and `footer`,
   a label on every terminal, the TUI's box drawing hidden from screen readers,
   everything reachable by keyboard, nothing that needs hover.
