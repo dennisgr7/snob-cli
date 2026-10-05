@@ -3,7 +3,9 @@ import type { Segment, TerminalLine, Tone } from '@/lib/terminal';
 
 /**
  * A terminal block: real text a reader can select and an agent can read, in
- * the TUI's colors. Dark in both themes, as a terminal is.
+ * the TUI's colors. Dark in both themes, as a terminal is. A small block, or
+ * one with a copy button, wraps long lines the way a terminal does; any other
+ * scrolls sideways, which keeps drawn columns lined up.
  */
 interface Props {
   /** What the block shows, for a screen reader. */
@@ -40,7 +42,7 @@ const segmentsOf = (output: string | Segment[]): Segment[] =>
     className,
   ]}
 >
-  <pre class:list={['font-mono leading-[1.65]', size === 'sm' && 'whitespace-pre-wrap break-words']}><code>{
+  <pre class:list={['font-mono leading-[1.65]', (size === 'sm' || hasActions) && 'whitespace-pre-wrap break-words']}><code>{
     lines.map((line) =>
       'command' in line ? (
         <span class="block"><span aria-hidden="true" class="text-term-prompt">$ </span>{line.command}</span>

@@ -58,9 +58,10 @@ const robots = noindex ? 'noindex, follow' : 'index, follow, max-image-preview:l
   <body class="flex min-h-dvh flex-col">
     <a href="#content" class="skip-link">Skip to content</a>
     <Nav />
-    <main id="content" class="flex-1">
+    <main id="content" tabindex="-1" class="flex-1 focus:outline-none">
       <slot />
     </main>
     <Footer />
+    <p id="announcer" class="sr-only" aria-live="polite"></p>
   </body>
 </html>

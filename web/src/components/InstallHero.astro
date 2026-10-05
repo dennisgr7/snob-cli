@@ -17,7 +17,7 @@ const variants = Object.entries(HERO_INSTALL) as [keyof typeof HERO_INSTALL, (ty
       <div data-platform={platform} hidden={platform !== 'macos'}>
         <p class="mb-2 font-mono text-xs text-muted">{variant.label}</p>
         <Terminal label={`Install on ${variant.label}`} lines={variant.commands.map((command) => ({ command }))} size="sm">
-          <CopyButton slot="actions" text={variant.commands.join('\n')} label={`Copy the ${variant.label} install`} />
+          <CopyButton slot="actions" commands={variant.commands} label={`Copy the ${variant.label} install`} />
         </Terminal>
       </div>
     ))
@@ -25,3 +25,13 @@ const variants = Object.entries(HERO_INSTALL) as [keyof typeof HERO_INSTALL, (ty
   <p data-platform="mobile" hidden class="font-mono text-sm text-muted">{ON_A_PHONE}</p>
   <p class="mt-3 font-mono text-sm"><a href="#install">other ways ↓</a></p>
 </div>
+
+<script>
+  import { browserHints, detectPlatform } from '@/lib/platform';
+
+  // Shows the variant for this system; the HTML already holds every one.
+  const platform = detectPlatform(browserHints());
+  for (const variant of document.querySelectorAll<HTMLElement>('[data-install-hero] [data-platform]')) {
+    variant.hidden = variant.dataset.platform !== platform;
+  }
+</script>

@@ -90,6 +90,14 @@ export const HERO_INSTALL: Record<Exclude<Platform, 'mobile'>, { label: string; 
   linux: { label: 'Linux · install script', commands: method('script').blocks[0]!.commands },
 };
 
+/** The install tab selected first for each system, matching the hero. */
+export const HERO_TAB: Record<Platform, InstallId> = {
+  macos: 'homebrew',
+  windows: 'scoop',
+  linux: 'script',
+  mobile: 'homebrew',
+};
+
 export const SUPPORT =
   'Builds exist for Windows and Linux on x86_64 and ARM64, and macOS on Apple Silicon. Everything that talks to Instagram needs a Chromium-based browser installed; no window is ever shown.';
 
