@@ -14,7 +14,7 @@ export const SITE = {
   locale: 'en',
   ogLocale: 'en_US',
   /** The footer signature, the one mention of who made it. */
-  author: { name: 'Dennis Industries', url: 'https://dennisindustries.net' },
+  author: { name: 'Dennis', url: 'https://dennisgr7.dev' },
   /** The browser bar, per theme: the page background of each. */
   themeColor: { light: '#fafafa', dark: '#0b0d10' },
 } as const;

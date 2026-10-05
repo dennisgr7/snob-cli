@@ -20,7 +20,8 @@ the name and the headline, never in the facts.
 
 ## Identity
 
-Snob has its own look. Dennis Industries appears once, as a signature in the footer.
+Snob has its own look. Its author appears once, as a signature in the footer: "by
+Dennis", linking to dennisgr7.dev.
 
 - **Mark**: *snob.* set in IBM Plex Mono bold italic, with the period in the accent
   color: the nose turned up, and the last word on the matter. The favicon is the
