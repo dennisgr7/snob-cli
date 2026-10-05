@@ -31,6 +31,12 @@ use std::path::{Path, PathBuf};
 /// is checked like any other.
 const THIS_FILE: &str = "crates/snob-core/tests/language.rs";
 
+/// Files a tool writes, skipped by name wherever they are. They hold other
+/// people's package names, not prose (`@img/colour` arrives with the website's
+/// image pipeline); `Cargo.lock` is the same kind of file and is already left
+/// out by its extension.
+const GENERATED: [&str; 1] = ["pnpm-lock.yaml"];
+
 /// What one guard reads, which lines it lets through, and what it looks for.
 struct Guard {
     extensions: &'static [&'static str],
@@ -44,7 +50,8 @@ struct Guard {
 impl Guard {
     /// Every offending line in `files`, as `path:line: found`, with the path
     /// named relative to `root`. A file with an extension this guard does not
-    /// read, [`THIS_FILE`], and a file that cannot be read are skipped.
+    /// read, [`THIS_FILE`], a [`GENERATED`] one, and a file that cannot be read
+    /// are skipped.
     fn violations(&self, root: &Path, files: &[PathBuf]) -> Vec<String> {
         let mut violations = Vec::new();
         for file in files {
@@ -53,7 +60,11 @@ impl Guard {
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| self.extensions.contains(&e));
             let relative = relative(root, file);
-            if !read_here || relative == THIS_FILE {
+            let generated = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| GENERATED.contains(&n));
+            if !read_here || generated || relative == THIS_FILE {
                 continue;
             }
 
@@ -689,6 +700,11 @@ fn planted(
     let exempt = dir.join(THIS_FILE);
     std::fs::write(&exempt, &contents).unwrap();
     files.push(exempt);
+    for name in GENERATED {
+        let generated = dir.join(name);
+        std::fs::write(&generated, &contents).unwrap();
+        files.push(generated);
+    }
     files.push(dir.join("missing.rs"));
 
     let found = guard.violations(dir, &files);
