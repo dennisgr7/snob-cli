@@ -1,0 +1,24 @@
+---
+/**
+ * Copies a command. It is `hidden` in the HTML and the page script shows it,
+ * because without JavaScript it could not copy anything (DESIGN.md).
+ */
+interface Props {
+  /** Exactly what lands on the clipboard. */
+  text: string;
+  /** What is being copied, for a screen reader: "Copy the macOS install". */
+  label: string;
+}
+
+const { text, label } = Astro.props;
+---
+
+<button
+  type="button"
+  hidden
+  data-copy={text}
+  aria-label={label}
+  class="rounded-control border border-term-line bg-term-bg px-2 py-1 font-mono text-xs text-term-dim hover:text-term-text"
+>
+  <span data-copy-idle>copy</span><span data-copy-done hidden>copied</span>
+</button>

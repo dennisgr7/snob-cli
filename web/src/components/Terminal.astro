@@ -25,6 +25,8 @@ const tones: Record<Tone, string> = {
   prompt: 'text-term-prompt',
 };
 
+const hasActions = Astro.slots.has('actions');
+
 const segmentsOf = (output: string | Segment[]): Segment[] =>
   typeof output === 'string' ? [output] : output;
 ---
@@ -32,17 +34,18 @@ const segmentsOf = (output: string | Segment[]): Segment[] =>
 <figure
   aria-label={label}
   class:list={[
-    'overflow-x-auto rounded-card border border-term-line bg-term-bg text-term-text',
+    'relative overflow-x-auto rounded-card border border-term-line bg-term-bg text-term-text',
     size === 'sm' ? 'px-3 py-2.5 text-[0.8125rem]' : 'px-4 py-3.5 text-code',
+    hasActions && 'pr-20',
     className,
   ]}
 >
-  <pre class="font-mono leading-[1.65]"><code>{
+  <pre class:list={['font-mono leading-[1.65]', size === 'sm' && 'whitespace-pre-wrap break-words']}><code>{
     lines.map((line) =>
       'command' in line ? (
         <span class="block"><span aria-hidden="true" class="text-term-prompt">$ </span>{line.command}</span>
       ) : (
-        <span class="block" aria-hidden={line.art ? 'true' : undefined}>{
+        <span class="block min-h-[1lh]" aria-hidden={line.art ? 'true' : undefined}>{
           segmentsOf(line.output).map((segment) =>
             typeof segment === 'string' ? segment : <span class={tones[segment.tone]}>{segment.text}</span>,
           )
@@ -50,4 +53,5 @@ const segmentsOf = (output: string | Segment[]): Segment[] =>
       ),
     )
   }</code></pre>
+  {hasActions && <div class="absolute top-2 right-2"><slot name="actions" /></div>}
 </figure>

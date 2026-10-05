@@ -97,6 +97,15 @@
     text-underline-offset: 0.2em;
   }
 
+  /*
+   * A grid item is as wide as its longest line unless told otherwise, and a
+   * terminal's longest line is a command: without this, one long command
+   * widens its column past the screen instead of scrolling inside its block.
+   */
+  :where(.grid) > * {
+    min-width: 0;
+  }
+
   ::selection {
     background-color: var(--accent);
     color: var(--on-accent);

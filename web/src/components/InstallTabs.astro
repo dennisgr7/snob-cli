@@ -1,0 +1,64 @@
+---
+import CopyButton from '@/components/CopyButton.astro';
+import Terminal from '@/components/Terminal.astro';
+import { INSTALL, type InstallBlock } from '@/lib/content';
+
+/**
+ * Every way to install. Without JavaScript the methods follow one another,
+ * each under its own heading; the page script turns the hidden tab list on
+ * and shows one panel at a time.
+ */
+---
+
+<div data-install-tabs>
+  <div role="tablist" aria-label="Install methods" hidden class="flex flex-wrap gap-1 border-b border-line font-mono text-sm">
+    {
+      INSTALL.map((method, index) => (
+        <button
+          type="button"
+          role="tab"
+          id={`tab-${method.id}`}
+          aria-controls={`panel-${method.id}`}
+          aria-selected={index === 0 ? 'true' : 'false'}
+          tabindex={index === 0 ? 0 : -1}
+          class="-mb-px rounded-t-control border border-transparent px-3 py-2 text-muted hover:text-text aria-selected:border-line aria-selected:border-b-bg aria-selected:bg-bg aria-selected:text-text"
+        >
+          {method.name}
+        </button>
+      ))
+    }
+  </div>
+  <div class="space-y-10" data-panels>
+    {
+      INSTALL.map((method) => (
+        <section id={`panel-${method.id}`} aria-labelledby={`heading-${method.id}`} data-panel>
+          <h3 id={`heading-${method.id}`} class="font-mono text-sm font-bold" data-panel-heading>
+            {method.name}
+          </h3>
+          <p class="mt-1 mb-3 text-sm text-muted">
+            {method.note}
+            {'link' in method && method.link && (
+              <>
+                {' '}
+                <a href={method.link.href}>{method.link.label}</a>
+              </>
+            )}
+          </p>
+          <div class="space-y-4">
+            {method.blocks.map((block: InstallBlock) => {
+              const name = block.label ?? method.name;
+              return (
+                <div>
+                  {block.label && <p class="mb-2 font-mono text-xs text-muted">{block.label}</p>}
+                  <Terminal label={`Install: ${name}`} lines={block.commands.map((command) => ({ command }))}>
+                    <CopyButton slot="actions" text={block.commands.join('\n')} label={`Copy the ${name} install`} />
+                  </Terminal>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      ))
+    }
+  </div>
+</div>

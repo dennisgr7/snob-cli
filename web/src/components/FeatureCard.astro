@@ -1,0 +1,19 @@
+---
+import Terminal from '@/components/Terminal.astro';
+import type { TerminalLine } from '@/lib/terminal';
+
+/** One command: its name, what it is for, and a small terminal showing it. */
+interface Props {
+  name: string;
+  description: string;
+  lines: readonly TerminalLine[];
+}
+
+const { name, description, lines } = Astro.props;
+---
+
+<li class="flex flex-col rounded-card border border-line bg-surface p-4">
+  <h3 class="font-mono text-sm font-bold">{name}</h3>
+  <p class="mt-1.5 mb-4 text-sm text-muted">{description}</p>
+  <Terminal label={`snob ${name}`} lines={lines} size="sm" class="mt-auto" />
+</li>
