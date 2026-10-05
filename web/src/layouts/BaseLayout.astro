@@ -1,5 +1,8 @@
 ---
 import '@/styles/global.css';
+import { Font } from 'astro:assets';
+import Footer from '@/components/Footer.astro';
+import Nav from '@/components/Nav.astro';
 import { SITE } from '@/lib/site';
 import { jsonLd } from '@/lib/jsonld';
 
@@ -29,6 +32,12 @@ const robots = noindex ? 'noindex, follow' : 'index, follow, max-image-preview:l
     <meta name="generator" content={Astro.generator} />
     <link rel="canonical" href={canonical} />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content={SITE.themeColor.light} />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content={SITE.themeColor.dark} />
+    <meta name="color-scheme" content="light dark" />
+    {/* Only what the first screen paints: the headline and the text under it. */}
+    <Font cssVariable="--font-plex-mono" preload={[{ weight: 700, style: 'normal' }]} />
+    <Font cssVariable="--font-plex-sans" preload={[{ weight: 400, style: 'normal' }]} />
     <link rel="sitemap" href="/sitemap-index.xml" />
     <link rel="describedby" type="text/plain" href="/llms.txt" title="Site index for agents" />
 
@@ -46,10 +55,12 @@ const robots = noindex ? 'noindex, follow' : 'index, follow, max-image-preview:l
 
     {!noindex && <script is:inline type="application/ld+json" set:html={jsonLd(canonical)} />}
   </head>
-  <body>
-    <a href="#content">Skip to content</a>
-    <main id="content">
+  <body class="flex min-h-dvh flex-col">
+    <a href="#content" class="skip-link">Skip to content</a>
+    <Nav />
+    <main id="content" class="flex-1">
       <slot />
     </main>
+    <Footer />
   </body>
 </html>

@@ -1,0 +1,140 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import Cursor from '@/components/Cursor.astro';
+import Section from '@/components/Section.astro';
+import Terminal from '@/components/Terminal.astro';
+import Wordmark from '@/components/Wordmark.astro';
+import { SITE } from '@/lib/site';
+import type { TerminalLine } from '@/lib/terminal';
+
+/**
+ * Every token and component, live, in whichever theme the system asks for.
+ * Not for search: `noindex`, out of the sitemap and of llms.txt. DESIGN.md is
+ * the reasoning; this is the result.
+ */
+
+const colors = [
+  { token: 'bg', swatch: 'bg-bg', light: '#fafafa', dark: '#0b0d10' },
+  { token: 'surface', swatch: 'bg-surface', light: '#ffffff', dark: '#12151a' },
+  { token: 'text', swatch: 'bg-text', light: '#111111', dark: '#e6e8ec' },
+  { token: 'muted', swatch: 'bg-muted', light: '#52525b', dark: '#9aa1ab' },
+  { token: 'line', swatch: 'bg-line', light: '#e4e4e7', dark: '#23272f' },
+  { token: 'accent', swatch: 'bg-accent', light: '#be185d', dark: '#f472b6' },
+  { token: 'on-accent', swatch: 'bg-on-accent', light: '#ffffff', dark: '#0b0d10' },
+] as const;
+
+const terminalColors = [
+  { token: 'term-text', swatch: 'bg-term-text', value: '#e6e8ec' },
+  { token: 'term-dim', swatch: 'bg-term-dim', value: '#8b929c' },
+  { token: 'term-ok', swatch: 'bg-term-ok', value: '#7ad46b' },
+  { token: 'term-warn', swatch: 'bg-term-warn', value: '#e5c07b' },
+  { token: 'term-error', swatch: 'bg-term-error', value: '#e06c75' },
+  { token: 'term-info', swatch: 'bg-term-info', value: '#3ec7d6' },
+  { token: 'term-prompt', swatch: 'bg-term-prompt', value: '#f472b6' },
+] as const;
+
+const sample: TerminalLine[] = [
+  { command: 'snob unfollowers' },
+  { output: [{ text: '✓ ', tone: 'ok' }, '23 accounts do not follow you back'] },
+  { output: [{ text: '! ', tone: 'warn' }, 'cooling down for 4 minutes'] },
+  { output: [{ text: '✗ ', tone: 'error' }, 'log in again: snob login'] },
+  { output: [{ text: 'i ', tone: 'info' }, 'saved to unfollowers.json'] },
+  { output: [{ text: '# a comment, dimmed', tone: 'dim' }] },
+  { output: '┌ unfollowers · 23 ┐', art: true },
+];
+---
+
+<BaseLayout title={`Design system · ${SITE.name}`} description="Every token and component of the Snob CLI website." noindex>
+  <div class="mx-auto max-w-page px-4 pt-10 sm:px-6">
+    <p class="font-mono text-sm text-muted">/design-system</p>
+    <h1 class="mt-3 font-mono text-hero font-bold">
+      design <span class="text-accent">system</span><Cursor />
+    </h1>
+    <p class="mt-4 max-w-[62ch] text-muted">
+      The tokens and components of the page, in the theme your system asks for. Switch your system between light and dark to
+      see the other.
+    </p>
+  </div>
+
+  <Section id="mark" title="The" accent="mark.">
+    <div class="flex flex-wrap items-end gap-10">
+      <Wordmark size="lg" />
+      <Wordmark size="md" />
+      <Wordmark size="sm" />
+    </div>
+  </Section>
+
+  <Section id="color" title="Color," accent="by the system.">
+    <ul class="grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-7">
+      {
+        colors.map((color) => (
+          <li class="overflow-hidden rounded-card border border-line bg-surface">
+            <div class:list={['h-16 border-b border-line', color.swatch]} />
+            <div class="p-3 font-mono text-xs">
+              <p class="font-bold text-text">{color.token}</p>
+              <p class="text-muted">{color.light}</p>
+              <p class="text-muted">{color.dark}</p>
+            </div>
+          </li>
+        ))
+      }
+    </ul>
+    <h3 class="mt-12 font-mono text-sm font-bold">terminal, in both themes</h3>
+    <ul class="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-7">
+      {
+        terminalColors.map((color) => (
+          <li class="overflow-hidden rounded-card border border-term-line bg-term-bg">
+            <div class:list={['h-10', color.swatch]} />
+            <div class="p-3 font-mono text-xs text-term-text">
+              <p class="font-bold">{color.token}</p>
+              <p class="text-term-dim">{color.value}</p>
+            </div>
+          </li>
+        ))
+      }
+    </ul>
+  </Section>
+
+  <Section id="type" title="Type:" accent="Plex Mono and Plex Sans.">
+    <div class="space-y-8">
+      <div>
+        <p class="font-mono text-xs text-muted">hero · Plex Mono 700 · 2.25 to 4.5 rem</p>
+        <p class="mt-2 font-mono text-hero font-bold">who doesn't follow you <span class="text-accent">back?</span></p>
+      </div>
+      <div>
+        <p class="font-mono text-xs text-muted">h2 · Plex Mono 700 · 1.5 to 2.25 rem</p>
+        <p class="mt-2 font-mono text-h2 font-bold">A light client, <span class="text-accent">on purpose.</span></p>
+      </div>
+      <div>
+        <p class="font-mono text-xs text-muted">body · Plex Sans 400 · 1.0625 rem / 1.6</p>
+        <p class="mt-2 max-w-[62ch]">
+          Snob signs in as you and sends its requests from a browser already on your machine, at a human pace. It only ever
+          changes two things, one account at a time and after asking.
+        </p>
+      </div>
+      <div>
+        <p class="font-mono text-xs text-muted">small · Plex Sans 400 · 0.875 rem · muted</p>
+        <p class="mt-2 text-sm text-muted">Not affiliated with Instagram or Meta.</p>
+      </div>
+      <div>
+        <p class="font-mono text-xs text-muted">link · accent, underlined</p>
+        <p class="mt-2"><a href="#type">A link in running text</a></p>
+      </div>
+    </div>
+  </Section>
+
+  <Section id="terminal" title="Terminal" accent="blocks.">
+    <div class="grid gap-6 lg:grid-cols-2">
+      <Terminal label="Every tone a terminal block uses" lines={sample} />
+      <Terminal label="The small block of a card" lines={sample.slice(0, 2)} size="sm" />
+    </div>
+  </Section>
+
+  <Section id="shape" title="Shape" accent="and space.">
+    <div class="flex flex-wrap items-center gap-6 font-mono text-xs">
+      <div class="rounded-control border border-line bg-surface px-4 py-3">radius-control · 6 px</div>
+      <div class="rounded-card border border-line bg-surface px-4 py-3">radius-card · 10 px</div>
+      <div class="rounded-card border border-line bg-surface px-4 py-3">container · 72 rem</div>
+    </div>
+  </Section>
+</BaseLayout>

@@ -1,10 +1,13 @@
 // @ts-check
-import { defineConfig } from 'astro/config';
+import { defineConfig, fontProviders } from 'astro/config';
 
 import tailwindcss from '@tailwindcss/vite';
 import sitemap from '@astrojs/sitemap';
 
 import { SITE } from './src/lib/site.ts';
+
+/** Pages that exist but are not for search: the 404 and the design system. */
+const OUT_OF_SITEMAP = ['/404', '/design-system'];
 
 // https://astro.build/config
 export default defineConfig({
@@ -25,9 +28,37 @@ export default defineConfig({
     sitemap({
       // No `lastmod`: the build date on every URL says nothing about real
       // changes, and Google ignores dates that do not reflect one.
-      // The 404 page is `noindex`, so it stays out.
-      filter: (page) => !new URL(page).pathname.startsWith('/404'),
+      // Both are `noindex`, so neither belongs here.
+      filter: (page) => !OUT_OF_SITEMAP.some((path) => new URL(page).pathname.startsWith(path)),
     }),
+  ],
+
+  // Self-hosted: Astro downloads the files at build time and serves them from
+  // the site, so no request ever goes to Google and the policy stays
+  // `font-src 'self'`. DESIGN.md says why Plex.
+  fonts: [
+    {
+      provider: fontProviders.google(),
+      name: 'IBM Plex Mono',
+      cssVariable: '--font-plex-mono',
+      weights: [400, 700],
+      // The italic is the mark's (Wordmark.astro); a face is only fetched
+      // when the page uses it.
+      styles: ['normal', 'italic'],
+      subsets: ['latin'],
+      display: 'swap',
+      fallbacks: ['ui-monospace', 'monospace'],
+    },
+    {
+      provider: fontProviders.google(),
+      name: 'IBM Plex Sans',
+      cssVariable: '--font-plex-sans',
+      weights: [400, 600],
+      styles: ['normal'],
+      subsets: ['latin'],
+      display: 'swap',
+      fallbacks: ['ui-sans-serif', 'system-ui', 'sans-serif'],
+    },
   ],
 
   // The policy travels as a `<meta http-equiv>` Astro writes on every page, with
