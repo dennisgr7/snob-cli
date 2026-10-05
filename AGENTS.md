@@ -271,6 +271,9 @@ preview URL. It shares nothing with the Rust workspace but the repository and th
 rules above (English, US spelling; `language.rs` reads its `.md`, `.json` and
 `.yaml` too, and skips `pnpm-lock.yaml` by name as a generated file).
 
+- **The look is decided in `web/DESIGN.md`**: who the page is for, the mark, the
+  tokens, the sections and the limits on scripts. Read it before changing anything
+  visual; `/design-system` on the dev server shows every token and component.
 - **The Workers Builds connection** (Workers & Pages, Create, Continue with
   GitHub, access to this repository only): Worker name `snob-web` (it must match
   `wrangler.jsonc`), root directory `web`, production branch `main`, build
