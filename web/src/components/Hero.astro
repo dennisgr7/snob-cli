@@ -15,7 +15,7 @@ import { HERO, HERO_SAMPLE } from '@/lib/content';
   <div class="grid items-center gap-12 lg:grid-cols-[1.1fr_1fr]">
     <div>
       <h1 id="hero-title" class="font-mono text-hero font-bold">
-        {HERO.title} <span class="text-accent">{HERO.accent}</span><Cursor />
+        {HERO.title} <span class="whitespace-nowrap"><span class="text-accent">{HERO.accent}</span><Cursor /></span>
       </h1>
       <p class="mt-6 max-w-[52ch] text-lg text-muted">{HERO.lead}</p>
       <InstallHero />
