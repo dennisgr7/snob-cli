@@ -49,8 +49,11 @@ export const INSTALL = [
   {
     id: 'deb',
     name: 'Debian · Ubuntu',
-    note: 'The .deb for your architecture, from the releases page.',
-    blocks: [{ commands: [`sudo apt install ./snob-v${VERSION}-x86_64-unknown-linux-musl.deb`] }],
+    note: 'The .deb for your architecture, downloaded from the releases page.',
+    blocks: [
+      { label: 'x86_64', commands: [`sudo apt install ./snob-v${VERSION}-x86_64-unknown-linux-musl.deb`] },
+      { label: 'ARM64', commands: [`sudo apt install ./snob-v${VERSION}-aarch64-unknown-linux-musl.deb`] },
+    ],
     link: { label: 'Releases', href: RELEASES },
   },
   {
@@ -211,7 +214,7 @@ export const BEHAVIOR = {
     { output: [{ text: '✓ ', tone: 'ok' }, 'a rest of 5 to 15 minutes every 40 pages'] },
     { output: [{ text: '✓ ', tone: 'ok' }, 'two writes, ever: follow and unfollow, after asking'] },
     { output: [{ text: '✓ ', tone: 'ok' }, 'stories are never marked as seen'] },
-    { output: [{ text: '✓ ', tone: 'ok' }, 'the session stays in your system keyring'] },
+    { output: [{ text: '✓ ', tone: 'ok' }, 'the session is stored on your machine, in the system keyring when there is one'] },
     { output: [{ text: '! ', tone: 'warn' }, 'the first push-back stops it, and it cools down'] },
   ] as Sample,
 } as const;

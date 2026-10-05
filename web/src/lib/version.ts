@@ -4,9 +4,11 @@ import { join } from 'node:path';
 /**
  * The version of the release the site describes, read at build time from the
  * workspace manifest, so nobody keeps a second copy by hand. Workers Builds
- * clones the whole repository, so the manifest is there. The site deploys
- * from `main`, where only released versions land, so this is always a version
- * whose files exist on the releases page.
+ * clones the whole repository, so the manifest is there. Production deploys
+ * from `main`, which only takes a version as it is released, so there it names
+ * files on the releases page (once the tag's build has published them). A
+ * preview build of another branch may carry a version not released yet, and
+ * its .deb lines can then name a file that does not exist.
  *
  * From the working directory rather than this module's URL: the build bundles
  * this file somewhere else, and every tool here runs from `web/`.
