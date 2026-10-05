@@ -3,9 +3,9 @@
  * Open Graph tags, the JSON-LD, robots.txt and llms.txt all read it from here.
  */
 export const SITE = {
-  // TODO: the custom domain GitHub Pages will serve. It must be the root of a
-  // host (no path), or robots.txt and llms.txt are never found by crawlers.
-  url: 'https://snob.example.com',
+  // The root of a host, never a path, or crawlers never find robots.txt and
+  // llms.txt. `wrangler.jsonc` routes the same host.
+  url: 'https://snob.dennisindustries.net',
   name: 'Snob CLI',
   description:
     'An Instagram client for the terminal, with extra utilities, media downloads and output ready for AI agents.',

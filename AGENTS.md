@@ -263,13 +263,18 @@ manifests from a release's `SHA256SUMS`; `install.sh` and `install.ps1`), and th
 
 ## The website
 
-`web/` is the project's site: Astro 7, fully static, published on GitHub Pages
-under a custom domain. It shares nothing with the Rust workspace but the repository
-and the rules above (English, US spelling; `language.rs` reads its `.md`, `.json`
-and `.yaml` too, and skips `pnpm-lock.yaml` by name as a generated file).
+`web/` is the project's site, `snob.dennisindustries.net`: Astro 7, fully static,
+served by Cloudflare as a Worker with static assets and no Worker code
+(`web/wrangler.jsonc`). Workers Builds is connected to the repository with `web/`
+as its root: a push to `main` deploys, any other branch uploads a version with a
+preview URL. It shares nothing with the Rust workspace but the repository and the
+rules above (English, US spelling; `language.rs` reads its `.md`, `.json` and
+`.yaml` too, and skips `pnpm-lock.yaml` by name as a generated file).
 
 - **pnpm only**, run from `web/` (`pnpm install`, `pnpm dev`, `pnpm check`,
-  `pnpm build`). The supply-chain policy is `web/pnpm-workspace.yaml`: a 24-hour
+  `pnpm build`; `pnpm preview` serves `dist/` through Wrangler, with the
+  production headers and 404). Wrangler is a pinned dev dependency, so a deploy
+  never runs whatever version `npx` finds that day. The supply-chain policy is `web/pnpm-workspace.yaml`: a 24-hour
   quarantine on fresh versions, no exotic transitive sources, install scripts
   blocked except the ones listed in `allowBuilds`, exact versions. A new
   dependency has to argue for itself, as in the workspace. Node is pinned in
@@ -281,12 +286,13 @@ and `.yaml` too, and skips `pnpm-lock.yaml` by name as a generated file).
   Graph, the JSON-LD and the generated `robots.txt` and `llms.txt` all read it.
   The domain must be the root of a host; under a path, crawlers never find
   `robots.txt` or `llms.txt`.
-- **Security travels in the page.** GitHub Pages cannot set response headers, so
-  the Content Security Policy is the `<meta>` Astro writes from `security.csp` in
-  `web/astro.config.mjs`, hashing every script and style it emits. No
-  `'unsafe-inline'`, no third-party origins, no inline `style` attributes, and
-  Shiki stays off (it styles inline). `frame-ancestors`, HSTS and the other
-  header-only protections are out of reach here.
+- **The Content Security Policy is the `<meta>` Astro writes** from `security.csp`
+  in `web/astro.config.mjs`, with the hash of every script and style each page
+  runs. No `'unsafe-inline'`, no third-party origins, no inline `style`
+  attributes, and Shiki stays off (it styles inline). `web/public/_headers` adds
+  what a `<meta>` cannot carry (`frame-ancestors`, HSTS, `nosniff`, the referrer
+  and permissions policies, the `llms.txt` link) and keeps version URLs out of
+  search. A response with both policies must satisfy both.
 - **Every page goes through `BaseLayout`**: title, description, canonical, robots,
   Open Graph, Twitter card and the JSON-LD `@graph` (`web/src/lib/jsonld.ts`,
   `<` escaped). A new page also gets a line in `llms.txt`; a `noindex` page is

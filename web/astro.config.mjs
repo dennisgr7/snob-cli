@@ -30,10 +30,10 @@ export default defineConfig({
     }),
   ],
 
-  // GitHub Pages cannot set response headers, so the policy travels as a
-  // `<meta http-equiv>` that Astro writes on every page, with the hashes of the
-  // scripts and styles it bundles. A meta policy cannot carry `frame-ancestors`,
-  // `report-uri` or `sandbox`; browsers ignore them there.
+  // The policy travels as a `<meta http-equiv>` Astro writes on every page, with
+  // the hashes of the scripts and styles that page runs, so nothing inline is
+  // trusted wholesale. What a meta policy cannot carry (`frame-ancestors`) and
+  // the other headers are in `public/_headers`.
   security: {
     csp: {
       algorithm: 'SHA-256',

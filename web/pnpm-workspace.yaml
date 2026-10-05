@@ -15,9 +15,11 @@ blockExoticSubdeps: true
 
 # Packages allowed to run install scripts; every other one is blocked by default
 # (`strictDepBuilds`). Add an entry only after checking why the package has to
-# build. esbuild only fetches its platform binary, which Astro and Vite need.
+# build. Both of these only check, or fetch from the registry, the binary for
+# this platform: esbuild for Astro and Vite, workerd for Wrangler.
 allowBuilds:
   esbuild: true
+  workerd: true
 
 # Reproducible installs
 
