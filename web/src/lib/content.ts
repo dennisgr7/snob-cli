@@ -1,6 +1,6 @@
-import { SITE } from '@/lib/site';
-import type { TerminalLine } from '@/lib/terminal';
-import { VERSION } from '@/lib/version';
+import { SITE } from './site.ts';
+import type { TerminalLine } from './terminal.ts';
+import { VERSION } from './version.ts';
 
 /**
  * Every word on the page. The HTML, llms.txt and the Markdown twin all read it
@@ -165,7 +165,7 @@ export const FEATURES: readonly Feature[] = [
     ],
   },
   {
-    name: 'posts · reels',
+    name: 'post · reel',
     description: 'One post or reel by its link, every photo and video in it.',
     sample: [
       { command: 'snob reel <link> -d all' },

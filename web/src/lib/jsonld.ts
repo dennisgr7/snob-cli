@@ -1,4 +1,5 @@
 import { SITE } from '@/lib/site';
+import { VERSION } from '@/lib/version';
 
 type Node = Record<string, unknown>;
 
@@ -24,10 +25,13 @@ function baseNodes(): Node[] {
       description: SITE.description,
       applicationCategory: 'UtilitiesApplication',
       operatingSystem: 'Windows, macOS, Linux',
+      softwareVersion: VERSION,
       url: `${SITE.url}/`,
+      downloadUrl: `${SITE.repository}/releases/latest`,
       codeRepository: SITE.repository,
       license: SITE.license,
       isAccessibleForFree: true,
+      offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
     },
   ];
 }

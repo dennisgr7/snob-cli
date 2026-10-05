@@ -16,7 +16,8 @@
     "preview": "wrangler dev",
     "check": "astro check",
     "astro": "astro",
-    "test": "playwright test"
+    "test": "playwright test",
+    "brand": "node scripts/brand.mjs"
   },
   "dependencies": {
     "@astrojs/sitemap": "3.7.4",

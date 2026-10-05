@@ -311,8 +311,18 @@ rules above (English, US spelling; `language.rs` reads its `.md`, `.json` and
   search. A response with both policies must satisfy both.
 - **Every page goes through `BaseLayout`**: title, description, canonical, robots,
   Open Graph, Twitter card and the JSON-LD `@graph` (`web/src/lib/jsonld.ts`,
-  `<` escaped). A new page also gets a line in `llms.txt`; a `noindex` page is
-  kept out of the sitemap in `astro.config.mjs`.
+  `<` escaped). A new page also gets a line in `llms.txt` and a Markdown twin
+  (`index.md.ts`, `web/src/lib/markdown.ts`); a `noindex` page is kept out of the
+  sitemap in `astro.config.mjs`.
+- **Every word on the page is in `web/src/lib/content.ts`**, which the HTML, the
+  twin and `llms.txt` all read, so `tests/agents.spec.ts` can hold them to each
+  other. Output shown there is what snob prints, with invented accounts; it is
+  checked against the code, not imagined. The release version comes from the
+  workspace `Cargo.toml` at build time. `content.ts` imports with relative `.ts`
+  paths, not `@/`, because `scripts/brand.mjs` loads it under plain Node.
+- **`pnpm brand`** redraws `og.png` and the icons in `web/public/` with
+  Playwright's Chromium and the built Plex files (build first); the images are
+  committed. Run it when the mark, the headline or the domain changes.
 - No client JavaScript unless a feature cannot work without it. Tailwind v4 runs
   as a Vite plugin with its entry in `web/src/styles/global.css`; there is no
   `tailwind.config.js`. TypeScript strict, `@/` is `web/src/`.
