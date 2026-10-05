@@ -1,0 +1,30 @@
+{
+  "name": "snob-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The Snob CLI website, a static Astro site published on GitHub Pages.",
+  "engines": {
+    "node": ">=24.21.0",
+    "pnpm": ">=12"
+  },
+  "packageManager": "pnpm@12.9.1",
+  "scripts": {
+    "dev": "astro dev",
+    "start": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "check": "astro check",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@astrojs/sitemap": "3.7.4",
+    "@tailwindcss/vite": "4.3.3",
+    "astro": "7.3.5",
+    "tailwindcss": "4.3.3"
+  },
+  "devDependencies": {
+    "@astrojs/check": "0.9.10",
+    "typescript": "6.0.3"
+  }
+}

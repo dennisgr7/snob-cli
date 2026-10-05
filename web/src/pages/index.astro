@@ -1,0 +1,9 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { SITE } from '@/lib/site';
+---
+
+<BaseLayout title={SITE.name}>
+  <h1>{SITE.name}</h1>
+  <p>{SITE.description}</p>
+</BaseLayout>

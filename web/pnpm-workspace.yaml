@@ -1,0 +1,29 @@
+# pnpm settings: supply-chain hardening and reproducible installs. Since pnpm v11
+# the configuration lives here, not in .npmrc. Some values are already the default
+# and are set anyway so the policy is explicit.
+
+# Supply chain
+
+# Quarantine, in minutes (1440 = 24 h), before a freshly published version can be
+# installed. Malicious releases are usually pulled within the first hour.
+minimumReleaseAge: 1440
+minimumReleaseAgeExclude: []
+
+# Only direct dependencies may come from outside the registry; transitive ones
+# always resolve from the trusted registry, never from git or a tarball.
+blockExoticSubdeps: true
+
+# Packages allowed to run install scripts; every other one is blocked by default
+# (`strictDepBuilds`). Add an entry only after checking why the package has to
+# build. esbuild only fetches its platform binary, which Astro and Vite need.
+allowBuilds:
+  esbuild: true
+
+# Reproducible installs
+
+# Exact versions in package.json (no ^ or ~), so a freshly published patch is
+# never adopted silently.
+savePrefix: ''
+
+# Enforce the Node and pnpm versions declared in `engines`.
+engineStrict: true

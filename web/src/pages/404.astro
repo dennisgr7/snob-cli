@@ -1,0 +1,9 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { SITE } from '@/lib/site';
+---
+
+<BaseLayout title={`Page not found · ${SITE.name}`} description="This page does not exist." noindex>
+  <h1>Page not found</h1>
+  <p><a href="/">Back to the home page</a></p>
+</BaseLayout>

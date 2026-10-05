@@ -1,0 +1,56 @@
+---
+import '@/styles/global.css';
+import { SITE } from '@/lib/site';
+import { jsonLd } from '@/lib/jsonld';
+
+interface Props {
+  title: string;
+  description?: string;
+  noindex?: boolean;
+  /** Absolute or root-relative path of the Open Graph image, once there is one. */
+  ogImage?: string;
+}
+
+const { title, description = SITE.description, noindex = false, ogImage } = Astro.props;
+
+const canonical = new URL(Astro.url.pathname, Astro.site);
+const ogImageUrl = ogImage ? new URL(ogImage, Astro.site).href : undefined;
+const robots = noindex ? 'noindex, follow' : 'index, follow, max-image-preview:large';
+---
+
+<!doctype html>
+<html lang={SITE.locale}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="robots" content={robots} />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <meta name="generator" content={Astro.generator} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="sitemap" href="/sitemap-index.xml" />
+    <link rel="describedby" type="text/plain" href="/llms.txt" title="Site index for agents" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content={SITE.name} />
+    <meta property="og:locale" content={SITE.ogLocale} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    {ogImageUrl && <meta property="og:image" content={ogImageUrl} />}
+    <meta name="twitter:card" content={ogImageUrl ? 'summary_large_image' : 'summary'} />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    {ogImageUrl && <meta name="twitter:image" content={ogImageUrl} />}
+
+    {!noindex && <script is:inline type="application/ld+json" set:html={jsonLd(canonical)} />}
+  </head>
+  <body>
+    <a href="#content">Skip to content</a>
+    <main id="content">
+      <slot />
+    </main>
+  </body>
+</html>
