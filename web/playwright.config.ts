@@ -7,6 +7,9 @@ const baseURL = `http://127.0.0.1:${port}`;
  * The tests read the production build: run `pnpm build` first. Wrangler serves
  * `dist/` the way Cloudflare does, with `public/_headers` and the real 404
  * status, which `astro preview` would not.
+ *
+ * Its own inspector port and state directory, so a `pnpm preview` left
+ * running beside it cannot take either and keep this one from starting.
  */
 export default defineConfig({
   testDir: './tests',
@@ -19,7 +22,7 @@ export default defineConfig({
     trace: 'on-first-retry',
   },
   webServer: {
-    command: `pnpm exec wrangler dev --port ${port} --ip 127.0.0.1`,
+    command: `pnpm exec wrangler dev --port ${port} --ip 127.0.0.1 --inspector-port 0 --persist-to .wrangler/test-state --show-interactive-dev-session=false`,
     url: baseURL,
     reuseExistingServer: !process.env.CI,
   },
