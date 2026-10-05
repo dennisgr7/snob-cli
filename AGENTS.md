@@ -290,8 +290,12 @@ rules above (English, US spelling; `language.rs` reads its `.md`, `.json` and
   blocked except the ones listed in `allowBuilds`, exact versions. A new
   dependency has to argue for itself, as in the workspace. Node is pinned in
   `web/.node-version`.
-- **`pnpm check` with 0 errors, 0 warnings, 0 hints and a clean `pnpm build`**
-  before every commit that touches `web/`.
+- **`pnpm check` with 0 errors, 0 warnings, 0 hints, a clean `pnpm build` and a
+  green `pnpm test`** before every commit that touches `web/`. The tests are
+  Playwright's, against the build served by Wrangler as production serves it
+  (headers, 404 status); they need a build first and Chromium, installed on
+  purpose with `pnpm exec playwright install chromium`, never by a postinstall.
+  `.github/workflows/web.yml` runs the same steps on every change under `web/`.
 - **One source for the site's identity**, `web/src/lib/site.ts`: the domain
   (`site`), the name and the description. The canonical URL, the sitemap, Open
   Graph, the JSON-LD and the generated `robots.txt` and `llms.txt` all read it.

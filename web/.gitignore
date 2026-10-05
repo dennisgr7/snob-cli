@@ -22,3 +22,7 @@ pnpm-debug.log*
 # Wrangler state and local secrets
 .wrangler/
 .dev.vars*
+
+# Playwright output
+test-results/
+playwright-report/
