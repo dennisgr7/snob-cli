@@ -5,7 +5,7 @@
 export const SITE = {
   // The root of a host, never a path, or crawlers never find robots.txt and
   // llms.txt. `wrangler.jsonc` routes the same host.
-  url: 'https://snob.dennisindustries.net',
+  url: 'https://snob.dennisgr7.dev',
   name: 'Snob CLI',
   description:
     'An Instagram client for the terminal, with extra utilities, media downloads and output ready for AI agents.',

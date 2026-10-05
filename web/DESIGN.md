@@ -1,6 +1,6 @@
 # The website's design
 
-What the site at `snob.dennisindustries.net` looks like and why, settled with the
+What the site at `snob.dennisgr7.dev` looks like and why, settled with the
 maintainer before any of it was built. `src/pages/design-system` shows every token
 and component live; this file is the reasoning behind them. A change to the look
 starts here.

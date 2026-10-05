@@ -263,7 +263,7 @@ manifests from a release's `SHA256SUMS`; `install.sh` and `install.ps1`), and th
 
 ## The website
 
-`web/` is the project's site, `snob.dennisindustries.net`: Astro 7, fully static,
+`web/` is the project's site, `snob.dennisgr7.dev`: Astro 7, fully static,
 served by Cloudflare as a Worker with static assets and no Worker code
 (`web/wrangler.jsonc`). Workers Builds is connected to the repository with `web/`
 as its root: a push to `main` deploys, any other branch uploads a version with a
@@ -281,7 +281,8 @@ rules above (English, US spelling; `language.rs` reads its `.md`, `.json` and
   branches `pnpm exec wrangler versions upload`. No build variables: Node comes
   from `web/.node-version`, and the image's older pnpm switches itself to the one
   `packageManager` names. The custom domain is created by the first deploy, not
-  by hand in DNS; a specific record wins over the zone's `*` wildcard.
+  by hand in DNS; the `dennisgr7.dev` zone has to be in the same Cloudflare
+  account as the Worker.
 - **pnpm only**, run from `web/` (`pnpm install`, `pnpm dev`, `pnpm check`,
   `pnpm build`; `pnpm preview` serves `dist/` through Wrangler, with the
   production headers and 404). Wrangler is a pinned dev dependency, so a deploy
