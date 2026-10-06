@@ -43,11 +43,11 @@ url.workspace = true
 #
 # **x86_64 Windows is deliberately not included.** It has never had the
 # problem: rustls turns on aws-lc's `prebuilt-nasm`, which ships compiled
-# objects for exactly that architecture, so bare Build Tools are enough. It
-# also has users on Windows 10, where schannel negotiates TLS 1.2 at best —
-# a client claiming to be a current Chrome while speaking 1.2 is the kind of
-# incoherence this project spends its effort avoiding. Windows 10 on ARM64 is
-# out of support, so that case does not arise here.
+# objects for exactly that architecture, so bare Build Tools are enough. And
+# schannel speaks what the Windows under it speaks, TLS 1.2 at best before
+# Windows 11: a client claiming to be a current Chrome while speaking 1.2 is
+# the kind of incoherence this project spends its effort avoiding, and rustls
+# does not depend on which Windows it runs on. snob supports Windows 11 only.
 #
 # What the split costs: two TLS stacks, so the ARM64 Windows binary is not
 # byte-for-byte the others. CI builds all five and runs the suite on it.
