@@ -22,6 +22,7 @@ function baseNodes(): Node[] {
       '@type': 'SoftwareApplication',
       '@id': softwareId,
       name: SITE.name,
+      alternateName: SITE.category,
       description: SITE.description,
       applicationCategory: 'UtilitiesApplication',
       operatingSystem: 'Windows, macOS, Linux',

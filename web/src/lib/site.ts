@@ -7,8 +7,10 @@ export const SITE = {
   // llms.txt. `wrangler.jsonc` routes the same host.
   url: 'https://snob.dennisgr7.dev',
   name: 'Snob CLI',
+  /** What people search for before they know the name. */
+  category: 'Instagram CLI',
   description:
-    'An Instagram client for the terminal, with extra utilities, media downloads and output ready for AI agents.',
+    'An Instagram CLI: a client for the terminal, with extra utilities, media downloads and output ready for AI agents.',
   repository: 'https://github.com/dennisgr7/snob-cli',
   license: 'https://github.com/dennisgr7/snob-cli/blob/main/LICENSE',
   locale: 'en',

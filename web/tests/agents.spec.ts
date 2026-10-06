@@ -52,6 +52,9 @@ test('llms.txt points at the twin', async ({ request }) => {
 
 test('the head tells search, previews and agents what the page is', async ({ page }) => {
   await page.goto('/');
+  // The words people search with before they know the name.
+  await expect(page).toHaveTitle(new RegExp(SITE.category));
+  await expect(page.locator('meta[name="description"]')).toHaveAttribute('content', new RegExp(SITE.category));
   await expect(page.locator('link[rel="canonical"]')).toHaveAttribute('href', `${SITE.url}/`);
   await expect(page.locator('link[rel="alternate"][type="text/markdown"]')).toHaveAttribute('href', `${SITE.url}/index.md`);
   await expect(page.locator('meta[property="og:image"]')).toHaveAttribute('content', `${SITE.url}/og.png`);
