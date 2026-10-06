@@ -17,22 +17,37 @@
 #
 # Weekly rather than daily: this is a small tool with five targets, and a pull
 # request per dependency per day is how an update feed gets muted.
+#
+# Every update goes into dev, like any other change: main only takes what dev
+# already has, through the release pull request. Dependabot reads this file
+# from the default branch, so a change here takes effect once it reaches main.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: "/"
+    target-branch: dev
     schedule:
       interval: weekly
   - package-ecosystem: cargo
     directory: "/"
+    target-branch: dev
     schedule:
       interval: weekly
     # The lockfile is what ships, so an update has to be a reviewed change to
     # it rather than a manifest range widening under everybody.
     versioning-strategy: lockfile-only
+    ignore:
+      # A version outside the manifest's range cannot be a lockfile-only
+      # update, and Dependabot does not skip it: it tries, changes nothing,
+      # and fails the whole cargo run with "No files changed". 0.23 is a new
+      # major for a 0.x crate, so moving to it is an edit to `Cargo.toml`
+      # somebody makes on purpose -- and then this entry goes.
+      - dependency-name: base64
+        versions: [">=0.23"]
   # The website's packages. pnpm's own 24-hour quarantine
   # (`web/pnpm-workspace.yaml`) holds on top of Dependabot's cooldown.
   - package-ecosystem: npm
     directory: "/web"
+    target-branch: dev
     schedule:
       interval: weekly
