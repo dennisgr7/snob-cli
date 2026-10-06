@@ -120,6 +120,30 @@ const MODE_AGAIN: Duration = Duration::from_secs(30);
 /// browser holds.
 const PROFILE_RETRY: Duration = Duration::from_secs(5);
 
+/// How long the owner keeps starting a browser on a profile the one before it
+/// has not let go of yet.
+///
+/// The browser closed for the last command, the owner's own or one a previous
+/// owner closed, has let go of the profile by the time its close returns, as a
+/// rule. On a loaded machine its last helpers can outlast that by moments, and
+/// the next browser then finds the profile held and leaves, which failed the
+/// command for a browser that was already on its way out. Measured on Windows
+/// under load, once in some sixty starts. Ten seconds is many times what such a
+/// browser takes to finish leaving, and short beside the patience a command
+/// gives the owner (`owner::ALLOWANCE`). Past it, what holds the profile is
+/// another snob in the middle of a run, and the command is told so.
+///
+/// The owner does not wait out a whole run, as a process with no owner does
+/// ([`PROFILE_RETRY`]): a command's patience with it is bounded, and the owner
+/// has nobody to say "waiting" to.
+const PROFILE_LETTING_GO: Duration = Duration::from_secs(10);
+
+/// The shortest and the longest pause between those starts. The first comes
+/// soon, since a browser on its way out is usually gone in a fraction of a
+/// second; they double from there.
+const LETTING_GO_PAUSES: (Duration, Duration) =
+    (Duration::from_millis(250), Duration::from_secs(1));
+
 /// How long a call waits for the app's own calls on the tab's document to
 /// carry what it copies from them, which they do as the document boots:
 /// the app sends its first ones within a second or two of the load. Past
@@ -235,6 +259,18 @@ fn forced_mode() -> Option<crate::power::qos::Mode> {
         "normal" => Some(crate::power::qos::Mode::Normal),
         _ => None,
     }
+}
+
+/// How long the owner pauses before starting a browser again on a profile
+/// still held, having waited `waited` already: the shortest pause, doubling
+/// up to the longest, and `None` once the next would go past
+/// [`PROFILE_LETTING_GO`]. Never again after a browser that handed over:
+/// what holds the profile took its command line, and each start would open
+/// another tab in it.
+fn letting_go(handed_over: bool, waited: Duration) -> Option<Duration> {
+    let (shortest, longest) = LETTING_GO_PAUSES;
+    let pause = waited.clamp(shortest, longest);
+    (!handed_over && waited + pause <= PROFILE_LETTING_GO).then_some(pause)
 }
 
 /// What `mutex` guards, whether or not a thread panicked holding it: every
@@ -1010,16 +1046,30 @@ impl Headless {
 
     /// Starts the browser, in a process with no owner once no other snob's
     /// holds the profile: looked at again every [`PROFILE_RETRY`], until
-    /// Ctrl+C. Said once per wait.
+    /// Ctrl+C. Said once per wait. In the owner, once the browser before it
+    /// has let go of the profile, for up to [`PROFILE_LETTING_GO`].
     async fn start_when_free(&self, session: &Session, account: &Account) -> Result<Live> {
         let mut told = false;
+        let mut waited = Duration::ZERO;
         loop {
             let error = match self.start(session, account).await {
-                Err(e) if self.waits.load(Ordering::SeqCst) => e,
+                Err(e) => e,
                 started => return started,
             };
-            if error.downcast_ref::<crate::cdp::ProfileInUse>().is_none() {
+            let Some(in_use) = error.downcast_ref::<crate::cdp::ProfileInUse>() else {
                 return Err(error);
+            };
+            if !self.waits.load(Ordering::SeqCst) {
+                let Some(pause) = letting_go(in_use.handed_over(), waited) else {
+                    return Err(error);
+                };
+                tracing::debug!(
+                    waited_ms = waited.as_millis(),
+                    "the profile is still held; starting the browser again shortly"
+                );
+                tokio::time::sleep(pause).await;
+                waited += pause;
+                continue;
             }
             if !told {
                 crate::ui::info(&format!(
@@ -4172,6 +4222,29 @@ mod tests {
         assert!(!on(Some("0")));
         assert!(!on(Some("")));
         assert!(!on(None));
+    }
+
+    /// The owner starts a browser again on a held profile soon, then less
+    /// often, and gives up past its patience; never after a browser that
+    /// handed over.
+    #[test]
+    fn a_profile_still_held_is_tried_again_for_a_while() {
+        let mut waited = Duration::ZERO;
+        let mut pauses = Vec::new();
+        while let Some(pause) = letting_go(false, waited) {
+            pauses.push(pause);
+            waited += pause;
+        }
+        let ms = |ms| Duration::from_millis(ms);
+        assert_eq!(pauses[..4], [ms(250), ms(250), ms(500), ms(1000)]);
+        assert!(pauses.iter().all(|p| *p <= LETTING_GO_PAUSES.1));
+        assert!(waited <= PROFILE_LETTING_GO);
+        assert!(
+            waited + LETTING_GO_PAUSES.1 > PROFILE_LETTING_GO,
+            "it waits out its patience: {waited:?}"
+        );
+
+        assert_eq!(letting_go(true, Duration::ZERO), None, "handed over");
     }
 
     /// A protocol URL pattern, matched as the browser matches it: `*` any
