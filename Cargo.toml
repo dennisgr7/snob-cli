@@ -255,7 +255,13 @@ zeroize = "1"
 # `Win32_System_Power` is what keeps the machine from sleeping on its own while
 # a walk sends requests (`snob_cli::power`): a power request, the documented
 # way to say so, which closing the lid or choosing Sleep still overrides.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Globalization", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+#
+# `Win32_UI_WindowsAndMessaging`, with `Win32_Graphics_Gdi` for the window
+# class's one brush field and `Win32_System_LibraryLoader` for the module
+# handle it is registered under, are the owner's window that hears the end of
+# the session (`snob_cli::owner::end_of_session`): a process with no console
+# and no window is told nothing when Windows signs out or shuts down.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Security_Cryptography", "Win32_Globalization", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_WindowsAndMessaging"] }
 
 # Test-only
 wiremock = "0.6"
