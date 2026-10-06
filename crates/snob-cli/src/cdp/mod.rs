@@ -94,7 +94,21 @@ pub struct Launched {
 /// Starts the browser against one of our own profiles with debugging
 /// enabled, in a window, on the login page.
 pub fn launch(browser: &Browser, profile: &Path) -> Result<Launched> {
-    launch_in(browser, profile, &[], LOGIN_URL, false)
+    // Chrome warns, in a bar across the top of the window, that
+    // `--disable-blink-features` (below) is an unsupported flag that "affects
+    // stability and security", which is not true of how snob uses it and reads
+    // to the person logging in as though something were wrong. `--test-type`
+    // is what skips that bar; ChromeDriver passes it for the same reason.
+    // Measured in October 2026 on Chrome 154: the bar is gone, and the page
+    // sees the same `navigator.webdriver`, User-Agent, plugins and
+    // `window.chrome` with or without it. Only the window has a bar to hide.
+    launch_in(
+        browser,
+        profile,
+        &["--test-type".to_string()],
+        LOGIN_URL,
+        false,
+    )
 }
 
 /// Starts the same browser on a profile with no window, for snob to send its
