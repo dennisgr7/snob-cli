@@ -25,9 +25,9 @@
 //!   places work by energy (ARM, and recent Intel parts without
 //!   hyper-threading). **Not `nice`**: an unprivileged process can raise its
 //!   niceness and never lower it again, and the browser has to come back.
-//! - **macOS**: the background policy (`PRIO_DARWIN_BG`) on every process of
-//!   the browser's group, which runs it on the efficiency cores only; and back.
-//!   What `taskpolicy -b -p` does.
+//! - **macOS**: nothing yet. The background policy, the one a running process
+//!   can be put under, throttles disk and network too, and left a browser
+//!   unable to answer in time (see `macos::in_group`).
 //!
 //! **Whatever the system refuses is left alone**, and logged: the browser is
 //! then as it was before any of this existed.
@@ -320,54 +320,23 @@ mod linux {
 mod macos {
     use super::Mode;
 
-    // From `<sys/resource.h>`; the `libc` crate does not bind them.
-    const PRIO_DARWIN_PROCESS: libc::c_int = 4;
-    const PRIO_DARWIN_BG: libc::c_int = 0x1000;
+    /// Left as it is, on macOS.
+    ///
+    /// The one policy a running process can be put under from outside is the
+    /// background one (`PRIO_DARWIN_BG`, what `taskpolicy -b -p` sets), and it
+    /// is not a lower gear: it throttles the process's disk and network as
+    /// well as its processor. Measured on the macOS CI runner, a browser
+    /// started under it stopped answering the debugging protocol within the
+    /// twenty seconds a command is given, before it had loaded a page. The
+    /// level that would fit, a utility clamp, can only be set as a process is
+    /// spawned (`posix_spawnattr_set_qos_class_np`), which `std` does not
+    /// offer; until the browser is started that way, the browser runs as any
+    /// program does.
+    pub(crate) fn in_group(_group: i32, _mode: Mode) {}
 
-    /// Every process of the process group `group`, the browser's own
-    /// (`pipe::spawn`).
-    pub(crate) fn in_group(group: i32, mode: Mode) {
-        for pid in members(group) {
-            set(pid, mode);
-        }
-    }
-
-    /// This process: left as it is. The background policy also throttles
-    /// a process's disk and network, and the owner's work is the sockets the
-    /// commands and the browsers reach it on and the log; what it would save
-    /// is next to nothing, since all it does is pass messages.
+    /// This process: left as it is, for the same reason, and because all the
+    /// owner does is pass messages.
     pub(crate) fn own(_mode: Mode) {}
-
-    /// The processes of `group`: `pgrep -g`, which asks the kernel's process
-    /// table the way `ps` does, rather than binding `sysctl` here for it.
-    fn members(group: i32) -> Vec<i32> {
-        let Ok(out) = std::process::Command::new("/usr/bin/pgrep")
-            .arg("-g")
-            .arg(group.to_string())
-            .output()
-        else {
-            return vec![group];
-        };
-        let mut pids: Vec<i32> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|line| line.trim().parse().ok())
-            .collect();
-        if !pids.contains(&group) {
-            pids.push(group);
-        }
-        pids
-    }
-
-    fn set(pid: i32, mode: Mode) {
-        let priority = if mode == Mode::Eco { PRIO_DARWIN_BG } else { 0 };
-        let Ok(who) = libc::id_t::try_from(pid) else {
-            return;
-        };
-        // SAFETY: a plain system call on a process id; nothing is borrowed.
-        if unsafe { libc::setpriority(PRIO_DARWIN_PROCESS, who, priority) } != 0 {
-            tracing::debug!(pid, error = %std::io::Error::last_os_error(), ?mode, "could not set a process's background policy");
-        }
-    }
 }
 
 #[cfg(test)]
