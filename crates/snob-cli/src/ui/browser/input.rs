@@ -91,6 +91,13 @@ pub fn focused() -> bool {
     FOCUSED.load(Ordering::Relaxed)
 }
 
+/// Forgets what the terminal last said about its focus, when its reports are
+/// turned off: taken as focused again, which is what a command in a terminal
+/// is until the next view hears otherwise.
+pub fn focus_unknown() {
+    FOCUSED.store(true, Ordering::Relaxed);
+}
+
 /// How long a view waits for something to happen before going round again:
 /// [`TICK`] while it is being looked at, [`UNFOCUSED_TICK`] while not.
 pub fn tick() -> Duration {
@@ -165,12 +172,16 @@ pub fn read(timeout: Duration) -> std::io::Result<Raw> {
         Event::Resize(..) => Raw::Resized,
         // Read as a resize, which every view answers by drawing: what changed
         // while nobody looked is put on screen as they come back.
+        // And the browsers this view reads through run at the normal pace
+        // while somebody looks at it, efficiently while not (`power::qos`).
         Event::FocusGained => {
             FOCUSED.store(true, Ordering::Relaxed);
+            crate::owner::attended(true);
             Raw::Resized
         }
         Event::FocusLost => {
             FOCUSED.store(false, Ordering::Relaxed);
+            crate::owner::attended(false);
             Raw::Tick
         }
         Event::Paste(text) => Raw::Paste(text),

@@ -112,6 +112,10 @@ const COMMAND_TIMEOUT: Duration = crate::cdp::CALL_TIMEOUT;
 /// start. A few minutes, since memory is what a browser costs.
 pub(crate) const IDLE: Duration = Duration::from_secs(5 * 60);
 
+/// How often an efficient browser's processes are looked at again for the
+/// helpers it started since (`Headless::keep_mode`).
+const MODE_AGAIN: Duration = Duration::from_secs(30);
+
 /// How often a process with no owner looks again at a profile another snob's
 /// browser holds.
 const PROFILE_RETRY: Duration = Duration::from_secs(5);
@@ -185,6 +189,9 @@ pub(crate) fn alone(paths: &AppPaths) -> Arc<Headless> {
     static REAPING: std::sync::Once = std::sync::Once::new();
     let headless = local(paths);
     headless.waits.store(true, Ordering::SeqCst);
+    headless
+        .attended_otherwise
+        .store(crate::owner::is_attended(), Ordering::SeqCst);
     REAPING.call_once(|| {
         let reaped = Arc::clone(&headless);
         tokio::spawn(async move {
@@ -197,6 +204,37 @@ pub(crate) fn alone(paths: &AppPaths) -> Arc<Headless> {
         });
     });
     headless
+}
+
+/// Whether anybody waits on the browsers this process runs itself, when it
+/// runs them without an owner: the command's own answer
+/// (`owner::attended`), applied to each now if it is not busy.
+pub(crate) fn attended_here(attended: bool) {
+    let Some(headless) = HEADLESS.get() else {
+        return;
+    };
+    headless
+        .attended_otherwise
+        .store(attended, Ordering::SeqCst);
+    for (pk, account) in headless.every_account() {
+        if let Ok(mut slot) = account.live.try_lock()
+            && let Some(live) = slot.as_mut()
+        {
+            headless.keep_mode(pk, live);
+        }
+    }
+}
+
+/// A mode forced from the environment, `SNOB_TEST_QOS=eco` or `normal`, for
+/// the measurement in `tests/headless.rs` that compares the two. In the
+/// `testing` build only.
+#[cfg(feature = "testing")]
+fn forced_mode() -> Option<crate::power::qos::Mode> {
+    match std::env::var("SNOB_TEST_QOS").ok()?.as_str() {
+        "eco" => Some(crate::power::qos::Mode::Eco),
+        "normal" => Some(crate::power::qos::Mode::Normal),
+        _ => None,
+    }
 }
 
 /// What `mutex` guards, whether or not a thread panicked holding it: every
@@ -252,6 +290,14 @@ pub(crate) struct Headless {
     /// open. `notify_one`, so a start that comes between the reaper looking
     /// and the reaper waiting is kept for it rather than lost.
     started: tokio::sync::Notify,
+    /// Per account, whether anybody waits on its browser, as the owner works
+    /// it out from the commands connected ([`Headless::attend`]).
+    attended: std::sync::Mutex<HashMap<Pk, bool>>,
+    /// The same for an account the owner has said nothing about: `false` in
+    /// the owner, whose browsers nobody waits on until a command says so; the
+    /// command's own answer in a process that runs its browsers itself
+    /// ([`attended_here`]).
+    attended_otherwise: AtomicBool,
 }
 
 /// One account's browser, while it has one.
@@ -342,6 +388,9 @@ struct Live {
     /// the path it was asked for: the only one a write may be built on
     /// ([`Live::build`]).
     asked_document: Option<(String, String)>,
+    /// What it was last moved to (`power::qos`), and when; `None` until it
+    /// has been. See [`Headless::keep_mode`].
+    mode: Option<(crate::power::qos::Mode, std::time::Instant)>,
 }
 
 impl Live {
@@ -608,6 +657,8 @@ impl Headless {
             heard: tokio::sync::broadcast::Sender::new(16),
             waits: AtomicBool::new(false),
             started: tokio::sync::Notify::new(),
+            attended: std::sync::Mutex::new(HashMap::new()),
+            attended_otherwise: AtomicBool::new(false),
         }
     }
 
@@ -620,6 +671,51 @@ impl Headless {
             .iter()
             .map(|(pk, account)| (*pk, Arc::clone(account)))
             .collect()
+    }
+
+    /// Whether anybody waits on the account's browser: the owner's answer,
+    /// worked out from the commands connected, and taken now if the browser
+    /// is not busy, or after its request otherwise.
+    pub(crate) fn attend(&self, pk: Pk, attended: bool) {
+        lock(&self.attended).insert(pk, attended);
+        let account = self.account(pk);
+        if let Ok(mut slot) = account.live.try_lock()
+            && let Some(live) = slot.as_mut()
+        {
+            self.keep_mode(pk, live);
+        }
+    }
+
+    /// What the account's browser runs as now (`power::qos`).
+    pub(crate) fn mode_of(&self, pk: Pk) -> crate::power::qos::Mode {
+        #[cfg(feature = "testing")]
+        if let Some(forced) = forced_mode() {
+            return forced;
+        }
+        let attended = lock(&self.attended)
+            .get(&pk)
+            .copied()
+            .unwrap_or_else(|| self.attended_otherwise.load(Ordering::SeqCst));
+        crate::power::qos::Mode::for_attention(attended)
+    }
+
+    /// Moves `live` to the mode the account calls for, when it is not in it
+    /// already, and once in a while while it is efficient: the browser starts
+    /// a helper for each page it opens, and a helper started since the last
+    /// time is not efficient until it is moved too. After every request, so
+    /// at most every [`MODE_AGAIN`].
+    fn keep_mode(&self, pk: Pk, live: &mut Live) {
+        let wanted = self.mode_of(pk);
+        let due = match live.mode {
+            None => true,
+            Some((mode, _)) if mode != wanted => true,
+            Some((mode, at)) => mode == crate::power::qos::Mode::Eco && at.elapsed() >= MODE_AGAIN,
+        };
+        if due {
+            tracing::debug!(account = %pk, mode = ?wanted, "the browser's processor mode");
+            live.cdp.set_mode(wanted);
+            live.mode = Some((wanted, std::time::Instant::now()));
+        }
     }
 
     /// Every push-back heard from now on, with its account.
@@ -786,6 +882,9 @@ impl Headless {
                 account.touch();
                 *slot = Some(started);
                 self.started.notify_one();
+                if let Some(live) = slot.as_mut() {
+                    self.keep_mode(session.ds_user_id, live);
+                }
             }
             let live = slot.as_mut().expect("a browser was started above");
             let ready = self.ready(live, session, origin).await;
@@ -813,6 +912,9 @@ impl Headless {
             Err(e) => Err(e),
         };
         account.touch();
+        if let Some(live) = slot.as_mut() {
+            self.keep_mode(session.ds_user_id, live);
+        }
         if let Err(PageError::Browser(_)) = &result {
             // A browser that failed once is not trusted with the next request:
             // it may be gone. The next request starts a fresh one. Only then —
@@ -1167,6 +1269,7 @@ impl Headless {
             account: account_paths,
             token_named: None,
             asked_document: None,
+            mode: None,
         })
     }
 }

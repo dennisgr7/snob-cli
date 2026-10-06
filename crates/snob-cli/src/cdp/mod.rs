@@ -468,6 +468,14 @@ impl Cdp {
 
     /// The browser's process id.
     ///
+    /// Moves the browser and its helpers to `mode` (`power::qos`).
+    pub(crate) fn set_mode(&self, mode: crate::power::qos::Mode) {
+        self.process
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_mode(mode);
+    }
+
     /// Only so the tests can ask the operating system about that process.
     /// Nothing in the program needs it.
     pub fn browser_pid(&self) -> u32 {
