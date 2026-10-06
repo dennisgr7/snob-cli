@@ -2468,33 +2468,43 @@ async fn serve_the_fake_world() {
 /// as nothing uses it. What decides is the efficient run's slowest loads
 /// against `APP_CALLS_PATIENCE`, eight seconds: past half of it, a document
 /// should be loaded at the normal pace and only the rest efficiently.
+///
+/// **Every load in a sandbox of its own**, signed in afresh and outside the
+/// clock. In one sandbox the pace bucket (`rate_budget.rs`) has spent its
+/// burst by the third command, and from then on spaces each request four
+/// seconds from the last: every run takes over half a minute, and the numbers
+/// are the pacer's, not the page's. The two modes take turns, so whatever the
+/// machine does meanwhile falls on both.
 #[tokio::test]
 #[ignore = "a measurement of this machine, run by hand"]
 async fn a_page_load_efficient_against_normal() {
     const RUNS: usize = 10;
+    const MODES: [&str; 2] = ["normal", "eco"];
 
     let Some(_alone) = a_browser_alone().await else {
         return;
     };
-    let tmp = tempfile::tempdir().unwrap();
     let (_, instagram) = fake_instagram().await;
-    logged_in(tmp.path(), &instagram, SESSIONID, "the login failed: ");
 
-    for mode in ["normal", "eco", "normal", "eco"] {
-        let mut took: Vec<std::time::Duration> = (0..RUNS)
-            .map(|_| {
-                let started = std::time::Instant::now();
-                let out = snob_with(
-                    tmp.path(),
-                    &instagram,
-                    &["profile", "someone", "--format", "json"],
-                    None,
-                    &[("SNOB_TEST_QOS", mode)],
-                );
-                assert!(out.status.success(), "{}", told(tmp.path(), &out));
-                started.elapsed()
-            })
-            .collect();
+    let mut times: [Vec<std::time::Duration>; MODES.len()] = Default::default();
+    for _ in 0..RUNS {
+        for (mode, took) in MODES.iter().zip(&mut times) {
+            let tmp = tempfile::tempdir().unwrap();
+            logged_in(tmp.path(), &instagram, SESSIONID, "the login failed: ");
+            let started = std::time::Instant::now();
+            let out = snob_with(
+                tmp.path(),
+                &instagram,
+                &["profile", "someone", "--format", "json"],
+                None,
+                &[("SNOB_TEST_QOS", mode)],
+            );
+            assert!(out.status.success(), "{}", told(tmp.path(), &out));
+            took.push(started.elapsed());
+        }
+    }
+
+    for (mode, mut took) in MODES.into_iter().zip(times) {
         took.sort();
         let at = |share: usize| took[(took.len() * share / 100).min(took.len() - 1)];
         println!(
