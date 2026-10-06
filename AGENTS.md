@@ -333,6 +333,9 @@ rules above (English, US spelling; `language.rs` reads its `.md`, `.json` and
 - **`pnpm brand`** redraws `og.png` and the icons in `web/public/` with
   Playwright's Chromium and the built Plex files (build first); the images are
   committed. Run it when the mark, the headline or the domain changes.
+- **`web/public/googledbdae8cd579cba2e.html` proves ownership to Google Search
+  Console** (the `https://snob.dennisgr7.dev/` property). Google checks it again
+  from time to time: deleting or renaming it loses the property.
 - No client JavaScript unless a feature cannot work without it. Tailwind v4 runs
   as a Vite plugin with its entry in `web/src/styles/global.css`; there is no
   `tailwind.config.js`. TypeScript strict, `@/` is `web/src/`.
