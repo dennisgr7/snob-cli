@@ -1,12 +1,15 @@
 name: Claude Code
 
 # "@claude" in a comment, a review or an issue starts Claude on this
-# repository, for work on dev and nothing else:
+# repository:
 #
-# - on a pull request, only one into dev; the release pull request into main
-#   is never worked on;
+# - on a pull request, any pull request, whatever branch it goes into; the
+#   action works on the pull request's own branch;
 # - on an issue, the branch it makes starts from dev and its pull request goes
 #   into dev (`base_branch`).
+#
+# The review of every pull request into main, and of one labelled
+# `claude-review`, is claude-code-review.yml, not this.
 #
 # Who may ask is the action's check: somebody with write access to the
 # repository. Bots and users without it are refused by default.
@@ -32,53 +35,12 @@ permissions:
   contents: read
 
 jobs:
-  # Which branch a comment on a pull request is about is not in the event, so
-  # it is asked; a review or a review comment carries it. An issue, or a
-  # comment on one, is work that starts from dev.
-  target:
+  claude:
     if: |
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: read
-    outputs:
-      dev: ${{ steps.base.outputs.dev }}
-    steps:
-      - name: The branch the work is for
-        id: base
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          EVENT: ${{ github.event_name }}
-          PR_BASE: ${{ github.event.pull_request.base.ref }}
-          ON_A_PR: ${{ github.event.issue.pull_request && 'true' || 'false' }}
-          NUMBER: ${{ github.event.issue.number }}
-        run: |
-          case "$EVENT" in
-            pull_request_review|pull_request_review_comment)
-              base="$PR_BASE" ;;
-            issue_comment)
-              if [ "$ON_A_PR" = true ]; then
-                base=$(gh api "repos/$REPO/pulls/$NUMBER" --jq .base.ref)
-              else
-                base=dev
-              fi ;;
-            *)
-              base=dev ;;
-          esac
-          echo "base: $base"
-          if [ "$base" = dev ]; then
-            echo "dev=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "dev=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  claude:
-    needs: target
-    if: needs.target.outputs.dev == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
