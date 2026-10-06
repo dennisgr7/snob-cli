@@ -109,6 +109,11 @@ pub async fn fetch(
     let walker = ListWalker::new(client)
         .with_pace(pace)
         .with_heartbeat(&still_wanted);
+    // The machine is kept from sleeping on its own while the walk reads, and
+    // let go while it waits for the day's accounts (`power::KeepAwake`). A
+    // walk against a test server sleeps through nothing and asks for nothing.
+    let mut awake =
+        crate::power::KeepAwake::new("snob is reading an Instagram list", client.is_live());
 
     let summary = match walker
         .walk(
@@ -120,7 +125,10 @@ pub async fn fetch(
                         .added,
                 )
             },
-            |event| progress.event(&event),
+            |event| {
+                awake.follow(&event);
+                progress.event(&event);
+            },
         )
         .await
     {

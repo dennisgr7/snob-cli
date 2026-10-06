@@ -19,7 +19,7 @@ use crate::page_values::Viewer;
 use crate::web::{Ask, Told};
 
 use super::IgClient;
-use super::ask::profile_path;
+use super::ask::{answered, profile_path, told_otherwise};
 use super::headers::Surface;
 
 /// Which side of the relationship is being requested.
@@ -460,6 +460,36 @@ impl IgClient {
             format!("/{username}/")
         };
         self.navigation(&route).await
+    }
+
+    /// What the app does when the machine wakes under it: the tab loads the
+    /// profile whose list is being read again, so the page the next requests
+    /// are built from is not the one from before the sleep.
+    ///
+    /// One paid read, the same document a write is made from
+    /// (`write_from_the_page`), answered with its status and bundles and never
+    /// its HTML. From the browser only; without one there is no page to
+    /// refresh. A name that cannot be a profile's loads the home page, which
+    /// the app also starts from.
+    pub async fn reload(&self, username: &str) -> Result<(), IgError> {
+        if !self.has_page() {
+            return Ok(());
+        }
+        let path = if crate::allowlist::profile_name(username) {
+            profile_path(username)
+        } else {
+            "/".to_string()
+        };
+        let ask = Ask::Document { path };
+        let endpoint = ask.endpoint();
+        let Told::Document { answer, .. } = self.ask_page(ask, "").await? else {
+            return Err(told_otherwise("a document"));
+        };
+        let answer = answered(&endpoint, answer);
+        if !answer.is_success() {
+            return Err(self.refuse(&answer));
+        }
+        Ok(())
     }
 
     /// Charges the day's accounts for what a list page carried.
