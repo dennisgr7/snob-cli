@@ -230,11 +230,24 @@ const PROFILE_IN_USE: i32 = 21;
 /// another snob's, which a caller may wait out. Says what [`died_early`] or
 /// [`windowless_died_early`] says.
 #[derive(Debug)]
-pub struct ProfileInUse(String);
+pub struct ProfileInUse {
+    said: String,
+    /// It exited 0: it handed its command line to a browser that has the
+    /// profile open and took it, rather than finding nobody to hand it to.
+    handed_over: bool,
+}
+
+impl ProfileInUse {
+    /// Whether the browser holding the profile took this one's command line,
+    /// and opened what it asked for: starting again would open it again.
+    pub fn handed_over(&self) -> bool {
+        self.handed_over
+    }
+}
 
 impl std::fmt::Display for ProfileInUse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.said)
     }
 }
 
@@ -403,14 +416,26 @@ impl Cdp {
             died_early(ended.code, &self.profile)
         };
         Some(match ended.code {
-            Some(0 | PROFILE_IN_USE) => ProfileInUse(said).into(),
+            Some(code @ (0 | PROFILE_IN_USE)) => ProfileInUse {
+                said,
+                handed_over: code == 0,
+            }
+            .into(),
             _ => anyhow!(said),
         })
     }
 
     /// Closes the browser politely, so the profile is not left looking like it
     /// crashed and offering to restore tabs on the next login.
+    ///
+    /// **At the normal pace, whatever it ran as** (`power::qos`). Closing is
+    /// where the browser writes what it holds to the profile, cookies
+    /// Instagram just rotated among them, and lets go of the profile, and the
+    /// next command waits for exactly that. Left efficient, that work runs on
+    /// the slowest cores at the lowest clock, and on a loaded machine outlasts
+    /// the close.
     pub async fn close(self) {
+        self.set_mode(crate::power::qos::Mode::Normal);
         // `call` carries its own timeout, so a browser that has stopped
         // answering delays the exit rather than preventing it.
         let _ = self
@@ -466,8 +491,6 @@ impl Cdp {
         anyhow::Error::new(error)
     }
 
-    /// The browser's process id.
-    ///
     /// Moves the browser and its helpers to `mode` (`power::qos`).
     pub(crate) fn set_mode(&self, mode: crate::power::qos::Mode) {
         self.process
@@ -476,6 +499,8 @@ impl Cdp {
             .set_mode(mode);
     }
 
+    /// The browser's process id.
+    ///
     /// Only so the tests can ask the operating system about that process.
     /// Nothing in the program needs it.
     pub fn browser_pid(&self) -> u32 {
