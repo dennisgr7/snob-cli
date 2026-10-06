@@ -246,6 +246,10 @@ pub struct ListWalker<'a> {
     pace: Pace,
     sleeps: bool,
     heartbeat: Option<Heartbeat<'a>>,
+    /// The wall clock the day's wait is measured against: always
+    /// [`snob_core::clock::now_ms`] outside the tests, which put a clock that
+    /// jumps here to stand in for a machine that slept.
+    wall: fn() -> EpochMs,
 }
 
 impl<'a> ListWalker<'a> {
@@ -262,6 +266,7 @@ impl<'a> ListWalker<'a> {
             pace: Pace::default(),
             sleeps: client.is_live(),
             heartbeat: None,
+            wall: snob_core::clock::now_ms,
         }
     }
 
@@ -494,6 +499,19 @@ impl<'a> ListWalker<'a> {
     ///
     /// `true` when the sleep was cut short: the person asked to stop, or the
     /// heartbeat said the walk is no longer wanted.
+    ///
+    /// **The wait ends at a moment on the wall clock, not after an amount of
+    /// sleeping.** The day's budget is kept in wall-clock time, and the timers
+    /// a sleep runs on are not: on Linux and macOS they stand still while the
+    /// machine is suspended, and on Windows a relative wait does not count a
+    /// low-power state either. Counted in sleeps, a laptop shut for the night
+    /// halfway through a six-hour wait would wake to six more hours of it,
+    /// for room the day made long ago. Each heartbeat looks at the wall clock
+    /// again, so the wait is over at the first one after the moment passed.
+    ///
+    /// The sleeping is still counted, as the other bound: a wall clock set
+    /// back by hand would otherwise move the moment away, and the wait is
+    /// never longer than the budget asked for.
     async fn sleep_through_the_day<O: FnMut(Event)>(
         &self,
         wait: Duration,
@@ -503,9 +521,19 @@ impl<'a> ListWalker<'a> {
             kind: WaitKind::Day,
             duration: wait,
         });
-        let mut left = wait;
-        while !left.is_zero() {
-            let step = left.min(HEARTBEAT);
+        let until = (self.wall)() + wait;
+        let mut slept = Duration::ZERO;
+        while slept < wait {
+            let on_the_wall = until - (self.wall)();
+            let Ok(on_the_wall) = u64::try_from(on_the_wall) else {
+                break;
+            };
+            if on_the_wall == 0 {
+                break;
+            }
+            let step = Duration::from_millis(on_the_wall)
+                .min(wait - slept)
+                .min(HEARTBEAT);
             if self.cancel().sleep_or_cancel(step).await {
                 return Ok(true);
             }
@@ -514,7 +542,7 @@ impl<'a> ListWalker<'a> {
             {
                 return Ok(true);
             }
-            left -= step;
+            slept += step;
         }
         Ok(false)
     }
@@ -1734,6 +1762,69 @@ mod tests {
             );
             Ok(())
         }
+    }
+
+    /// A wall clock that reads its starting moment once, then two hours
+    /// later: the machine slept through the day's wait.
+    fn slept_through() -> EpochMs {
+        static READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let start = 1_700_000_000_000;
+        if READ.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            EpochMs::new(start + 2 * 3_600_000)
+        } else {
+            EpochMs::new(start)
+        }
+    }
+
+    /// A wall clock somebody set an hour back once the wait had started.
+    fn set_back() -> EpochMs {
+        static READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let start = 1_700_000_000_000;
+        if READ.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            EpochMs::new(start - 3_600_000)
+        } else {
+            EpochMs::new(start)
+        }
+    }
+
+    /// A day's wait the machine slept through is over when it wakes: the
+    /// budget's day is on the wall clock, and so is the end of the wait.
+    #[tokio::test]
+    async fn a_day_wait_slept_through_is_over_on_waking() {
+        let server = MockServer::start().await;
+        let client = client_with(&server, Pacer::new(Day::new(0, 0)));
+        let mut walker = ListWalker::new(&client);
+        walker.wall = slept_through;
+
+        let started = std::time::Instant::now();
+        let mut events = Vec::new();
+        let cut_short = walker
+            .sleep_through_the_day(Duration::from_secs(3_600), &mut |e| events.push(e))
+            .await
+            .unwrap();
+
+        assert!(!cut_short);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(days_waited(&events), 1, "the wait is still announced");
+    }
+
+    /// A wall clock set back does not stretch the wait past what the budget
+    /// asked for.
+    #[tokio::test]
+    async fn a_clock_set_back_does_not_stretch_a_day_wait() {
+        let server = MockServer::start().await;
+        let client = client_with(&server, Pacer::new(Day::new(0, 0)));
+        let mut walker = ListWalker::new(&client);
+        walker.wall = set_back;
+
+        let started = std::time::Instant::now();
+        let cut_short = walker
+            .sleep_through_the_day(Duration::from_millis(50), &mut |_| {})
+            .await
+            .unwrap();
+
+        assert!(!cut_short);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     fn zero_pace() -> Pace {

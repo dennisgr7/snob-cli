@@ -116,7 +116,17 @@ pub enum Raw {
 }
 
 /// Waits up to `timeout` for something to happen, and hands it over unbound.
+///
+/// **A stop the system asked for arrives as a Ctrl+C.** Raw mode keeps the
+/// signal from being one, and the browsers decide about the key, so a
+/// `SIGTERM` or a closing console would cancel the token and leave an idle
+/// browser waiting for a key nobody will press. Every browser reads through
+/// here, between keys and while a fetch runs (`watching_cancel_keys`), so each
+/// one leaves by the road it already has for Ctrl+C.
 pub fn read(timeout: Duration) -> std::io::Result<Raw> {
+    if crate::interrupt::asked_by_the_system() {
+        return Ok(Raw::Key(system_stop()));
+    }
     if !event::poll(timeout)? {
         return Ok(Raw::Tick);
     }
@@ -129,6 +139,11 @@ pub fn read(timeout: Duration) -> std::io::Result<Raw> {
         Event::Key(key) if key.kind == KeyEventKind::Press => Raw::Key(key),
         _ => Raw::Tick,
     })
+}
+
+/// The key a stop the system asked for is read as. See [`read`].
+fn system_stop() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
 }
 
 /// Waits up to `timeout` for a key, and binds it.
@@ -347,6 +362,13 @@ mod tests {
             action_of(key(KeyCode::Char('q'), KeyModifiers::ALT)),
             Action::None
         );
+    }
+
+    /// A stop the system asked for is read as the key every browser already
+    /// leaves on.
+    #[test]
+    fn a_stop_the_system_asked_for_reads_as_ctrl_c() {
+        assert_eq!(action_of(system_stop()), Action::Interrupt);
     }
 
     #[test]

@@ -26,9 +26,10 @@ use snob_ig::pager::{Event, WaitKind};
 /// The moment the wait being drawn right now ends, if one is under way.
 ///
 /// Shared with the style, which reads it on every redraw. That sharing is the
-/// whole trick behind the countdown: the bar already ticks several times a
-/// second to animate itself, and this gives it something new to say each time
-/// rather than the same frozen number.
+/// whole trick behind the countdown: the bar ticks to animate itself, and this
+/// gives it something new to say each time rather than the same frozen number.
+/// While it is set the bar ticks at [`WAITING_TICK`], since a countdown in
+/// whole seconds has nothing new to say any faster.
 type Deadline = Arc<Mutex<Option<Instant>>>;
 
 /// Cloning shares the same stack rather than making a second one: the pacer
@@ -51,14 +52,30 @@ pub struct Progress {
     done: Arc<Mutex<Vec<ProgressBar>>>,
     quiet: bool,
     waiting_until: Deadline,
+    /// How often the current bar's ticker runs, or `None` while it has none:
+    /// a fresh bar before [`Progress::animate`], a frozen or finished one
+    /// after. Kept so a wait starting or ending changes the rate of a bar that
+    /// is drawing, and never starts one that is not.
+    ticking: Arc<Mutex<Option<Duration>>>,
     /// Whether this terminal can draw block and braille characters. Worked out
     /// once: it cannot change while the process runs, and it is read on every
     /// style rebuild.
     rich: bool,
 }
 
-/// How often a bar redraws itself. It is also how often the countdown moves.
+/// How often a bar redraws itself while pages are arriving: what the spinner
+/// turns at.
 const TICK: Duration = Duration::from_millis(120);
+
+/// How often a bar redraws itself while a wait is counted down.
+///
+/// The countdown moves in whole seconds, so a faster tick redraws the same
+/// number. And the waits are where a walk spends its life: a sitting's rest is
+/// five to fifteen minutes and a day's wait can be hours, during which
+/// [`TICK`] wakes the process thirty thousand times an hour to say nothing new.
+/// At one second it is three thousand six hundred. The spinner turns slower
+/// while it waits, which is also what it is saying.
+const WAITING_TICK: Duration = Duration::from_secs(1);
 
 impl Progress {
     pub fn new(enabled: bool) -> Self {
@@ -84,6 +101,7 @@ impl Progress {
             done: Arc::new(Mutex::new(Vec::new())),
             quiet,
             waiting_until,
+            ticking: Arc::new(Mutex::new(None)),
             rich,
         };
         *progress.lock() = progress.fresh();
@@ -140,13 +158,31 @@ impl Progress {
     /// finishes and `reset` does not bring it back.
     fn animate(&self) {
         if !self.quiet {
-            self.current().enable_steady_tick(TICK);
+            let rate = self.rate();
+            *self.ticking() = Some(rate);
+            self.current().enable_steady_tick(rate);
         }
+    }
+
+    /// The tick the bar should run at right now: slower while a wait is being
+    /// counted down. See [`WAITING_TICK`].
+    fn rate(&self) -> Duration {
+        let waiting = self
+            .waiting_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if waiting { WAITING_TICK } else { TICK }
+    }
+
+    fn ticking(&self) -> std::sync::MutexGuard<'_, Option<Duration>> {
+        self.ticking.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Swaps a frozen bar for a fresh one, leaving the frozen line on screen.
     fn renew_if_frozen(&self) {
         if self.frozen.swap(false, Ordering::Relaxed) {
+            *self.ticking() = None;
             *self.lock() = self.fresh();
         }
     }
@@ -178,8 +214,19 @@ impl Progress {
         }
     }
 
+    /// Starts or ends the countdown, and moves a bar that is drawing to the
+    /// rate that goes with it. `indicatif` replaces a ticker it is given again,
+    /// so the change is one call; it is made only when the rate changes,
+    /// because each call is a new ticker thread.
     fn set_deadline(&self, at: Option<Instant>) {
         *self.waiting_until.lock().unwrap_or_else(|e| e.into_inner()) = at;
+        let rate = self.rate();
+        let mut ticking = self.ticking();
+        if ticking.is_some_and(|now| now != rate) {
+            *ticking = Some(rate);
+            drop(ticking);
+            self.current().enable_steady_tick(rate);
+        }
     }
 
     /// Takes a walk event and reflects it.
@@ -309,6 +356,7 @@ impl Progress {
         // the length, which would draw a rate-limited walk as if it had
         // completed. The fraction is the news; it stays where it stopped.
         bar.abandon();
+        *self.ticking() = None;
         self.done
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -388,6 +436,7 @@ impl Progress {
         self.stack.clear().ok();
         // The removed bar cannot draw again; whoever needs one next gets a
         // fresh one, exactly as after a freeze.
+        *self.ticking() = None;
         self.frozen.store(true, Ordering::Relaxed);
     }
 }
@@ -691,6 +740,28 @@ mod tests {
         // The event that ends a pause: the next page arriving.
         p.event(&page(7, 350));
         assert_eq!(deadline_of(&p), None);
+    }
+
+    fn ticking_of(p: &Progress) -> Option<Duration> {
+        *p.ticking.lock().unwrap()
+    }
+
+    /// A bar that is drawing slows down for a countdown and speeds up again
+    /// when the page arrives; a bar that is not drawing is not started by
+    /// either.
+    #[test]
+    fn a_countdown_ticks_once_a_second_and_pages_tick_fast() {
+        let p = Progress::drawing();
+        p.waiting("resting", Duration::from_secs(10));
+        assert_eq!(ticking_of(&p), Some(WAITING_TICK));
+
+        p.event(&page(7, 350));
+        assert_eq!(ticking_of(&p), Some(TICK));
+
+        p.finish();
+        assert_eq!(ticking_of(&p), None);
+        p.set_deadline(Some(Instant::now() + Duration::from_secs(5)));
+        assert_eq!(ticking_of(&p), None, "a finished bar is not started again");
     }
 
     /// When the followers bar finishes, the following bar must not replace it:

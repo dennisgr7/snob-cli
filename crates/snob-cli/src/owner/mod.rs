@@ -234,7 +234,7 @@ impl Remote {
 
     /// This process's own browsers.
     fn here(&self) -> Arc<crate::headless::Headless> {
-        crate::headless::alone(&self.paths, Linger::for_people().tick)
+        crate::headless::alone(&self.paths)
     }
 
     /// Sends `request` as `session`: through the owner, or from this

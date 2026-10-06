@@ -41,7 +41,14 @@ pub struct Linger {
     /// Close a browser as soon as no connected command has used it, rather
     /// than keep it for the next.
     pub close_when_unused: bool,
-    /// How often the owner looks.
+    /// The longest the owner sleeps without looking.
+    ///
+    /// **Not how often it looks.** It wakes when something happens — a command
+    /// connecting or leaving, a push-back heard, a request to leave — and
+    /// otherwise when the first open browser would idle out
+    /// ([`crate::headless::Reaped::next`]); this only bounds the sleep, in case
+    /// something changes that tells nobody. A browser crashing is such a
+    /// thing, and was never noticed by looking either.
     pub tick: Duration,
 }
 
@@ -50,7 +57,9 @@ impl Linger {
     pub fn for_people() -> Self {
         Self {
             close_when_unused: false,
-            tick: Duration::from_secs(1),
+            // Once a second, it woke three hundred times over a browser's
+            // five idle minutes to find nothing to do on all but the last.
+            tick: Duration::from_secs(60),
         }
     }
 
@@ -75,6 +84,16 @@ const FIRST_COMMAND: Duration = Duration::from_secs(30);
 /// them.
 fn due(open: &Open, users: usize, linger: &Linger, retiring: bool) -> bool {
     open.idle >= IDLE || (users == 0 && (retiring || open.latched || linger.close_when_unused))
+}
+
+/// How long the loop sleeps before it looks again: until the first open
+/// browser would idle out, or the first command was due to have arrived,
+/// whichever comes first, and never longer than `cap`.
+fn nap(next: Option<Duration>, first_command_left: Option<Duration>, cap: Duration) -> Duration {
+    [next, first_command_left]
+        .into_iter()
+        .flatten()
+        .fold(cap, Duration::min)
 }
 
 /// What every connection shares with the loop that decides when to close.
@@ -147,6 +166,12 @@ pub(super) async fn run_on(
     let mut accepting = Some(tokio::spawn(accept(listener, accepted)));
     let started = Instant::now();
     let mut quit = std::pin::pin!(asked_to_quit());
+    // A push-back latches a browser, which then closes once no connected
+    // command uses it; hearing it is what wakes the loop to look. The sender
+    // lives in `engine`, which this holds, so the channel never closes under
+    // it and a closed one cannot spin the loop.
+    let mut hear = engine.hear();
+    let mut sleep = linger.tick;
     loop {
         tokio::select! {
             Some(stream) = arrivals.recv() => {
@@ -154,8 +179,9 @@ pub(super) async fn run_on(
                 state.reached.store(true, Ordering::SeqCst);
                 tokio::spawn(connection(stream, Arc::clone(&engine), Arc::clone(&state), linger));
             }
-            () = tokio::time::sleep(linger.tick) => {}
+            () = tokio::time::sleep(sleep) => {}
             () = state.changed.notified() => {}
+            _ = hear.recv() => {}
             () = &mut quit => break,
         }
         let retiring = state.retiring.load(Ordering::SeqCst);
@@ -166,14 +192,18 @@ pub(super) async fn run_on(
             // pipe's name lasts while any instance of it is open.
             accepting.abort();
         }
-        let open = engine
+        let reaped = engine
             .reap(|open| due(open, state.users(open.pk), &linger, retiring))
             .await;
         let connected = state.connections.load(Ordering::SeqCst);
-        let settled = state.reached.load(Ordering::SeqCst) || started.elapsed() >= FIRST_COMMAND;
-        if connected == 0 && open == 0 && settled {
+        let reached = state.reached.load(Ordering::SeqCst);
+        let settled = reached || started.elapsed() >= FIRST_COMMAND;
+        if connected == 0 && reaped.open == 0 && settled {
             break;
         }
+        let first_command_left =
+            (!reached).then(|| FIRST_COMMAND.saturating_sub(started.elapsed()));
+        sleep = nap(reaped.next, first_command_left, linger.tick);
     }
     if let Some(accepting) = accepting.take() {
         accepting.abort();
@@ -327,9 +357,13 @@ async fn serve_commands<R: AsyncRead + Unpin>(
                 let _ = outgoing.send(FromOwner::Done { id });
             }
             ToOwner::Release { id, pk } => {
-                let (engine, outgoing) = (Arc::clone(engine), outgoing.clone());
+                let (engine, outgoing, state) =
+                    (Arc::clone(engine), outgoing.clone(), Arc::clone(state));
                 tokio::spawn(async move {
                     engine.release(pk).await;
+                    // The loop sleeps until something changes, and a browser
+                    // fewer may be the last thing keeping the owner up.
+                    state.changed.notify_one();
                     let _ = outgoing.send(FromOwner::Done { id });
                 });
             }
@@ -414,6 +448,20 @@ mod tests {
         let sandbox = Linger::for_a_sandbox();
         assert!(due(&open(0, false), 0, &sandbox, false));
         assert!(!due(&open(0, false), 1, &sandbox, false));
+    }
+
+    /// The loop sleeps until the first thing that could need it, and never
+    /// past its cap.
+    #[test]
+    fn the_owner_sleeps_until_the_first_thing_due() {
+        let cap = Duration::from_secs(60);
+        let secs = Duration::from_secs;
+        assert_eq!(nap(None, None, cap), cap, "nothing open, already reached");
+        assert_eq!(nap(Some(secs(240)), None, cap), cap);
+        assert_eq!(nap(Some(secs(7)), None, cap), secs(7));
+        assert_eq!(nap(None, Some(secs(12)), cap), secs(12));
+        assert_eq!(nap(Some(secs(30)), Some(secs(12)), cap), secs(12));
+        assert_eq!(nap(Some(Duration::ZERO), None, cap), Duration::ZERO);
     }
 
     #[test]
