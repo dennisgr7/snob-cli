@@ -38,7 +38,7 @@ use crate::exit::ExitCode;
 use crate::media::{Saved, Story, save_story};
 use crate::report;
 use crate::ui::accounts::{self, Browsed, Picked};
-use crate::ui::browser::input::{self, Action, TICK, next, page, watching_cancel_keys};
+use crate::ui::browser::input::{self, Action, next, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::tui::{self, Tui};
 
@@ -154,7 +154,7 @@ pub async fn browse(
                 }
             })?;
 
-            let Some(action) = next(TICK).map_err(input::unreadable)? else {
+            let Some(action) = next(input::tick()).map_err(input::unreadable)? else {
                 continue;
             };
             note.clear();
@@ -402,6 +402,11 @@ pub(crate) async fn keep_folder(
     };
     if kept > 0 {
         receipts.push(note.clone());
+    }
+    // A folder is minutes: somebody who went to another window meanwhile is
+    // told it is done (`ui::notify`).
+    if !stopped && !crate::ui::browser::input::focused() {
+        crate::ui::notify::finished(&note, true);
     }
     note
 }

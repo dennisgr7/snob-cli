@@ -57,6 +57,10 @@ pub struct Progress {
     /// after. Kept so a wait starting or ending changes the rate of a bar that
     /// is drawing, and never starts one that is not.
     ticking: Arc<Mutex<Option<Duration>>>,
+    /// When the first bar of this stack started drawing, for
+    /// [`Progress::finish`] to tell somebody who may have gone to another
+    /// window that a long run is done (`ui::notify`).
+    since: Arc<Mutex<Option<Instant>>>,
     /// Whether this terminal can draw block and braille characters. Worked out
     /// once: it cannot change while the process runs, and it is read on every
     /// style rebuild.
@@ -102,6 +106,7 @@ impl Progress {
             quiet,
             waiting_until,
             ticking: Arc::new(Mutex::new(None)),
+            since: Arc::new(Mutex::new(None)),
             rich,
         };
         *progress.lock() = progress.fresh();
@@ -158,6 +163,10 @@ impl Progress {
     /// finishes and `reset` does not bring it back.
     fn animate(&self) {
         if !self.quiet {
+            self.since
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(Instant::now);
             let rate = self.rate();
             *self.ticking() = Some(rate);
             self.current().enable_steady_tick(rate);
@@ -247,6 +256,12 @@ impl Progress {
                 // walk.
                 self.set_deadline(None);
 
+                if !self.quiet {
+                    crate::ui::notify::progress(match estimated {
+                        Some(_) => crate::ui::notify::Progress::Percent(0),
+                        None => crate::ui::notify::Progress::Unknown,
+                    });
+                }
                 match estimated {
                     Some(total) => {
                         bar.set_length(*total);
@@ -279,6 +294,16 @@ impl Progress {
                     bar.set_length(running_total);
                 }
                 bar.set_position(running_total);
+                // On the taskbar too, where the terminal shows one: a walk of
+                // an hour glanced at without switching to it.
+                if !self.quiet
+                    && let Some(length) = bar.length().filter(|l| *l > 0)
+                {
+                    let percent = (running_total.saturating_mul(100) / length).min(100);
+                    crate::ui::notify::progress(crate::ui::notify::Progress::Percent(
+                        u8::try_from(percent).unwrap_or(100),
+                    ));
+                }
                 // No page number: pages are how the API paginates, not how
                 // anybody counts their followers. With a total on screen the
                 // fraction already moves; without one, the running count is
@@ -429,7 +454,20 @@ impl Progress {
     /// are really *removed*: indicatif keeps a finished bar's line until
     /// then, and a later walk would redraw the previous walk's receipts
     /// above its own.
+    ///
+    /// A run that drew for longer than [`crate::ui::notify::LONG`] says it is
+    /// done outside the window too, where the terminal can (`ui::notify`): a
+    /// plain command cannot tell whether anybody is looking, and somebody who
+    /// started an hour's walk has probably gone elsewhere. Its progress comes
+    /// off the taskbar either way.
     pub fn finish(&self) {
+        if !self.quiet {
+            crate::ui::notify::progress(crate::ui::notify::Progress::Clear);
+            let since = self.since.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if since.is_some_and(|since| since.elapsed() >= crate::ui::notify::LONG) {
+                crate::ui::notify::finished("finished reading from Instagram", false);
+            }
+        }
         let bar = self.current();
         bar.finish_and_clear();
         self.stack.remove(&bar);

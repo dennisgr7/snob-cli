@@ -287,17 +287,22 @@ pub fn choose_login_method() -> Result<Option<LoginMethod>> {
 /// and `?2004l` with paste already off are defined no-ops, writing to a
 /// non-terminal stderr fails silently, and leaving raw mode a terminal was
 /// never in is a no-op.
+///
+/// Focus reporting goes off with them (`?1004l`, a no-op when it is), and a
+/// walk's progress comes off the taskbar where the terminal showed one.
 pub fn restore_terminal() {
     use crossterm::cursor::Show;
-    use crossterm::event::DisableBracketedPaste;
+    use crossterm::event::{DisableBracketedPaste, DisableFocusChange};
     use crossterm::terminal::LeaveAlternateScreen;
     let _ = crossterm::execute!(
         std::io::stderr(),
+        DisableFocusChange,
         DisableBracketedPaste,
         LeaveAlternateScreen,
         Show
     );
     let _ = crossterm::terminal::disable_raw_mode();
+    notify::progress(notify::Progress::Clear);
 }
 
 pub fn warn(message: &str) {
@@ -506,6 +511,7 @@ pub mod accounts;
 pub mod browser;
 pub mod highlights;
 pub mod menu;
+pub mod notify;
 pub mod people;
 pub mod pfp;
 pub mod posts;
