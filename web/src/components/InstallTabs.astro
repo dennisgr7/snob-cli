@@ -1,7 +1,7 @@
 ---
 import CopyButton from '@/components/CopyButton.astro';
 import Terminal from '@/components/Terminal.astro';
-import { HERO_TAB, INSTALL, type InstallBlock } from '@/lib/content';
+import { HERO_TAB, INSTALL, splitAround, type InstallBlock, type InstallMethod } from '@/lib/content';
 
 /**
  * Every way to install. Without JavaScript the methods follow one another,
@@ -38,14 +38,24 @@ const firstFor = (id: string) =>
   </div>
   <div class="space-y-10" data-panels>
     {
-      INSTALL.map((method) => (
+      INSTALL.map((method: InstallMethod) => {
+        const around = splitAround(method.note, method.tool);
+        return (
         <section id={`panel-${method.id}`} aria-labelledby={`heading-${method.id}`} data-panel>
           <h3 id={`heading-${method.id}`} class="font-mono text-sm font-bold" data-panel-heading>
             {method.name}
           </h3>
           <p class="mt-1 mb-3 text-sm text-muted">
-            {method.note}
-            {'link' in method && method.link && (
+            {around && method.tool ? (
+              <>
+                {around[0]}
+                <a href={method.tool.href}>{method.tool.text}</a>
+                {around[1]}
+              </>
+            ) : (
+              method.note
+            )}
+            {method.link && (
               <>
                 {' '}
                 <a href={method.link.href}>{method.link.label}</a>
@@ -66,7 +76,8 @@ const firstFor = (id: string) =>
             })}
           </div>
         </section>
-      ))
+        );
+      })
     }
   </div>
 </div>

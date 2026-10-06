@@ -95,7 +95,9 @@ One page, in this order:
    usual consequence is a verification check. The site never hides it.
 4. **Scripts and agents**: the same answer seen in the TUI and as JSON down a pipe,
    with the flags and the exit codes.
-5. **Install**: every platform in tabs, each with a copy button.
+5. **Install**: every platform in tabs, each with a copy button. A copy button is
+   an icon, two pages that turn into a check once copied, in the terminal's dim
+   text and never a state color; Homebrew and Scoop link to their own sites.
 6. **Footer**: MIT, GitHub, `llms.txt`, "Not affiliated with Instagram or Meta",
    and the signature.
 

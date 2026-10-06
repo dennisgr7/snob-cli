@@ -7,7 +7,9 @@ import {
   HERO_SAMPLE,
   INSTALL,
   INSTALL_SECTION,
+  splitAround,
   type InstallBlock,
+  type InstallMethod,
   type Sample,
 } from '@/lib/content';
 import { SITE } from '@/lib/site';
@@ -31,12 +33,14 @@ export function homeToMarkdown(site: URL | string): string {
     (feature) => `### snob ${feature.name}\n\n${feature.description}\n\n${block(feature.sample)}`,
   ).join('\n\n');
 
-  const install = INSTALL.map((method) => {
-    const link = 'link' in method && method.link ? ` [${method.link.label}](${method.link.href})` : '';
+  const install = INSTALL.map((method: InstallMethod) => {
+    const around = splitAround(method.note, method.tool);
+    const note = around && method.tool ? `${around[0]}[${method.tool.text}](${method.tool.href})${around[1]}` : method.note;
+    const link = method.link ? ` [${method.link.label}](${method.link.href})` : '';
     const blocks = method.blocks
       .map((b: InstallBlock) => `${b.label ? `${b.label}:\n\n` : ''}${block(b.commands.map((command) => ({ command })))}`)
       .join('\n\n');
-    return `### ${method.name}\n\n${method.note}${link}\n\n${blocks}`;
+    return `### ${method.name}\n\n${note}${link}\n\n${blocks}`;
   }).join('\n\n');
 
   const flags = AGENTS.flags.map((item) => `- \`${item.flag}\`: ${item.means}`).join('\n');

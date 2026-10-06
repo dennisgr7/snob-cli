@@ -19,12 +19,30 @@ export interface InstallBlock {
   commands: readonly string[];
 }
 
+/** A word of a line that links somewhere, such as a package manager's site. */
+export interface TextLink {
+  text: string;
+  href: string;
+}
+
+/**
+ * The line cut around the first `link.text` in it, so the word can be drawn
+ * as a link in place; undefined when there is no link or the word is absent.
+ */
+export function splitAround(line: string, link: TextLink | undefined): [string, string] | undefined {
+  if (!link) return undefined;
+  const at = line.indexOf(link.text);
+  return at < 0 ? undefined : [line.slice(0, at), line.slice(at + link.text.length)];
+}
+
 export interface InstallMethod {
   id: string;
   /** The tab's name. */
   name: string;
   /** Who it is for, one line under the tab. */
   note: string;
+  /** The package manager, linked where its name appears in the note and the hero. */
+  tool?: TextLink;
   /** Alternatives: each block is complete on its own. */
   blocks: readonly InstallBlock[];
   /** A page the method needs, such as the releases page for the .deb. */
@@ -38,12 +56,14 @@ export const INSTALL = [
     id: 'homebrew',
     name: 'macOS · Linux',
     note: 'With Homebrew.',
+    tool: { text: 'Homebrew', href: 'https://brew.sh/' },
     blocks: [{ commands: [`brew tap dennisgr7/snob ${SITE.repository}`, 'brew install snob'] }],
   },
   {
     id: 'scoop',
     name: 'Windows',
     note: 'With Scoop.',
+    tool: { text: 'Scoop', href: 'https://scoop.sh/' },
     blocks: [{ commands: [`scoop bucket add snob ${SITE.repository}`, 'scoop install snob'] }],
   },
   {
@@ -87,9 +107,12 @@ const method = (id: InstallId): InstallMethod => INSTALL.find((m) => m.id === id
  * What the hero offers each system. Linux gets the script rather than
  * Homebrew, which many Linux machines do not have. A phone gets no command.
  */
-export const HERO_INSTALL: Record<Exclude<Platform, 'mobile'>, { label: string; commands: readonly string[] }> = {
-  macos: { label: 'macOS · Homebrew', commands: method('homebrew').blocks[0]!.commands },
-  windows: { label: 'Windows · Scoop', commands: method('scoop').blocks[0]!.commands },
+export const HERO_INSTALL: Record<
+  Exclude<Platform, 'mobile'>,
+  { label: string; commands: readonly string[]; tool?: TextLink | undefined }
+> = {
+  macos: { label: 'macOS · Homebrew', commands: method('homebrew').blocks[0]!.commands, tool: method('homebrew').tool },
+  windows: { label: 'Windows · Scoop', commands: method('scoop').blocks[0]!.commands, tool: method('scoop').tool },
   linux: { label: 'Linux · install script', commands: method('script').blocks[0]!.commands },
 };
 
@@ -113,7 +136,7 @@ export const HERO = {
   /** The headline; `accent` closes it in the brand color. */
   title: "who doesn't follow you",
   accent: 'back?',
-  lead: 'Snob knows. An Instagram client for the terminal: who left, who never followed back, stories and reels to keep, and output ready for AI agents.',
+  lead: 'Snob knows. An Instagram client for the terminal: download reels or stories, who unfollowed you, who never followed you back, ... Also ready for your AI agent.',
 } as const;
 
 /**
@@ -169,7 +192,7 @@ export const FEATURES: readonly Feature[] = [
   },
   {
     name: 'post · reel',
-    description: 'One post or reel by its link, every photo and video in it.',
+    description: 'See or download a post or reel, including every photo and video in it.',
     sample: [
       { command: 'snob reel <link> -d all' },
       { output: [{ text: '# every photo and video in it, saved', tone: 'dim' }] },
