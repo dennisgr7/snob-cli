@@ -252,7 +252,10 @@ mod linux {
             Mode::Eco => libc::SCHED_BATCH,
             Mode::Normal => libc::SCHED_OTHER,
         };
-        let param = libc::sched_param { sched_priority: 0 };
+        // SAFETY: all-zero is a valid `sched_param`, priority 0 included,
+        // which is the only one these two policies take. Zeroed rather than
+        // written out: musl's has fields glibc's does not.
+        let param: libc::sched_param = unsafe { std::mem::zeroed() };
         // Through the system call rather than the C library's function, which
         // musl declines to implement. Between `SCHED_OTHER` and `SCHED_BATCH`
         // in either direction is allowed unprivileged, and leaves the nice
