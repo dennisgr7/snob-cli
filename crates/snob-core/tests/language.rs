@@ -37,6 +37,12 @@ const THIS_FILE: &str = "crates/snob-core/tests/language.rs";
 /// out by its extension.
 const GENERATED: [&str; 1] = ["pnpm-lock.yaml"];
 
+/// Top-level directories of other people's prose, kept in the repository
+/// as their authors wrote it. `.agents/` holds the agent skills installed with
+/// `skills-lock.json`: third-party guides, some in British spelling, which are
+/// replaced wholesale on update rather than edited here.
+const VENDORED: [&str; 1] = [".agents"];
+
 /// What one guard reads, which lines it lets through, and what it looks for.
 struct Guard {
     extensions: &'static [&'static str],
@@ -50,8 +56,8 @@ struct Guard {
 impl Guard {
     /// Every offending line in `files`, as `path:line: found`, with the path
     /// named relative to `root`. A file with an extension this guard does not
-    /// read, [`THIS_FILE`], a [`GENERATED`] one, and a file that cannot be read
-    /// are skipped.
+    /// read, [`THIS_FILE`], a [`GENERATED`] one, one under a [`VENDORED`]
+    /// directory, and a file that cannot be read are skipped.
     fn violations(&self, root: &Path, files: &[PathBuf]) -> Vec<String> {
         let mut violations = Vec::new();
         for file in files {
@@ -64,7 +70,10 @@ impl Guard {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| GENERATED.contains(&n));
-            if !read_here || generated || relative == THIS_FILE {
+            let vendored = relative
+                .split_once('/')
+                .is_some_and(|(top, _)| VENDORED.contains(&top));
+            if !read_here || generated || vendored || relative == THIS_FILE {
                 continue;
             }
 
@@ -704,6 +713,12 @@ fn planted(
         let generated = dir.join(name);
         std::fs::write(&generated, &contents).unwrap();
         files.push(generated);
+    }
+    for top in VENDORED {
+        let vendored = dir.join(top).join("planted.md");
+        std::fs::create_dir_all(vendored.parent().unwrap()).unwrap();
+        std::fs::write(&vendored, &contents).unwrap();
+        files.push(vendored);
     }
     files.push(dir.join("missing.rs"));
 
