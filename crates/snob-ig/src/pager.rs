@@ -256,6 +256,9 @@ pub struct ListWalker<'a> {
     pace: Pace,
     sleeps: bool,
     heartbeat: Option<Heartbeat<'a>>,
+    /// Asked between every two pages: `true` ends the walk there, as a stop
+    /// rather than a failure, with its cursor. See [`ListWalker::with_stop`].
+    stop: Option<&'a dyn Fn() -> bool>,
     /// The wall clock the day's wait is measured against: always
     /// [`snob_core::clock::now_ms`] outside the tests, which put a clock that
     /// jumps here to stand in for a machine that slept.
@@ -288,6 +291,7 @@ impl<'a> ListWalker<'a> {
             pace: Pace::default(),
             sleeps: client.is_live(),
             heartbeat: None,
+            stop: None,
             wall: snob_core::clock::now_ms,
             awake: crate::awake::now,
         }
@@ -298,6 +302,18 @@ impl<'a> ListWalker<'a> {
     #[must_use]
     pub fn with_heartbeat(mut self, heartbeat: Heartbeat<'a>) -> Self {
         self.heartbeat = Some(heartbeat);
+        self
+    }
+
+    /// Sets what is asked before every page: `true` stops the walk there,
+    /// as [`StopReason::Canceled`] with its cursor, so the next run picks it
+    /// up. For a reason outside the walk that is not the person stopping it,
+    /// such as the battery running out under the monitor; the process's
+    /// cancellation is not used for it, since that one also stops everything
+    /// after the walk.
+    #[must_use]
+    pub fn with_stop(mut self, stop: &'a dyn Fn() -> bool) -> Self {
+        self.stop = Some(stop);
         self
     }
 
@@ -387,6 +403,10 @@ impl<'a> ListWalker<'a> {
 
             if let Some(end) = state.cap_reached(&request) {
                 break end;
+            }
+
+            if self.stop.is_some_and(|stop| stop()) {
+                break StopReason::Canceled;
             }
 
             // The day's accounts, asked before the page rather than found out
@@ -2126,6 +2146,33 @@ mod tests {
             !events.iter().any(|e| matches!(e, Event::Page { .. })),
             "nothing asked of a page that could not be loaded: {events:?}"
         );
+    }
+
+    /// A stop asked from outside ends the walk between two pages, as a stop
+    /// with its cursor, and asks nothing more.
+    #[tokio::test]
+    async fn a_stop_asked_between_pages_keeps_the_cursor() {
+        let server = server(vec![ok(body(0, 25, Some("c1"))), ok(body(25, 25, None))]).await;
+        let client = client(&server);
+        let pages = std::sync::atomic::AtomicU32::new(0);
+        let stop = || pages.load(std::sync::atomic::Ordering::SeqCst) >= 1;
+        let walker = ListWalker::new(&client).with_stop(&stop);
+
+        let summary = walker
+            .walk(
+                request(),
+                |p, _| {
+                    pages.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(p.users.len())
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.reason, StopReason::Canceled);
+        assert_eq!(summary.pending_cursor.as_deref(), Some("c1"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     fn zero_pace() -> Pace {
