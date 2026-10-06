@@ -466,6 +466,10 @@ fn reconsider(engine: &Headless, state: &State, pk: Pk) {
 /// each one no other command is using is closed before it is told. Each one
 /// that stays is efficient from now on unless another command somebody waits
 /// on is using it: a browser lingering for the next command waits on nobody.
+///
+/// Closed before it is reconsidered, so a browser on its way out is not made
+/// efficient first: its close is what the command, and the next one, wait for
+/// (`Cdp::close`).
 async fn leave(
     engine: &Headless,
     state: &State,
@@ -477,7 +481,6 @@ async fn leave(
         if attended {
             watch(state, pk, false);
         }
-        reconsider(engine, state, pk);
         let remaining = {
             let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
             let count = users.entry(pk).or_default();
@@ -487,6 +490,7 @@ async fn leave(
         if remaining == 0 && linger.close_when_unused {
             engine.release(Some(pk)).await;
         }
+        reconsider(engine, state, pk);
     }
     state.changed.notify_one();
 }
