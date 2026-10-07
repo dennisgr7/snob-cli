@@ -23,6 +23,8 @@ does its job:
 | The cookie boundary and the protocol client | `cdp/mod.rs`, `cdp/connection.rs`, `pipe.rs` |
 | Request budget, cooldowns, the common brake | `snob-core/src/budget.rs`, `snob-store/src/store/rate_budget.rs` |
 | The schema | `crates/snob-store/src/store/sql/` |
+| Telling that the machine slept in the middle of a walk | `crates/snob-ig/src/awake.rs` |
+| What snob asks of the system's power management: keeping it awake, the battery | `crates/snob-cli/src/power/` |
 
 ## What this is
 
@@ -758,7 +760,14 @@ Windows ARM64 (bundled SQLite roughly 9%, the `xlsx` feature roughly 9% more, an
 opt-out). The release profile is `opt-level = "s"`, fat LTO, `panic = "abort"`,
 stripped; nothing on a walk is CPU-bound against minutes of deliberate pacing.
 Running the browser took `snob whoami` from 0.1 s to about 2.7 s on a Pi 5 against a
-local fake. `clap` without `color` and `zstd` out of `Accept-Encoding` would save
+local fake. Under callgrind (October 2026, x86_64), a 12,000-account walk with the
+waits off is about 870 million instructions, of which snob's own crates are under half
+a percent: SQLite 46%, the allocator and `memcpy` 18%, the standard library 13%,
+`serde_json` 6%. Exporting the same list takes 0.03 s of CPU to csv or json and 0.19 s
+to xlsx. So no code of snob's is worth compiling twice for newer instructions, and the
+libraries that do the heavy lifting choose theirs at run time; the one baseline raised
+is Windows x86_64's, to `x86-64-v2`, which Windows 11 requires anyway
+(`.cargo/config.toml`). `clap` without `color` and `zstd` out of `Accept-Encoding` would save
 bytes and are kept anyway as positions: help in color, and an `Accept-Encoding` that
 is Chrome's character for character.
 

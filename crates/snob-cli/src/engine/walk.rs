@@ -100,15 +100,30 @@ pub async fn fetch(
         over_budget,
     };
 
+    // The monitor's question between two pages, if this is the monitor.
+    let stop_between_pages = app.stop_between_pages();
     let (client, db, progress) = app.parts();
     // One store for two callers that never overlap: the pages are saved
     // between requests, and the claim is kept alive only while the walk sleeps
     // on the day's accounts, so other processes see it asleep rather than dead.
     let db = std::cell::RefCell::new(db);
     let still_wanted = || Ok(snapshots::keep_claim(&db.borrow(), id)?);
+    let stopping = || {
+        let stop = stop_between_pages.is_some_and(|stop| stop());
+        if stop {
+            progress.warn(crate::report::BATTERY_CRITICAL_STOP);
+        }
+        stop
+    };
     let walker = ListWalker::new(client)
         .with_pace(pace)
-        .with_heartbeat(&still_wanted);
+        .with_heartbeat(&still_wanted)
+        .with_stop(&stopping);
+    // The machine is kept from sleeping on its own while the walk reads, and
+    // let go while it waits for the day's accounts (`power::KeepAwake`). A
+    // walk against a test server sleeps through nothing and asks for nothing.
+    let mut awake =
+        crate::power::KeepAwake::new("snob is reading an Instagram list", client.is_live());
 
     let summary = match walker
         .walk(
@@ -120,7 +135,10 @@ pub async fn fetch(
                         .added,
                 )
             },
-            |event| progress.event(&event),
+            |event| {
+                awake.follow(&event);
+                progress.event(&event);
+            },
         )
         .await
     {

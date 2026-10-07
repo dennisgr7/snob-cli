@@ -28,7 +28,7 @@ use snob_store::secrets::SecretStore;
 
 use crate::app::Viewer;
 use crate::exit::ExitCode;
-use crate::ui::browser::input::{self, Action, Raw, TICK, action_of};
+use crate::ui::browser::input::{self, Action, Raw, action_of};
 use crate::ui::tui::{self, Tui};
 
 /// One account, as the picker shows it.
@@ -215,7 +215,7 @@ pub async fn pick(
             under(frame);
             draw(frame, &picker, current, colors);
         })?;
-        let Raw::Key(key) = input::read(TICK).map_err(input::unreadable)? else {
+        let Raw::Key(key) = input::read(input::tick()).map_err(input::unreadable)? else {
             continue;
         };
         match picker.key(key) {

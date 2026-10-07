@@ -26,6 +26,7 @@ pub mod owner;
 /// loopback port. See the module for why it cannot be `std::process::Command`.
 pub(crate) mod pipe;
 pub mod posts;
+pub(crate) mod power;
 pub(crate) mod progress;
 pub mod report;
 pub mod ui;

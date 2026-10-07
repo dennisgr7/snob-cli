@@ -110,6 +110,11 @@ apple-native-keyring-store = { version = "1", default-features = false, features
 # `crypto-rust` rather than the OpenSSL default, for the same reason the webhook
 # signs with RustCrypto: this project does not link a C crypto library.
 zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
+# Only on Linux, and only to ask logind for an `idle` inhibitor while a walk
+# reads (`snob_cli::power`). It costs no crate: the keyring's Secret Service
+# backend already compiles it, with these same default features, on every
+# Linux build.
+zbus = "5"
 comfy-table = "7"
 indicatif = "0.18"
 supports-hyperlinks = "3"
@@ -240,7 +245,23 @@ zeroize = "1"
 # `CreateProcessW` with the handle-inheritance blob `std::process::Command` does
 # not expose, and the job object that takes the browser down with this process
 # however this process dies.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Globalization", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
+#
+# `Win32_System_WindowsProgramming` is for one function, and it is the one
+# that answers whether the machine slept: `QueryUnbiasedInterruptTime`, a
+# clock that leaves sleep and hibernation out, against which a walk compares
+# the wall clock (`snob_ig::awake`). `Instant` counts through a sleep on
+# Windows, so nothing in std can be asked instead.
+#
+# `Win32_System_Power` is what keeps the machine from sleeping on its own while
+# a walk sends requests (`snob_cli::power`): a power request, the documented
+# way to say so, which closing the lid or choosing Sleep still overrides.
+#
+# `Win32_UI_WindowsAndMessaging`, with `Win32_Graphics_Gdi` for the window
+# class's one brush field and `Win32_System_LibraryLoader` for the module
+# handle it is registered under, are the owner's window that hears the end of
+# the session (`snob_cli::owner::end_of_session`): a process with no console
+# and no window is told nothing when Windows signs out or shuts down.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Security_Cryptography", "Win32_Globalization", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_WindowsAndMessaging"] }
 
 # Test-only
 wiremock = "0.6"

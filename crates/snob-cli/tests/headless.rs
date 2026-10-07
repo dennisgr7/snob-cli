@@ -2450,3 +2450,68 @@ async fn serve_the_fake_world() {
         .unwrap_or(600);
     tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
 }
+
+/// **A measurement, not a check**: how long a command that loads a page takes
+/// through a browser running efficiently, against one running at the normal
+/// pace (`power::qos`), on this machine.
+///
+/// Ignored, because what it measures is the machine: run it by hand on one
+/// with efficiency cores, from a release build of the `testing` features,
+///
+/// ```text
+/// cargo test -p snob-cli --release --features testing --test headless \
+///     a_page_load_efficient_against_normal -- --ignored --nocapture
+/// ```
+///
+/// and read the two lines it prints. The browser's own start is part of each
+/// run, as it is of a command's in the sandbox, whose browser closes as soon
+/// as nothing uses it. What decides is the efficient run's slowest loads
+/// against `APP_CALLS_PATIENCE`, eight seconds: past half of it, a document
+/// should be loaded at the normal pace and only the rest efficiently.
+///
+/// **Every load in a sandbox of its own**, signed in afresh and outside the
+/// clock. In one sandbox the pace bucket (`rate_budget.rs`) has spent its
+/// burst by the third command, and from then on spaces each request four
+/// seconds from the last: every run takes over half a minute, and the numbers
+/// are the pacer's, not the page's. The two modes take turns, so whatever the
+/// machine does meanwhile falls on both.
+#[tokio::test]
+#[ignore = "a measurement of this machine, run by hand"]
+async fn a_page_load_efficient_against_normal() {
+    const RUNS: usize = 10;
+    const MODES: [&str; 2] = ["normal", "eco"];
+
+    let Some(_alone) = a_browser_alone().await else {
+        return;
+    };
+    let (_, instagram) = fake_instagram().await;
+
+    let mut times: [Vec<std::time::Duration>; MODES.len()] = Default::default();
+    for _ in 0..RUNS {
+        for (mode, took) in MODES.iter().zip(&mut times) {
+            let tmp = tempfile::tempdir().unwrap();
+            logged_in(tmp.path(), &instagram, SESSIONID, "the login failed: ");
+            let started = std::time::Instant::now();
+            let out = snob_with(
+                tmp.path(),
+                &instagram,
+                &["profile", "someone", "--format", "json"],
+                None,
+                &[("SNOB_TEST_QOS", mode)],
+            );
+            assert!(out.status.success(), "{}", told(tmp.path(), &out));
+            took.push(started.elapsed());
+        }
+    }
+
+    for (mode, mut took) in MODES.into_iter().zip(times) {
+        took.sort();
+        let at = |share: usize| took[(took.len() * share / 100).min(took.len() - 1)];
+        println!(
+            "{mode:>6}: median {:>6.2} s, p95 {:>6.2} s, slowest {:>6.2} s",
+            at(50).as_secs_f64(),
+            at(95).as_secs_f64(),
+            took[took.len() - 1].as_secs_f64()
+        );
+    }
+}

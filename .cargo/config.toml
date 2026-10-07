@@ -52,8 +52,20 @@
 # What it costs is that the TimeDateStamp stops being a date. Nothing here reads
 # it; some very old tooling displays it, and will show a number that is not a
 # time.
+#
+# **`x86-64-v2` on Windows x86_64**, the one target whose floor the system
+# already sets that high. Windows 11 requires SSE4.2 and POPCNT, 24H2 refuses to
+# boot without them, and snob supports Windows 11 only, so the instructions
+# `x86-64-v2` adds (`SSE3`, `SSSE3`, `SSE4.1`, `SSE4.2`, `POPCNT`, `CX16`) are
+# on every machine this binary can run on, and the compiler may use them
+# anywhere instead of only where a library checks for them at run time. The
+# gain is small and is not why: it costs nothing, since no machine loses the
+# binary. Nothing higher, here or elsewhere: `x86-64-v3` leaves out the
+# Pentium, Celeron and Atom parts Windows 11 supports, and the other targets'
+# systems run on CPUs older than any level above the baseline. The standard
+# library is the prebuilt one either way, at the baseline.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-Ctarget-feature=+crt-static", "-Clink-arg=/Brepro"]
+rustflags = ["-Ctarget-feature=+crt-static", "-Clink-arg=/Brepro", "-Ctarget-cpu=x86-64-v2"]
 
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-Ctarget-feature=+crt-static", "-Clink-arg=/Brepro"]

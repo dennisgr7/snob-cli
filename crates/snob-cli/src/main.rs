@@ -305,6 +305,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         };
         snob_cli::owner::install(&paths, start);
     }
+    snob_cli::owner::attended(somebody_waits(&cli));
     // A copy for the command, which consumes its store; the write-back needs
     // the same store, on the same keyring service, once it is done.
     let outcome = dispatch(cli, store.clone(), &paths).await;
@@ -312,6 +313,15 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // while it ran, and the stored copy learns what it kept.
     snob_cli::owner::finish(&store, &paths).await;
     outcome
+}
+
+/// Whether somebody is waiting on this command, for the pace its browsers
+/// run at (`owner::attended`): a command typed in a terminal, and not the
+/// scheduled monitor, which runs for days and is waited on by nobody.
+fn somebody_waits(cli: &Cli) -> bool {
+    use std::io::IsTerminal;
+    let monitor = matches!(&cli.command, Command::Watch(args) if args.command.is_none());
+    !monitor && std::io::stderr().is_terminal()
 }
 
 /// Runs the command, as the account it resolves to when it acts as one.

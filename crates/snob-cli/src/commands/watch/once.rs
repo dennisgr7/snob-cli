@@ -49,6 +49,16 @@ pub(super) async fn once(
 
     let watched = watched_from(args.target.clone(), configured.as_ref(), in_use);
 
+    // A run on a timer at a critical battery would be cut off by the system
+    // hibernating under it. It is not run, and says so; the timer's next
+    // turn runs it once there is power. 130, an interrupted run's code: nothing
+    // is wrong, and nothing was done.
+    if super::run::waits_for_power(paths, snob_core::clock::now()) {
+        ui::warn(report::BATTERY_CRITICAL_HOLD);
+        return Ok(ExitCode::Interrupted);
+    }
+    super::run::power_is_back(paths);
+
     let outcome = run_viewers(
         paths,
         &secrets,

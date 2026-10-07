@@ -12,6 +12,7 @@ use std::time::Duration;
 use snob_core::model::StopReason;
 use snob_core::{EpochMs, Pk};
 
+use crate::awake::Asleep;
 use crate::client::{Direction, IgClient};
 use crate::error::{IgError, Reaction};
 use crate::model::FriendshipsPage;
@@ -67,6 +68,9 @@ pub enum WaitKind {
     /// The day's accounts ran out: the walk sleeps until the last 24 hours
     /// have room for `PAGES_AFTER_A_PAUSE` more pages, then carries on.
     Day,
+    /// The machine slept, and the network is not back yet: one of
+    /// [`crate::pace::RECONNECT_WAITS_SECS`].
+    Reconnect,
 }
 
 /// How many pages the day must have room for before a walk paused on its
@@ -110,6 +114,12 @@ pub enum Event {
         error: String,
     },
     Warning(Warning),
+    /// The machine slept for `slept` in the middle of the walk. The walk
+    /// carries on as after a sitting: the page reloaded once the network is
+    /// back, and the list opened again.
+    Resumed {
+        slept: Duration,
+    },
     Finished {
         pages: u32,
         users: usize,
@@ -246,6 +256,25 @@ pub struct ListWalker<'a> {
     pace: Pace,
     sleeps: bool,
     heartbeat: Option<Heartbeat<'a>>,
+    /// Asked between every two pages: `true` ends the walk there, as a stop
+    /// rather than a failure, with its cursor. See [`ListWalker::with_stop`].
+    stop: Option<&'a dyn Fn() -> bool>,
+    /// The wall clock the day's wait is measured against: always
+    /// [`snob_core::clock::now_ms`] outside the tests, which put a clock that
+    /// jumps here to stand in for a machine that slept.
+    wall: fn() -> EpochMs,
+    /// The clock that stands still while the machine sleeps
+    /// ([`crate::awake::now`]), read beside `wall` to tell that it slept.
+    awake: fn() -> Duration,
+}
+
+/// What [`ListWalker::fetch_page`] came back with.
+enum Fetched {
+    Page(FriendshipsPage),
+    /// The request failed after the machine slept for this long: not a
+    /// network failure to retry, but a walk to pick up again
+    /// ([`ListWalker::come_back`]).
+    Slept(Duration),
 }
 
 impl<'a> ListWalker<'a> {
@@ -262,6 +291,9 @@ impl<'a> ListWalker<'a> {
             pace: Pace::default(),
             sleeps: client.is_live(),
             heartbeat: None,
+            stop: None,
+            wall: snob_core::clock::now_ms,
+            awake: crate::awake::now,
         }
     }
 
@@ -270,6 +302,18 @@ impl<'a> ListWalker<'a> {
     #[must_use]
     pub fn with_heartbeat(mut self, heartbeat: Heartbeat<'a>) -> Self {
         self.heartbeat = Some(heartbeat);
+        self
+    }
+
+    /// Sets what is asked before every page: `true` stops the walk there,
+    /// as [`StopReason::Canceled`] with its cursor, so the next run picks it
+    /// up. For a reason outside the walk that is not the person stopping it,
+    /// such as the battery running out under the monitor; the process's
+    /// cancellation is not used for it, since that one also stops everything
+    /// after the walk.
+    #[must_use]
+    pub fn with_stop(mut self, stop: &'a dyn Fn() -> bool) -> Self {
+        self.stop = Some(stop);
         self
     }
 
@@ -311,8 +355,10 @@ impl<'a> ListWalker<'a> {
 
         let mut state = WalkState::new(&request);
         // Whether the list has been opened: once a walk, before its first
-        // page, whatever the loop starts over for before it.
+        // page, whatever the loop starts over for before it, and again after
+        // the machine slept.
         let mut opened = false;
+        let mut asleep = Asleep::new((self.wall)(), (self.awake)());
 
         let reason = loop {
             if self.cancel().is_canceled() {
@@ -357,6 +403,10 @@ impl<'a> ListWalker<'a> {
 
             if let Some(end) = state.cap_reached(&request) {
                 break end;
+            }
+
+            if self.stop.is_some_and(|stop| stop()) {
+                break StopReason::Canceled;
             }
 
             // The day's accounts, asked before the page rather than found out
@@ -418,8 +468,28 @@ impl<'a> ListWalker<'a> {
                 break StopReason::Canceled;
             }
 
-            let page = match self.fetch_page(&request, &state, &mut observe).await {
-                Ok(p) => p,
+            // **A machine that slept is a walk to pick up again**, looked for
+            // before every page: after the rest, the day's wait, the dwell
+            // or the step the loop came through, any of which it may have
+            // slept in, and again when the page fails (`fetch_page`). See
+            // `come_back`.
+            let fetched = match self.slept(&mut asleep) {
+                Some(slept) => Ok(Fetched::Slept(slept)),
+                None => {
+                    self.fetch_page(&request, &state, &mut asleep, &mut observe)
+                        .await
+                }
+            };
+            let page = match fetched {
+                Ok(Fetched::Page(p)) => p,
+                Ok(Fetched::Slept(slept)) => {
+                    if let Err(e) = self.come_back(&request, slept, &mut observe).await {
+                        break self.stop_reason_for(e, &mut state);
+                    }
+                    asleep = Asleep::new((self.wall)(), (self.awake)());
+                    opened = false;
+                    continue;
+                }
                 Err(e) => break self.stop_reason_for(e, &mut state),
             };
             let received = page.users.len();
@@ -494,6 +564,19 @@ impl<'a> ListWalker<'a> {
     ///
     /// `true` when the sleep was cut short: the person asked to stop, or the
     /// heartbeat said the walk is no longer wanted.
+    ///
+    /// **The wait ends at a moment on the wall clock, not after an amount of
+    /// sleeping.** The day's budget is kept in wall-clock time, and the timers
+    /// a sleep runs on are not: on Linux and macOS they stand still while the
+    /// machine is suspended, and on Windows a relative wait does not count a
+    /// low-power state either. Counted in sleeps, a laptop shut for the night
+    /// halfway through a six-hour wait would wake to six more hours of it,
+    /// for room the day made long ago. Each heartbeat looks at the wall clock
+    /// again, so the wait is over at the first one after the moment passed.
+    ///
+    /// The sleeping is still counted, as the other bound: a wall clock set
+    /// back by hand would otherwise move the moment away, and the wait is
+    /// never longer than the budget asked for.
     async fn sleep_through_the_day<O: FnMut(Event)>(
         &self,
         wait: Duration,
@@ -503,9 +586,19 @@ impl<'a> ListWalker<'a> {
             kind: WaitKind::Day,
             duration: wait,
         });
-        let mut left = wait;
-        while !left.is_zero() {
-            let step = left.min(HEARTBEAT);
+        let until = (self.wall)() + wait;
+        let mut slept = Duration::ZERO;
+        while slept < wait {
+            let on_the_wall = until - (self.wall)();
+            let Ok(on_the_wall) = u64::try_from(on_the_wall) else {
+                break;
+            };
+            if on_the_wall == 0 {
+                break;
+            }
+            let step = Duration::from_millis(on_the_wall)
+                .min(wait - slept)
+                .min(HEARTBEAT);
             if self.cancel().sleep_or_cancel(step).await {
                 return Ok(true);
             }
@@ -514,7 +607,7 @@ impl<'a> ListWalker<'a> {
             {
                 return Ok(true);
             }
-            left -= step;
+            slept += step;
         }
         Ok(false)
     }
@@ -541,8 +634,9 @@ impl<'a> ListWalker<'a> {
         &self,
         request: &ListRequest<'_>,
         state: &WalkState,
+        asleep: &mut Asleep,
         observe: &mut O,
-    ) -> Result<FriendshipsPage, IgError> {
+    ) -> Result<Fetched, IgError> {
         let mut attempt = 0;
         loop {
             let result = self
@@ -557,9 +651,18 @@ impl<'a> ListWalker<'a> {
                 .await;
 
             let error = match result {
-                Ok(p) => return Ok(p),
+                Ok(p) => return Ok(Fetched::Page(p)),
                 Err(e) => e,
             };
+
+            // A request that failed across a sleep failed because of it: the
+            // network was going down as the lid closed, or is not back yet.
+            // Not one of the retries, which are for a server that failed.
+            if error.reaction() == Reaction::Retry
+                && let Some(slept) = self.slept(asleep)
+            {
+                return Ok(Fetched::Slept(slept));
+            }
 
             // `reaction()` rather than the individual predicates: it is the
             // single authority here, and it is what guarantees a 429 is never
@@ -612,6 +715,51 @@ impl<'a> ListWalker<'a> {
         };
         state.error = Some(error);
         reason
+    }
+
+    /// How long the machine slept since `asleep` last looked, if it did.
+    fn slept(&self, asleep: &mut Asleep) -> Option<Duration> {
+        asleep.check((self.wall)(), (self.awake)())
+    }
+
+    /// Picks the walk up again after the machine slept for `slept`.
+    ///
+    /// **As at the end of a sitting, not as after a failure.** Everything the
+    /// walk had in hand is as old as the sleep: the page the requests are
+    /// built from, the network the machine was on. So the document the list
+    /// opens over is loaded again ([`IgClient::reload`]), waiting for the
+    /// network as long as [`crate::pace::RECONNECT_WAITS_SECS`] allows, and
+    /// the walk starts a new action and opens the list again, with the dwell
+    /// a person takes, before its next page. Nothing is asked sooner than the
+    /// walk would have asked it: a sleep is already the longest pause it has.
+    ///
+    /// An error is how the walk ends: a network that never came back is a
+    /// network failure, as it was before, and the walk keeps its cursor.
+    async fn come_back<O: FnMut(Event)>(
+        &self,
+        request: &ListRequest<'_>,
+        slept: Duration,
+        observe: &mut O,
+    ) -> Result<(), IgError> {
+        tracing::info!(slept = ?slept, "the machine slept during a walk; picking it up again");
+        observe(Event::Resumed { slept });
+        self.client.pacer().begin_action();
+        let mut waits = crate::pace::RECONNECT_WAITS_SECS.into_iter();
+        loop {
+            let error = match self.client.reload(request.username).await {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
+            let Some(after) = waits.next().filter(|_| error.reaction() == Reaction::Retry) else {
+                return Err(error);
+            };
+            if self
+                .wait(WaitKind::Reconnect, Duration::from_secs(after), observe)
+                .await
+            {
+                return Err(IgError::Canceled);
+            }
+        }
     }
 
     /// Returns `true` if it was canceled while waiting.
@@ -846,7 +994,9 @@ mod tests {
 
     use super::*;
     use crate::client::harness::{SID, UA, client_with};
+    use crate::client::page::PageError;
     use crate::pace::Pacer;
+    use crate::web::Told;
 
     #[test]
     fn the_cooldown_display_pluralizes_the_minutes() {
@@ -1151,6 +1301,7 @@ mod tests {
                 WaitKind::Step => (1_000, 3_000),
                 WaitKind::Sitting => (300_000, 900_000),
                 WaitKind::Day => panic!("a free budget never pauses for the day"),
+                WaitKind::Reconnect => panic!("a machine that never slept never reconnects"),
             };
             assert!(
                 (range.0..=range.1).contains(&ms),
@@ -1734,6 +1885,294 @@ mod tests {
             );
             Ok(())
         }
+    }
+
+    /// A wall clock that reads its starting moment once, then two hours
+    /// later: the machine slept through the day's wait.
+    fn slept_through() -> EpochMs {
+        static READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let start = 1_700_000_000_000;
+        if READ.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            EpochMs::new(start + 2 * 3_600_000)
+        } else {
+            EpochMs::new(start)
+        }
+    }
+
+    /// A wall clock somebody set an hour back once the wait had started.
+    fn set_back() -> EpochMs {
+        static READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let start = 1_700_000_000_000;
+        if READ.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            EpochMs::new(start - 3_600_000)
+        } else {
+            EpochMs::new(start)
+        }
+    }
+
+    /// A day's wait the machine slept through is over when it wakes: the
+    /// budget's day is on the wall clock, and so is the end of the wait.
+    #[tokio::test]
+    async fn a_day_wait_slept_through_is_over_on_waking() {
+        let server = MockServer::start().await;
+        let client = client_with(&server, Pacer::new(Day::new(0, 0)));
+        let mut walker = ListWalker::new(&client);
+        walker.wall = slept_through;
+
+        let started = std::time::Instant::now();
+        let mut events = Vec::new();
+        let cut_short = walker
+            .sleep_through_the_day(Duration::from_secs(3_600), &mut |e| events.push(e))
+            .await
+            .unwrap();
+
+        assert!(!cut_short);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(days_waited(&events), 1, "the wait is still announced");
+    }
+
+    /// A wall clock set back does not stretch the wait past what the budget
+    /// asked for.
+    #[tokio::test]
+    async fn a_clock_set_back_does_not_stretch_a_day_wait() {
+        let server = MockServer::start().await;
+        let client = client_with(&server, Pacer::new(Day::new(0, 0)));
+        let mut walker = ListWalker::new(&client);
+        walker.wall = set_back;
+
+        let started = std::time::Instant::now();
+        let cut_short = walker
+            .sleep_through_the_day(Duration::from_millis(50), &mut |_| {})
+            .await
+            .unwrap();
+
+        assert!(!cut_short);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Answers as it is told to, and says the machine slept as it does: the
+    /// request in flight when the lid closed.
+    struct AsTheLidCloses {
+        answer: ResponseTemplate,
+        slept: &'static std::sync::atomic::AtomicBool,
+    }
+
+    impl wiremock::Respond for AsTheLidCloses {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            self.slept.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.answer.clone()
+        }
+    }
+
+    /// A clock the machine is awake by that never moves: every move of the
+    /// wall clock in these tests is then time spent asleep.
+    fn never_moves() -> Duration {
+        Duration::from_secs(1)
+    }
+
+    const NIGHT_MS: i64 = 8 * 3_600_000;
+
+    static SLEPT_MID_PAGE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn wall_after_a_night_mid_page() -> EpochMs {
+        let slept = SLEPT_MID_PAGE.load(std::sync::atomic::Ordering::SeqCst);
+        EpochMs::new(1_700_000_000_000 + if slept { NIGHT_MS } else { 0 })
+    }
+
+    /// A page that fails because the machine slept under it is not a network
+    /// failure to retry: the walk is picked up again, the list opened again
+    /// with its dwell, and the same page asked once the walk is back.
+    #[tokio::test]
+    async fn a_page_failing_across_a_sleep_picks_the_walk_up_again() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(AsTheLidCloses {
+                answer: ResponseTemplate::new(503),
+                slept: &SLEPT_MID_PAGE,
+            })
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ok(body(0, 25, None)))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let client = client(&server);
+        let mut walker = ListWalker::new(&client);
+        walker.wall = wall_after_a_night_mid_page;
+        walker.awake = never_moves;
+
+        let mut events = Vec::new();
+        let summary = walker
+            .walk(request(), |p, _| Ok(p.users.len()), |e| events.push(e))
+            .await
+            .unwrap();
+
+        assert_eq!(summary.reason, StopReason::Completed, "{events:?}");
+        assert!(
+            events.contains(&Event::Resumed {
+                slept: Duration::from_millis(u64::try_from(NIGHT_MS).unwrap())
+            }),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Retrying { .. })),
+            "no retry spent on the sleep: {events:?}"
+        );
+        let dwells = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::Waiting {
+                        kind: WaitKind::Dwell,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(dwells, 2, "the list is opened again: {events:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    static SLEPT_BEFORE_A_PAGE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn wall_after_a_night_before_a_page() -> EpochMs {
+        // The first look is the walk starting; every one after it finds the
+        // night gone by.
+        if SLEPT_BEFORE_A_PAGE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            EpochMs::new(1_700_000_000_000 + NIGHT_MS)
+        } else {
+            EpochMs::new(1_700_000_000_000)
+        }
+    }
+
+    static SLEPT_UNDER_A_DEAD_NETWORK: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn wall_after_a_night_with_no_network() -> EpochMs {
+        if SLEPT_UNDER_A_DEAD_NETWORK.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            EpochMs::new(1_700_000_000_000 + NIGHT_MS)
+        } else {
+            EpochMs::new(1_700_000_000_000)
+        }
+    }
+
+    /// A browser's page that answers lists from `rest` and loads the
+    /// document as `document` says, counting each document asked.
+    fn a_page_reloading(
+        document: impl Fn(u32) -> Result<Told, PageError> + Send + Sync + 'static,
+    ) -> (IgClient, std::sync::Arc<std::sync::atomic::AtomicU32>) {
+        use crate::client::harness::{Scripted, page_said, spending_client};
+        let documents = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = std::sync::Arc::clone(&documents);
+        let page = Scripted::telling(move |call| match &call.ask {
+            crate::web::Ask::Document { .. } => {
+                document(counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+            }
+            crate::web::Ask::Rest { .. } => Ok(Told::Answer(page_said(200, &body(0, 25, None)))),
+            _ => Ok(Told::Answer(page_said(200, r#"{"status":"ok"}"#))),
+        });
+        let (client, _) = spending_client(page);
+        (client, documents)
+    }
+
+    /// After a sleep the page the walk reads from is loaded again, as many
+    /// times as the network takes to come back, with a wait before each, and
+    /// the walk then carries on.
+    #[tokio::test]
+    async fn the_page_is_reloaded_once_the_network_is_back() {
+        let (client, documents) = a_page_reloading(|n| {
+            if n < 2 {
+                Err(PageError::Unreachable("the radio is still off".into()))
+            } else {
+                Ok(Told::Document {
+                    answer: crate::client::harness::page_said(200, ""),
+                    bundles: Vec::new(),
+                })
+            }
+        });
+        let mut walker = ListWalker::new(&client);
+        walker.wall = wall_after_a_night_before_a_page;
+        walker.awake = never_moves;
+
+        let mut events = Vec::new();
+        let summary = walker
+            .walk(request(), |p, _| Ok(p.users.len()), |e| events.push(e))
+            .await
+            .unwrap();
+
+        assert_eq!(summary.reason, StopReason::Completed, "{events:?}");
+        assert_eq!(documents.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let reconnects = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::Waiting {
+                        kind: WaitKind::Reconnect,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(reconnects, 2, "{events:?}");
+    }
+
+    /// A network that never comes back ends the walk as a network failure,
+    /// with its cursor, once the waits are spent.
+    #[tokio::test]
+    async fn a_network_that_never_comes_back_ends_the_walk_on_it() {
+        let (client, documents) =
+            a_page_reloading(|_| Err(PageError::Unreachable("nothing answers".into())));
+        let mut walker = ListWalker::new(&client);
+        walker.wall = wall_after_a_night_with_no_network;
+        walker.awake = never_moves;
+
+        let mut events = Vec::new();
+        let summary = walker
+            .walk(request(), |p, _| Ok(p.users.len()), |e| events.push(e))
+            .await
+            .unwrap();
+
+        assert_eq!(summary.reason, StopReason::Network, "{events:?}");
+        let tries = u32::try_from(crate::pace::RECONNECT_WAITS_SECS.len()).unwrap() + 1;
+        assert_eq!(documents.load(std::sync::atomic::Ordering::SeqCst), tries);
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Page { .. })),
+            "nothing asked of a page that could not be loaded: {events:?}"
+        );
+    }
+
+    /// A stop asked from outside ends the walk between two pages, as a stop
+    /// with its cursor, and asks nothing more.
+    #[tokio::test]
+    async fn a_stop_asked_between_pages_keeps_the_cursor() {
+        let server = server(vec![ok(body(0, 25, Some("c1"))), ok(body(25, 25, None))]).await;
+        let client = client(&server);
+        let pages = std::sync::atomic::AtomicU32::new(0);
+        let stop = || pages.load(std::sync::atomic::Ordering::SeqCst) >= 1;
+        let walker = ListWalker::new(&client).with_stop(&stop);
+
+        let summary = walker
+            .walk(
+                request(),
+                |p, _| {
+                    pages.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(p.users.len())
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.reason, StopReason::Canceled);
+        assert_eq!(summary.pending_cursor.as_deref(), Some("c1"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     fn zero_pace() -> Pace {

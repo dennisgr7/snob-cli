@@ -50,6 +50,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::headless::write_back::Rotated;
 
+#[cfg(windows)]
+mod end_of_session;
 mod server;
 mod socket;
 mod spawn;
@@ -74,6 +76,40 @@ const LEAVING: Duration = Duration::from_secs(30);
 
 /// This process's way to the owner, once something has asked for a page.
 static REMOTE: OnceLock<Arc<Remote>> = OnceLock::new();
+
+/// Whether somebody is waiting on this command now. See [`attended`].
+static ATTENDED: AtomicBool = AtomicBool::new(true);
+
+/// Says whether somebody is waiting on this command now, so the browsers it
+/// uses run at the system's normal pace or efficiently (`power::qos`).
+///
+/// **Waiting means a person at a terminal.** A command typed in one is
+/// waited on; the monitor, and anything run with no terminal (a timer, a
+/// script, an agent), is not; a full-screen view is waited on while its
+/// terminal has the focus and not while it does not. `main` says it once for
+/// the command, and the views say it again as the focus comes and goes.
+///
+/// Told to the owner when it changes, and to every connection made later; a
+/// process that runs its browsers itself applies it to them.
+pub fn attended(attended: bool) {
+    if ATTENDED.swap(attended, Ordering::SeqCst) == attended {
+        return;
+    }
+    crate::headless::attended_here(attended);
+    let Some(remote) = REMOTE.get() else {
+        return;
+    };
+    if let Ok(slot) = remote.link.try_lock()
+        && let Some(link) = slot.as_ref().filter(|link| link.alive())
+    {
+        link.tell(&wire::ToOwner::Attention { attended });
+    }
+}
+
+/// What [`attended`] said last: `true` until it says otherwise.
+pub(crate) fn is_attended() -> bool {
+    ATTENDED.load(Ordering::SeqCst)
+}
 
 /// Sends every request of every client built from now on through the owner
 /// of the browsers. `start` is what the owner is started with: the global
@@ -206,6 +242,10 @@ impl Remote {
             return Ok(Arc::clone(link));
         }
         let link = Arc::new(Link::open(&self.paths, Some(start), Arc::clone(&self.heard)).await?);
+        // Before any request on it, so its browser starts in the right mode.
+        link.tell(&wire::ToOwner::Attention {
+            attended: is_attended(),
+        });
         *slot = Some(Arc::clone(&link));
         Ok(link)
     }
@@ -234,7 +274,7 @@ impl Remote {
 
     /// This process's own browsers.
     fn here(&self) -> Arc<crate::headless::Headless> {
-        crate::headless::alone(&self.paths, Linger::for_people().tick)
+        crate::headless::alone(&self.paths)
     }
 
     /// Sends `request` as `session`: through the owner, or from this
@@ -579,6 +619,15 @@ impl Link {
 
     fn alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+
+    /// Sends `message`, which has no answer, and does not wait. A link that
+    /// is gone takes it nowhere, which is what a message nobody answers can
+    /// afford.
+    fn tell(&self, message: &wire::ToOwner) {
+        if let Ok(frame) = wire::frame(message) {
+            let _ = self.outgoing.send(frame);
+        }
     }
 
     /// Sends what `make` builds with a fresh id and waits for its answer.
