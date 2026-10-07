@@ -1,7 +1,9 @@
 // The site is a Worker with static assets and no Worker code: Cloudflare serves
 // `dist/` as built, applying `public/_headers`. Workers Builds runs the build
-// from `web/` on every push: `main` deploys, any other branch uploads a version
-// with its own preview URL.
+// from `web/` on every push that touches `web/` (its build watch path, set in
+// the dashboard): `main` deploys, any other branch uploads a version with a
+// preview URL named after the branch, such as
+// `dev-snob-web.cheseydennis.workers.dev`.
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "snob-web",

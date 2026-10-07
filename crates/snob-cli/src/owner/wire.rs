@@ -120,6 +120,13 @@ pub(super) enum ToOwner {
     /// command of a newer build found this owner with nobody else to serve,
     /// or a purge is about to take its files.
     Retire,
+    /// Whether somebody is waiting on this command now: one typed in a
+    /// terminal, or a full-screen view with the focus. The browsers it uses
+    /// run at the system's normal pace while any command on them says so,
+    /// and efficiently otherwise (`power::qos`). Said after the handshake and
+    /// whenever it changes; no answer. Only ever sent to an owner of this
+    /// build, like everything after the handshake.
+    Attention { attended: bool },
 }
 
 /// From the owner to a command.
@@ -306,6 +313,19 @@ mod tests {
         assert_eq!(asked.headers, request().headers);
         // Nothing left over: one frame is one message.
         assert!(read::<ToOwner>(&mut reader).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn attention_arrives_as_it_was_said() {
+        for said in [true, false] {
+            let bytes = frame(&ToOwner::Attention { attended: said }).unwrap();
+            let mut reader = &bytes[..];
+            let Some(ToOwner::Attention { attended }) = read::<ToOwner>(&mut reader).await.unwrap()
+            else {
+                panic!("not attention");
+            };
+            assert_eq!(attended, said);
+        }
     }
 
     #[tokio::test]

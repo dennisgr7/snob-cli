@@ -1,0 +1,36 @@
+---
+import { ARM, PLATFORMS } from '@/lib/content';
+
+/**
+ * Every system and the builds it has, above the install tabs. The native ARM
+ * builds take the accent, and the line under them says what that means.
+ */
+---
+
+<div class="mb-12">
+  <ul class="grid gap-3 sm:grid-cols-3" aria-label="Builds">
+    {
+      PLATFORMS.map((platform) => (
+        <li class="rounded-card border border-line bg-surface px-4 py-3">
+          <p class="font-mono text-sm font-bold">{platform.name}</p>
+          <ul class="mt-2 flex flex-wrap gap-2 font-mono text-xs">
+            {platform.arches.map((arch) => (
+              <li
+                class:list={[
+                  'rounded-control border px-2 py-0.5',
+                  arch.arm ? 'border-accent text-accent' : 'border-line text-muted',
+                ]}
+              >
+                {arch.name}
+              </li>
+            ))}
+          </ul>
+        </li>
+      ))
+    }
+  </ul>
+  <p class="mt-4 text-sm text-muted">
+    <span class="mr-2 rounded-control bg-accent px-2 py-0.5 font-mono text-xs font-bold text-on-accent">{ARM.label}</span>
+    {ARM.text}
+  </p>
+</div>

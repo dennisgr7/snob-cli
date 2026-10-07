@@ -27,7 +27,7 @@ use crate::exit::ExitCode;
 use crate::media::{Stories, Story, bytes_of, default_name, extension_of, left_of, posted_of};
 use crate::output;
 use crate::ui::accounts::{self, Browsed, Picked};
-use crate::ui::browser::input::{self, Action, TICK, next, page, watching_cancel_keys};
+use crate::ui::browser::input::{self, Action, next, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::tui;
 
@@ -80,7 +80,7 @@ pub async fn browse(
                 );
             })?;
 
-            let Some(action) = next(TICK).map_err(input::unreadable)? else {
+            let Some(action) = next(input::tick()).map_err(input::unreadable)? else {
                 continue;
             };
             // A note stays up until the user does something else, not until the

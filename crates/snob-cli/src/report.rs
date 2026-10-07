@@ -515,6 +515,33 @@ pub fn paused_for_the_day(wait: std::time::Duration) -> String {
     )
 }
 
+/// What the monitor says when it stops a walk for the battery.
+pub const BATTERY_CRITICAL_STOP: &str = "the battery is critical; the walk stops here, \
+     and the next run picks it up from this page";
+
+/// What the monitor says when the battery turned critical before a list it
+/// had not started.
+pub const BATTERY_CRITICAL_SKIP: &str =
+    "the battery is critical; this run reads no more lists, and the next run reads them";
+
+/// What the scheduled monitor says when the run that is due waits for power.
+pub const BATTERY_CRITICAL_HOLD: &str = "the battery is critical; the run that is due waits \
+     until the machine is on power or charged again";
+
+/// What a walk says when it finds the machine slept in the middle of it.
+pub fn slept_during_the_walk(slept: std::time::Duration) -> String {
+    let minutes = slept.as_secs().div_ceil(60);
+    let how_long = if minutes < 120 {
+        format!("{minutes} minutes")
+    } else {
+        format!("about {} hours", minutes.div_ceil(60))
+    };
+    format!(
+        "the computer slept for {how_long}; picking the walk up again where it stopped \
+         once the network is back"
+    )
+}
+
 /// The consent question, with the account named the way the warning above
 /// named it.
 pub fn ask_to_continue(shown: &str) -> String {

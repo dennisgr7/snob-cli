@@ -40,11 +40,19 @@
 //!   these views hold for the whole session lives on [`crate::ui::tui::Tui`],
 //!   with the rest of the terminal claim.
 //!
-//! What is **not** taken: mouse tracking, focus events and the kitty keyboard
-//! protocol. Mouse capture breaks the terminal's own text selection, which is
-//! the loudest complaint against every full-screen tool that turns it on, and
-//! four keys do not need it. The kitty protocol exists to disambiguate
-//! Shift+Enter and Ctrl+Enter, which nothing here binds.
+//! **Focus is taken, and only to do less.** With focus reporting on, the
+//! terminal says when its window gains and loses the focus, and a view that
+//! is not being looked at wakes every [`UNFOCUSED_TICK`] rather than every
+//! [`TICK`]. It still draws what changes, the next screen, a load that
+//! finished, as it happens: a terminal without the focus is often still on
+//! screen, beside the window that has it. A terminal that never reports focus
+//! is taken as focused for good, which is how every view behaved before.
+//!
+//! What is **not** taken: mouse tracking and the kitty keyboard protocol.
+//! Mouse capture breaks the terminal's own text selection, which is the
+//! loudest complaint against every full-screen tool that turns it on, and four
+//! keys do not need it. The kitty protocol exists to disambiguate Shift+Enter
+//! and Ctrl+Enter, which nothing here binds.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,6 +73,36 @@ use snob_ig::pace::CancelToken;
 /// under crossterm's raw mode it is a `KeyEvent` carrying `CONTROL`, on both
 /// platforms, which is something a program can decide about.
 pub const TICK: Duration = Duration::from_millis(150);
+
+/// How long a view whose terminal has lost the focus waits before waking up
+/// on its own: seven times in a second become one every two. Not longer,
+/// because the wake-up is also where a stop the system asked for is noticed
+/// ([`read`]), and Windows gives a closing console a few seconds.
+pub const UNFOCUSED_TICK: Duration = Duration::from_secs(2);
+
+/// Whether the terminal has the focus, as it last said. Written by [`read`],
+/// the one place every view and the fetch watcher read through, so a change
+/// that arrives while a fetch runs is not lost with the keys it drops.
+static FOCUSED: AtomicBool = AtomicBool::new(true);
+
+/// Whether the terminal has the focus, as far as anybody can tell: `true`
+/// until it says otherwise.
+pub fn focused() -> bool {
+    FOCUSED.load(Ordering::Relaxed)
+}
+
+/// Forgets what the terminal last said about its focus, when its reports are
+/// turned off: taken as focused again, which is what a command in a terminal
+/// is until the next view hears otherwise.
+pub fn focus_unknown() {
+    FOCUSED.store(true, Ordering::Relaxed);
+}
+
+/// How long a view waits for something to happen before going round again:
+/// [`TICK`] while it is being looked at, [`UNFOCUSED_TICK`] while not.
+pub fn tick() -> Duration {
+    if focused() { TICK } else { UNFOCUSED_TICK }
+}
 
 /// What the browser understands, resolved from a key.
 ///
@@ -116,12 +154,36 @@ pub enum Raw {
 }
 
 /// Waits up to `timeout` for something to happen, and hands it over unbound.
+///
+/// **A stop the system asked for arrives as a Ctrl+C.** Raw mode keeps the
+/// signal from being one, and the browsers decide about the key, so a
+/// `SIGTERM` or a closing console would cancel the token and leave an idle
+/// browser waiting for a key nobody will press. Every browser reads through
+/// here, between keys and while a fetch runs (`watching_cancel_keys`), so each
+/// one leaves by the road it already has for Ctrl+C.
 pub fn read(timeout: Duration) -> std::io::Result<Raw> {
+    if crate::interrupt::asked_by_the_system() {
+        return Ok(Raw::Key(system_stop()));
+    }
     if !event::poll(timeout)? {
         return Ok(Raw::Tick);
     }
     Ok(match event::read()? {
         Event::Resize(..) => Raw::Resized,
+        // Read as a resize, which every view answers by drawing: what changed
+        // while nobody looked is put on screen as they come back.
+        // And the browsers this view reads through run at the normal pace
+        // while somebody looks at it, efficiently while not (`power::qos`).
+        Event::FocusGained => {
+            FOCUSED.store(true, Ordering::Relaxed);
+            crate::owner::attended(true);
+            Raw::Resized
+        }
+        Event::FocusLost => {
+            FOCUSED.store(false, Ordering::Relaxed);
+            crate::owner::attended(false);
+            Raw::Tick
+        }
         Event::Paste(text) => Raw::Paste(text),
         // `KeyEventKind` matters on Windows, where the console reports the
         // release of a key as well as the press. Without this filter every
@@ -129,6 +191,11 @@ pub fn read(timeout: Duration) -> std::io::Result<Raw> {
         Event::Key(key) if key.kind == KeyEventKind::Press => Raw::Key(key),
         _ => Raw::Tick,
     })
+}
+
+/// The key a stop the system asked for is read as. See [`read`].
+fn system_stop() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
 }
 
 /// Waits up to `timeout` for a key, and binds it.
@@ -347,6 +414,24 @@ mod tests {
             action_of(key(KeyCode::Char('q'), KeyModifiers::ALT)),
             Action::None
         );
+    }
+
+    /// A view nobody is looking at wakes seldom, and one being looked at as
+    /// it always did.
+    #[test]
+    fn a_view_out_of_focus_wakes_seldom() {
+        assert_eq!(tick(), TICK, "focused until the terminal says otherwise");
+        FOCUSED.store(false, Ordering::Relaxed);
+        assert_eq!(tick(), UNFOCUSED_TICK);
+        FOCUSED.store(true, Ordering::Relaxed);
+        assert_eq!(tick(), TICK);
+    }
+
+    /// A stop the system asked for is read as the key every browser already
+    /// leaves on.
+    #[test]
+    fn a_stop_the_system_asked_for_reads_as_ctrl_c() {
+        assert_eq!(action_of(system_stop()), Action::Interrupt);
     }
 
     #[test]

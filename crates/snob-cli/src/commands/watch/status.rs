@@ -17,6 +17,7 @@ use snob_core::{Epoch, Pk};
 use snob_store::config::{self, WatchConfig};
 use snob_store::paths::{AccountPaths, AppPaths};
 use snob_store::registry::Registry;
+use snob_store::store::shared::PowerWait;
 use snob_store::store::{Store, deliveries, watch as watch_store};
 
 use crate::app::Viewer;
@@ -45,6 +46,7 @@ pub fn status(
         &recorded.reported,
         owed,
         snob_core::clock::now(),
+        waiting_for_power(paths),
     );
 
     if args.output.json {
@@ -445,12 +447,20 @@ struct HalfRead {
     missing: Option<ListKind>,
 }
 
+/// The due run the monitor holds back for a critical battery, as the run
+/// loop wrote it down; `None` when it is not, or nothing can tell.
+fn waiting_for_power(paths: &AppPaths) -> Option<PowerWait> {
+    let shared = snob_store::store::shared::Shared::read_existing(paths).ok()??;
+    shared.waiting_for_power().ok()?
+}
+
 fn health(
     config: Option<&WatchConfig>,
     runs: &[RunOf],
     reported: &[HalfRead],
     owed: deliveries::Owed,
     now: Epoch,
+    waiting_for_power: Option<PowerWait>,
 ) -> Health {
     let mut notes = Vec::new();
     let mut verdict = Verdict::Ok;
@@ -524,7 +534,28 @@ fn health(
     //
     // The gap comes from the schedule rather than from a guess, so a weekly
     // monitor is not called late after two days.
-    if let Some(gap) = config.and_then(|c| expected_gap(c, now))
+    //
+    // **Except while it waits for power.** A monitor on a laptop whose battery
+    // is critical holds the run that is due until the machine is on power
+    // again (`run::waits_for_power`); that is the monitor doing what it
+    // should, and it is said as such rather than counted late.
+    //
+    // **Only while somebody is still looking.** A monitor stopped, killed, or
+    // shut down with the machine while it waited never says that power is
+    // back, and its marker would hide a dead monitor for good. The scheduled
+    // loop looks every minute and `watch once` on a timer every period, so a
+    // last look older than one period is a monitor that is no longer there,
+    // and the lateness check below takes over from it.
+    let gap = config.and_then(|c| expected_gap(c, now));
+    let waiting_for_power =
+        waiting_for_power.filter(|wait| gap.is_none_or(|gap| now - wait.seen <= gap));
+    if let Some(wait) = waiting_for_power {
+        at_least(Verdict::Warned);
+        notes.push(format!(
+            "the run that is due is waiting for power: the battery has been critical since {}",
+            report::stored_on(wait.since)
+        ));
+    } else if let Some(gap) = gap
         && let Some(newest) = runs.iter().map(|r| r.run.started_at).max()
     {
         let silent = now - newest;
@@ -1063,7 +1094,8 @@ url = \"https://n8n.internal/hook\"
                 &[of(&ok)],
                 &[],
                 deliveries::Owed::default(),
-                NOW
+                NOW,
+                None
             )
             .verdict,
             Verdict::Ok,
@@ -1080,7 +1112,8 @@ url = \"https://n8n.internal/hook\"
                     &[of(&run)],
                     &[],
                     deliveries::Owed::default(),
-                    NOW
+                    NOW,
+                    None
                 )
                 .verdict,
                 Verdict::Warned,
@@ -1097,7 +1130,8 @@ url = \"https://n8n.internal/hook\"
                 &[of(&dead)],
                 &[],
                 deliveries::Owed::default(),
-                NOW
+                NOW,
+                None
             )
             .verdict,
             Verdict::Failed
@@ -1114,7 +1148,8 @@ url = \"https://n8n.internal/hook\"
                     elsewhere: 0,
                     given_up: 0,
                 },
-                NOW
+                NOW,
+                None
             )
             .verdict,
             Verdict::Warned
@@ -1139,7 +1174,8 @@ every = \"6h\"
                     elsewhere: 2,
                     given_up: 0,
                 },
-                NOW
+                NOW,
+                None
             )
             .verdict,
             Verdict::Warned,
@@ -1148,7 +1184,7 @@ every = \"6h\"
 
         // And a machine with nothing configured is not broken, but a bare
         // `snob watch` there has no schedule to run on.
-        let nothing = health(None, &[], &[], deliveries::Owed::default(), NOW);
+        let nothing = health(None, &[], &[], deliveries::Owed::default(), NOW, None);
         assert_eq!(nothing.verdict, Verdict::Warned);
         assert_eq!(nothing.notes.len(), 2, "{:?}", nothing.notes);
     }
@@ -1171,7 +1207,14 @@ every = \"6h\"
 url = \"n8n.local/hook\"
 ",
         );
-        let found = health(Some(&no_scheme), &[], &[], deliveries::Owed::default(), NOW);
+        let found = health(
+            Some(&no_scheme),
+            &[],
+            &[],
+            deliveries::Owed::default(),
+            NOW,
+            None,
+        );
         assert_eq!(
             found.verdict,
             Verdict::Failed,
@@ -1196,7 +1239,8 @@ url = \"https://user:pw@example.com/hook\"
                 &[],
                 &[],
                 deliveries::Owed::default(),
-                NOW
+                NOW,
+                None
             )
             .verdict,
             Verdict::Failed
@@ -1212,7 +1256,14 @@ every = \"6h\"
 url = \"https://example.com/hook\"
 ",
         );
-        let ok = health(Some(&fine), &[], &[], deliveries::Owed::default(), NOW);
+        let ok = health(
+            Some(&fine),
+            &[],
+            &[],
+            deliveries::Owed::default(),
+            NOW,
+            None,
+        );
         assert_eq!(ok.verdict, Verdict::Warned, "{:?}", ok.notes);
     }
 
@@ -1234,6 +1285,7 @@ url = \"https://example.com/hook\"
                 &[],
                 deliveries::Owed::default(),
                 NOW,
+                None,
             )
             .verdict
         };
@@ -1290,7 +1342,14 @@ url = \"https://example.com/hook\"
     #[test]
     fn both_probes_say_the_same_thing_about_an_unconfigured_machine() {
         let ok = ran(ExitCode::Ok);
-        let status = health(None, &[of(&ok)], &[], deliveries::Owed::default(), NOW);
+        let status = health(
+            None,
+            &[of(&ok)],
+            &[],
+            deliveries::Owed::default(),
+            NOW,
+            None,
+        );
         assert_eq!(status.notes.len(), 1, "{:?}", status.notes);
 
         let check = crate::engine::check::without_a_session(None, None, NOW);
@@ -1329,7 +1388,7 @@ url = \"https://example.com/hook\"
         let moved = watch_toml(
             "schema = 1\nevery = \"6h\"\n\n[webhook]\nurl = \"https://n8n.new.local/hook\"\n",
         );
-        let stranded = health(Some(&moved), &[of(&ok)], &[], two_elsewhere, NOW);
+        let stranded = health(Some(&moved), &[of(&ok)], &[], two_elsewhere, NOW, None);
         assert_eq!(stranded.verdict, Verdict::Failed, "{:?}", stranded.notes);
 
         // The same rows with no `[webhook]` in the file are the shape the README
@@ -1337,7 +1396,14 @@ url = \"https://example.com/hook\"
         // them. A guess in the alarming direction is what costs a probe its
         // credibility.
         let from_the_flag = watch_toml("schema = 1\nevery = \"6h\"\n");
-        let fine = health(Some(&from_the_flag), &[of(&ok)], &[], two_elsewhere, NOW);
+        let fine = health(
+            Some(&from_the_flag),
+            &[of(&ok)],
+            &[],
+            two_elsewhere,
+            NOW,
+            None,
+        );
         assert_eq!(fine.verdict, Verdict::Warned, "{:?}", fine.notes);
         assert_eq!(fine.verdict.exit_code(), ExitCode::Ok);
         assert!(
@@ -1381,6 +1447,7 @@ url = \"https://example.com/hook\"
                 &[],
                 deliveries::Owed::default(),
                 NOW,
+                None,
             );
             assert_eq!(
                 health.verdict,
@@ -1399,7 +1466,8 @@ url = \"https://example.com/hook\"
                 &[of(&ok)],
                 &[],
                 deliveries::Owed::default(),
-                NOW
+                NOW,
+                None
             )
             .verdict,
             Verdict::Ok
@@ -1431,6 +1499,7 @@ url = \"https://example.com/hook\"
             &[half],
             deliveries::Owed::default(),
             NOW,
+            None,
         );
         assert_eq!(blind.verdict, Verdict::Warned, "{:?}", blind.notes);
         assert!(
@@ -1454,7 +1523,8 @@ url = \"https://example.com/hook\"
                 &[of(&ok)],
                 &[whole],
                 deliveries::Owed::default(),
-                NOW
+                NOW,
+                None
             )
             .verdict,
             Verdict::Ok
@@ -1479,7 +1549,8 @@ url = \"https://example.com/hook\"
                 &[of(&recent)],
                 &[],
                 deliveries::Owed::default(),
-                NOW
+                NOW,
+                None
             )
             .verdict,
             Verdict::Ok
@@ -1496,6 +1567,7 @@ url = \"https://example.com/hook\"
             &[],
             deliveries::Owed::default(),
             NOW,
+            None,
         );
         assert_eq!(one.verdict, Verdict::Warned, "{:?}", one.notes);
 
@@ -1510,6 +1582,7 @@ url = \"https://example.com/hook\"
             &[],
             deliveries::Owed::default(),
             NOW,
+            None,
         );
         assert_eq!(stopped.verdict, Verdict::Failed, "{:?}", stopped.notes);
         assert!(
@@ -1519,6 +1592,93 @@ url = \"https://example.com/hook\"
                 .any(|n| n.contains("has not run since")),
             "and it has to say so: {:?}",
             stopped.notes
+        );
+    }
+
+    /// A monitor holding its run for a critical battery is doing what it
+    /// should: said as such, and not counted late however long it waits.
+    #[test]
+    fn a_monitor_waiting_for_power_is_not_late() {
+        let configured = watch_toml("schema = 1\nevery = \"6h\"\n");
+        let gone = watch_store::Run {
+            started_at: NOW - Duration::from_secs(2 * 86_400),
+            ..ran(ExitCode::Ok)
+        };
+        let waiting = health(
+            Some(&configured),
+            &[of(&gone)],
+            &[],
+            deliveries::Owed::default(),
+            NOW,
+            Some(PowerWait {
+                since: NOW - Duration::from_secs(3_600),
+                seen: NOW - Duration::from_secs(60),
+            }),
+        );
+        assert_eq!(waiting.verdict, Verdict::Warned, "{:?}", waiting.notes);
+        assert!(
+            waiting
+                .notes
+                .iter()
+                .any(|n| n.contains("waiting for power")),
+            "{:?}",
+            waiting.notes
+        );
+        assert!(
+            !waiting
+                .notes
+                .iter()
+                .any(|n| n.contains("has not run since")),
+            "{:?}",
+            waiting.notes
+        );
+    }
+
+    /// A marker nobody has looked at for a whole period was left by a monitor
+    /// that stopped while it waited: it is late like any other, not waiting.
+    #[test]
+    fn a_marker_left_behind_does_not_hide_a_dead_monitor() {
+        let configured = watch_toml(
+            "schema = 1
+every = \"6h\"
+",
+        );
+        let gone = watch_store::Run {
+            started_at: NOW - Duration::from_secs(2 * 86_400),
+            ..ran(ExitCode::Ok)
+        };
+        let left_behind = health(
+            Some(&configured),
+            &[of(&gone)],
+            &[],
+            deliveries::Owed::default(),
+            NOW,
+            Some(PowerWait {
+                since: NOW - Duration::from_secs(43_200),
+                seen: NOW - Duration::from_secs(7 * 3_600),
+            }),
+        );
+        assert_eq!(
+            left_behind.verdict,
+            Verdict::Failed,
+            "{:?}",
+            left_behind.notes
+        );
+        assert!(
+            !left_behind
+                .notes
+                .iter()
+                .any(|n| n.contains("waiting for power")),
+            "{:?}",
+            left_behind.notes
+        );
+        assert!(
+            left_behind
+                .notes
+                .iter()
+                .any(|n| n.contains("has not run since")),
+            "{:?}",
+            left_behind.notes
         );
     }
 
@@ -1538,7 +1698,8 @@ url = \"https://example.com/hook\"
                 &[of(&two_days_ago)],
                 &[],
                 deliveries::Owed::default(),
-                NOW
+                NOW,
+                None
             )
             .verdict,
             Verdict::Ok,
@@ -1552,7 +1713,8 @@ url = \"https://example.com/hook\"
                 &[of(&two_days_ago)],
                 &[],
                 deliveries::Owed::default(),
-                NOW
+                NOW,
+                None
             )
             .verdict,
             Verdict::Ok,
@@ -1631,6 +1793,7 @@ every = \"6h\"
             &[],
             deliveries::Owed::default(),
             NOW,
+            None,
         );
 
         assert_eq!(health.verdict, Verdict::Ok, "{:?}", health.notes);
@@ -1685,6 +1848,7 @@ every = \"6h\"
             &recorded.reported,
             recorded.owed,
             NOW,
+            None,
         );
         let document = super::super::wire::status_json(
             true,

@@ -327,6 +327,21 @@ impl BrowserProcess {
         }
     }
 
+    /// Moves it, with every process it started, to `mode`
+    /// (`power::qos`): its job on Windows, its process group on Linux and
+    /// macOS. Not once it has gone: its group's number may be someone else's
+    /// by then.
+    pub fn set_mode(&mut self, mode: crate::power::qos::Mode) {
+        #[cfg(windows)]
+        crate::power::qos::in_job(self.inner.job, mode);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if !self.nothing_left() {
+            crate::power::qos::in_group(self.group(), mode);
+        }
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        let _ = mode;
+    }
+
     /// Its process group's number, which is its own id.
     #[cfg(unix)]
     fn group(&self) -> libc::pid_t {
@@ -426,7 +441,7 @@ mod windows_impl {
         /// Held for exactly as long as the browser should live. Closing it is
         /// what `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` reacts to, and the
         /// operating system closes it for us however this process dies.
-        job: HANDLE,
+        pub(super) job: HANDLE,
         pub(super) pid: u32,
         ended: Option<Ended>,
     }

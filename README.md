@@ -1,7 +1,7 @@
 # Snob CLI
 
-An Instagram client for the terminal, with extra utilities, media downloads and
-output ready for AI agents.
+An Instagram CLI: a client for the terminal, with extra utilities, media
+downloads and output ready for AI agents.
 
 `snob` tells you who does not follow you back, browses profiles, stories,
 highlights, posts and reels, downloads their photos and videos, and watches an
@@ -49,7 +49,7 @@ irm https://raw.githubusercontent.com/dennisgr7/snob-cli/main/packaging/install.
 cargo install --locked --git https://github.com/dennisgr7/snob-cli snob-cli
 ```
 
-Builds exist for Windows and Linux on x86_64 and ARM64, and macOS on Apple
+Builds exist for Windows 11 and Linux on x86_64 and ARM64, and macOS on Apple
 Silicon. Everything that talks to Instagram needs a Chromium-based browser
 installed; no window is ever shown.
 

@@ -642,6 +642,115 @@ async fn a_canceled_run_does_not_walk_the_second_list() {
     );
 }
 
+/// A monitor run at a critical battery stops its walks before their next page,
+/// as a stop kept for the next run rather than as an error, and without
+/// canceling the process: the scheduled loop goes on to wait for power.
+#[tokio::test]
+async fn a_critical_battery_stops_the_monitor_s_walks_between_pages() {
+    let server = MockServer::start().await;
+    mount_profile(&server, 3, 2).await;
+    mount_list(&server, "followers", &[1, 2, 3]).await;
+    mount_list(&server, "following", &[8, 9]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&server, open_db(tmp.path()));
+    app.stops_on_a_critical_battery(|| true);
+
+    let tick = watch::tick(&mut app, &Watched::own()).await.unwrap();
+
+    for list in &tick.lists {
+        assert!(
+            matches!(
+                list.skipped,
+                Some(Skipped::Incomplete(
+                    snob_core::model::StopReason::Canceled,
+                    _
+                ))
+            ),
+            "{:?}: {:?}",
+            list.kind,
+            list.skipped
+        );
+    }
+    let asked = server.received_requests().await.unwrap();
+    assert!(
+        asked.is_empty(),
+        "nothing asked once the battery is critical, not even the profile: {:?}",
+        asked.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+    assert!(!app.cancel().is_canceled(), "the process goes on");
+}
+
+/// A battery that turns critical after the first list has been walked stops
+/// the second before it opens the profile again: the stop does not cancel the
+/// process, so the token the tick asks between lists never sees it.
+#[tokio::test]
+async fn a_battery_that_turns_critical_between_the_lists_stops_the_second() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Critical from the moment the followers page has been served. A static
+    /// because the stop is a plain `fn`, and this test's own.
+    static CRITICAL: AtomicBool = AtomicBool::new(false);
+
+    struct ThenCritical(ResponseTemplate);
+    impl wiremock::Respond for ThenCritical {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            CRITICAL.store(true, Ordering::SeqCst);
+            self.0.clone()
+        }
+    }
+
+    let server = MockServer::start().await;
+    mount_profile(&server, 3, 2).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/friendships/42/followers/"))
+        .respond_with(ThenCritical(ResponseTemplate::new(200).set_body_string(
+            r#"{"users":[{"pk":1,"username":"u1"},{"pk":2,"username":"u2"},{"pk":3,"username":"u3"}]}"#,
+        )))
+        .mount(&server)
+        .await;
+    // Mounted so a second walk would be answered and counted, not refused by
+    // a missing mock.
+    mount_list(&server, "following", &[8, 9]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&server, open_db(tmp.path()));
+    app.stops_on_a_critical_battery(|| CRITICAL.load(Ordering::SeqCst));
+
+    let tick = watch::tick(&mut app, &Watched::own()).await.unwrap();
+
+    let following = tick
+        .lists
+        .iter()
+        .find(|l| l.kind == ListKind::Following)
+        .expect("both lists are still reported on");
+    assert!(
+        matches!(
+            following.skipped,
+            Some(Skipped::Incomplete(
+                snob_core::model::StopReason::Canceled,
+                _
+            ))
+        ),
+        "{:?}",
+        following.skipped
+    );
+    let asked: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert_eq!(
+        asked,
+        vec![
+            "/api/v1/users/web_profile_info/",
+            "/api/v1/friendships/42/followers/",
+        ],
+        "nothing may be asked after the battery turned critical"
+    );
+    assert!(!app.cancel().is_canceled(), "the process goes on");
+}
+
 /// A list served with names rather than only ids, so a rename can be arranged.
 async fn mount_named(server: &MockServer, kind: &str, users: &[(u64, &str)]) {
     let users: Vec<String> = users

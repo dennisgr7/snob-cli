@@ -129,6 +129,21 @@ pub const PAGES_PER_SITTING: u32 = 40;
 /// `snob-store`'s `snapshots.rs`).
 pub const SITTING_PAUSE_MS: (u64, u64) = (300_000, 900_000);
 
+/// How long a walk that finds the machine slept waits for the network to come
+/// back, in seconds: one wait before each attempt after the first, five
+/// attempts after it, two and a quarter minutes in all.
+///
+/// **Only ever an added wait**, never a request sooner than the walk would
+/// have sent one. A machine waking from sleep takes seconds to rejoin a
+/// network, a Wi-Fi one longer, and the request budget's ordinary retries
+/// (two, four and eight seconds) were made for a server that failed, not for a
+/// radio that is still off: three of them would end the walk on a network
+/// failure a few seconds into waking. Waiting longer costs nothing, since the
+/// walk has been quiet for as long as the machine slept; and what is asked is
+/// one document, the page the walk reads from, which is what a person opening
+/// the app again asks too (`pager::ListWalker`).
+pub const RECONNECT_WAITS_SECS: [u64; 5] = [5, 10, 20, 40, 60];
+
 /// Request cadence: within an action, and between sittings.
 #[derive(Debug, Clone, Copy)]
 pub struct Pace {

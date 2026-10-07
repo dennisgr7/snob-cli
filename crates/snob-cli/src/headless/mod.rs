@@ -112,9 +112,37 @@ const COMMAND_TIMEOUT: Duration = crate::cdp::CALL_TIMEOUT;
 /// start. A few minutes, since memory is what a browser costs.
 pub(crate) const IDLE: Duration = Duration::from_secs(5 * 60);
 
+/// How often an efficient browser's processes are looked at again for the
+/// helpers it started since (`Headless::keep_mode`).
+const MODE_AGAIN: Duration = Duration::from_secs(30);
+
 /// How often a process with no owner looks again at a profile another snob's
 /// browser holds.
 const PROFILE_RETRY: Duration = Duration::from_secs(5);
+
+/// How long the owner keeps starting a browser on a profile the one before it
+/// has not let go of yet.
+///
+/// The browser closed for the last command, the owner's own or one a previous
+/// owner closed, has let go of the profile by the time its close returns, as a
+/// rule. On a loaded machine its last helpers can outlast that by moments, and
+/// the next browser then finds the profile held and leaves, which failed the
+/// command for a browser that was already on its way out. Measured on Windows
+/// under load, once in some sixty starts. Ten seconds is many times what such a
+/// browser takes to finish leaving, and short beside the patience a command
+/// gives the owner (`owner::ALLOWANCE`). Past it, what holds the profile is
+/// another snob in the middle of a run, and the command is told so.
+///
+/// The owner does not wait out a whole run, as a process with no owner does
+/// ([`PROFILE_RETRY`]): a command's patience with it is bounded, and the owner
+/// has nobody to say "waiting" to.
+const PROFILE_LETTING_GO: Duration = Duration::from_secs(10);
+
+/// The shortest and the longest pause between those starts. The first comes
+/// soon, since a browser on its way out is usually gone in a fraction of a
+/// second; they double from there.
+const LETTING_GO_PAUSES: (Duration, Duration) =
+    (Duration::from_millis(250), Duration::from_secs(1));
 
 /// How long a call waits for the app's own calls on the tab's document to
 /// carry what it copies from them, which they do as the document boots:
@@ -167,26 +195,82 @@ pub(crate) fn local(paths: &AppPaths) -> Arc<Headless> {
 
 /// The browsers of a process with no owner to send through
 /// (`owner::Remote::send_as` sends through this when it has none), each closed once it has been idle
-/// for [`IDLE`], looked at every `tick`: a walk asleep on the day's budget
-/// would otherwise hold its profile against every other command for hours.
-/// What a browser rotated stays in its profile, where the next one reads it.
+/// for [`IDLE`]: a walk asleep on the day's budget would otherwise hold its
+/// profile against every other command for hours. What a browser rotated
+/// stays in its profile, where the next one reads it.
+///
+/// **The reaper wakes when there is something to close, not on a timer.** It
+/// sleeps until the first open browser would be idle for [`IDLE`], and with no
+/// browser open it sleeps until one starts. Looked at once a second instead, a
+/// `snob watch` running without an owner woke eighty-six thousand times a day
+/// for a browser that is open a few minutes of it, while the monitor's own
+/// loop goes out of its way to wake a few hundred times
+/// (`commands::watch::scheduled::nap_for`).
 ///
 /// Such a process waits for a profile another snob's browser holds, rather
 /// than failing: with no owner there is nobody to share that browser through.
-pub(crate) fn alone(paths: &AppPaths, tick: Duration) -> Arc<Headless> {
+pub(crate) fn alone(paths: &AppPaths) -> Arc<Headless> {
     static REAPING: std::sync::Once = std::sync::Once::new();
     let headless = local(paths);
     headless.waits.store(true, Ordering::SeqCst);
+    headless
+        .attended_otherwise
+        .store(crate::owner::is_attended(), Ordering::SeqCst);
     REAPING.call_once(|| {
         let reaped = Arc::clone(&headless);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(tick).await;
-                reaped.reap(|open| open.idle >= IDLE).await;
+                match reaped.reap(|open| open.idle >= IDLE).await.next {
+                    Some(wait) => tokio::time::sleep(wait).await,
+                    None => reaped.started.notified().await,
+                }
             }
         });
     });
     headless
+}
+
+/// Whether anybody waits on the browsers this process runs itself, when it
+/// runs them without an owner: the command's own answer
+/// (`owner::attended`), applied to each now if it is not busy.
+pub(crate) fn attended_here(attended: bool) {
+    let Some(headless) = HEADLESS.get() else {
+        return;
+    };
+    headless
+        .attended_otherwise
+        .store(attended, Ordering::SeqCst);
+    for (pk, account) in headless.every_account() {
+        if let Ok(mut slot) = account.live.try_lock()
+            && let Some(live) = slot.as_mut()
+        {
+            headless.keep_mode(pk, live);
+        }
+    }
+}
+
+/// A mode forced from the environment, `SNOB_TEST_QOS=eco` or `normal`, for
+/// the measurement in `tests/headless.rs` that compares the two. In the
+/// `testing` build only.
+#[cfg(feature = "testing")]
+fn forced_mode() -> Option<crate::power::qos::Mode> {
+    match std::env::var("SNOB_TEST_QOS").ok()?.as_str() {
+        "eco" => Some(crate::power::qos::Mode::Eco),
+        "normal" => Some(crate::power::qos::Mode::Normal),
+        _ => None,
+    }
+}
+
+/// How long the owner pauses before starting a browser again on a profile
+/// still held, having waited `waited` already: the shortest pause, doubling
+/// up to the longest, and `None` once the next would go past
+/// [`PROFILE_LETTING_GO`]. Never again after a browser that handed over:
+/// what holds the profile took its command line, and each start would open
+/// another tab in it.
+fn letting_go(handed_over: bool, waited: Duration) -> Option<Duration> {
+    let (shortest, longest) = LETTING_GO_PAUSES;
+    let pause = waited.clamp(shortest, longest);
+    (!handed_over && waited + pause <= PROFILE_LETTING_GO).then_some(pause)
 }
 
 /// What `mutex` guards, whether or not a thread panicked holding it: every
@@ -238,6 +322,18 @@ pub(crate) struct Headless {
     heard: tokio::sync::broadcast::Sender<(Pk, PushedBack)>,
     /// Set by [`alone`]: a profile another snob holds is waited for.
     waits: AtomicBool,
+    /// Poked when a browser starts, for [`alone`]'s reaper asleep with none
+    /// open. `notify_one`, so a start that comes between the reaper looking
+    /// and the reaper waiting is kept for it rather than lost.
+    started: tokio::sync::Notify,
+    /// Per account, whether anybody waits on its browser, as the owner works
+    /// it out from the commands connected ([`Headless::attend`]).
+    attended: std::sync::Mutex<HashMap<Pk, bool>>,
+    /// The same for an account the owner has said nothing about: `false` in
+    /// the owner, whose browsers nobody waits on until a command says so; the
+    /// command's own answer in a process that runs its browsers itself
+    /// ([`attended_here`]).
+    attended_otherwise: AtomicBool,
 }
 
 /// One account's browser, while it has one.
@@ -273,6 +369,18 @@ impl Account {
         }
         *lock(&self.listened) = None;
     }
+}
+
+/// What [`Headless::reap`] leaves behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Reaped {
+    /// The browsers still open, busy ones included.
+    pub(crate) open: usize,
+    /// How long until the first of them has been idle for [`IDLE`], when one
+    /// is open: the next moment there may be something to close. A busy one
+    /// counts as a whole [`IDLE`] away, since it is touched again when its
+    /// request ends.
+    pub(crate) next: Option<Duration>,
 }
 
 /// An open browser, as the owner decides whether to close it.
@@ -316,6 +424,9 @@ struct Live {
     /// the path it was asked for: the only one a write may be built on
     /// ([`Live::build`]).
     asked_document: Option<(String, String)>,
+    /// What it was last moved to (`power::qos`), and when; `None` until it
+    /// has been. See [`Headless::keep_mode`].
+    mode: Option<(crate::power::qos::Mode, std::time::Instant)>,
 }
 
 impl Live {
@@ -581,6 +692,9 @@ impl Headless {
             accounts: std::sync::Mutex::new(HashMap::new()),
             heard: tokio::sync::broadcast::Sender::new(16),
             waits: AtomicBool::new(false),
+            started: tokio::sync::Notify::new(),
+            attended: std::sync::Mutex::new(HashMap::new()),
+            attended_otherwise: AtomicBool::new(false),
         }
     }
 
@@ -593,6 +707,51 @@ impl Headless {
             .iter()
             .map(|(pk, account)| (*pk, Arc::clone(account)))
             .collect()
+    }
+
+    /// Whether anybody waits on the account's browser: the owner's answer,
+    /// worked out from the commands connected, and taken now if the browser
+    /// is not busy, or after its request otherwise.
+    pub(crate) fn attend(&self, pk: Pk, attended: bool) {
+        lock(&self.attended).insert(pk, attended);
+        let account = self.account(pk);
+        if let Ok(mut slot) = account.live.try_lock()
+            && let Some(live) = slot.as_mut()
+        {
+            self.keep_mode(pk, live);
+        }
+    }
+
+    /// What the account's browser runs as now (`power::qos`).
+    pub(crate) fn mode_of(&self, pk: Pk) -> crate::power::qos::Mode {
+        #[cfg(feature = "testing")]
+        if let Some(forced) = forced_mode() {
+            return forced;
+        }
+        let attended = lock(&self.attended)
+            .get(&pk)
+            .copied()
+            .unwrap_or_else(|| self.attended_otherwise.load(Ordering::SeqCst));
+        crate::power::qos::Mode::for_attention(attended)
+    }
+
+    /// Moves `live` to the mode the account calls for, when it is not in it
+    /// already, and once in a while while it is efficient: the browser starts
+    /// a helper for each page it opens, and a helper started since the last
+    /// time is not efficient until it is moved too. After every request, so
+    /// at most every [`MODE_AGAIN`].
+    fn keep_mode(&self, pk: Pk, live: &mut Live) {
+        let wanted = self.mode_of(pk);
+        let due = match live.mode {
+            None => true,
+            Some((mode, _)) if mode != wanted => true,
+            Some((mode, at)) => mode == crate::power::qos::Mode::Eco && at.elapsed() >= MODE_AGAIN,
+        };
+        if due {
+            tracing::debug!(account = %pk, mode = ?wanted, "the browser's processor mode");
+            live.cdp.set_mode(wanted);
+            live.mode = Some((wanted, std::time::Instant::now()));
+        }
     }
 
     /// Every push-back heard from now on, with its account.
@@ -650,12 +809,16 @@ impl Headless {
     }
 
     /// Closes the open browsers `due` says to, never one answering a request,
-    /// and says how many are still open, busy ones included.
-    pub(crate) async fn reap(&self, due: impl Fn(&Open) -> bool) -> usize {
+    /// and says how many are still open, busy ones included, and when the
+    /// first of them idles out.
+    pub(crate) async fn reap(&self, due: impl Fn(&Open) -> bool) -> Reaped {
         let mut open = 0;
+        let mut next: Option<Duration> = None;
+        let mut sooner = |wait: Duration| next = Some(next.map_or(wait, |next| next.min(wait)));
         for (pk, account) in self.every_account() {
             let Ok(mut slot) = account.live.try_lock() else {
                 open += 1;
+                sooner(IDLE);
                 continue;
             };
             let Some(live) = slot.as_ref() else {
@@ -671,9 +834,10 @@ impl Headless {
                 account.close(&mut slot).await;
             } else {
                 open += 1;
+                sooner(IDLE.saturating_sub(state.idle));
             }
         }
-        open
+        Reaped { open, next }
     }
 
     /// Sends `request` as `session`, from the account's own browser
@@ -753,6 +917,10 @@ impl Headless {
                 starts += 1;
                 account.touch();
                 *slot = Some(started);
+                self.started.notify_one();
+                if let Some(live) = slot.as_mut() {
+                    self.keep_mode(session.ds_user_id, live);
+                }
             }
             let live = slot.as_mut().expect("a browser was started above");
             let ready = self.ready(live, session, origin).await;
@@ -780,6 +948,9 @@ impl Headless {
             Err(e) => Err(e),
         };
         account.touch();
+        if let Some(live) = slot.as_mut() {
+            self.keep_mode(session.ds_user_id, live);
+        }
         if let Err(PageError::Browser(_)) = &result {
             // A browser that failed once is not trusted with the next request:
             // it may be gone. The next request starts a fresh one. Only then —
@@ -875,16 +1046,30 @@ impl Headless {
 
     /// Starts the browser, in a process with no owner once no other snob's
     /// holds the profile: looked at again every [`PROFILE_RETRY`], until
-    /// Ctrl+C. Said once per wait.
+    /// Ctrl+C. Said once per wait. In the owner, once the browser before it
+    /// has let go of the profile, for up to [`PROFILE_LETTING_GO`].
     async fn start_when_free(&self, session: &Session, account: &Account) -> Result<Live> {
         let mut told = false;
+        let mut waited = Duration::ZERO;
         loop {
             let error = match self.start(session, account).await {
-                Err(e) if self.waits.load(Ordering::SeqCst) => e,
+                Err(e) => e,
                 started => return started,
             };
-            if error.downcast_ref::<crate::cdp::ProfileInUse>().is_none() {
+            let Some(in_use) = error.downcast_ref::<crate::cdp::ProfileInUse>() else {
                 return Err(error);
+            };
+            if !self.waits.load(Ordering::SeqCst) {
+                let Some(pause) = letting_go(in_use.handed_over(), waited) else {
+                    return Err(error);
+                };
+                tracing::debug!(
+                    waited_ms = waited.as_millis(),
+                    "the profile is still held; starting the browser again shortly"
+                );
+                tokio::time::sleep(pause).await;
+                waited += pause;
+                continue;
             }
             if !told {
                 crate::ui::info(&format!(
@@ -1134,6 +1319,7 @@ impl Headless {
             account: account_paths,
             token_named: None,
             asked_document: None,
+            mode: None,
         })
     }
 }
@@ -4036,6 +4222,29 @@ mod tests {
         assert!(!on(Some("0")));
         assert!(!on(Some("")));
         assert!(!on(None));
+    }
+
+    /// The owner starts a browser again on a held profile soon, then less
+    /// often, and gives up past its patience; never after a browser that
+    /// handed over.
+    #[test]
+    fn a_profile_still_held_is_tried_again_for_a_while() {
+        let mut waited = Duration::ZERO;
+        let mut pauses = Vec::new();
+        while let Some(pause) = letting_go(false, waited) {
+            pauses.push(pause);
+            waited += pause;
+        }
+        let ms = |ms| Duration::from_millis(ms);
+        assert_eq!(pauses[..4], [ms(250), ms(250), ms(500), ms(1000)]);
+        assert!(pauses.iter().all(|p| *p <= LETTING_GO_PAUSES.1));
+        assert!(waited <= PROFILE_LETTING_GO);
+        assert!(
+            waited + LETTING_GO_PAUSES.1 > PROFILE_LETTING_GO,
+            "it waits out its patience: {waited:?}"
+        );
+
+        assert_eq!(letting_go(true, Duration::ZERO), None, "handed over");
     }
 
     /// A protocol URL pattern, matched as the browser matches it: `*` any

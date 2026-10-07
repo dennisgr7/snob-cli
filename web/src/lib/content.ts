@@ -19,12 +19,30 @@ export interface InstallBlock {
   commands: readonly string[];
 }
 
+/** A word of a line that links somewhere, such as a package manager's site. */
+export interface TextLink {
+  text: string;
+  href: string;
+}
+
+/**
+ * The line cut around the first `link.text` in it, so the word can be drawn
+ * as a link in place; undefined when there is no link or the word is absent.
+ */
+export function splitAround(line: string, link: TextLink | undefined): [string, string] | undefined {
+  if (!link) return undefined;
+  const at = line.indexOf(link.text);
+  return at < 0 ? undefined : [line.slice(0, at), line.slice(at + link.text.length)];
+}
+
 export interface InstallMethod {
   id: string;
   /** The tab's name. */
   name: string;
   /** Who it is for, one line under the tab. */
   note: string;
+  /** The package manager, linked where its name appears in the note and the hero. */
+  tool?: TextLink;
   /** Alternatives: each block is complete on its own. */
   blocks: readonly InstallBlock[];
   /** A page the method needs, such as the releases page for the .deb. */
@@ -38,12 +56,14 @@ export const INSTALL = [
     id: 'homebrew',
     name: 'macOS · Linux',
     note: 'With Homebrew.',
+    tool: { text: 'Homebrew', href: 'https://brew.sh/' },
     blocks: [{ commands: [`brew tap dennisgr7/snob ${SITE.repository}`, 'brew install snob'] }],
   },
   {
     id: 'scoop',
     name: 'Windows',
-    note: 'With Scoop.',
+    note: 'With Scoop, on Windows 11.',
+    tool: { text: 'Scoop', href: 'https://scoop.sh/' },
     blocks: [{ commands: [`scoop bucket add snob ${SITE.repository}`, 'scoop install snob'] }],
   },
   {
@@ -66,7 +86,7 @@ export const INSTALL = [
         commands: ['curl -fsSL https://raw.githubusercontent.com/dennisgr7/snob-cli/main/packaging/install.sh | sh'],
       },
       {
-        label: 'Windows · PowerShell',
+        label: 'Windows 11 · PowerShell',
         commands: ['irm https://raw.githubusercontent.com/dennisgr7/snob-cli/main/packaging/install.ps1 | iex'],
       },
     ],
@@ -87,9 +107,12 @@ const method = (id: InstallId): InstallMethod => INSTALL.find((m) => m.id === id
  * What the hero offers each system. Linux gets the script rather than
  * Homebrew, which many Linux machines do not have. A phone gets no command.
  */
-export const HERO_INSTALL: Record<Exclude<Platform, 'mobile'>, { label: string; commands: readonly string[] }> = {
-  macos: { label: 'macOS · Homebrew', commands: method('homebrew').blocks[0]!.commands },
-  windows: { label: 'Windows · Scoop', commands: method('scoop').blocks[0]!.commands },
+export const HERO_INSTALL: Record<
+  Exclude<Platform, 'mobile'>,
+  { label: string; commands: readonly string[]; tool?: TextLink | undefined }
+> = {
+  macos: { label: 'macOS · Homebrew', commands: method('homebrew').blocks[0]!.commands, tool: method('homebrew').tool },
+  windows: { label: 'Windows 11 · Scoop', commands: method('scoop').blocks[0]!.commands, tool: method('scoop').tool },
   linux: { label: 'Linux · install script', commands: method('script').blocks[0]!.commands },
 };
 
@@ -101,10 +124,41 @@ export const HERO_TAB: Record<Platform, InstallId> = {
   mobile: 'homebrew',
 };
 
+/** README, under "Install", word for word. Windows 10 is not supported. */
 export const SUPPORT =
-  'Builds exist for Windows and Linux on x86_64 and ARM64, and macOS on Apple Silicon. Everything that talks to Instagram needs a Chromium-based browser installed; no window is ever shown.';
+  'Builds exist for Windows 11 and Linux on x86_64 and ARM64, and macOS on Apple Silicon. Everything that talks to Instagram needs a Chromium-based browser installed; no window is ever shown.';
 
-export const ON_A_PHONE = 'Snob runs on your computer: Windows, macOS and Linux.';
+export const ON_A_PHONE = 'Snob runs on your computer: Windows 11, macOS and Linux.';
+
+export interface PlatformBuild {
+  name: string;
+  /** The architectures built for it; `arm` marks the native ARM build. */
+  arches: readonly { name: string; arm?: boolean }[];
+}
+
+/** SUPPORT drawn as a table: every system, every build. */
+export const PLATFORMS: readonly PlatformBuild[] = [
+  { name: 'Windows 11', arches: [{ name: 'x86_64' }, { name: 'ARM64', arm: true }] },
+  { name: 'macOS', arches: [{ name: 'Apple Silicon', arm: true }] },
+  { name: 'Linux', arches: [{ name: 'x86_64' }, { name: 'ARM64', arm: true }] },
+];
+
+/** The ARM builds, said once: each is native, none runs under emulation. */
+export const ARM = {
+  label: 'ARM ready',
+  text: 'A native ARM64 build on every system, nothing emulated: Apple Silicon Macs, Windows 11 on ARM laptops, and ARM64 Linux, Raspberry Pi included.',
+} as const;
+
+/**
+ * The invitation to star the repository. No page can star it for the
+ * visitor: that takes their GitHub session, so the link opens the repository
+ * and its own Star button does the rest.
+ */
+export const STAR = {
+  label: 'Star',
+  line: 'Useful to you? A star on GitHub helps other people find it.',
+  link: 'Star it on GitHub',
+} as const;
 
 /** Lines of terminal that show a command and what it printed. */
 export type Sample = readonly TerminalLine[];
@@ -113,7 +167,7 @@ export const HERO = {
   /** The headline; `accent` closes it in the brand color. */
   title: "who doesn't follow you",
   accent: 'back?',
-  lead: 'Snob knows. An Instagram client for the terminal: who left, who never followed back, stories and reels to keep, and output ready for AI agents.',
+  lead: 'Snob knows. An Instagram client for the terminal: download reels or stories, who unfollowed you, who never followed you back, ... Also ready for your AI agent.',
 } as const;
 
 /**
@@ -169,7 +223,7 @@ export const FEATURES: readonly Feature[] = [
   },
   {
     name: 'post · reel',
-    description: 'One post or reel by its link, every photo and video in it.',
+    description: 'See or download a post or reel, including every photo and video in it.',
     sample: [
       { command: 'snob reel <link> -d all' },
       { output: [{ text: '# every photo and video in it, saved', tone: 'dim' }] },

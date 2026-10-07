@@ -28,7 +28,7 @@ use crate::commands::pfp::Picture;
 use crate::exit::ExitCode;
 use crate::output;
 use crate::ui::accounts::{self, Browsed, Picked};
-use crate::ui::browser::input::{self, Action, TICK, next};
+use crate::ui::browser::input::{self, Action, next};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::tui;
 
@@ -58,7 +58,7 @@ pub(crate) async fn browse(
             tui.terminal
                 .draw(|frame| draw(frame, picture, viewer, &note, colors))?;
 
-            let Some(action) = next(TICK).map_err(input::unreadable)? else {
+            let Some(action) = next(input::tick()).map_err(input::unreadable)? else {
                 continue;
             };
             note.clear();

@@ -94,7 +94,21 @@ pub struct Launched {
 /// Starts the browser against one of our own profiles with debugging
 /// enabled, in a window, on the login page.
 pub fn launch(browser: &Browser, profile: &Path) -> Result<Launched> {
-    launch_in(browser, profile, &[], LOGIN_URL, false)
+    // Chrome warns, in a bar across the top of the window, that
+    // `--disable-blink-features` (below) is an unsupported flag that "affects
+    // stability and security", which is not true of how snob uses it and reads
+    // to the person logging in as though something were wrong. `--test-type`
+    // is what skips that bar; ChromeDriver passes it for the same reason.
+    // Measured in October 2026 on Chrome 154: the bar is gone, and the page
+    // sees the same `navigator.webdriver`, User-Agent, plugins and
+    // `window.chrome` with or without it. Only the window has a bar to hide.
+    launch_in(
+        browser,
+        profile,
+        &["--test-type".to_string()],
+        LOGIN_URL,
+        false,
+    )
 }
 
 /// Starts the same browser on a profile with no window, for snob to send its
@@ -216,11 +230,24 @@ const PROFILE_IN_USE: i32 = 21;
 /// another snob's, which a caller may wait out. Says what [`died_early`] or
 /// [`windowless_died_early`] says.
 #[derive(Debug)]
-pub struct ProfileInUse(String);
+pub struct ProfileInUse {
+    said: String,
+    /// It exited 0: it handed its command line to a browser that has the
+    /// profile open and took it, rather than finding nobody to hand it to.
+    handed_over: bool,
+}
+
+impl ProfileInUse {
+    /// Whether the browser holding the profile took this one's command line,
+    /// and opened what it asked for: starting again would open it again.
+    pub fn handed_over(&self) -> bool {
+        self.handed_over
+    }
+}
 
 impl std::fmt::Display for ProfileInUse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.said)
     }
 }
 
@@ -389,14 +416,26 @@ impl Cdp {
             died_early(ended.code, &self.profile)
         };
         Some(match ended.code {
-            Some(0 | PROFILE_IN_USE) => ProfileInUse(said).into(),
+            Some(code @ (0 | PROFILE_IN_USE)) => ProfileInUse {
+                said,
+                handed_over: code == 0,
+            }
+            .into(),
             _ => anyhow!(said),
         })
     }
 
     /// Closes the browser politely, so the profile is not left looking like it
     /// crashed and offering to restore tabs on the next login.
+    ///
+    /// **At the normal pace, whatever it ran as** (`power::qos`). Closing is
+    /// where the browser writes what it holds to the profile, cookies
+    /// Instagram just rotated among them, and lets go of the profile, and the
+    /// next command waits for exactly that. Left efficient, that work runs on
+    /// the slowest cores at the lowest clock, and on a loaded machine outlasts
+    /// the close.
     pub async fn close(self) {
+        self.set_mode(crate::power::qos::Mode::Normal);
         // `call` carries its own timeout, so a browser that has stopped
         // answering delays the exit rather than preventing it.
         let _ = self
@@ -450,6 +489,14 @@ impl Cdp {
             return anyhow!("{left}\n(while waiting for {method})");
         }
         anyhow::Error::new(error)
+    }
+
+    /// Moves the browser and its helpers to `mode` (`power::qos`).
+    pub(crate) fn set_mode(&self, mode: crate::power::qos::Mode) {
+        self.process
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_mode(mode);
     }
 
     /// The browser's process id.

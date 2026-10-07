@@ -1,8 +1,14 @@
 ---
 import Wordmark from '@/components/Wordmark.astro';
+import { STAR } from '@/lib/content';
 import { SITE } from '@/lib/site';
 
-/** The bar on top: the mark, the sections in brackets, the repository. */
+/**
+ * The bar on top: the mark, the sections in brackets, and the repository as a
+ * Star link. A plain link on purpose: GitHub has no button another site can
+ * embed that stars for the visitor, and the third-party widgets that show a
+ * count load a script and a frame the page's policy refuses.
+ */
 const links = [
   { href: '/#features', label: 'features', wide: true },
   { href: '/#agents', label: 'agents', wide: true },
@@ -24,7 +30,13 @@ const links = [
         ))
       }
       <li class="ml-2 sm:ml-3">
-        <a href={SITE.repository} class="text-text no-underline hover:text-accent">GitHub<span aria-hidden="true"> ↗</span></a>
+        <a
+          href={SITE.repository}
+          class="inline-flex items-center gap-1.5 rounded-control border border-line px-2.5 py-1 text-text no-underline hover:border-accent hover:text-accent"
+        >
+          <span aria-hidden="true" class="text-accent">★</span>
+          <span>{STAR.label}<span class="sr-only sm:not-sr-only"> on GitHub</span></span>
+        </a>
       </li>
     </ul>
   </nav>

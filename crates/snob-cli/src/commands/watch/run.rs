@@ -14,6 +14,7 @@ use snob_store::paths::{AccountPaths, AppPaths};
 use snob_store::registry::Registry;
 use snob_store::secrets::SecretStore;
 use snob_store::store::Store;
+use snob_store::store::shared::Shared;
 
 use crate::app::{App, Viewer};
 use crate::engine::watch::{TickReport, Watched, group_by_viewer};
@@ -43,9 +44,42 @@ pub(super) async fn run_viewers(
 ) -> RunSummary {
     let cancel = crate::interrupt::install();
     run_groups(paths, watched, delivery, printing, &cancel, |account| {
-        Ok(App::open(&secrets.session_of(account), account, with_progress)?.map(Box::new))
+        let opened = App::open(&secrets.session_of(account), account, with_progress)?;
+        Ok(opened.map(|mut app| {
+            app.stops_on_a_critical_battery(crate::power::battery::critical);
+            Box::new(app)
+        }))
     })
     .await
+}
+
+/// Whether the run that is due waits for power: the battery is critical, so
+/// the system is about to hibernate or shut down under a run started now
+/// (`power::battery`). Written down in `shared.db` at every look, so `snob
+/// watch status` says what the monitor is doing instead of calling it late,
+/// and can tell a monitor still waiting from one that is gone.
+pub(super) fn waits_for_power(paths: &AppPaths, now: Epoch) -> bool {
+    if !crate::power::battery::critical() {
+        return false;
+    }
+    match Shared::open(paths) {
+        Ok(shared) => {
+            if let Err(e) = shared.wait_for_power(now) {
+                tracing::debug!(error = %e, "could not write down that the run waits for power");
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "could not open shared.db"),
+    }
+    true
+}
+
+/// The run that waited for power is running: `snob watch status` stops
+/// saying it waits.
+pub(super) fn power_is_back(paths: &AppPaths) {
+    match Shared::open(paths).and_then(|shared| shared.power_is_back()) {
+        Ok(()) => {}
+        Err(e) => tracing::debug!(error = %e, "could not write down that power is back"),
+    }
 }
 
 /// [`run_viewers`] with the opening handed in, so a test can open an `App`

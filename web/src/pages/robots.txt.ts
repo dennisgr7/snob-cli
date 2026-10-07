@@ -51,10 +51,6 @@ User-agent: *
 Content-Signal: search=yes, ai-input=yes, ai-train=yes
 Allow: /
 
-# Known to ignore the rules and crawl aggressively
-User-agent: Bytespider
-Disallow: /
-
 Sitemap: ${new URL('/sitemap-index.xml', site)}
 `;
   return new Response(body, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });

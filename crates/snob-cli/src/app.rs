@@ -209,6 +209,10 @@ pub struct App {
     /// walk, each sitting of one and a monitor tick move. "N requests" and the
     /// JSON `requests` still read `Pacer::spent()`, the truth about requests.
     resolved: Option<Memo>,
+    /// Asked between every two pages of a walk: `true` stops it there, kept
+    /// for the next run. Set by the monitor alone, to the battery being
+    /// critical ([`App::stops_on_a_critical_battery`]).
+    stop_between_pages: Option<fn() -> bool>,
 }
 
 /// One resolution, and the question it answers.
@@ -290,6 +294,7 @@ impl App {
             consented: None,
             consent_in_advance: ConsentInAdvance::default(),
             resolved: None,
+            stop_between_pages: None,
         }))
     }
 
@@ -310,6 +315,7 @@ impl App {
             consented: None,
             consent_in_advance: ConsentInAdvance::default(),
             resolved: None,
+            stop_between_pages: None,
         }
     }
 
@@ -403,6 +409,21 @@ impl App {
     /// than of a call.
     pub fn consent_comes_from_the_config(&mut self) {
         self.consent_in_advance = ConsentInAdvance::WatchConfig;
+    }
+
+    /// Said by the monitor: a walk stops between two pages once `critical`
+    /// says the battery is, rather than being cut off by the system
+    /// hibernating under it, and the next run picks it up. A person's own
+    /// command is not stopped for it; the monitor is, because nobody is there
+    /// to decide (`power::battery`).
+    pub fn stops_on_a_critical_battery(&mut self, critical: fn() -> bool) {
+        self.stop_between_pages = Some(critical);
+    }
+
+    /// What a walk asks between two pages, if anything: see
+    /// [`App::stops_on_a_critical_battery`].
+    pub fn stop_between_pages(&self) -> Option<fn() -> bool> {
+        self.stop_between_pages
     }
 
     /// What `asked` resolved to earlier in this run, if it was the same

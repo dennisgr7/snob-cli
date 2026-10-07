@@ -178,7 +178,7 @@ enum Intents {
 /// A page with no browser behind it: it answers what `answer` says to each
 /// request, and keeps what it was asked to send, and each intent it was
 /// asked.
-pub(super) struct Scripted {
+pub(crate) struct Scripted {
     answer: Box<Answering>,
     intents: Intents,
     asked: std::sync::Mutex<Vec<PageRequest>>,
@@ -193,7 +193,7 @@ impl Scripted {
     }
 
     /// A page that answers each intent as `tell` says, and sends nothing.
-    pub(super) fn telling(
+    pub(crate) fn telling(
         tell: impl Fn(&Call) -> Result<Told, PageError> + Send + Sync + 'static,
     ) -> Arc<Self> {
         Self::made(
@@ -251,7 +251,7 @@ impl Scripted {
     }
 
     /// The intents it was asked, in order.
-    pub(super) fn asks(&self) -> Vec<Call> {
+    pub(crate) fn asks(&self) -> Vec<Call> {
         self.asks.lock().unwrap().clone()
     }
 
@@ -352,7 +352,7 @@ impl Page for Scripted {
 
 /// A budget that counts what it was charged, and can be put in a cooldown.
 #[derive(Default)]
-pub(super) struct Counting {
+pub(crate) struct Counting {
     reads: std::sync::atomic::AtomicU32,
     writes: std::sync::atomic::AtomicU32,
     cooling: std::sync::atomic::AtomicBool,
@@ -410,7 +410,7 @@ impl RateBudget for Counting {
 /// A client that sends only through `page`, paying through a budget that
 /// counts, pointed at an address nothing listens on: nothing it does can
 /// reach a server.
-pub(super) fn spending_client(page: Arc<dyn Page>) -> (IgClient, Arc<Counting>) {
+pub(crate) fn spending_client(page: Arc<dyn Page>) -> (IgClient, Arc<Counting>) {
     let budget = Arc::new(Counting::default());
     let pacer = Pacer::new(Arc::clone(&budget) as Arc<dyn RateBudget>);
     (built(NOWHERE, pacer, false).through(page), budget)
@@ -428,7 +428,7 @@ pub(super) fn counting_client_of(server: &MockServer) -> (IgClient, Arc<Counting
 pub(super) const NOWHERE: &str = "http://127.0.0.1:9/";
 
 /// A page's answer: `status` with `body`, where it was asked.
-pub(super) fn page_said(status: u16, body: &str) -> PageResponse {
+pub(crate) fn page_said(status: u16, body: &str) -> PageResponse {
     PageResponse {
         status,
         body: body.to_string(),
