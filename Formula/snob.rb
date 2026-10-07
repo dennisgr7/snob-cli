@@ -2,24 +2,24 @@
 class Snob < Formula
   desc "Instagram CLI client with extra utilities, media downloads and output ready for AI agents"
   homepage "https://github.com/dennisgr7/snob-cli"
-  version "0.6.0"
+  version "0.7.0"
   license "MIT"
 
   on_macos do
     # There is no macOS Intel build; see the note in .github/workflows/ci.yml.
     depends_on arch: :arm64
-    url "https://github.com/dennisgr7/snob-cli/releases/download/v0.6.0/snob-v0.6.0-aarch64-apple-darwin.tar.gz"
-    sha256 "a96edc9742ce27bfc31dd1f3a90e82d2c53ebb8d1a1391d99e4b54618c1467d0"
+    url "https://github.com/dennisgr7/snob-cli/releases/download/v0.7.0/snob-v0.7.0-aarch64-apple-darwin.tar.gz"
+    sha256 "63e6d60e48980635f103e2431fa5e2239c04cce973cc96852ca97c96b6b8b0fa"
   end
 
   on_linux do
     on_intel do
-      url "https://github.com/dennisgr7/snob-cli/releases/download/v0.6.0/snob-v0.6.0-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "49ecc2c79a127a9ce5d56e205c703c5ee96d53c7d8653255659381d46e6d07e4"
+      url "https://github.com/dennisgr7/snob-cli/releases/download/v0.7.0/snob-v0.7.0-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "b3297639e49bab3324d7f2a43ad754b2df515753fd4eb350148e16e4f59fa4c1"
     end
     on_arm do
-      url "https://github.com/dennisgr7/snob-cli/releases/download/v0.6.0/snob-v0.6.0-aarch64-unknown-linux-musl.tar.gz"
-      sha256 "62b4d52cbe8220f2d5a5094e7daeeb74ea0b3b97228bc45530aa85a7e6ea1f1a"
+      url "https://github.com/dennisgr7/snob-cli/releases/download/v0.7.0/snob-v0.7.0-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "43073e36a906e80cd6b28a00ad884450a523449a889b2171cc1321ca3768126f"
     end
   end
 
