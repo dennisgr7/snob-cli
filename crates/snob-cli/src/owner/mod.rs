@@ -50,6 +50,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::headless::write_back::Rotated;
 
+#[cfg(windows)]
+mod end_of_session;
 mod server;
 mod socket;
 mod spawn;

@@ -216,6 +216,9 @@ pub(super) async fn run_on(
         accepting.abort();
     }
     engine.release(None).await;
+    // The window holding the end of the session may let it go now.
+    #[cfg(windows)]
+    super::end_of_session::closed();
     tracing::debug!("the owner of the browsers is leaving");
     Ok(())
 }
@@ -255,7 +258,14 @@ async fn asked_to_quit() {
             _ = interrupt.recv() => {}
         }
     }
-    #[cfg(not(unix))]
+    // On Windows the owner has no console to be sent an event on: the end of
+    // the session reaches it as a window message (`end_of_session`).
+    #[cfg(windows)]
+    match super::end_of_session::listen() {
+        Some(ending) => ending.heard().await,
+        None => std::future::pending::<()>().await,
+    }
+    #[cfg(not(any(unix, windows)))]
     std::future::pending::<()>().await
 }
 
