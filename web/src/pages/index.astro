@@ -4,9 +4,10 @@ import FeatureCard from '@/components/FeatureCard.astro';
 import Hero from '@/components/Hero.astro';
 import HumanVsAgent from '@/components/HumanVsAgent.astro';
 import InstallTabs from '@/components/InstallTabs.astro';
+import Platforms from '@/components/Platforms.astro';
 import Section from '@/components/Section.astro';
 import Terminal from '@/components/Terminal.astro';
-import { AGENTS, BEHAVIOR, FEATURES, FEATURES_SECTION, INSTALL_SECTION } from '@/lib/content';
+import { AGENTS, BEHAVIOR, FEATURES, FEATURES_SECTION, INSTALL_SECTION, STAR } from '@/lib/content';
 import { SITE } from '@/lib/site';
 ---
 
@@ -31,6 +32,10 @@ import { SITE } from '@/lib/site';
   </Section>
 
   <Section id="install" title={INSTALL_SECTION.title} accent={INSTALL_SECTION.accent} lead={INSTALL_SECTION.lead}>
+    <Platforms />
     <InstallTabs />
+    <p class="mt-12 text-sm text-muted">
+      {STAR.line} <a href={SITE.repository}>{STAR.link}</a><span aria-hidden="true"> ↗</span>
+    </p>
   </Section>
 </BaseLayout>

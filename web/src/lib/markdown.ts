@@ -7,6 +7,9 @@ import {
   HERO_SAMPLE,
   INSTALL,
   INSTALL_SECTION,
+  ARM,
+  PLATFORMS,
+  STAR,
   splitAround,
   type InstallBlock,
   type InstallMethod,
@@ -42,6 +45,8 @@ export function homeToMarkdown(site: URL | string): string {
       .join('\n\n');
     return `### ${method.name}\n\n${note}${link}\n\n${blocks}`;
   }).join('\n\n');
+
+  const platforms = PLATFORMS.map((p) => `- ${p.name}: ${p.arches.map((a) => a.name).join(', ')}`).join('\n');
 
   const flags = AGENTS.flags.map((item) => `- \`${item.flag}\`: ${item.means}`).join('\n');
   const exits = AGENTS.exitCodes.map((item) => `- \`${item.code}\`: ${item.means}`).join('\n');
@@ -92,7 +97,13 @@ ${exits}
 
 ${INSTALL_SECTION.lead}
 
+${platforms}
+
+**${ARM.label}.** ${ARM.text}
+
 ${install}
+
+${STAR.line} [${STAR.link}](${SITE.repository})
 
 ---
 

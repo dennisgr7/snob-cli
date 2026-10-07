@@ -34,8 +34,12 @@ Dennis", linking to dennisgr7.dev.
   command; IBM Plex Sans for reading. Plex has a humanist, slightly editorial touch
   that suits the name and stays technical.
 - **Layout**: a clean grid with the essence of a terminal: monospaced headlines, the
-  navigation as `[features] [agents] [install]`, a blinking block cursor after the
-  headline.
+  navigation as `[features] [agents] [install]` and a bordered "★ Star on GitHub"
+  link, a blinking block cursor after the headline.
+- **Star**: a link to the repository, never a widget. GitHub offers no button another
+  site can embed that stars for the visitor (starring needs their GitHub session),
+  and the widgets that show a live count load a third-party script and frame that
+  the page's policy refuses and that would hand every visitor to another host.
 
 ## Theme
 
@@ -95,9 +99,12 @@ One page, in this order:
    usual consequence is a verification check. The site never hides it.
 4. **Scripts and agents**: the same answer seen in the TUI and as JSON down a pipe,
    with the flags and the exit codes.
-5. **Install**: every platform in tabs, each with a copy button. A copy button is
-   an icon, two pages that turn into a check once copied, in the terminal's dim
-   text and never a state color; Homebrew and Scoop link to their own sites.
+5. **Install**: first the builds, one card per system (Windows 11, macOS, Linux)
+   with its architectures, the native ARM ones in the accent and an "ARM ready"
+   line under them; then every platform in tabs, each with a copy button. A copy
+   button is an icon, two pages that turn into a check once copied, in the
+   terminal's dim text and never a state color; Homebrew and Scoop link to their
+   own sites. It closes with a line inviting a star on GitHub.
 6. **Footer**: MIT, GitHub, `llms.txt`, "Not affiliated with Instagram or Meta",
    and the signature.
 

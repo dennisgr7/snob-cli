@@ -62,7 +62,7 @@ export const INSTALL = [
   {
     id: 'scoop',
     name: 'Windows',
-    note: 'With Scoop.',
+    note: 'With Scoop, on Windows 11.',
     tool: { text: 'Scoop', href: 'https://scoop.sh/' },
     blocks: [{ commands: [`scoop bucket add snob ${SITE.repository}`, 'scoop install snob'] }],
   },
@@ -86,7 +86,7 @@ export const INSTALL = [
         commands: ['curl -fsSL https://raw.githubusercontent.com/dennisgr7/snob-cli/main/packaging/install.sh | sh'],
       },
       {
-        label: 'Windows · PowerShell',
+        label: 'Windows 11 · PowerShell',
         commands: ['irm https://raw.githubusercontent.com/dennisgr7/snob-cli/main/packaging/install.ps1 | iex'],
       },
     ],
@@ -112,7 +112,7 @@ export const HERO_INSTALL: Record<
   { label: string; commands: readonly string[]; tool?: TextLink | undefined }
 > = {
   macos: { label: 'macOS · Homebrew', commands: method('homebrew').blocks[0]!.commands, tool: method('homebrew').tool },
-  windows: { label: 'Windows · Scoop', commands: method('scoop').blocks[0]!.commands, tool: method('scoop').tool },
+  windows: { label: 'Windows 11 · Scoop', commands: method('scoop').blocks[0]!.commands, tool: method('scoop').tool },
   linux: { label: 'Linux · install script', commands: method('script').blocks[0]!.commands },
 };
 
@@ -124,10 +124,41 @@ export const HERO_TAB: Record<Platform, InstallId> = {
   mobile: 'homebrew',
 };
 
+/** README, under "Install", word for word. Windows 10 is not supported. */
 export const SUPPORT =
-  'Builds exist for Windows and Linux on x86_64 and ARM64, and macOS on Apple Silicon. Everything that talks to Instagram needs a Chromium-based browser installed; no window is ever shown.';
+  'Builds exist for Windows 11 and Linux on x86_64 and ARM64, and macOS on Apple Silicon. Everything that talks to Instagram needs a Chromium-based browser installed; no window is ever shown.';
 
-export const ON_A_PHONE = 'Snob runs on your computer: Windows, macOS and Linux.';
+export const ON_A_PHONE = 'Snob runs on your computer: Windows 11, macOS and Linux.';
+
+export interface PlatformBuild {
+  name: string;
+  /** The architectures built for it; `arm` marks the native ARM build. */
+  arches: readonly { name: string; arm?: boolean }[];
+}
+
+/** SUPPORT drawn as a table: every system, every build. */
+export const PLATFORMS: readonly PlatformBuild[] = [
+  { name: 'Windows 11', arches: [{ name: 'x86_64' }, { name: 'ARM64', arm: true }] },
+  { name: 'macOS', arches: [{ name: 'Apple Silicon', arm: true }] },
+  { name: 'Linux', arches: [{ name: 'x86_64' }, { name: 'ARM64', arm: true }] },
+];
+
+/** The ARM builds, said once: each is native, none runs under emulation. */
+export const ARM = {
+  label: 'ARM ready',
+  text: 'A native ARM64 build on every system, nothing emulated: Apple Silicon Macs, Windows 11 on ARM laptops, and ARM64 Linux, Raspberry Pi included.',
+} as const;
+
+/**
+ * The invitation to star the repository. No page can star it for the
+ * visitor: that takes their GitHub session, so the link opens the repository
+ * and its own Star button does the rest.
+ */
+export const STAR = {
+  label: 'Star',
+  line: 'Useful to you? A star on GitHub helps other people find it.',
+  link: 'Star it on GitHub',
+} as const;
 
 /** Lines of terminal that show a command and what it printed. */
 export type Sample = readonly TerminalLine[];
