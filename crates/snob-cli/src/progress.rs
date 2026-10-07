@@ -307,6 +307,9 @@ impl Progress {
                         self.warn(&crate::report::paused_for_the_day(*duration));
                         self.waiting("waiting for the day's accounts", *duration);
                     }
+                    WaitKind::Reconnect => {
+                        self.waiting("waiting for the network", *duration);
+                    }
                     WaitKind::Step | WaitKind::Dwell => {}
                 }
             }
@@ -323,6 +326,11 @@ impl Progress {
             }
             // The pager says what it saw; `report` says it in English.
             Event::Warning(warning) => self.warn(&crate::report::pager_warning(*warning)),
+            // Kept above the bar, as the day's wait is: a walk that stood
+            // still for hours says why.
+            Event::Resumed { slept } => {
+                self.warn(&crate::report::slept_during_the_walk(*slept));
+            }
             Event::Finished { users, reason, .. } => {
                 self.set_deadline(None);
                 self.freeze(*users, *reason);

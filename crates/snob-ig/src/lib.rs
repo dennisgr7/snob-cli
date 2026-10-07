@@ -35,6 +35,7 @@
 //! sent.
 
 pub mod allowlist;
+pub mod awake;
 pub mod client;
 pub mod client_hints;
 pub mod error;

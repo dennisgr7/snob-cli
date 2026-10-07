@@ -23,6 +23,8 @@ does its job:
 | The cookie boundary and the protocol client | `cdp/mod.rs`, `cdp/connection.rs`, `pipe.rs` |
 | Request budget, cooldowns, the common brake | `snob-core/src/budget.rs`, `snob-store/src/store/rate_budget.rs` |
 | The schema | `crates/snob-store/src/store/sql/` |
+| Telling that the machine slept in the middle of a walk | `crates/snob-ig/src/awake.rs` |
+| What snob asks of the system's power management | `crates/snob-cli/src/power/` |
 
 ## What this is
 

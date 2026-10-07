@@ -99,6 +99,10 @@ windows-sys.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# Asking logind to hold off idle sleep while a walk reads (`src/power/`).
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
+
 [dev-dependencies]
 wiremock.workspace = true
 # What `tests/common/tab.rs` sends with: a tab with no browser behind it, on
