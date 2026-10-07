@@ -8,7 +8,7 @@ name: Claude Code
 # - on an issue, the branch it makes starts from dev and its pull request goes
 #   into dev (`base_branch`).
 #
-# The review of every pull request into main, and of one labelled
+# The review of every pull request into main, and of one labeled
 # `claude-review`, is claude-code-review.yml, not this.
 #
 # Who may ask is the action's check: somebody with write access to the
