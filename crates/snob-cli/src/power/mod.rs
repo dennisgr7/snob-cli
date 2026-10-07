@@ -33,6 +33,7 @@ pub mod battery;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod qos;
 #[cfg(windows)]
 mod windows;
 

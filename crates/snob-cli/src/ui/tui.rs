@@ -143,6 +143,10 @@ impl Tui {
             crossterm::execute!(stderr(), DisableFocusChange, DisableBracketedPaste, Show)
         };
         let raw = disable_raw_mode();
+        // Back to a command in a terminal, which somebody waits on, whatever
+        // the view's focus last said (`owner::attended`).
+        crate::owner::attended(true);
+        crate::ui::browser::input::focus_unknown();
         modes.and(raw)?;
         self.active = false;
         Ok(())

@@ -12,7 +12,9 @@
 //! own calls, and the listener keeps hearing them: a push-back heard then is
 //! recorded, and the next command meets the cooldown. That is kept: a
 //! person's tab does not go quiet the moment they stop clicking, and the next
-//! command finds the browser warm.
+//! command finds the browser warm. Nobody waits on it meanwhile, so it runs
+//! efficiently (`power::qos`): at the normal pace only while a command
+//! somebody waits on is using it ([`ToOwner::Attention`]).
 //!
 //! The one thing stored from here is the cooldown such a push-back earns,
 //! written by the listener (`headless::listen`) to the account's database,
@@ -102,6 +104,10 @@ struct State {
     build: String,
     /// Per account, the commands connected that have sent as it.
     users: std::sync::Mutex<HashMap<Pk, usize>>,
+    /// Per account, how many of those somebody is waiting on
+    /// ([`ToOwner::Attention`]): the browser runs at the normal pace while
+    /// any is, and efficiently otherwise (`power::qos`).
+    watched: std::sync::Mutex<HashMap<Pk, usize>>,
     connections: AtomicUsize,
     reached: AtomicBool,
     retiring: AtomicBool,
@@ -156,6 +162,7 @@ pub(super) async fn run_on(
     let state = Arc::new(State {
         build,
         users: std::sync::Mutex::new(HashMap::new()),
+        watched: std::sync::Mutex::new(HashMap::new()),
         connections: AtomicUsize::new(0),
         reached: AtomicBool::new(false),
         retiring: AtomicBool::new(false),
@@ -288,6 +295,10 @@ where
     });
 
     let mut used = HashSet::new();
+    // Whether somebody waits on this command. Taken as yes until it says
+    // otherwise, which a command of this build does at once: a browser runs
+    // efficiently only when nobody is said to be waiting.
+    let mut attended = true;
     // Whatever the command is, it is told who this is and whom else this
     // serves; one of another build then asks this owner to leave, or goes.
     if let Ok(Some(ToOwner::Hello { .. })) = wire::read::<ToOwner>(&mut from).await {
@@ -295,10 +306,19 @@ where
             build: state.build.clone(),
             others: state.connections.load(Ordering::SeqCst).saturating_sub(1),
         });
-        serve_commands(&mut from, &outgoing, &engine, &state, &linger, &mut used).await;
+        serve_commands(
+            &mut from,
+            &outgoing,
+            &engine,
+            &state,
+            &linger,
+            &mut used,
+            &mut attended,
+        )
+        .await;
     }
 
-    leave(&engine, &state, &linger, &mut used).await;
+    leave(&engine, &state, &linger, &mut used, attended).await;
     telling.abort();
     drop(outgoing);
     let _ = writer.await;
@@ -313,6 +333,7 @@ async fn serve_commands<R: AsyncRead + Unpin>(
     state: &Arc<State>,
     linger: &Linger,
     used: &mut HashSet<Pk>,
+    attended: &mut bool,
 ) {
     loop {
         let message = match wire::read::<ToOwner>(from).await {
@@ -330,7 +351,7 @@ async fn serve_commands<R: AsyncRead + Unpin>(
                 session,
                 request,
             } => {
-                uses(state, used, session.ds_user_id);
+                uses(engine, state, used, session.ds_user_id, *attended);
                 let (engine, outgoing) = (Arc::clone(engine), outgoing.clone());
                 tokio::spawn(async move {
                     let answer = engine.send_as(&session, request).await;
@@ -338,7 +359,7 @@ async fn serve_commands<R: AsyncRead + Unpin>(
                 });
             }
             ToOwner::Ask { id, session, call } => {
-                uses(state, used, session.ds_user_id);
+                uses(engine, state, used, session.ds_user_id, *attended);
                 let (engine, outgoing) = (Arc::clone(engine), outgoing.clone());
                 tokio::spawn(async move {
                     let told = engine.ask_as(&session, *call).await.map(Box::new);
@@ -353,7 +374,7 @@ async fn serve_commands<R: AsyncRead + Unpin>(
                 });
             }
             ToOwner::Leave { id } => {
-                leave(engine, state, linger, used).await;
+                leave(engine, state, linger, used, *attended).await;
                 let _ = outgoing.send(FromOwner::Done { id });
             }
             ToOwner::Release { id, pk } => {
@@ -372,13 +393,25 @@ async fn serve_commands<R: AsyncRead + Unpin>(
                 state.retiring.store(true, Ordering::SeqCst);
                 state.changed.notify_one();
             }
+            ToOwner::Attention { attended: now } => {
+                if now != *attended {
+                    *attended = now;
+                    for pk in used.iter() {
+                        watch(state, *pk, now);
+                    }
+                    for pk in used.iter() {
+                        reconsider(engine, state, *pk);
+                    }
+                }
+            }
         }
     }
 }
 
 /// The command uses the account `pk`'s browser: counted once per command,
-/// so the browser is left open while any command still uses it.
-fn uses(state: &State, used: &mut HashSet<Pk>, pk: Pk) {
+/// so the browser is left open while any command still uses it, and counted
+/// as watched when somebody waits on the command.
+fn uses(engine: &Headless, state: &State, used: &mut HashSet<Pk>, pk: Pk, attended: bool) {
     if used.insert(pk) {
         *state
             .users
@@ -386,13 +419,58 @@ fn uses(state: &State, used: &mut HashSet<Pk>, pk: Pk) {
             .unwrap_or_else(|e| e.into_inner())
             .entry(pk)
             .or_default() += 1;
+        if attended {
+            watch(state, pk, true);
+        }
+        reconsider(engine, state, pk);
     }
 }
 
+/// One command on `pk`'s browser more (`true`) or fewer that somebody waits
+/// on.
+fn watch(state: &State, pk: Pk, more: bool) {
+    let mut watched = state.watched.lock().unwrap_or_else(|e| e.into_inner());
+    let count = watched.entry(pk).or_default();
+    *count = if more {
+        *count + 1
+    } else {
+        count.saturating_sub(1)
+    };
+}
+
+/// Tells `pk`'s browser whether anybody waits on it now, and this process
+/// whether anybody waits on any: the owner runs efficiently when nobody does.
+fn reconsider(engine: &Headless, state: &State, pk: Pk) {
+    let (this, any) = {
+        let watched = state.watched.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            watched.get(&pk).copied().unwrap_or(0) > 0,
+            watched.values().any(|n| *n > 0),
+        )
+    };
+    engine.attend(pk, this);
+    crate::power::qos::own(crate::power::qos::Mode::for_attention(any));
+}
+
 /// A command is done with the browsers it used. With nothing to linger for,
-/// each one no other command is using is closed before it is told.
-async fn leave(engine: &Headless, state: &State, linger: &Linger, used: &mut HashSet<Pk>) {
+/// each one no other command is using is closed before it is told. Each one
+/// that stays is efficient from now on unless another command somebody waits
+/// on is using it: a browser lingering for the next command waits on nobody.
+///
+/// Closed before it is reconsidered, so a browser on its way out is not made
+/// efficient first: its close is what the command, and the next one, wait for
+/// (`Cdp::close`).
+async fn leave(
+    engine: &Headless,
+    state: &State,
+    linger: &Linger,
+    used: &mut HashSet<Pk>,
+    attended: bool,
+) {
     for pk in used.drain() {
+        if attended {
+            watch(state, pk, false);
+        }
         let remaining = {
             let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
             let count = users.entry(pk).or_default();
@@ -402,6 +480,7 @@ async fn leave(engine: &Headless, state: &State, linger: &Linger, used: &mut Has
         if remaining == 0 && linger.close_when_unused {
             engine.release(Some(pk)).await;
         }
+        reconsider(engine, state, pk);
     }
     state.changed.notify_one();
 }
@@ -448,6 +527,50 @@ mod tests {
         let sandbox = Linger::for_a_sandbox();
         assert!(due(&open(0, false), 0, &sandbox, false));
         assert!(!due(&open(0, false), 1, &sandbox, false));
+    }
+
+    fn state() -> State {
+        State {
+            build: "test".to_string(),
+            users: std::sync::Mutex::new(HashMap::new()),
+            watched: std::sync::Mutex::new(HashMap::new()),
+            connections: AtomicUsize::new(0),
+            reached: AtomicBool::new(false),
+            retiring: AtomicBool::new(false),
+            changed: Notify::new(),
+        }
+    }
+
+    /// A browser runs at the normal pace while any command on it is waited
+    /// on, efficiently once none is, and efficiently while it lingers with no
+    /// command at all.
+    #[tokio::test]
+    async fn a_browser_is_efficient_while_nobody_waits_on_it() {
+        use crate::power::qos::Mode;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Headless::apart(&AppPaths::rooted_at(tmp.path()));
+        let state = state();
+        let people = Linger::for_people();
+        let pk = Pk::new(42);
+
+        let (mut script, mut person) = (HashSet::new(), HashSet::new());
+        uses(&engine, &state, &mut script, pk, false);
+        assert_eq!(engine.mode_of(pk), Mode::Eco, "a script waits on nobody");
+
+        uses(&engine, &state, &mut person, pk, true);
+        assert_eq!(
+            engine.mode_of(pk),
+            Mode::Normal,
+            "a person at a terminal does"
+        );
+
+        leave(&engine, &state, &people, &mut person, true).await;
+        assert_eq!(engine.mode_of(pk), Mode::Eco, "the person is gone");
+
+        leave(&engine, &state, &people, &mut script, false).await;
+        assert_eq!(engine.mode_of(pk), Mode::Eco, "lingering for nobody");
+        assert_eq!(state.watched.lock().unwrap().get(&pk).copied(), Some(0));
     }
 
     /// The loop sleeps until the first thing that could need it, and never
