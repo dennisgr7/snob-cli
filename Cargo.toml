@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/snob-ig", "crates/snob-core", "crates/snob-store", "crates/snob-cli"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 # The oldest compiler every locked dependency accepts: rusqlite_migration 2.6
 # declares 1.95, so a `cargo install --git` on anything older fails in the
