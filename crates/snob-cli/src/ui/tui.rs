@@ -35,7 +35,9 @@ use std::io::{Stderr, stderr};
 use std::path::PathBuf;
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -64,8 +66,13 @@ pub struct Tui {
 }
 
 impl Tui {
-    /// Raw mode, the alternate screen, bracketed paste, cursor hidden. For the
-    /// browsers.
+    /// Raw mode, the alternate screen, bracketed paste, focus reporting,
+    /// cursor hidden. For the browsers.
+    ///
+    /// Focus reporting is what tells a view whether anybody is looking
+    /// (`browser::input::focused`), and it is handed back with the rest on
+    /// [`Tui::suspend`]: left on under a cooked terminal, the terminal's
+    /// reports would be typed into the shell.
     pub fn fullscreen() -> std::io::Result<Self> {
         Self::enter(true, Viewport::Fullscreen)
     }
@@ -79,9 +86,15 @@ impl Tui {
     fn enter(fullscreen: bool, viewport: Viewport) -> std::io::Result<Self> {
         enable_raw_mode()?;
         let modes = if fullscreen {
-            crossterm::execute!(stderr(), EnterAlternateScreen, EnableBracketedPaste, Hide)
+            crossterm::execute!(
+                stderr(),
+                EnterAlternateScreen,
+                EnableBracketedPaste,
+                EnableFocusChange,
+                Hide
+            )
         } else {
-            crossterm::execute!(stderr(), EnableBracketedPaste, Hide)
+            crossterm::execute!(stderr(), EnableBracketedPaste, EnableFocusChange, Hide)
         };
         let terminal = modes.and_then(|()| {
             Terminal::with_options(
@@ -119,9 +132,15 @@ impl Tui {
             return Ok(());
         }
         let modes = if self.fullscreen {
-            crossterm::execute!(stderr(), DisableBracketedPaste, LeaveAlternateScreen, Show)
+            crossterm::execute!(
+                stderr(),
+                DisableFocusChange,
+                DisableBracketedPaste,
+                LeaveAlternateScreen,
+                Show
+            )
         } else {
-            crossterm::execute!(stderr(), DisableBracketedPaste, Show)
+            crossterm::execute!(stderr(), DisableFocusChange, DisableBracketedPaste, Show)
         };
         let raw = disable_raw_mode();
         modes.and(raw)?;
@@ -137,9 +156,15 @@ impl Tui {
         }
         enable_raw_mode()?;
         let modes = if self.fullscreen {
-            crossterm::execute!(stderr(), EnterAlternateScreen, EnableBracketedPaste, Hide)
+            crossterm::execute!(
+                stderr(),
+                EnterAlternateScreen,
+                EnableBracketedPaste,
+                EnableFocusChange,
+                Hide
+            )
         } else {
-            crossterm::execute!(stderr(), EnableBracketedPaste, Hide)
+            crossterm::execute!(stderr(), EnableBracketedPaste, EnableFocusChange, Hide)
         };
         if let Err(e) = modes {
             // Raw mode is on and half the modes may be too. `active` is still

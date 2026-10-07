@@ -34,7 +34,7 @@ use crate::commands::posts::{about, clipped, size_of};
 use crate::exit::ExitCode;
 use crate::posts::{self, Comments, Grid, Opened, Post};
 use crate::report;
-use crate::ui::browser::input::{self, Action, Raw, TICK, page, watching_cancel_keys};
+use crate::ui::browser::input::{self, Action, Raw, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::tui::{self, Tui};
 
@@ -207,7 +207,7 @@ impl Session<'_> {
         let outcome: Result<ExitCode> = async {
             loop {
                 self.draw(&mut tui, &mut list, viewer, colors, &mut page_rows)?;
-                let raw = input::read(TICK).map_err(input::unreadable)?;
+                let raw = input::read(input::tick()).map_err(input::unreadable)?;
                 let key = match raw {
                     Raw::Key(key) => key_of(key),
                     Raw::Resized | Raw::Paste(_) | Raw::Tick => continue,
@@ -473,6 +473,11 @@ impl Session<'_> {
         let (note, saved) = kept;
         if saved {
             self.receipts.push(note.clone());
+        }
+        // Said outside the window to somebody who went to another one while
+        // it downloaded (`ui::notify`).
+        if stopped == input::Stopped::No && !input::focused() {
+            crate::ui::notify::finished(&note, true);
         }
         self.note = note;
         stopped.leave()

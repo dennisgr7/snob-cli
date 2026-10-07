@@ -71,7 +71,7 @@ use crate::exit::{ExitCode, ExitError};
 use crate::report;
 use crate::ui::accounts::{self, Browsed, Picked};
 use crate::ui::browser::input::Action;
-use crate::ui::browser::input::{self, Raw, TICK, action_of, page, watching_cancel_keys};
+use crate::ui::browser::input::{self, Raw, action_of, page, watching_cancel_keys};
 use crate::ui::profile::{self, Answer, answer, question_modal};
 use crate::ui::tui::{self, Tui};
 
@@ -314,7 +314,7 @@ async fn run(
             })?;
         }
 
-        let event = input::read(TICK).map_err(input::unreadable)?;
+        let event = input::read(input::tick()).map_err(input::unreadable)?;
         // A note stays up until the user does something else, not until the
         // next timer tick wipes it.
         if !matches!(event, Raw::Tick | Raw::Resized) {

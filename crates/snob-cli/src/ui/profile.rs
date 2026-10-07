@@ -55,7 +55,7 @@ use crate::exit::ExitCode;
 use crate::media::Story;
 use crate::report;
 use crate::ui::accounts::{self, Browsed, Picked};
-use crate::ui::browser::input::{self, Action, Raw, TICK, action_of, page, watching_cancel_keys};
+use crate::ui::browser::input::{self, Action, Raw, action_of, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::highlights::{Folder, empty_note, keep_folder, stem_of, walk_in};
 use crate::ui::people::Shelf;
@@ -256,7 +256,7 @@ pub async fn browse(
                 );
             })?;
 
-            let event = input::read(TICK).map_err(input::unreadable)?;
+            let event = input::read(input::tick()).map_err(input::unreadable)?;
             let key = match event {
                 Raw::Tick | Raw::Resized | Raw::Paste(_) => continue,
                 Raw::Key(key) => key,
@@ -1091,7 +1091,7 @@ pub(crate) fn peek(
                 Some(PEEK_HINT),
             );
         })?;
-        let key = match input::read(TICK).map_err(input::unreadable)? {
+        let key = match input::read(input::tick()).map_err(input::unreadable)? {
             Raw::Tick | Raw::Resized | Raw::Paste(_) => continue,
             Raw::Key(key) => key,
         };
