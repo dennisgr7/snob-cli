@@ -167,13 +167,21 @@ pub(crate) fn local(paths: &AppPaths) -> Arc<Headless> {
 
 /// The browsers of a process with no owner to send through
 /// (`owner::Remote::send_as` sends through this when it has none), each closed once it has been idle
-/// for [`IDLE`], looked at every `tick`: a walk asleep on the day's budget
-/// would otherwise hold its profile against every other command for hours.
-/// What a browser rotated stays in its profile, where the next one reads it.
+/// for [`IDLE`]: a walk asleep on the day's budget would otherwise hold its
+/// profile against every other command for hours. What a browser rotated
+/// stays in its profile, where the next one reads it.
+///
+/// **The reaper wakes when there is something to close, not on a timer.** It
+/// sleeps until the first open browser would be idle for [`IDLE`], and with no
+/// browser open it sleeps until one starts. Looked at once a second instead, a
+/// `snob watch` running without an owner woke eighty-six thousand times a day
+/// for a browser that is open a few minutes of it, while the monitor's own
+/// loop goes out of its way to wake a few hundred times
+/// (`commands::watch::scheduled::nap_for`).
 ///
 /// Such a process waits for a profile another snob's browser holds, rather
 /// than failing: with no owner there is nobody to share that browser through.
-pub(crate) fn alone(paths: &AppPaths, tick: Duration) -> Arc<Headless> {
+pub(crate) fn alone(paths: &AppPaths) -> Arc<Headless> {
     static REAPING: std::sync::Once = std::sync::Once::new();
     let headless = local(paths);
     headless.waits.store(true, Ordering::SeqCst);
@@ -181,8 +189,10 @@ pub(crate) fn alone(paths: &AppPaths, tick: Duration) -> Arc<Headless> {
         let reaped = Arc::clone(&headless);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(tick).await;
-                reaped.reap(|open| open.idle >= IDLE).await;
+                match reaped.reap(|open| open.idle >= IDLE).await.next {
+                    Some(wait) => tokio::time::sleep(wait).await,
+                    None => reaped.started.notified().await,
+                }
             }
         });
     });
@@ -238,6 +248,10 @@ pub(crate) struct Headless {
     heard: tokio::sync::broadcast::Sender<(Pk, PushedBack)>,
     /// Set by [`alone`]: a profile another snob holds is waited for.
     waits: AtomicBool,
+    /// Poked when a browser starts, for [`alone`]'s reaper asleep with none
+    /// open. `notify_one`, so a start that comes between the reaper looking
+    /// and the reaper waiting is kept for it rather than lost.
+    started: tokio::sync::Notify,
 }
 
 /// One account's browser, while it has one.
@@ -273,6 +287,18 @@ impl Account {
         }
         *lock(&self.listened) = None;
     }
+}
+
+/// What [`Headless::reap`] leaves behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Reaped {
+    /// The browsers still open, busy ones included.
+    pub(crate) open: usize,
+    /// How long until the first of them has been idle for [`IDLE`], when one
+    /// is open: the next moment there may be something to close. A busy one
+    /// counts as a whole [`IDLE`] away, since it is touched again when its
+    /// request ends.
+    pub(crate) next: Option<Duration>,
 }
 
 /// An open browser, as the owner decides whether to close it.
@@ -581,6 +607,7 @@ impl Headless {
             accounts: std::sync::Mutex::new(HashMap::new()),
             heard: tokio::sync::broadcast::Sender::new(16),
             waits: AtomicBool::new(false),
+            started: tokio::sync::Notify::new(),
         }
     }
 
@@ -650,12 +677,16 @@ impl Headless {
     }
 
     /// Closes the open browsers `due` says to, never one answering a request,
-    /// and says how many are still open, busy ones included.
-    pub(crate) async fn reap(&self, due: impl Fn(&Open) -> bool) -> usize {
+    /// and says how many are still open, busy ones included, and when the
+    /// first of them idles out.
+    pub(crate) async fn reap(&self, due: impl Fn(&Open) -> bool) -> Reaped {
         let mut open = 0;
+        let mut next: Option<Duration> = None;
+        let mut sooner = |wait: Duration| next = Some(next.map_or(wait, |next| next.min(wait)));
         for (pk, account) in self.every_account() {
             let Ok(mut slot) = account.live.try_lock() else {
                 open += 1;
+                sooner(IDLE);
                 continue;
             };
             let Some(live) = slot.as_ref() else {
@@ -671,9 +702,10 @@ impl Headless {
                 account.close(&mut slot).await;
             } else {
                 open += 1;
+                sooner(IDLE.saturating_sub(state.idle));
             }
         }
-        open
+        Reaped { open, next }
     }
 
     /// Sends `request` as `session`, from the account's own browser
@@ -753,6 +785,7 @@ impl Headless {
                 starts += 1;
                 account.touch();
                 *slot = Some(started);
+                self.started.notify_one();
             }
             let live = slot.as_mut().expect("a browser was started above");
             let ready = self.ready(live, session, origin).await;

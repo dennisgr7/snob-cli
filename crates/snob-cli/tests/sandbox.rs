@@ -1614,6 +1614,69 @@ fn snob_from(cwd: &Path, root: &Path, instagram: &MockServer, args: &[&str]) -> 
 /// The fixture serves the same made-up accounts for both lists: followers
 /// `user0..user2`, following `user0..user1`. So `fans` is `user2`, `friends`
 /// is `user0` and `user1`, and nobody is an unfollower.
+/// A walk asked to stop by the system, the way `systemctl stop` or a closed
+/// terminal asks, stops the way a Ctrl+C stops it: promptly, mid-request, and
+/// with the code an interrupted run exits with, rather than being killed where
+/// it stood.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_walk_asked_to_stop_by_the_system_stops_as_for_ctrl_c() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    // The list never answers, so the walk is mid-request when it is asked.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(120)))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    let walks = || async {
+        instagram
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/followers/"))
+            .count()
+    };
+
+    for signal in [libc::SIGTERM, libc::SIGHUP] {
+        let before = walks().await;
+        let mut child = command(tmp.path(), Some(&instagram))
+            .arg("followers")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the binary runs");
+        let asked = std::time::Instant::now();
+        while walks().await == before {
+            assert!(
+                asked.elapsed() < std::time::Duration::from_secs(30),
+                "the walk never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        // SAFETY: `pid` is this test's own child, still running: it has not
+        // been waited for.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+
+        let stopped = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                stopped.elapsed() < std::time::Duration::from_secs(15),
+                "signal {signal} did not stop the walk"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(status.code(), Some(130), "signal {signal}");
+    }
+}
+
 #[tokio::test]
 async fn the_whole_tool_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
