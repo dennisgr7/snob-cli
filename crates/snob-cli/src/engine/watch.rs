@@ -615,7 +615,29 @@ pub async fn tick(app: &mut App, watched: &Watched) -> Result<TickReport> {
         // looked at must not be compared or marked, which is exactly what
         // `Skipped` means, and saying so keeps the report honest about why it
         // is short.
-        if app.cancel().is_canceled() {
+        //
+        // **The monitor's battery stop too**, asked again here rather than
+        // only between pages. It does not cancel the process (the scheduled
+        // loop goes on to wait for power), so the token above never sees it,
+        // and a walk it stopped comes back `Ok` just the same: without this
+        // the second list would open the profile again and start walking on a
+        // battery the first list had already stopped for. Asked of the
+        // battery, not of the first list's outcome, so a battery that turns
+        // critical between two lists, or two accounts, stops the run as well.
+        let power_stop =
+            !app.cancel().is_canceled() && app.stop_between_pages().is_some_and(|stop| stop());
+        if app.cancel().is_canceled() || power_stop {
+            // Said once: a walk the battery stopped has already said so.
+            if power_stop
+                && !lists.iter().any(|list: &TickList| {
+                    matches!(
+                        list.skipped,
+                        Some(Skipped::Incomplete(StopReason::Canceled, _))
+                    )
+                })
+            {
+                app.warn(crate::report::BATTERY_CRITICAL_SKIP);
+            }
             lists.push(TickList {
                 kind,
                 skipped: Some(Skipped::Incomplete(StopReason::Canceled, None)),
