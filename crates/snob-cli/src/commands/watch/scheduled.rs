@@ -113,6 +113,9 @@ pub(super) async fn scheduled(
     // The previous time round's clock reading, which is how a clock that jumped
     // is told from one that ticked.
     let mut clock_was: Option<Epoch> = None;
+    // Whether the run that is due is being held for a critical battery, so it
+    // is said once rather than at every look.
+    let mut waiting_for_power = false;
 
     loop {
         let now = snob_core::clock::now();
@@ -169,6 +172,30 @@ pub(super) async fn scheduled(
         };
 
         if now >= wake_at {
+            // **A critical battery holds the run back**, and only that: a run
+            // started now would be cut off by the system hibernating under
+            // it. The moment waited for is kept, so the run goes as soon as
+            // the machine is on power or charged again, as an overdue run, with
+            // no jitter. Looked at again at the near nap, which is soon enough
+            // for a charger plugged in and rare enough for a battery that
+            // stays empty.
+            if super::run::waits_for_power(paths, now) {
+                if !waiting_for_power {
+                    ui::warn(report::BATTERY_CRITICAL_HOLD);
+                    waiting_for_power = true;
+                }
+                if cancel
+                    .sleep_or_cancel(std::time::Duration::from_secs(NAP_NEAR_SECS.unsigned_abs()))
+                    .await
+                {
+                    ui::info("Stopped.");
+                    return Ok(ExitCode::Interrupted);
+                }
+                continue;
+            }
+            if std::mem::take(&mut waiting_for_power) {
+                super::run::power_is_back(paths);
+            }
             if missed > 0 {
                 ui::warn(&missed_warning(missed));
             }

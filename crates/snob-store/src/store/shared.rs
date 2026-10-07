@@ -32,6 +32,11 @@ const KEPT: Duration = Duration::from_secs(2 * 24 * 3600);
 /// The `meta` key the interval seed is kept under.
 const INTERVAL_SEED: &str = "interval_seeded_at";
 
+/// The `meta` key under which the monitor writes since when it has held a due
+/// run back for a critical battery. A row in an existing table rather than a
+/// column: it is one value for the machine, and it needs no migration.
+const WAITING_FOR_POWER: &str = "monitor_waiting_for_power_since";
+
 pub struct Shared {
     conn: Connection,
 }
@@ -119,6 +124,33 @@ impl Shared {
         Ok(self.interval_seeded_at()?.unwrap_or(at))
     }
 
+    /// Since when the monitor has held the run that is due back, because the
+    /// battery is critical; `None` while it is not.
+    pub fn waiting_for_power_since(&self) -> Result<Option<Epoch>, StoreError> {
+        let at = super::meta_get(&self.conn, WAITING_FOR_POWER)?;
+        Ok(at.and_then(|at| at.parse().ok()).map(Epoch::new))
+    }
+
+    /// Writes down that the monitor is holding a due run for power, unless it
+    /// already is: the moment kept is the first, which is when it started
+    /// waiting.
+    pub fn wait_for_power(&self, since: Epoch) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
+            params![WAITING_FOR_POWER, since.get().to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The machine is on power again, or the battery out of danger.
+    pub fn power_is_back(&self) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            params![WAITING_FOR_POWER],
+        )?;
+        Ok(())
+    }
+
     /// Removes every push-back on `pk`, for `purge --account`.
     pub fn forget(&self, pk: Pk) -> Result<(), StoreError> {
         self.conn.execute(
@@ -133,6 +165,24 @@ impl Shared {
 mod tests {
     use super::*;
     use snob_core::clock::now_ms;
+
+    /// The first moment the monitor started waiting for power is the one
+    /// kept, until power is back.
+    #[test]
+    fn waiting_for_power_keeps_when_it_started() {
+        let (_tmp, shared) = shared();
+        assert_eq!(shared.waiting_for_power_since().unwrap(), None);
+
+        shared.wait_for_power(Epoch::new(100)).unwrap();
+        shared.wait_for_power(Epoch::new(200)).unwrap();
+        assert_eq!(
+            shared.waiting_for_power_since().unwrap(),
+            Some(Epoch::new(100))
+        );
+
+        shared.power_is_back().unwrap();
+        assert_eq!(shared.waiting_for_power_since().unwrap(), None);
+    }
 
     #[test]
     fn the_migration_chain_is_valid() {

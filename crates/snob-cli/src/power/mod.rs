@@ -28,6 +28,7 @@
 //! logged and left alone: the walk is not worse off than it was before this
 //! existed.
 
+pub mod battery;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]

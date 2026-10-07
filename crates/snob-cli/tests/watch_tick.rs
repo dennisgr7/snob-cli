@@ -642,6 +642,46 @@ async fn a_canceled_run_does_not_walk_the_second_list() {
     );
 }
 
+/// A monitor run at a critical battery stops its walks before their next page,
+/// as a stop kept for the next run rather than as an error, and without
+/// canceling the process: the scheduled loop goes on to wait for power.
+#[tokio::test]
+async fn a_critical_battery_stops_the_monitor_s_walks_between_pages() {
+    let server = MockServer::start().await;
+    mount_profile(&server, 3, 2).await;
+    mount_list(&server, "followers", &[1, 2, 3]).await;
+    mount_list(&server, "following", &[8, 9]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&server, open_db(tmp.path()));
+    app.stops_on_a_critical_battery(|| true);
+
+    let tick = watch::tick(&mut app, &Watched::own()).await.unwrap();
+
+    for list in &tick.lists {
+        assert!(
+            matches!(
+                list.skipped,
+                Some(Skipped::Incomplete(
+                    snob_core::model::StopReason::Canceled,
+                    _
+                ))
+            ),
+            "{:?}: {:?}",
+            list.kind,
+            list.skipped
+        );
+    }
+    let walked = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().contains("/friendships/"))
+        .count();
+    assert_eq!(walked, 0, "no page asked once the battery is critical");
+    assert!(!app.cancel().is_canceled(), "the process goes on");
+}
+
 /// A list served with names rather than only ids, so a rename can be arranged.
 async fn mount_named(server: &MockServer, kind: &str, users: &[(u64, &str)]) {
     let users: Vec<String> = users

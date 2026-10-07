@@ -24,7 +24,7 @@ does its job:
 | Request budget, cooldowns, the common brake | `snob-core/src/budget.rs`, `snob-store/src/store/rate_budget.rs` |
 | The schema | `crates/snob-store/src/store/sql/` |
 | Telling that the machine slept in the middle of a walk | `crates/snob-ig/src/awake.rs` |
-| What snob asks of the system's power management | `crates/snob-cli/src/power/` |
+| What snob asks of the system's power management: keeping it awake, the battery | `crates/snob-cli/src/power/` |
 
 ## What this is
 

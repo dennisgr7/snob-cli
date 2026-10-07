@@ -515,6 +515,14 @@ pub fn paused_for_the_day(wait: std::time::Duration) -> String {
     )
 }
 
+/// What the monitor says when it stops a walk for the battery.
+pub const BATTERY_CRITICAL_STOP: &str = "the battery is critical; the walk stops here, \
+     and the next run picks it up from this page";
+
+/// What the scheduled monitor says when the run that is due waits for power.
+pub const BATTERY_CRITICAL_HOLD: &str = "the battery is critical; the run that is due waits \
+     until the machine is on power or charged again";
+
 /// What a walk says when it finds the machine slept in the middle of it.
 pub fn slept_during_the_walk(slept: std::time::Duration) -> String {
     let minutes = slept.as_secs().div_ceil(60);
