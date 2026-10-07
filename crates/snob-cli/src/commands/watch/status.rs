@@ -17,6 +17,7 @@ use snob_core::{Epoch, Pk};
 use snob_store::config::{self, WatchConfig};
 use snob_store::paths::{AccountPaths, AppPaths};
 use snob_store::registry::Registry;
+use snob_store::store::shared::PowerWait;
 use snob_store::store::{Store, deliveries, watch as watch_store};
 
 use crate::app::Viewer;
@@ -446,11 +447,11 @@ struct HalfRead {
     missing: Option<ListKind>,
 }
 
-/// Since when the monitor has held a due run back for a critical battery, as
-/// the run loop wrote it down; `None` when it is not, or nothing can tell.
-fn waiting_for_power(paths: &AppPaths) -> Option<Epoch> {
+/// The due run the monitor holds back for a critical battery, as the run
+/// loop wrote it down; `None` when it is not, or nothing can tell.
+fn waiting_for_power(paths: &AppPaths) -> Option<PowerWait> {
     let shared = snob_store::store::shared::Shared::read_existing(paths).ok()??;
-    shared.waiting_for_power_since().ok()?
+    shared.waiting_for_power().ok()?
 }
 
 fn health(
@@ -459,7 +460,7 @@ fn health(
     reported: &[HalfRead],
     owed: deliveries::Owed,
     now: Epoch,
-    waiting_for_power: Option<Epoch>,
+    waiting_for_power: Option<PowerWait>,
 ) -> Health {
     let mut notes = Vec::new();
     let mut verdict = Verdict::Ok;
@@ -536,15 +537,25 @@ fn health(
     //
     // **Except while it waits for power.** A monitor on a laptop whose battery
     // is critical holds the run that is due until the machine is on power
-    // again (`scheduled::battery_is_critical`); that is the monitor doing
-    // what it should, and it is said as such rather than counted late.
-    if let Some(since) = waiting_for_power {
+    // again (`run::waits_for_power`); that is the monitor doing what it
+    // should, and it is said as such rather than counted late.
+    //
+    // **Only while somebody is still looking.** A monitor stopped, killed, or
+    // shut down with the machine while it waited never says that power is
+    // back, and its marker would hide a dead monitor for good. The scheduled
+    // loop looks every minute and `watch once` on a timer every period, so a
+    // last look older than one period is a monitor that is no longer there,
+    // and the lateness check below takes over from it.
+    let gap = config.and_then(|c| expected_gap(c, now));
+    let waiting_for_power =
+        waiting_for_power.filter(|wait| gap.is_none_or(|gap| now - wait.seen <= gap));
+    if let Some(wait) = waiting_for_power {
         at_least(Verdict::Warned);
         notes.push(format!(
             "the run that is due is waiting for power: the battery has been critical since {}",
-            report::stored_on(since)
+            report::stored_on(wait.since)
         ));
-    } else if let Some(gap) = config.and_then(|c| expected_gap(c, now))
+    } else if let Some(gap) = gap
         && let Some(newest) = runs.iter().map(|r| r.run.started_at).max()
     {
         let silent = now - newest;
@@ -1599,7 +1610,10 @@ url = \"https://example.com/hook\"
             &[],
             deliveries::Owed::default(),
             NOW,
-            Some(NOW - Duration::from_secs(3_600)),
+            Some(PowerWait {
+                since: NOW - Duration::from_secs(3_600),
+                seen: NOW - Duration::from_secs(60),
+            }),
         );
         assert_eq!(waiting.verdict, Verdict::Warned, "{:?}", waiting.notes);
         assert!(
@@ -1617,6 +1631,54 @@ url = \"https://example.com/hook\"
                 .any(|n| n.contains("has not run since")),
             "{:?}",
             waiting.notes
+        );
+    }
+
+    /// A marker nobody has looked at for a whole period was left by a monitor
+    /// that stopped while it waited: it is late like any other, not waiting.
+    #[test]
+    fn a_marker_left_behind_does_not_hide_a_dead_monitor() {
+        let configured = watch_toml(
+            "schema = 1
+every = \"6h\"
+",
+        );
+        let gone = watch_store::Run {
+            started_at: NOW - Duration::from_secs(2 * 86_400),
+            ..ran(ExitCode::Ok)
+        };
+        let left_behind = health(
+            Some(&configured),
+            &[of(&gone)],
+            &[],
+            deliveries::Owed::default(),
+            NOW,
+            Some(PowerWait {
+                since: NOW - Duration::from_secs(43_200),
+                seen: NOW - Duration::from_secs(7 * 3_600),
+            }),
+        );
+        assert_eq!(
+            left_behind.verdict,
+            Verdict::Failed,
+            "{:?}",
+            left_behind.notes
+        );
+        assert!(
+            !left_behind
+                .notes
+                .iter()
+                .any(|n| n.contains("waiting for power")),
+            "{:?}",
+            left_behind.notes
+        );
+        assert!(
+            left_behind
+                .notes
+                .iter()
+                .any(|n| n.contains("has not run since")),
+            "{:?}",
+            left_behind.notes
         );
     }
 

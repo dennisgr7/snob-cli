@@ -188,6 +188,9 @@ pub(super) async fn scheduled(
                     .sleep_or_cancel(std::time::Duration::from_secs(NAP_NEAR_SECS.unsigned_abs()))
                     .await
                 {
+                    // Nobody is waiting any more, so `snob watch status` must
+                    // not go on saying somebody is.
+                    super::run::power_is_back(paths);
                     ui::info("Stopped.");
                     return Ok(ExitCode::Interrupted);
                 }

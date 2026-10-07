@@ -37,6 +37,21 @@ const INTERVAL_SEED: &str = "interval_seeded_at";
 /// column: it is one value for the machine, and it needs no migration.
 const WAITING_FOR_POWER: &str = "monitor_waiting_for_power_since";
 
+/// The `meta` key under which the monitor writes when it last looked at the
+/// battery while holding that run. What tells a monitor still waiting from a
+/// marker left behind by one that was stopped, killed, or went down with the
+/// machine: those never get to say that power is back.
+const WAITING_FOR_POWER_SEEN: &str = "monitor_waiting_for_power_seen";
+
+/// A due run held back for a critical battery, as the monitor wrote it down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PowerWait {
+    /// When it started waiting.
+    pub since: Epoch,
+    /// When it last looked and found the battery still critical.
+    pub seen: Epoch,
+}
+
 pub struct Shared {
     conn: Connection,
 }
@@ -124,29 +139,37 @@ impl Shared {
         Ok(self.interval_seeded_at()?.unwrap_or(at))
     }
 
-    /// Since when the monitor has held the run that is due back, because the
-    /// battery is critical; `None` while it is not.
-    pub fn waiting_for_power_since(&self) -> Result<Option<Epoch>, StoreError> {
-        let at = super::meta_get(&self.conn, WAITING_FOR_POWER)?;
-        Ok(at.and_then(|at| at.parse().ok()).map(Epoch::new))
+    /// The run that is due being held back for a critical battery; `None`
+    /// while it is not.
+    pub fn waiting_for_power(&self) -> Result<Option<PowerWait>, StoreError> {
+        let read = |key| -> Result<Option<Epoch>, StoreError> {
+            let at = super::meta_get(&self.conn, key)?;
+            Ok(at.and_then(|at| at.parse().ok()).map(Epoch::new))
+        };
+        let Some(since) = read(WAITING_FOR_POWER)? else {
+            return Ok(None);
+        };
+        let seen = read(WAITING_FOR_POWER_SEEN)?.unwrap_or(since);
+        Ok(Some(PowerWait { since, seen }))
     }
 
-    /// Writes down that the monitor is holding a due run for power, unless it
-    /// already is: the moment kept is the first, which is when it started
-    /// waiting.
-    pub fn wait_for_power(&self, since: Epoch) -> Result<(), StoreError> {
+    /// Writes down that the monitor is holding a due run for power, at `now`.
+    /// The moment it started waiting is kept from the first call; the moment
+    /// it last looked moves with every one.
+    pub fn wait_for_power(&self, now: Epoch) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
-            params![WAITING_FOR_POWER, since.get().to_string()],
+            params![WAITING_FOR_POWER, now.get().to_string()],
         )?;
-        Ok(())
+        super::meta_set(&self.conn, WAITING_FOR_POWER_SEEN, &now.get().to_string())
     }
 
-    /// The machine is on power again, or the battery out of danger.
+    /// The machine is on power again, the battery out of danger, or the
+    /// monitor no longer waiting.
     pub fn power_is_back(&self) -> Result<(), StoreError> {
         self.conn.execute(
-            "DELETE FROM meta WHERE key = ?1",
-            params![WAITING_FOR_POWER],
+            "DELETE FROM meta WHERE key IN (?1, ?2)",
+            params![WAITING_FOR_POWER, WAITING_FOR_POWER_SEEN],
         )?;
         Ok(())
     }
@@ -167,21 +190,33 @@ mod tests {
     use snob_core::clock::now_ms;
 
     /// The first moment the monitor started waiting for power is the one
-    /// kept, until power is back.
+    /// kept, the last look moves, and both go when power is back.
     #[test]
     fn waiting_for_power_keeps_when_it_started() {
         let (_tmp, shared) = shared();
-        assert_eq!(shared.waiting_for_power_since().unwrap(), None);
+        assert_eq!(shared.waiting_for_power().unwrap(), None);
 
         shared.wait_for_power(Epoch::new(100)).unwrap();
         shared.wait_for_power(Epoch::new(200)).unwrap();
         assert_eq!(
-            shared.waiting_for_power_since().unwrap(),
-            Some(Epoch::new(100))
+            shared.waiting_for_power().unwrap(),
+            Some(PowerWait {
+                since: Epoch::new(100),
+                seen: Epoch::new(200),
+            })
         );
 
         shared.power_is_back().unwrap();
-        assert_eq!(shared.waiting_for_power_since().unwrap(), None);
+        assert_eq!(shared.waiting_for_power().unwrap(), None);
+        shared.wait_for_power(Epoch::new(300)).unwrap();
+        assert_eq!(
+            shared.waiting_for_power().unwrap(),
+            Some(PowerWait {
+                since: Epoch::new(300),
+                seen: Epoch::new(300),
+            }),
+            "a new wait starts from its own first look"
+        );
     }
 
     #[test]

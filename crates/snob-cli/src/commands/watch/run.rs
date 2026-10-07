@@ -55,8 +55,9 @@ pub(super) async fn run_viewers(
 
 /// Whether the run that is due waits for power: the battery is critical, so
 /// the system is about to hibernate or shut down under a run started now
-/// (`power::battery`). Written down in `shared.db` the first time, so `snob
-/// watch status` says what the monitor is doing instead of calling it late.
+/// (`power::battery`). Written down in `shared.db` at every look, so `snob
+/// watch status` says what the monitor is doing instead of calling it late,
+/// and can tell a monitor still waiting from one that is gone.
 pub(super) fn waits_for_power(paths: &AppPaths, now: Epoch) -> bool {
     if !crate::power::battery::critical() {
         return false;
