@@ -318,7 +318,8 @@ rules above (English, US spelling; `language.rs` reads its `.md`, `.json` and
   in `web/astro.config.mjs`, with the hash of every script and style each page
   runs. No `'unsafe-inline'`, no third-party origins, no inline `style`
   attributes, and Shiki stays off (it styles inline). `web/public/_headers` adds
-  what a `<meta>` cannot carry (`frame-ancestors`, HSTS, `nosniff`, the referrer
+  what a `<meta>` cannot carry (`frame-ancestors`, which lets only dennisgr7.dev
+  frame the page for its live preview, HSTS, `nosniff`, the referrer
   and permissions policies, the `llms.txt` link) and keeps version URLs out of
   search. A response with both policies must satisfy both.
 - **Every page goes through `BaseLayout`**: title, description, canonical, robots,
