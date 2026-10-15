@@ -59,8 +59,12 @@
   color-scheme: light;
 }
 
+/* The system's scheme, unless the portfolio's live preview says otherwise
+   (`data-theme`, set only there by scripts/portfolio-preview.ts): inside an
+   iframe, prefers-color-scheme is the system's, not the theme the portfolio
+   shows. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme='light']) {
     --bg: #0b0d10;
     --surface: #12151a;
     --text: #e6e8ec;
@@ -72,6 +76,19 @@
     --term-line: #23272f;
     color-scheme: dark;
   }
+}
+
+:root[data-theme='dark'] {
+  --bg: #0b0d10;
+  --surface: #12151a;
+  --text: #e6e8ec;
+  --muted: #9aa1ab;
+  --line: #23272f;
+  --accent: #f472b6;
+  --on-accent: #0b0d10;
+  --term-bg: #12151a;
+  --term-line: #23272f;
+  color-scheme: dark;
 }
 
 @layer base {

@@ -134,7 +134,8 @@ macOS command. "Other ways ↓" always leads to the install section.
 
 - **Three small scripts and nothing else**: the platform detection, the copy
   buttons with the install tabs, and the line that tells the author's portfolio
-  (dennisgr7.dev) its live preview of the page has rendered, inert anywhere else.
+  (dennisgr7.dev) its live preview of the page has rendered and takes the theme
+  the portfolio shows, inert anywhere else.
   Astro bundles them and writes their hashes into the Content Security Policy. Executable code is never `is:inline`, which the policy
   would not cover, and nothing carries a `style` attribute.
 - **Everything works without JavaScript**: the hero shows macOS, the install
