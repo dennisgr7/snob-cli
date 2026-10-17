@@ -43,7 +43,19 @@ yanked = "deny"
 # Every entry here needs a comment saying why and when it stops applying.
 # An ignore list without them is how this check gets switched off entirely,
 # which is the same failure the language guard is warned about.
-ignore = []
+ignore = [
+  # `zip` 8.6.0, three advisories about `ZipArchive::extract` and
+  # `ZipStreamReader::extract` writing symlinks, SUID/SGID bits and permissions
+  # outside the destination. Fixed in zip 9. Nothing here calls either: snob
+  # only reads entries from an Instagram export into memory
+  # (`ZipArchive::new`), and `rust_xlsxwriter` only writes. It cannot move yet
+  # because `rust_xlsxwriter` 0.99.1, the latest, still asks for zip 8, so a
+  # bump would leave a second, vulnerable copy in the tree. Remove these three
+  # once `rust_xlsxwriter` releases on zip 9 and `zip` is raised to 9.
+  { id = "RUSTSEC-2026-0367", reason = "zip 8 extract(): not called; waiting for rust_xlsxwriter to move to zip 9" },
+  { id = "RUSTSEC-2026-0368", reason = "zip 8 extract(): not called; waiting for rust_xlsxwriter to move to zip 9" },
+  { id = "RUSTSEC-2026-0369", reason = "zip 8 extract(): not called; waiting for rust_xlsxwriter to move to zip 9" },
+]
 
 [licenses]
 version = 2
