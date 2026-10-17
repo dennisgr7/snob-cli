@@ -57,7 +57,6 @@ test('the page carries a policy and the headers from _headers', async ({ page })
   for (const name of [
     'strict-transport-security',
     'x-content-type-options',
-    'x-frame-options',
     'referrer-policy',
     'permissions-policy',
     'content-security-policy',
@@ -65,5 +64,8 @@ test('the page carries a policy and the headers from _headers', async ({ page })
     expect(HEADERS.toLowerCase()).toContain(`${name}:`);
     expect(headers[name], name).toBeTruthy();
   }
-  expect(headers['content-security-policy']).toContain("frame-ancestors 'none'");
+  // Framed only by the portfolio's live preview, and no X-Frame-Options, which
+  // cannot name an origin.
+  expect(headers['content-security-policy']).toContain('frame-ancestors https://dennisgr7.dev;');
+  expect(headers['x-frame-options']).toBeUndefined();
 });
