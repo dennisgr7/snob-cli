@@ -2515,3 +2515,229 @@ async fn a_page_load_efficient_against_normal() {
         );
     }
 }
+
+/// The fake's login page for `login --remote`: a field and a button that
+/// signs in as whatever was typed into the field, placed where the test
+/// clicks.
+const RELAYED_LOGIN_PAGE: &str = r#"<!doctype html>
+<html><body style="margin:0">
+<input id="field" style="position:absolute;left:0;top:0;width:400px;height:100px">
+<button id="go" style="position:absolute;left:0;top:200px;width:400px;height:100px"
+  onclick="document.cookie='sessionid='+document.getElementById('field').value+'; path=/';
+           document.cookie='ds_user_id=42; path=/'">Log in</button>
+</body></html>"#;
+
+/// A connection to the relay's far end, as the tunnel's would be.
+trait RelayStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> RelayStream for T {}
+
+async fn reach_the_relay(far_end: &str) -> Box<dyn RelayStream> {
+    #[cfg(unix)]
+    if far_end.starts_with('/') {
+        return Box::new(
+            tokio::net::UnixStream::connect(far_end)
+                .await
+                .expect("the relay's socket takes a connection"),
+        );
+    }
+    Box::new(
+        tokio::net::TcpStream::connect(far_end)
+            .await
+            .expect("the relay's port takes a connection"),
+    )
+}
+
+/// One request through the relay, and its whole answer.
+async fn through_the_relay(far_end: &str, request: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = reach_the_relay(far_end).await;
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut answer = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        stream.read_to_end(&mut answer),
+    )
+    .await
+    .expect("the relay answers")
+    .unwrap();
+    String::from_utf8_lossy(&answer).into_owned()
+}
+
+/// `login --remote`, end to end: the binary prints a tunnel and a link, the
+/// test is the browser at the other end of the tunnel — it opens the link,
+/// reads frames off the event stream, and clicks and types into the fake's
+/// login page through the relay — and the session that page sets is the one
+/// stored. What reaches the relay's page is pictures; what comes back is the
+/// person's input, and the cookie is read off snob's own browser.
+#[tokio::test]
+async fn a_login_through_the_relay_is_stored() {
+    use std::io::BufRead;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Some(_alone) = a_browser_alone().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let (_world, instagram) = fake_instagram().await;
+    Mock::given(method("GET"))
+        .and(url_path("/accounts/login/"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(RELAYED_LOGIN_PAGE, "text/html"))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+
+    let mut child = snob_started(tmp.path(), &instagram, &["login", "--remote"], None, &[]);
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let (lines, said) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut printed = Vec::new();
+    let (mut tunnel, mut link) = (None, None);
+    while tunnel.is_none() || link.is_none() {
+        let line = said
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .unwrap_or_else(|_| panic!("no tunnel and link were printed:\n{}", printed.join("\n")));
+        let trimmed = line.trim().to_string();
+        if trimmed.starts_with("ssh -N -L ") {
+            tunnel = Some(trimmed.clone());
+        } else if trimmed.starts_with("http://127.0.0.1:") {
+            link = Some(trimmed.clone());
+        }
+        printed.push(line);
+    }
+    let (tunnel, link) = (tunnel.unwrap(), link.unwrap());
+    // `ssh -N -L <near port>:<far end> <host>`
+    let forward = tunnel.split_whitespace().nth(3).expect("a forward");
+    let (near_port, far_end) = forward.split_once(':').expect("port:far end");
+    let token = link.rsplit('/').next().expect("a token");
+    assert!(
+        link.contains(&format!(":{near_port}/")),
+        "{tunnel} / {link}"
+    );
+    let host = format!("127.0.0.1:{near_port}");
+
+    let opened = through_the_relay(
+        far_end,
+        &format!("GET /{token} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+    )
+    .await;
+    assert!(opened.starts_with("HTTP/1.1 303"), "{opened}");
+    let cookie = opened
+        .lines()
+        .find_map(|l| l.strip_prefix("Set-Cookie: "))
+        .and_then(|c| c.split(';').next())
+        .expect("a cookie for the spent token")
+        .to_string();
+    let again = through_the_relay(
+        far_end,
+        &format!("GET /{token} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+    )
+    .await;
+    assert!(
+        again.starts_with("HTTP/1.1 404"),
+        "the link opens once: {again}"
+    );
+
+    // The event stream, read until the login page is on it.
+    let mut events = reach_the_relay(far_end).await;
+    events
+        .write_all(
+            format!("GET /events HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut streamed = String::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let read_until = |wanted: &'static str| move |streamed: &String| streamed.contains(wanted);
+    let mut read_events = async |streamed: &mut String, done: &dyn Fn(&String) -> bool| {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+        while !done(streamed) {
+            let read = tokio::time::timeout_at(deadline, events.read(&mut chunk))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the event stream did not get there:\n{}",
+                        &streamed[..streamed.len().min(2000)]
+                    )
+                })
+                .unwrap();
+            assert!(read > 0, "the event stream ended:\n{streamed}");
+            streamed.push_str(&String::from_utf8_lossy(&chunk[..read]));
+        }
+    };
+    read_events(&mut streamed, &read_until("/accounts/login/")).await;
+    let after = streamed.len();
+    read_events(&mut streamed, &move |s: &String| {
+        s[after..].contains("event: frame")
+    })
+    .await;
+    assert!(
+        streamed.contains(r#"data: {"data":"/9j/"#),
+        "frames are JPEG: {}",
+        &streamed[..streamed.len().min(300)]
+    );
+    // The page has painted; give its script a moment past that.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let click = |x: u32, y: u32| {
+        format!(
+            r#"{{"t":"mouse","kind":"move","x":{x},"y":{y}}},
+               {{"t":"mouse","kind":"down","x":{x},"y":{y},"button":"left","buttons":1,"clicks":1}},
+               {{"t":"mouse","kind":"up","x":{x},"y":{y},"button":"left","buttons":0,"clicks":1}}"#
+        )
+    };
+    let body = format!(
+        r#"[{},{{"t":"text","text":"42%3Aremote%3A1"}},
+            {{"t":"key","down":true,"key":"7","code":"Digit7","keyCode":55,"text":"7"}},
+            {{"t":"key","down":false,"key":"7","code":"Digit7","keyCode":55}},{}]"#,
+        click(50, 50),
+        click(50, 250)
+    );
+    let posted = through_the_relay(
+        far_end,
+        &format!(
+            "POST /input HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\nX-Snob-Input: 1\r\n\
+             Origin: http://{host}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    assert!(posted.starts_with("HTTP/1.1 204"), "{posted}");
+
+    read_events(&mut streamed, &read_until("event: done")).await;
+    drop(events);
+    let out = child.wait_with_output().expect("the login finishes");
+    reader.join().unwrap();
+    let rest: Vec<String> = said.try_iter().collect();
+    let logged = format!("{}\n{}", printed.join("\n"), rest.join("\n"));
+    assert!(
+        out.status.success(),
+        "{logged}\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Session stored"),
+        "{logged}\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    #[cfg(unix)]
+    assert!(
+        !std::path::Path::new(far_end).exists(),
+        "the relay's socket goes with it"
+    );
+
+    let whoami = snob(tmp.path(), &instagram, &["whoami", "--json"], None);
+    assert!(whoami.status.success(), "{}", told(tmp.path(), &whoami));
+    assert!(
+        last_session_seen(&instagram)
+            .await
+            .contains("42%3Aremote%3A17")
+    );
+}

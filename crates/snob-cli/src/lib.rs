@@ -28,6 +28,8 @@ pub(crate) mod pipe;
 pub mod posts;
 pub(crate) mod power;
 pub(crate) mod progress;
+pub(crate) mod relay;
 pub mod report;
+pub mod seat;
 pub mod ui;
 pub mod watch;

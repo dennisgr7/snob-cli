@@ -59,10 +59,11 @@ const PK: Pk = Pk::new(42);
 /// `CARGO_BIN_EXE_snob` is the binary this test's own build produced, so it
 /// carries the `testing` feature and nothing else has to be arranged. Every
 /// invocation gets `--sandbox-root`, which is what keeps the keyring and the
-/// user's real data directory out of it. The five variables removed below do
-/// not reach the run when set outside the test: an account, a token, a key, a
+/// user's real data directory out of it. The variables removed below do not
+/// reach the run when set outside the test: an account, a token, a key, a
 /// cooldown override or a log level named in the developer's environment is
-/// not this test's.
+/// not this test's, and neither is the SSH session the suite may be run from,
+/// which changes what `login` offers (`seat`).
 fn command(root: &Path, instagram: Option<&MockServer>) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_snob"));
     command.arg("--sandbox-root").arg(root);
@@ -78,6 +79,9 @@ fn command(root: &Path, instagram: Option<&MockServer>) -> Command {
         "SNOB_SIGNING_KEY",
         "SNOB_IGNORE_COOLDOWN",
         "SNOB_LOG",
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
+        "SSH_TTY",
     ] {
         command.env_remove(inherited);
     }
@@ -3547,4 +3551,60 @@ async fn a_dry_run_in_a_cooldown_exits_five() {
     let out = snob(tmp.path(), Some(&instagram), &["fans", "--dry-run"]);
     assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
     assert!(stdout(&out).contains("cooldown"), "{}", stdout(&out));
+}
+
+/// The `SSH_CONNECTION` of a session to a machine at 192.168.1.50.
+const OVER_SSH: (&str, &str) = ("SSH_CONNECTION", "192.168.1.20 52344 192.168.1.50 22");
+
+/// Over SSH to a Linux machine with no display, a window cannot open, and
+/// `--browser` says so and what works instead, before any browser is looked
+/// for — rather than Chromium exiting 1 and the advice being a guess.
+#[cfg(not(any(target_os = "macos", windows)))]
+#[test]
+fn a_window_over_ssh_with_no_display_points_at_the_tunnel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = command(tmp.path(), None)
+        .env(OVER_SSH.0, OVER_SSH.1)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .args(["login", "--browser"])
+        .output()
+        .expect("the binary runs");
+    assert!(!out.status.success());
+    let said = stderr(&out);
+    assert!(said.contains("SSH session"), "{said}");
+    assert!(said.contains("snob login --remote"), "{said}");
+    assert!(said.contains("snob login --paste"), "{said}");
+    assert!(
+        !snob_store::paths::AppPaths::rooted_at(tmp.path())
+            .browser_profile()
+            .exists(),
+        "no profile was made for a browser that could not open"
+    );
+}
+
+/// With nobody to show the menu to, over SSH, the methods named are the two
+/// that work from there.
+#[test]
+fn a_login_with_no_terminal_over_ssh_names_the_tunnel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = snob_with(tmp.path(), None, &[OVER_SSH], &["login"]);
+    assert!(!out.status.success());
+    let said = stderr(&out);
+    assert!(said.contains("snob login --remote"), "{said}");
+    assert!(said.contains("snob login --paste"), "{said}");
+}
+
+/// One method per login: `--remote` with either other is refused by the
+/// command line itself.
+#[test]
+fn the_tunnel_is_one_method_among_three() {
+    let tmp = tempfile::tempdir().unwrap();
+    for both in [
+        &["login", "--remote", "--paste"][..],
+        &["login", "--remote", "--browser"][..],
+    ] {
+        let out = snob(tmp.path(), None, both);
+        assert_eq!(out.status.code(), Some(2), "{both:?}: {}", stderr(&out));
+    }
 }

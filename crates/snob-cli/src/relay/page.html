@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>snob login</title>
+<link rel="stylesheet" href="/page.css">
+<script src="/page.js" defer></script>
+</head>
+<body>
+<header>
+<button type="button" id="back" title="Back" aria-label="Back">&#8592;</button>
+<button type="button" id="forward" title="Forward" aria-label="Forward">&#8594;</button>
+<button type="button" id="reload" title="Reload" aria-label="Reload">&#8635;</button>
+<span id="address">connecting to snob's browser...</span>
+<button type="button" id="keyboard" title="Show the keyboard" aria-label="Show the keyboard">&#9000;</button>
+</header>
+<main id="stage">
+<img id="screen" alt="Instagram's login page, in snob's browser" draggable="false">
+<textarea id="keys" autocapitalize="off" autocomplete="off" spellcheck="false" aria-label="What you type goes to snob's browser"></textarea>
+</main>
+<div id="done" hidden>
+<p>Logged in. snob has the session, and this tab can be closed.</p>
+</div>
+</body>
+</html>

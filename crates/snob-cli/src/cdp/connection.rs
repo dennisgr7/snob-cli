@@ -338,6 +338,18 @@ impl Connection {
         receiver
     }
 
+    /// A connection to no browser at all, whose every call fails at once:
+    /// for the tests of what only needs one to exist.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        let (to_browser, _) = mpsc::unbounded_channel();
+        let (_, from_browser) = mpsc::channel(1);
+        Self::start(PipeTransport {
+            to_browser,
+            from_browser,
+        })
+    }
+
     /// What every target attached from now on is given before it runs.
     pub fn set_on_attach(&self, plan: OnAttach) {
         self.shared.lock().on_attach = Some(plan);

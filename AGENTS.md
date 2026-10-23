@@ -20,6 +20,7 @@ does its job:
 | What the browser listens for (push-back) | `headless/listen.rs` |
 | What the tab lets out (the guard) | `headless/guard.rs` |
 | The one process that runs the browsers | `crates/snob-cli/src/owner/` |
+| Logging in over SSH: where the person sits, the relay to their browser | `crates/snob-cli/src/seat.rs`, `relay/mod.rs` |
 | The cookie boundary and the protocol client | `cdp/mod.rs`, `cdp/connection.rs`, `pipe.rs` |
 | Request budget, cooldowns, the common brake | `snob-core/src/budget.rs`, `snob-store/src/store/rate_budget.rs` |
 | The schema | `crates/snob-store/src/store/sql/` |
@@ -55,7 +56,7 @@ an immediate stop when the service pushes back.
 Commands (`crates/snob-cli/src/cli.rs` is the source of truth; `snob --help` and
 `snob <command> --help` print it):
 
-- Session and accounts: `login` (`--paste`, `--browser`, `--add`), `whoami`,
+- Session and accounts: `login` (`--paste`, `--browser`, `--remote`, `--add`), `whoami`,
   `status` (`--session`, `--budget`, `--cooldown`, `--lists`, `--watch`),
   `account list`, `account use`, `logout` (`--all`), `purge` (`--account`,
   `--dry-run`).
@@ -605,6 +606,15 @@ the account's directory (DPAPI-sealed on Windows, 0600 elsewhere).
   brought up to date from it at the end of each run and between monitor runs
   (`headless::write_back`), never over a login made since and never another
   account's.
+- `login --remote` is the same login for a machine reached over SSH (`seat` tells
+  where the person sits and orders the wizard's menu; `--browser` is refused only
+  where no window can open). The browser runs headless on the same profile, with
+  the requests' identity (`headless::for_a_remote_login`, no guard), and `relay/`
+  shows its tab to a page in the person's own browser through `ssh -L`: JPEG frames
+  out (`Page.startScreencast`), mouse, wheel, key and text events back
+  (`relay::input`). It listens on a `0600` socket checked with `peer_cred` (a
+  `127.0.0.1` port on Windows), behind a one-use 256-bit token traded for an
+  `HttpOnly` cookie. The cookies still come back over the pipe.
 - **One browser profile per account**, `browser-profile/<pk>`, and two accounts
   never share one (`AppPaths::browser_profile_for`). The profile is the device.
 - **The session is checked from the page**: `PolarisViewer` on the tab's document,
@@ -692,7 +702,8 @@ caller has to remember. The reasoning is in the doc-comment at each location.
   same user can trigger, that process can satisfy.
 - **A challenge's cooldown is not lifted by clearing the challenge.**
 - **The browser is talked to over a pipe; there is no debugging port.** A port hands
-  the session cookie to any local process.
+  the session cookie to any local process. The relay of `login --remote` is not
+  one: it carries pictures and input, never the protocol or a cookie.
 - **`snob purge` deletes the stored data and not the binary**, session first.
   `snob logout` deletes the account's browser profile and session, keeps its data
   and its registry entry.

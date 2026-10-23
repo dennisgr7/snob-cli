@@ -77,7 +77,7 @@ pub async fn run(
         // A paste is whichever account the sessionid is: there is nothing to
         // renew or add, and `finish` says what it replaces once it knows.
         LoginMethod::Paste => by_paste(args, store, paths).await,
-        LoginMethod::Browser => {
+        method @ (LoginMethod::Browser | LoginMethod::Remote) => {
             // A question not answered is 130, as it is everywhere else —
             // `watch setup`'s menu, a confirmation — and as the exit codes say.
             let renewing = match renewing {
@@ -97,18 +97,21 @@ pub async fn run(
             {
                 announce_replacement(&stored);
             }
-            by_browser(args, store, paths, renewing).await
+            by_browser(args, store, paths, renewing, method).await
         }
     }
 }
 
 /// Adds an account through a browser login, as `snob login --add --browser`
 /// does, for the interactive views' account picker, which has no command
-/// line to take the flags from.
+/// line to take the flags from. Over SSH, where a window would not be seen,
+/// it is `--remote`'s login instead (`crate::seat`).
 pub async fn add_by_browser(store: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
+    let remote = crate::seat::Seat::here().prefers_remote();
     let args = LoginArgs {
         paste: false,
-        browser: true,
+        browser: !remote,
+        remote,
         user_agent: None,
         csrftoken: None,
         add: true,
@@ -166,19 +169,51 @@ fn writable(paths: &AppPaths) -> Result<()> {
 /// from the menu. With no interactive terminal there is no menu, so the method
 /// has to be given explicitly.
 fn choose_method(args: &LoginArgs) -> Result<Option<LoginMethod>> {
+    choose_method_at(args, crate::seat::Seat::here())
+}
+
+fn choose_method_at(args: &LoginArgs, seat: &crate::seat::Seat) -> Result<Option<LoginMethod>> {
     if args.paste {
         return Ok(Some(LoginMethod::Paste));
     }
+    if args.remote {
+        return Ok(Some(LoginMethod::Remote));
+    }
     if args.browser {
+        // Said outright, and taken as said — except where a window cannot
+        // open at all, which Chromium would only report as exiting with 1.
+        if seat.window == crate::seat::Window::Nowhere {
+            bail!("{}", no_window_here(seat));
+        }
         return Ok(Some(LoginMethod::Browser));
     }
     if !ui::can_show_a_menu() {
+        let example = if seat.prefers_remote() {
+            "\"snob login --remote\" or \"snob login --paste\""
+        } else {
+            "\"snob login --paste\""
+        };
         bail!(
             "there is no interactive terminal to show the menu in.\n\
-             Give the method explicitly, for example \"snob login --paste\"."
+             Give the method explicitly, for example {example}."
         );
     }
-    ui::choose_login_method()
+    ui::choose_login_method(seat)
+}
+
+/// Why `--browser` cannot work at `seat`, and what does.
+fn no_window_here(seat: &crate::seat::Seat) -> String {
+    let why = if seat.ssh.is_some() {
+        "this is an SSH session to a machine with no display"
+    } else {
+        "there is no display here (neither DISPLAY nor WAYLAND_DISPLAY is set)"
+    };
+    format!(
+        "a browser window cannot open: {why}.\n\
+         \"snob login --remote\" logs in from the browser of the computer you are at, \
+         through an SSH tunnel; \"snob login --paste\" takes a sessionid copied from a \
+         browser where you are logged in."
+    )
 }
 
 /// Which browser this login is about.
@@ -237,9 +272,23 @@ async fn by_browser(
     store: SecretStore,
     paths: &AppPaths,
     renewing: Option<Viewer>,
+    method: LoginMethod,
 ) -> Result<ExitCode> {
+    let remote = method == LoginMethod::Remote;
+    let seat = crate::seat::Seat::here();
+    if !remote && seat.window == crate::seat::Window::Elsewhere {
+        ui::info(
+            "This is an SSH session: the browser window opens on this machine's own screen, \
+             not on the computer you are at. \"snob login --remote\" shows it there instead.",
+        );
+    }
     let installed = browser::detect_all();
-    let Some(found) = choose_browser("Which browser should snob open?", &installed)? else {
+    let purpose = if remote {
+        "Which browser should snob log in with?"
+    } else {
+        "Which browser should snob open?"
+    };
+    let Some(found) = choose_browser(purpose, &installed)? else {
         bail!(
             "no Chromium-based browser was found installed, and this needs one to \
              open.\n\
@@ -282,21 +331,35 @@ async fn by_browser(
         Some(_) => profile.clone(),
         None => paths.browser_profile(),
     };
-    ui::info(&format!(
-        "Opening {} on Instagram's login page.\n\
-         It uses a profile of its own, under {}, so it is not your everyday browser \
-         and logging in there changes nothing about it.\n\
-         Log in as usual; snob will notice when you are done, and gives up after \
-         {} minutes. Ctrl+C to cancel.",
-        found.name,
-        kept_at.display(),
-        cdp::LOGIN_TIMEOUT.as_secs() / 60
-    ));
+    if remote {
+        ui::info(&format!(
+            "Starting {} here, without a window, on Instagram's login page.\n\
+             It uses a profile of its own, under {}, so it is not your everyday browser \
+             and logging in there changes nothing about it.",
+            found.name,
+            kept_at.display(),
+        ));
+    } else {
+        ui::info(&format!(
+            "Opening {} on Instagram's login page.\n\
+             It uses a profile of its own, under {}, so it is not your everyday browser \
+             and logging in there changes nothing about it.\n\
+             Log in as usual; snob will notice when you are done, and gives up after \
+             {} minutes. Ctrl+C to cancel.",
+            found.name,
+            kept_at.display(),
+            cdp::LOGIN_TIMEOUT.as_secs() / 60
+        ));
+    }
 
     // Anything from here on can be interrupted, and a Ctrl+C has to read as
     // one rather than as a failure, so the result is held rather than unwrapped
     // until the browser has been shut down.
-    let captured = capture(&found, args.user_agent.clone(), &profile, &cancel).await;
+    let captured = if remote {
+        capture_remotely(&found, args.user_agent.clone(), &profile, paths, &cancel).await
+    } else {
+        capture(&found, args.user_agent.clone(), &profile, &cancel).await
+    };
     // Whatever `capture` came back with, and before either exit below: the
     // profile holds a live session from the moment the form was submitted.
     //
@@ -374,14 +437,7 @@ async fn by_browser(
     // The profile made this session, and is the browser's to keep current from
     // now on: the next run must not write the stored copy back over it.
     crate::headless::ProfileMark::after_login(made_it, &found, &session);
-    let finished = finish(
-        session,
-        store,
-        LoginMethod::Browser,
-        paths,
-        renewing.as_ref(),
-    )
-    .await;
+    let finished = finish(session, store, method, paths, renewing.as_ref()).await;
     if let Some(swap) = swap {
         match &finished {
             Ok(_) => swap.keep(),
@@ -499,6 +555,94 @@ async fn collect(
     };
 
     Ok((cookies, user_agent))
+}
+
+/// [`capture`], for a login watched from another machine: the browser runs
+/// here without a window, and its tab is relayed through a tunnel to a page
+/// in the person's own browser (`crate::relay`), until the session is in it.
+///
+/// The relay listens before the browser starts, so that one that cannot
+/// costs no browser start.
+async fn capture_remotely(
+    found: &browser::Browser,
+    requested_user_agent: Option<String>,
+    profile: &std::path::Path,
+    paths: &AppPaths,
+    cancel: &CancelToken,
+) -> Result<(login::BrowserCookies, String)> {
+    let relay = crate::relay::Relay::bind(paths)?;
+    let crate::headless::RemoteLogin {
+        cdp,
+        tab,
+        user_agent,
+    } = crate::headless::for_a_remote_login(found, profile, paths, cancel).await?;
+    // An explicit --user-agent still wins, as in a windowed login. Otherwise
+    // the one the tab sends, which is the running build's: the browser's own
+    // report would say `HeadlessChrome`.
+    let user_agent = requested_user_agent.unwrap_or(user_agent);
+    let outcome = relayed(&cdp, &tab, relay, cancel).await;
+    cdp.close().await;
+    outcome.map(|cookies| (cookies, user_agent))
+}
+
+async fn relayed(
+    cdp: &cdp::Cdp,
+    tab: &str,
+    relay: crate::relay::Relay,
+    cancel: &CancelToken,
+) -> Result<login::BrowserCookies> {
+    // As in a windowed login: a profile still signed in is taken as it is.
+    if let Some(existing) = cdp.instagram_cookies().await? {
+        ui::info(
+            "This browser profile was still logged in, so that session is the one \
+             being stored.\n\
+             To sign in as somebody else, run \"snob login --add\".",
+        );
+        return Ok(existing);
+    }
+    // Only now, with the tab dressed (`headless::for_a_remote_login`): the
+    // login page's first request already carries the identity every request
+    // after it will.
+    cdp.page_call(
+        tab,
+        "Page.navigate",
+        serde_json::json!({ "url": cdp::login_url() }),
+        cdp::CALL_TIMEOUT,
+    )
+    .await?;
+    ui::info(&remote_instructions(
+        &relay,
+        crate::seat::Seat::here().ssh.as_ref(),
+    ));
+    // As in `collect`: one bar, started once nothing else is printed.
+    let progress = Progress::new(true);
+    let captured = relay.serve(cdp, tab, cancel, &progress).await;
+    progress.finish();
+    captured
+}
+
+/// What to do on the computer the person is at, for `relay`.
+fn remote_instructions(relay: &crate::relay::Relay, ssh: Option<&crate::seat::Ssh>) -> String {
+    let named = ssh.and_then(|s| s.server.as_ref()).is_some();
+    let host_note = if named {
+        "(or with the name you usually give ssh for this machine)"
+    } else {
+        "(with the name you usually give ssh for this machine in place of \"this-machine\")"
+    };
+    format!(
+        "\nOn the computer you are at, open a tunnel to this machine, in a terminal of its \
+         own:\n\n\
+        \x20   {}\n\n\
+         {host_note}, and then open this link in a browser there:\n\n\
+        \x20   {}\n\n\
+         The link opens once, in one browser, and only through that tunnel. Log in on the \
+         page it shows, which is snob's browser on this machine; snob notices when you are \
+         done, and gives up after {} minutes. Ctrl+C to cancel.\n\
+         If ssh refuses to forward, use \"snob login --paste\" instead.\n",
+        relay.tunnel(ssh),
+        relay.link(),
+        cdp::LOGIN_TIMEOUT.as_secs() / 60
+    )
 }
 
 async fn by_paste(args: LoginArgs, store: SecretStore, paths: &AppPaths) -> Result<ExitCode> {
@@ -633,7 +777,7 @@ async fn finish(
                         "Instagram rejected the session. Check that the sessionid was \
                              copied whole and that the User-Agent belongs to the same browser"
                     }
-                    LoginMethod::Browser => {
+                    LoginMethod::Browser | LoginMethod::Remote => {
                         "Instagram rejected the session the browser handed over. It may \
                              have been signed out in the meantime; run \"snob logout\" and \
                              log in again"
@@ -874,4 +1018,76 @@ fn prompt_user_agent() -> Result<ChosenAgent> {
     }
 
     Ok(ChosenAgent::pinned(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::seat::{Seat, Ssh, Window};
+
+    fn args(paste: bool, browser: bool, remote: bool) -> LoginArgs {
+        LoginArgs {
+            paste,
+            browser,
+            remote,
+            user_agent: None,
+            csrftoken: None,
+            add: false,
+            keep_profile: false,
+        }
+    }
+
+    fn over_ssh(window: Window) -> Seat {
+        Seat {
+            ssh: Some(Ssh {
+                server: Some(("192.168.1.50".to_string(), 22)),
+                user: None,
+            }),
+            window,
+        }
+    }
+
+    /// A method said outright is the method, wherever the person sits: the
+    /// one refusal is a window where none can open.
+    #[test]
+    fn the_method_said_is_the_method_taken() {
+        let seat = over_ssh(Window::Elsewhere);
+        let chosen = |a| choose_method_at(&a, &seat).unwrap();
+        assert_eq!(chosen(args(true, false, false)), Some(LoginMethod::Paste));
+        assert_eq!(chosen(args(false, true, false)), Some(LoginMethod::Browser));
+        assert_eq!(chosen(args(false, false, true)), Some(LoginMethod::Remote));
+
+        let nowhere = over_ssh(Window::Nowhere);
+        let refused = choose_method_at(&args(false, true, false), &nowhere).unwrap_err();
+        let said = format!("{refused:#}");
+        assert!(
+            said.contains("--remote") && said.contains("--paste"),
+            "{said}"
+        );
+        assert_eq!(
+            choose_method_at(&args(false, false, true), &nowhere).unwrap(),
+            Some(LoginMethod::Remote)
+        );
+    }
+
+    /// The instructions give the tunnel, then the link, each on a line of its
+    /// own to copy, and say how long the login waits.
+    #[tokio::test]
+    async fn the_remote_instructions_give_the_tunnel_and_the_link() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted_at(temporary.path());
+        paths.ensure_dirs().unwrap();
+        let relay = crate::relay::Relay::bind(&paths).unwrap();
+        let ssh = over_ssh(Window::Nowhere).ssh;
+        let said = remote_instructions(&relay, ssh.as_ref());
+        let tunnel = format!("    {}", relay.tunnel(ssh.as_ref()));
+        let link = format!("    {}", relay.link());
+        let lines: Vec<&str> = said.lines().collect();
+        let at = |wanted: &str| lines.iter().position(|line| *line == wanted);
+        assert!(at(&tunnel).is_some(), "{said}");
+        assert!(at(&tunnel) < at(&link), "{said}");
+        assert!(said.contains("10 minutes"), "{said}");
+        assert!(!said.contains("this-machine"), "{said}");
+        assert!(remote_instructions(&relay, None).contains("in place of \"this-machine\""));
+    }
 }
