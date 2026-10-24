@@ -28,7 +28,8 @@
 //!   owner's is (`owner::socket`): `ssh -L port:/path/to/socket` reaches it as
 //!   the user who logged in over SSH, and nobody else on the machine can.
 //! - Where that cannot be had — Windows, or a data directory too deep for a
-//!   socket's path — a TCP port on `127.0.0.1`, never another address; any
+//!   socket's path or named with what `ssh -L` cannot be given
+//!   (`can_be_forwarded`) — a TCP port on `127.0.0.1`, never another address; any
 //!   account on the machine can connect to that, so the next point is what
 //!   keeps them out.
 //! - Either way the printed link carries a token of 256 random bits, good for
@@ -116,6 +117,10 @@ const IDLE: Duration = Duration::from_secs(60);
 
 /// How many connections are served at once. A browser holds about six to one
 /// host, and the event stream is one of them.
+///
+/// A limit on what is spent, not a boundary: on the port, any account on the
+/// machine can hold them all and shut the person's browser out until `IDLE`
+/// ends them, but no connection gets past the token or the cookie.
 const MOST_CONNECTIONS: usize = 64;
 
 /// Where the relay listens, and the tunnel's near end to suggest for it.
@@ -409,7 +414,11 @@ async fn screencast(shared: Arc<Shared>, mut events: tokio::sync::mpsc::Receiver
 async fn accept(listener: &Listener, shared: Arc<Shared>) -> Infallible {
     let mut connections = JoinSet::new();
     loop {
-        match listener.accept().await {
+        let accepted = listener.accept().await;
+        // Finished connections, before they are counted: the cap is on the
+        // ones open, and the set does not grow for the length of a login.
+        while connections.try_join_next().is_some() {}
+        match accepted {
             // Closed at once: whoever holds that many is not one browser.
             Ok(_) if connections.len() >= MOST_CONNECTIONS => {
                 tracing::debug!("refused a connection to the relay: too many open");
@@ -423,9 +432,6 @@ async fn accept(listener: &Listener, shared: Arc<Shared>) -> Infallible {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-        // Finished connections, so the set does not grow for the length of
-        // a login.
-        while connections.try_join_next().is_some() {}
     }
 }
 
@@ -800,6 +806,20 @@ enum Listener {
 #[cfg(unix)]
 const MOST_SOCKET_PATH: usize = 100;
 
+/// Whether `path` can go into the printed `ssh -L` as it is: `ssh` splits
+/// the forward at a colon, and inside the double quotes `tunnel_command`
+/// puts around a space a shell still reads `$`, a backtick and a backslash,
+/// and stops at a quote. A data directory with any of them gets the port.
+#[cfg(unix)]
+fn can_be_forwarded(path: &std::path::Path) -> bool {
+    path.to_str().is_some_and(|path| {
+        path.len() <= MOST_SOCKET_PATH
+            && !path
+                .chars()
+                .any(|c| c.is_control() || matches!(c, ':' | '"' | '$' | '`' | '\\' | '!'))
+    })
+}
+
 impl Listener {
     fn bind(paths: &AppPaths) -> Result<Self> {
         #[cfg(unix)]
@@ -808,7 +828,7 @@ impl Listener {
             sweep_dead_sockets(&dir);
             let name = format!("relay-{:08x}.sock", fastrand::u32(..));
             let path = dir.join(name);
-            if path.as_os_str().len() <= MOST_SOCKET_PATH {
+            if can_be_forwarded(&path) {
                 match bind_socket(&path) {
                     Ok(listener) => return Ok(Self::Socket { listener, path }),
                     Err(e) => {
@@ -869,12 +889,15 @@ fn sweep_dead_sockets(dir: &std::path::Path) {
             continue;
         }
         let path = entry.path();
+        // A socket, not whatever a link points at, before anything connects.
         let is_socket = entry
             .file_type()
             .is_ok_and(|t| std::os::unix::fs::FileTypeExt::is_socket(&t));
-        let dead = std::os::unix::net::UnixStream::connect(&path)
-            .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused);
-        if is_socket && dead {
+        let dead = || {
+            std::os::unix::net::UnixStream::connect(&path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused)
+        };
+        if is_socket && dead() {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -947,11 +970,12 @@ mod tests {
         )
         .await;
         assert!(first.starts_with("HTTP/1.1 303"), "{first}");
+        let lasting = 2 * cdp::LOGIN_TIMEOUT.as_secs();
         assert!(
-            first.contains(
-                "Set-Cookie: snob_relay_1=the-cookie; Path=/; Max-Age=1200; HttpOnly; \
+            first.contains(&format!(
+                "Set-Cookie: snob_relay_1=the-cookie; Path=/; Max-Age={lasting}; HttpOnly; \
                  SameSite=Strict"
-            ),
+            )),
             "{first}"
         );
         assert!(*shared.opened.borrow());
@@ -1090,6 +1114,111 @@ mod tests {
         );
         let bad = answer(&garbage, &shared).await;
         assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+    }
+
+    /// A connection that sends nothing, or stops halfway through a request,
+    /// is closed once it has been quiet for `IDLE`, and not before.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_left_open_is_closed_after_a_while() {
+        use tokio::io::AsyncReadExt as _;
+        for sent in ["", "GET / HTTP/1.1\r\nHost: local"] {
+            let shared = Arc::new(shared(Connection::detached()));
+            let (mut ours, theirs) = tokio::io::duplex(1024);
+            ours.write_all(sent.as_bytes()).await.unwrap();
+            let started = tokio::time::Instant::now();
+            let served = tokio::spawn(serve_connection(Box::new(theirs), shared));
+            let mut byte = [0u8; 1];
+            assert_eq!(ours.read(&mut byte).await.unwrap(), 0, "{sent:?}");
+            assert!(started.elapsed() >= IDLE, "{sent:?}");
+            served.await.unwrap();
+        }
+    }
+
+    /// Past the cap a connection is closed at once, and the ones that ended
+    /// make room again: the cap counts the connections open, not the ones
+    /// served since the last was taken.
+    #[tokio::test]
+    async fn connections_past_the_cap_are_closed_until_some_end() {
+        use tokio::io::AsyncReadExt as _;
+        let shared = Arc::new(shared(Connection::detached()));
+        let tcp = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = tcp.local_addr().unwrap();
+        let listener = Listener::Tcp(tcp);
+        let connect = || tokio::net::TcpStream::connect(address);
+        // Whether the relay serves a connection, which it answers, or
+        // closes it unread.
+        let served = async |mut stream: tokio::net::TcpStream| {
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut answer = Vec::new();
+            let _ = stream.read_to_end(&mut answer).await;
+            String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 403")
+        };
+        let checks = async {
+            let mut open = Vec::new();
+            for _ in 0..MOST_CONNECTIONS {
+                open.push(connect().await.unwrap());
+            }
+            // Each of those is being served by the time this one is taken.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(!served(connect().await.unwrap()).await, "one past the cap");
+            open.truncate(MOST_CONNECTIONS - 8);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(served(connect().await.unwrap()).await, "room made");
+        };
+        tokio::select! {
+            () = checks => {}
+            never = accept(&listener, shared) => match never {},
+        }
+    }
+
+    /// A tab that answers nothing holds a post of input up for one call's
+    /// patience in all, not for one per input, and the post is still
+    /// answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_tab_that_does_not_answer_holds_a_post_up_once() {
+        let (connection, _ends) = Connection::unanswered();
+        let shared = shared(connection);
+        let body = r#"[{"t":"mouse","kind":"move","x":1,"y":1},
+                       {"t":"mouse","kind":"move","x":2,"y":2},
+                       {"t":"mouse","kind":"move","x":3,"y":3}]"#;
+        let post = format!(
+            "POST /input HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nCookie: snob_relay_1=the-cookie\r\n\
+             X-Snob-Input: 1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let started = tokio::time::Instant::now();
+        let answered = answer(&post, &shared).await;
+        let took = started.elapsed();
+        assert!(answered.starts_with("HTTP/1.1 204"), "{answered}");
+        assert!(took >= CALL_TIMEOUT && took < 2 * CALL_TIMEOUT, "{took:?}");
+    }
+
+    /// A path `ssh -L` would split, or a shell would read inside the quotes,
+    /// is not offered as a socket; a space, which the quotes hold, is.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_path_that_survives_the_command_is_a_socket() {
+        use std::path::Path;
+        assert!(can_be_forwarded(Path::new(
+            "/Users/someone/Library/Application Support/snob-ig/relay-1.sock"
+        )));
+        for path in [
+            "/home/some:one/.local/share/snob-ig/relay-1.sock",
+            "/home/$HOME/relay-1.sock",
+            "/home/a\"b/relay-1.sock",
+            "/home/a`b`/relay-1.sock",
+            "/home/a\\b/relay-1.sock",
+            "/home/a\nb/relay-1.sock",
+        ] {
+            assert!(!can_be_forwarded(Path::new(path)), "{path}");
+        }
+        let deep = format!("/{}/relay-1.sock", "d".repeat(MOST_SOCKET_PATH));
+        assert!(!can_be_forwarded(Path::new(&deep)));
     }
 
     #[test]

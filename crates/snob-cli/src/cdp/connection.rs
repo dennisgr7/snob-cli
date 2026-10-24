@@ -350,6 +350,23 @@ impl Connection {
         })
     }
 
+    /// A connection to a browser that never answers, whose every call waits
+    /// out its timeout, and the ends that keep it open: for the tests of
+    /// what has to give up on one.
+    #[cfg(test)]
+    pub(crate) fn unanswered() -> (
+        Self,
+        (mpsc::UnboundedReceiver<Message>, mpsc::Sender<Frame>),
+    ) {
+        let (to_browser, written) = mpsc::unbounded_channel();
+        let (browser, from_browser) = mpsc::channel(1);
+        let connection = Self::start(PipeTransport {
+            to_browser,
+            from_browser,
+        });
+        (connection, (written, browser))
+    }
+
     /// What every target attached from now on is given before it runs.
     pub fn set_on_attach(&self, plan: OnAttach) {
         self.shared.lock().on_attach = Some(plan);

@@ -2756,4 +2756,33 @@ async fn a_login_through_the_relay_is_stored() {
             .await
             .contains("42%3Aremote%3A17")
     );
+
+    // The device the login was made on is the one the requests come from:
+    // the login page's own load names the same browser, with the same hints,
+    // as the document the requests' browser loaded afterwards.
+    let received = snobs_requests(&instagram).await;
+    let login_page = received
+        .iter()
+        .find(|r| r.url.path() == "/accounts/login/")
+        .expect("the login page was loaded");
+    let document = received
+        .iter()
+        .rev()
+        .find(|r| r.url.path() == "/")
+        .expect("the site was loaded");
+    for name in [
+        "user-agent",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+    ] {
+        let at_login = header(login_page, name).unwrap_or_default();
+        assert!(!at_login.is_empty(), "the login page was sent no {name}");
+        assert!(!at_login.contains("Headless"), "{name}: {at_login}");
+        assert_eq!(
+            Some(at_login),
+            header(document, name),
+            "{name} at the login and after it"
+        );
+    }
 }
