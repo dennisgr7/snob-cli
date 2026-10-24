@@ -33,8 +33,10 @@
 //!   keeps them out.
 //! - Either way the printed link carries a token of 256 random bits, good for
 //!   one visit: the first request that brings it is answered with a cookie
-//!   of another 256 bits, `HttpOnly` and `SameSite=Strict`, and the token is
-//!   spent. Every other route asks for the cookie; the input route also asks
+//!   of another 256 bits, `HttpOnly`, `SameSite=Strict` and kept no longer
+//!   than a login lasts, and the token is spent: the browser holding that
+//!   cookie may open the link again and is sent to the page, nobody else
+//!   may. Every other route asks for the cookie; the input route also asks
 //!   for a header of its own, which a page on another site cannot send
 //!   without a preflight this server never answers. A `Host` that is not a
 //!   loopback name is refused, which is what a site the person has open would
@@ -47,9 +49,11 @@
 //! `window.open` — are not shown; Instagram's login uses neither. A
 //! JavaScript dialog is accepted at once, since there is nobody to show it to.
 
+use std::convert::Infallible;
 #[cfg(unix)]
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -72,7 +76,9 @@ const PAGE: &str = include_str!("page.html");
 const SCRIPT: &str = include_str!("page.js");
 const STYLE: &str = include_str!("page.css");
 
-/// The cookie the spent token is traded for.
+/// The cookie the spent token is traded for, named per relay
+/// (`snob_relay_<id>`): cookies are kept per host and not per port, so two
+/// relays open in one browser at once would otherwise take each other's.
 const COOKIE: &str = "snob_relay";
 
 /// The header the input route asks for besides the cookie. A page on another
@@ -102,13 +108,29 @@ const EVENT_ROOM: usize = 64;
 /// The JPEG quality of a frame: legible text at a fraction of the size.
 const QUALITY: u8 = 70;
 
+/// How long a connection may sit between requests, or take over one, before
+/// it is closed. A browser opens a kept-alive connection again without a
+/// word; what this ends is a connection somebody opened and left, which on
+/// the port (Windows) can be anybody's on the machine.
+const IDLE: Duration = Duration::from_secs(60);
+
+/// How many connections are served at once. A browser holds about six to one
+/// host, and the event stream is one of them.
+const MOST_CONNECTIONS: usize = 64;
+
 /// Where the relay listens, and the tunnel's near end to suggest for it.
 pub struct Relay {
     listener: Listener,
     token: String,
-    cookie: String,
+    cookie: Cookie,
     /// The port on the person's machine the instructions name.
     local_port: u16,
+}
+
+/// The cookie the spent token is traded for.
+struct Cookie {
+    name: String,
+    value: String,
 }
 
 impl Relay {
@@ -126,7 +148,10 @@ impl Relay {
         Ok(Self {
             listener,
             token: secret()?,
-            cookie: secret()?,
+            cookie: Cookie {
+                name: format!("{COOKIE}_{:08x}", fastrand::u32(..)),
+                value: secret()?,
+            },
             local_port,
         })
     }
@@ -141,17 +166,7 @@ impl Relay {
             #[cfg(unix)]
             Listener::Socket { path, .. } => path.display().to_string(),
         };
-        let server = ssh.and_then(|s| s.server.as_ref());
-        let host = server.map_or("this-machine", |(address, _)| address.as_str());
-        let user = ssh
-            .and_then(|s| s.user.as_deref())
-            .map(|user| format!("{user}@"))
-            .unwrap_or_default();
-        let port = match server {
-            Some((_, port)) if *port != 22 => format!(" -p {port}"),
-            _ => String::new(),
-        };
-        format!("ssh -N -L {}:{far_end} {user}{host}{port}", self.local_port)
+        tunnel_command(self.local_port, &far_end, ssh)
     }
 
     /// The link to open once the tunnel is up, with its token.
@@ -179,7 +194,8 @@ impl Relay {
             ..
         } = self;
         let shared = Arc::new(Shared {
-            token: Mutex::new(Some(token)),
+            token,
+            spent: AtomicBool::new(false),
             cookie,
             opened: watch::Sender::new(false),
             frame: watch::Sender::new(None),
@@ -190,62 +206,108 @@ impl Relay {
             tab: tab.to_string(),
         });
 
-        // Everything relayed runs in these, and ends when they are dropped:
-        // on the way out of this function, however it leaves.
-        let mut tasks = JoinSet::new();
-        // Subscribed before the screencast starts, so its first frame is not
-        // missed.
-        let events = cdp.connection().subscribe(Some(tab), EVENT_ROOM);
-        cdp.page_call(tab, "Page.enable", json!({}), CALL_TIMEOUT)
-            .await?;
-        tasks.spawn(screencast(Arc::clone(&shared), events));
-        // The address the tab is at already: it may have navigated before the
-        // events above were asked for, and no `frameNavigated` would then
-        // say where it is until the next page.
-        if let Some(url) = current_address(cdp, tab).await {
-            shared.address.send_if_modified(|address| {
-                let unset = address.is_empty();
-                if unset {
-                    *address = url;
-                }
-                unset
-            });
-        }
-        cdp.page_call(
-            tab,
-            "Page.startScreencast",
-            json!({
-                "format": "jpeg",
-                "quality": QUALITY,
-                "maxWidth": crate::headless::SCREEN.0,
-                "maxHeight": crate::headless::SCREEN.1,
-            }),
-            CALL_TIMEOUT,
-        )
-        .await?;
-        tasks.spawn(accept(listener, Arc::clone(&shared)));
-
-        progress.waiting("waiting for the link to be opened", cdp::LOGIN_TIMEOUT);
-        let mut opened = shared.opened.subscribe();
+        // Connections are taken beside the relaying, and stop with it: the
+        // listener stays this function's, so its socket file is gone by the
+        // time this returns, however it returns, rather than whenever the
+        // runtime gets around to a task it was told to drop.
         tokio::select! {
-            _ = async { opened.wait_for(|opened| *opened).await.is_ok() } => {}
-            () = tokio::time::sleep(cdp::LOGIN_TIMEOUT) => bail!(
-                "nobody opened the link within {} minutes",
-                cdp::LOGIN_TIMEOUT.as_secs() / 60
-            ),
-            () = cancel.canceled() => bail!("canceled"),
+            relayed = relay(cdp, tab, &shared, cancel, progress) => relayed,
+            never = accept(&listener, Arc::clone(&shared)) => match never {},
         }
-        progress.waiting("waiting for you to log in", cdp::LOGIN_TIMEOUT);
-        let cookies = cdp::wait_for_login(cdp, cancel).await?;
-
-        // Told to the page, which says it is done, and given a moment to get
-        // there before the tunnel's far end goes.
-        shared.done.send_replace(true);
-        cdp.connection()
-            .fire(Some(tab), "Page.stopScreencast", json!({}));
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        Ok(cookies)
     }
+}
+
+/// The relaying itself, for [`Relay::serve`].
+async fn relay(
+    cdp: &Cdp,
+    tab: &str,
+    shared: &Arc<Shared>,
+    cancel: &CancelToken,
+    progress: &Progress,
+) -> Result<BrowserCookies> {
+    // Everything relayed runs in these, and ends when they are dropped:
+    // on the way out of this function, however it leaves.
+    let mut tasks = JoinSet::new();
+    // Subscribed before the screencast starts, so its first frame is not
+    // missed.
+    let events = cdp.connection().subscribe(Some(tab), EVENT_ROOM);
+    cdp.page_call(tab, "Page.enable", json!({}), CALL_TIMEOUT)
+        .await?;
+    tasks.spawn(screencast(Arc::clone(shared), events));
+    // The address the tab is at already: it may have navigated before the
+    // events above were asked for, and no `frameNavigated` would then
+    // say where it is until the next page.
+    if let Some(url) = current_address(cdp, tab).await {
+        shared.address.send_if_modified(|address| {
+            let unset = address.is_empty();
+            if unset {
+                *address = url;
+            }
+            unset
+        });
+    }
+    cdp.page_call(
+        tab,
+        "Page.startScreencast",
+        json!({
+            "format": "jpeg",
+            "quality": QUALITY,
+            "maxWidth": crate::headless::SCREEN.0,
+            "maxHeight": crate::headless::SCREEN.1,
+        }),
+        CALL_TIMEOUT,
+    )
+    .await?;
+
+    progress.waiting("waiting for the link to be opened", cdp::LOGIN_TIMEOUT);
+    let mut opened = shared.opened.subscribe();
+    tokio::select! {
+        _ = async { opened.wait_for(|opened| *opened).await.is_ok() } => {}
+        () = tokio::time::sleep(cdp::LOGIN_TIMEOUT) => bail!(
+            "nobody opened the link within {} minutes",
+            cdp::LOGIN_TIMEOUT.as_secs() / 60
+        ),
+        () = cancel.canceled() => bail!("canceled"),
+    }
+    progress.waiting("waiting for you to log in", cdp::LOGIN_TIMEOUT);
+    let cookies = cdp::wait_for_login(cdp, cancel).await?;
+
+    // Told to the page, which says it is done, and given a moment to get
+    // there before the tunnel's far end goes.
+    shared.done.send_replace(true);
+    cdp.connection()
+        .fire(Some(tab), "Page.stopScreencast", json!({}));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    Ok(cookies)
+}
+
+/// `ssh` told to forward `local_port` on the person's machine to `far_end`
+/// here, reaching this machine as `ssh` says the client did.
+///
+/// The far end is quoted when it holds anything a shell would split or
+/// read: a Mac's data directory is under `Application Support`. Double
+/// quotes, which the shells and Windows' `cmd` and PowerShell all take.
+fn tunnel_command(local_port: u16, far_end: &str, ssh: Option<&Ssh>) -> String {
+    let server = ssh.and_then(|s| s.server.as_ref());
+    let host = server.map_or("this-machine", |(address, _)| address.as_str());
+    let user = ssh
+        .and_then(|s| s.user.as_deref())
+        .map(|user| format!("{user}@"))
+        .unwrap_or_default();
+    let port = match server {
+        Some((_, port)) if *port != 22 => format!(" -p {port}"),
+        _ => String::new(),
+    };
+    let forward = format!("{local_port}:{far_end}");
+    let plain = forward
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-:+@".contains(c));
+    let forward = if plain {
+        forward
+    } else {
+        format!("\"{forward}\"")
+    };
+    format!("ssh -N -L {forward} {user}{host}{port}")
 }
 
 /// The address of the entry the tab's history is at.
@@ -261,10 +323,12 @@ async fn current_address(cdp: &Cdp, tab: &str) -> Option<String> {
 
 /// What the relay's tasks share.
 struct Shared {
-    /// The link's token, until it is spent.
-    token: Mutex<Option<String>>,
+    /// The link's token.
+    token: String,
+    /// The token was traded for the cookie, which it is only once.
+    spent: AtomicBool,
     /// What the spent token was traded for.
-    cookie: String,
+    cookie: Cookie,
     /// The link was opened.
     opened: watch::Sender<bool>,
     /// The latest frame, for every page connected and the next to connect.
@@ -342,10 +406,14 @@ async fn screencast(shared: Arc<Shared>, mut events: tokio::sync::mpsc::Receiver
 
 /// Takes connections until dropped, each in a task of its own that ends with
 /// this one.
-async fn accept(listener: Listener, shared: Arc<Shared>) {
+async fn accept(listener: &Listener, shared: Arc<Shared>) -> Infallible {
     let mut connections = JoinSet::new();
     loop {
         match listener.accept().await {
+            // Closed at once: whoever holds that many is not one browser.
+            Ok(_) if connections.len() >= MOST_CONNECTIONS => {
+                tracing::debug!("refused a connection to the relay: too many open");
+            }
             Ok(stream) => {
                 connections.spawn(serve_connection(stream, Arc::clone(&shared)));
             }
@@ -372,10 +440,11 @@ enum Answered {
 async fn serve_connection(mut stream: Box<dyn Stream>, shared: Arc<Shared>) {
     let mut buffered = Vec::new();
     loop {
-        let request = match http::read(&mut stream, &mut buffered).await {
-            Ok(request) => request,
-            Err(http::Unread::Closed) => return,
-            Err(http::Unread::Bad) => {
+        let read = tokio::time::timeout(IDLE, http::read(&mut stream, &mut buffered));
+        let request = match read.await {
+            Ok(Ok(request)) => request,
+            Err(_) | Ok(Err(http::Unread::Closed)) => return,
+            Ok(Err(http::Unread::Bad)) => {
                 let _ = text(
                     &mut stream,
                     "400 Bad Request",
@@ -413,12 +482,9 @@ async fn route<S: AsyncWrite + Unpin>(
     let path = request.path.as_str();
     // The link's own path: anything that is not one of the routes below.
     if get && !matches!(path, "/" | "/page.js" | "/page.css" | "/events" | "/input") {
-        return redeem(stream, path.trim_start_matches('/'), shared, keep).await;
+        return redeem(stream, request, shared).await;
     }
-    if !request
-        .cookie(COOKIE)
-        .is_some_and(|c| same(c.as_bytes(), shared.cookie.as_bytes()))
-    {
+    if !has_the_cookie(request, shared) {
         text(
             stream,
             "403 Forbidden",
@@ -487,10 +553,17 @@ async fn route<S: AsyncWrite + Unpin>(
                 .await?;
                 return Ok(Answered::Again);
             };
-            for one in inputs {
-                if let Some(command) = input::command(one) {
-                    perform(shared, command).await;
+            // A tab that has stopped answering holds one post up for this
+            // long, not each of its inputs for as long again.
+            let performed = tokio::time::timeout(CALL_TIMEOUT, async {
+                for one in inputs {
+                    if let Some(command) = input::command(one) {
+                        perform(shared, command).await;
+                    }
                 }
+            });
+            if performed.await.is_err() {
+                tracing::debug!("the tab took too long over a post of input; the rest dropped");
             }
             http::respond(stream, "204 No Content", "text/plain", &[], b"", keep).await?;
         }
@@ -501,48 +574,66 @@ async fn route<S: AsyncWrite + Unpin>(
     Ok(Answered::Again)
 }
 
+/// Whether `request` carries the cookie the token was traded for.
+fn has_the_cookie(request: &http::Request, shared: &Shared) -> bool {
+    request
+        .cookie(&shared.cookie.name)
+        .is_some_and(|c| same(c.as_bytes(), shared.cookie.value.as_bytes()))
+}
+
 /// The link's token traded for the cookie, once.
+///
+/// The link opened again by the browser that holds the cookie — a reload, a
+/// second click, a tab opened again after the tunnel dropped — goes to the
+/// page, since that browser is the one it was opened in; anybody else is
+/// told it was opened already.
 async fn redeem<S: AsyncWrite + Unpin>(
     stream: &mut S,
-    offered: &str,
+    request: &http::Request,
     shared: &Shared,
-    keep: bool,
 ) -> std::io::Result<Answered> {
-    let taken = {
-        let mut token = shared.token.lock().unwrap_or_else(|e| e.into_inner());
-        let matches = token
-            .as_deref()
-            .is_some_and(|t| same(t.as_bytes(), offered.as_bytes()));
-        if matches {
-            *token = None;
-        }
-        matches
-    };
-    if !taken {
-        text(
+    let keep = request.keeps_alive();
+    let offered = request.path.trim_start_matches('/');
+    let first = same(shared.token.as_bytes(), offered.as_bytes())
+        && !shared.spent.swap(true, Ordering::SeqCst);
+    if first {
+        shared.opened.send_replace(true);
+        let cookie = format!(
+            "{}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict",
+            shared.cookie.name,
+            shared.cookie.value,
+            // The two waits of a login; nothing answers after them.
+            2 * cdp::LOGIN_TIMEOUT.as_secs()
+        );
+        http::respond(
             stream,
-            "404 Not Found",
-            "This link is not valid, or has been opened already. Each link opens once; \
-             run \"snob login --remote\" again for a new one.",
+            "303 See Other",
+            "text/plain",
+            &[("Location", "/"), ("Set-Cookie", &cookie)],
+            b"",
             keep,
         )
         .await?;
-        return Ok(Answered::Again);
+    } else if same(shared.token.as_bytes(), offered.as_bytes()) && has_the_cookie(request, shared) {
+        http::respond(
+            stream,
+            "303 See Other",
+            "text/plain",
+            &[("Location", "/")],
+            b"",
+            keep,
+        )
+        .await?;
+    } else {
+        text(
+            stream,
+            "404 Not Found",
+            "This link is not valid, or has been opened already in another browser. Each \
+             link opens once; run \"snob login --remote\" again for a new one.",
+            keep,
+        )
+        .await?;
     }
-    shared.opened.send_replace(true);
-    let cookie = format!(
-        "{COOKIE}={}; Path=/; HttpOnly; SameSite=Strict",
-        shared.cookie
-    );
-    http::respond(
-        stream,
-        "303 See Other",
-        "text/plain",
-        &[("Location", "/"), ("Set-Cookie", &cookie)],
-        b"",
-        keep,
-    )
-    .await?;
     Ok(Answered::Again)
 }
 
@@ -714,6 +805,7 @@ impl Listener {
         #[cfg(unix)]
         {
             let dir = std::path::absolute(paths.data_dir())?;
+            sweep_dead_sockets(&dir);
             let name = format!("relay-{:08x}.sock", fastrand::u32(..));
             let path = dir.join(name);
             if path.as_os_str().len() <= MOST_SOCKET_PATH {
@@ -750,12 +842,40 @@ impl Listener {
     }
 }
 
-/// Removes the socket file, which is this relay's alone.
+/// Removes the socket file, which is this relay's alone. One left by a
+/// process that never got here is swept by the next relay
+/// (`sweep_dead_sockets`).
 impl Drop for Listener {
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Self::Socket { path, .. } = self {
             let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Removes the sockets of relays that are gone without removing their own:
+/// a process killed, or a release build's panic, which aborts. One a relay
+/// still listens on takes the connection and is left alone.
+#[cfg(unix)]
+fn sweep_dead_sockets(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("relay-") && name.ends_with(".sock")) {
+            continue;
+        }
+        let path = entry.path();
+        let is_socket = entry
+            .file_type()
+            .is_ok_and(|t| std::os::unix::fs::FileTypeExt::is_socket(&t));
+        let dead = std::os::unix::net::UnixStream::connect(&path)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused);
+        if is_socket && dead {
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
@@ -793,8 +913,12 @@ mod tests {
 
     fn shared(connection: Connection) -> Shared {
         Shared {
-            token: Mutex::new(Some("the-token".to_string())),
-            cookie: "the-cookie".to_string(),
+            token: "the-token".to_string(),
+            spent: AtomicBool::new(false),
+            cookie: Cookie {
+                name: "snob_relay_1".to_string(),
+                value: "the-cookie".to_string(),
+            },
             opened: watch::Sender::new(false),
             frame: watch::Sender::new(None),
             sent: watch::Sender::new(0),
@@ -824,7 +948,10 @@ mod tests {
         .await;
         assert!(first.starts_with("HTTP/1.1 303"), "{first}");
         assert!(
-            first.contains("Set-Cookie: snob_relay=the-cookie; Path=/; HttpOnly; SameSite=Strict"),
+            first.contains(
+                "Set-Cookie: snob_relay_1=the-cookie; Path=/; Max-Age=1200; HttpOnly; \
+                 SameSite=Strict"
+            ),
             "{first}"
         );
         assert!(*shared.opened.borrow());
@@ -838,12 +965,47 @@ mod tests {
         assert!(again.contains("opened already"), "{again}");
     }
 
+    /// The browser the link was opened in can open it again, and is sent to
+    /// the page without a new cookie.
+    #[tokio::test]
+    async fn the_link_opened_again_where_it_was_goes_to_the_page() {
+        let shared = shared(Connection::detached());
+        answer(
+            "GET /the-token HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n",
+            &shared,
+        )
+        .await;
+        let again = answer(
+            "GET /the-token HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\
+             Cookie: snob_relay_1=the-cookie\r\n\r\n",
+            &shared,
+        )
+        .await;
+        assert!(again.starts_with("HTTP/1.1 303"), "{again}");
+        assert!(again.contains("Location: /\r\n"), "{again}");
+        assert!(!again.contains("Set-Cookie"), "{again}");
+        let wrong = answer(
+            "GET /the-token HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\
+             Cookie: snob_relay_1=the-cooki\r\n\r\n",
+            &shared,
+        )
+        .await;
+        assert!(wrong.starts_with("HTTP/1.1 404"), "{wrong}");
+        let another = answer(
+            "GET /guess HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\
+             Cookie: snob_relay_1=the-cookie\r\n\r\n",
+            &shared,
+        )
+        .await;
+        assert!(another.starts_with("HTTP/1.1 404"), "{another}");
+    }
+
     #[tokio::test]
     async fn a_wrong_token_is_spent_on_nothing() {
         let shared = shared(Connection::detached());
         let wrong = answer("GET /guess HTTP/1.1\r\nHost: localhost\r\n\r\n", &shared).await;
         assert!(wrong.starts_with("HTTP/1.1 404"), "{wrong}");
-        assert!(shared.token.lock().unwrap().is_some());
+        assert!(!shared.spent.load(Ordering::SeqCst));
         assert!(!*shared.opened.borrow());
     }
 
@@ -855,13 +1017,13 @@ mod tests {
         assert!(without.starts_with("HTTP/1.1 403"), "{without}");
         assert!(!without.contains("<html"), "{without}");
         let wrong = answer(
-            "GET / HTTP/1.1\r\nHost: localhost\r\nCookie: snob_relay=the-cooki\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nCookie: snob_relay_1=the-cooki\r\n\r\n",
             &shared,
         )
         .await;
         assert!(wrong.starts_with("HTTP/1.1 403"), "{wrong}");
         let with = answer(
-            "GET / HTTP/1.1\r\nHost: localhost\r\nCookie: snob_relay=the-cookie\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nCookie: snob_relay_1=the-cookie\r\n\r\n",
             &shared,
         )
         .await;
@@ -886,7 +1048,7 @@ mod tests {
         .await;
         assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
         assert!(
-            shared.token.lock().unwrap().is_some(),
+            !shared.spent.load(Ordering::SeqCst),
             "the token was not spent"
         );
     }
@@ -896,7 +1058,7 @@ mod tests {
     #[tokio::test]
     async fn input_from_another_page_is_refused() {
         let shared = shared(Connection::detached());
-        let cookie = "Cookie: snob_relay=the-cookie\r\n";
+        let cookie = "Cookie: snob_relay_1=the-cookie\r\n";
         let body = r#"[{"t":"reload"}]"#;
         let post = |extra: &str| {
             format!(
@@ -986,6 +1148,66 @@ mod tests {
         };
         assert!(relay.tunnel(Some(&usual)).ends_with(" 10.0.0.1"));
         assert!(relay.tunnel(None).ends_with(" this-machine"));
+    }
+
+    /// A far end a shell would split — a Mac's data directory is under
+    /// `Application Support` — is quoted whole; a plain one is left as it is.
+    #[test]
+    fn a_far_end_with_a_space_is_quoted() {
+        let ssh = Ssh {
+            server: Some(("192.168.1.50".to_string(), 22)),
+            user: Some("someone".to_string()),
+        };
+        assert_eq!(
+            tunnel_command(
+                51234,
+                "/Users/someone/Library/Application Support/snob-ig/relay-1.sock",
+                Some(&ssh)
+            ),
+            "ssh -N -L \"51234:/Users/someone/Library/Application Support/snob-ig/relay-1.sock\" \
+             someone@192.168.1.50"
+        );
+        assert_eq!(
+            tunnel_command(
+                51234,
+                "/home/someone/.local/share/snob-ig/relay-1.sock",
+                None
+            ),
+            "ssh -N -L 51234:/home/someone/.local/share/snob-ig/relay-1.sock this-machine"
+        );
+        assert_eq!(
+            tunnel_command(51234, "127.0.0.1:40000", None),
+            "ssh -N -L 51234:127.0.0.1:40000 this-machine"
+        );
+    }
+
+    /// A socket left by a relay that is gone is removed when the next one
+    /// starts; one a relay still listens on is not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_socket_of_a_relay_that_is_gone_is_swept() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted_at(temporary.path());
+        paths.ensure_dirs().unwrap();
+        let dir = std::path::absolute(paths.data_dir()).unwrap();
+        let dead = dir.join("relay-00000000.sock");
+        drop(std::os::unix::net::UnixListener::bind(&dead).unwrap());
+        assert!(dead.exists(), "a listener leaves its file behind");
+        let unrelated = dir.join("relay-notes.txt");
+        std::fs::write(&unrelated, "kept").unwrap();
+        let alive = Relay::bind(&paths).unwrap();
+        let Listener::Socket {
+            path: alive_path, ..
+        } = &alive.listener
+        else {
+            panic!("a temporary directory is short enough for a socket");
+        };
+
+        let next = Relay::bind(&paths).unwrap();
+        assert!(!dead.exists());
+        assert!(alive_path.exists(), "a live relay's socket is kept");
+        assert!(unrelated.exists());
+        drop(next);
     }
 
     /// On Unix the relay is a socket only this user can open, and it goes

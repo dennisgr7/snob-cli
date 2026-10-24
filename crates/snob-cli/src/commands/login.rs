@@ -638,7 +638,8 @@ fn remote_instructions(relay: &crate::relay::Relay, ssh: Option<&crate::seat::Ss
          The link opens once, in one browser, and only through that tunnel. Log in on the \
          page it shows, which is snob's browser on this machine; snob notices when you are \
          done, and gives up after {} minutes. Ctrl+C to cancel.\n\
-         If ssh refuses to forward, use \"snob login --paste\" instead.\n",
+         If the tunnel drops, open it again and reload the page. If ssh refuses to \
+         forward, use \"snob login --paste\" instead.\n",
         relay.tunnel(ssh),
         relay.link(),
         cdp::LOGIN_TIMEOUT.as_secs() / 60

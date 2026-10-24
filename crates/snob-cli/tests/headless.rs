@@ -2613,7 +2613,11 @@ async fn a_login_through_the_relay_is_stored() {
     }
     let (tunnel, link) = (tunnel.unwrap(), link.unwrap());
     // `ssh -N -L <near port>:<far end> <host>`
-    let forward = tunnel.split_whitespace().nth(3).expect("a forward");
+    let forward = tunnel
+        .split_whitespace()
+        .nth(3)
+        .expect("a forward")
+        .trim_matches('"');
     let (near_port, far_end) = forward.split_once(':').expect("port:far end");
     let token = link.rsplit('/').next().expect("a token");
     assert!(
@@ -2642,6 +2646,18 @@ async fn a_login_through_the_relay_is_stored() {
     assert!(
         again.starts_with("HTTP/1.1 404"),
         "the link opens once: {again}"
+    );
+    let reopened = through_the_relay(
+        far_end,
+        &format!(
+            "GET /{token} HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\n\
+             Connection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(
+        reopened.starts_with("HTTP/1.1 303") && !reopened.contains("Set-Cookie"),
+        "the browser it was opened in goes back to the page: {reopened}"
     );
 
     // The event stream, read until the login page is on it.

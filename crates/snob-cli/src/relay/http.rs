@@ -144,7 +144,7 @@ pub(super) fn is_loopback_host(host: &str) -> bool {
     let name = match host.strip_prefix('[') {
         Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
         None => host.rsplit_once(':').map_or(host, |(name, port)| {
-            if port.chars().all(|c| c.is_ascii_digit()) {
+            if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
                 name
             } else {
                 host
@@ -289,6 +289,7 @@ mod tests {
             "127.0.0.1.evil.example",
             "localhost.evil.example:80",
             "",
+            "127.0.0.1:",
             "[::2]:80",
         ] {
             assert!(!is_loopback_host(host), "{host}");
