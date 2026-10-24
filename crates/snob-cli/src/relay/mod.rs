@@ -560,7 +560,10 @@ async fn route<S: AsyncWrite + Unpin>(
                 return Ok(Answered::Again);
             };
             // A tab that has stopped answering holds one post up for this
-            // long, not each of its inputs for as long again.
+            // long, not each of its inputs for as long again. What the post
+            // still held is dropped, a button's release or a key's among it,
+            // which the tab then takes as still held: accepted, since a tab
+            // that answers nothing is a login that has failed already.
             let performed = tokio::time::timeout(CALL_TIMEOUT, async {
                 for one in inputs {
                     if let Some(command) = input::command(one) {
