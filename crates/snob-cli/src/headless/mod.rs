@@ -173,7 +173,7 @@ const PAGE_WIRE_CAP: u64 = (crate::pipe::MAX_MESSAGE_BYTES - 2 * 1024 * 1024) as
 const LISTENING_BUFFER: u64 = 1024 * 1024;
 
 /// The screen the browser says it is on: the commonest desktop size.
-const SCREEN: (u32, u32) = (1920, 1080);
+pub(crate) const SCREEN: (u32, u32) = (1920, 1080);
 
 /// The strip at the bottom of that screen a taskbar keeps for itself.
 ///
@@ -1135,26 +1135,7 @@ impl Headless {
         // `--user-agent` (which blanks it) and kept. See `machine_hints`.
         let hints = machine_hints(&browser, &self.paths).await;
 
-        let flags = vec![
-            "--headless=new".to_string(),
-            // Kept although every target is overridden below: a few requests
-            // belong to no target — the script of a service worker is one — and
-            // without it they would name `HeadlessChrome`.
-            format!("--user-agent={user_agent}"),
-            format!(
-                "--screen-info={{0,0 {}x{} workAreaBottom={TASKBAR}}}",
-                SCREEN.0, SCREEN.1
-            ),
-            "--window-position=0,0".to_string(),
-            format!("--window-size={},{}", SCREEN.0, SCREEN.1 - TASKBAR),
-            // A headless browser has no pointer: `(pointer: fine)` and
-            // `(hover: hover)` were both false, which is a phone's answer on a
-            // desktop's screen. A mouse is what the machine this claims to be
-            // has.
-            "--blink-settings=primaryPointerType=4,availablePointerTypes=4,\
-             primaryHoverType=2,availableHoverTypes=2"
-                .to_string(),
-        ];
+        let flags = windowless_flags(&user_agent);
         let cancel = CancelToken::default();
         let launched = crate::cdp::launch_headless(&browser, &profile, &flags)
             .with_context(|| format!("could not start {} without a window", browser.name))?;
@@ -1163,25 +1144,7 @@ impl Headless {
             mark.write(&profile);
         }
 
-        let version = cdp.browser_call("Browser.getVersion", json!({})).await?;
-        let full_version = version
-            .get("product")
-            .and_then(Value::as_str)
-            .and_then(|product| product.split('/').nth(1))
-            .unwrap_or_default()
-            .to_string();
-        // The build that runs, which is not always the one detection read: an
-        // update waiting for the browser to close puts the new version beside
-        // the old, and the old one is what starts — and what answered the
-        // probe. The User-Agent states the running build's major version, as
-        // every client hint beside it does; `--user-agent` above, which only
-        // the few requests of no target carry, keeps the detected one.
-        let running = full_version
-            .split('.')
-            .next()
-            .and_then(|major| major.parse::<u32>().ok())
-            .unwrap_or(browser.major_version);
-        let user_agent = browser.user_agent_at(running);
+        let (full_version, user_agent) = running_build(&cdp, &browser).await?;
 
         // Attached before the plan below is set, so the dispatcher only
         // registers the tab: the calls after the plan are the one place the
@@ -1643,6 +1606,140 @@ pub(crate) fn refuse_root() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The flags a browser without a window starts with, saying `user_agent`.
+/// Each corrects one of the things a headless browser gives away that this
+/// module's header lists.
+fn windowless_flags(user_agent: &str) -> Vec<String> {
+    vec![
+        "--headless=new".to_string(),
+        // Kept although every target is overridden once it attaches: a few requests
+        // belong to no target — the script of a service worker is one — and
+        // without it they would name `HeadlessChrome`.
+        format!("--user-agent={user_agent}"),
+        format!(
+            "--screen-info={{0,0 {}x{} workAreaBottom={TASKBAR}}}",
+            SCREEN.0, SCREEN.1
+        ),
+        "--window-position=0,0".to_string(),
+        format!("--window-size={},{}", SCREEN.0, SCREEN.1 - TASKBAR),
+        // A headless browser has no pointer: `(pointer: fine)` and
+        // `(hover: hover)` were both false, which is a phone's answer on a
+        // desktop's screen. A mouse is what the machine this claims to be
+        // has.
+        "--blink-settings=primaryPointerType=4,availablePointerTypes=4,\
+         primaryHoverType=2,availableHoverTypes=2"
+            .to_string(),
+    ]
+}
+
+/// The whole version of the build that runs, and the User-Agent that states
+/// it.
+async fn running_build(cdp: &Cdp, browser: &crate::browser::Browser) -> Result<(String, String)> {
+    let version = cdp.browser_call("Browser.getVersion", json!({})).await?;
+    let full_version = version
+        .get("product")
+        .and_then(Value::as_str)
+        .and_then(|product| product.split('/').nth(1))
+        .unwrap_or_default()
+        .to_string();
+    // The build that runs, which is not always the one detection read: an
+    // update waiting for the browser to close puts the new version beside
+    // the old, and the old one is what starts — and what answered the
+    // probe. The User-Agent states the running build's major version, as
+    // every client hint beside it does; `--user-agent` (`windowless_flags`), which only
+    // the few requests of no target carry, keeps the detected one.
+    let running = full_version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .unwrap_or(browser.major_version);
+    let user_agent = browser.user_agent_at(running);
+    Ok((full_version, user_agent))
+}
+
+/// A browser without a window, for a login watched from another machine
+/// (`crate::relay`), on the tab it opened.
+pub(crate) struct RemoteLogin {
+    pub cdp: Cdp,
+    /// The DevTools session of its tab.
+    pub tab: String,
+    /// The User-Agent its tab sends, which the session is tied to: the
+    /// running build's, never the `HeadlessChrome` the browser would report.
+    pub user_agent: String,
+}
+
+/// Starts the browser a login watched from another machine happens in, on
+/// `profile`, dressed as every request's browser is, and on `about:blank`.
+///
+/// **The same identity as the requests that follow**, from the first request
+/// the login page sends: the flags, the client hints, the override on every
+/// target, the focus. The login is the device's first appearance, and a
+/// device that changed its screen, its pointer or its name between signing in
+/// and asking for anything is not one device.
+///
+/// **Without the guard** (`guard`): what the person does here is a login,
+/// with its own posts — the form, a two-factor code, a challenge — and none
+/// of them is a call of snob's to judge. The windowed login has no guard
+/// either.
+pub(crate) async fn for_a_remote_login(
+    browser: &crate::browser::Browser,
+    profile: &std::path::Path,
+    paths: &AppPaths,
+    cancel: &CancelToken,
+) -> Result<RemoteLogin> {
+    refuse_root()?;
+    let hints = machine_hints(browser, paths).await;
+    let flags = windowless_flags(&browser.user_agent());
+    let launched = crate::cdp::launch_headless(browser, profile, &flags)
+        .with_context(|| format!("could not start {} without a window", browser.name))?;
+    let cdp = Cdp::connect(launched, cancel).await?;
+    let (full_version, user_agent) = running_build(&cdp, browser).await?;
+    let Tab { session: tab, .. } = attach_to_a_tab(&cdp).await?;
+
+    let metadata = metadata(&user_agent, &full_version, hints.as_ref());
+    let identity = json!({ "userAgent": user_agent, "userAgentMetadata": metadata });
+    let page_commands = vec![
+        ("Emulation.setUserAgentOverride", identity.clone()),
+        (
+            "Emulation.setFocusEmulationEnabled",
+            json!({ "enabled": true }),
+        ),
+    ];
+    cdp.connection().set_on_attach(crate::cdp::OnAttach {
+        page: page_commands.clone(),
+        worker: vec![("Network.setUserAgentOverride", identity)],
+    });
+    cdp.browser_call(
+        "Target.setAutoAttach",
+        json!({
+            "autoAttach": true,
+            "waitForDebuggerOnStart": true,
+            "flatten": true,
+            "filter": [
+                { "type": "service_worker", "exclude": false },
+                { "type": "shared_worker", "exclude": false },
+                { "exclude": true },
+            ],
+        }),
+    )
+    .await?;
+    for (method, params) in page_commands {
+        cdp.page_call(&tab, method, params, COMMAND_TIMEOUT).await?;
+    }
+    cdp.page_call(
+        &tab,
+        "Target.setAutoAttach",
+        json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }),
+        COMMAND_TIMEOUT,
+    )
+    .await?;
+    Ok(RemoteLogin {
+        cdp,
+        tab,
+        user_agent,
+    })
 }
 
 /// A failure of the browser, or of driving it, as the page reports one.

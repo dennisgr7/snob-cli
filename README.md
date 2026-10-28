@@ -60,8 +60,14 @@ snob login      # sign in through a browser snob opens, or paste a sessionid
 snob whoami
 ```
 
-Your password never goes through snob, and it never reads your own browser's
-cookies.
+Over SSH, where no window can reach you, `snob login --remote` prints an `ssh`
+command that opens a tunnel from your computer and a link to open there: you log
+in on that page, in snob's browser seen from afar, and the session stays on the
+machine snob runs on.
+
+snob never sees your password when you log in in a window or paste a session,
+and it never reads your own browser's cookies. With `--remote` what you type on
+that page is passed through snob to its browser, and kept nowhere.
 
 ## Commands
 

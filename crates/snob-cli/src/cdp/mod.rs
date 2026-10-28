@@ -73,7 +73,14 @@ const POLL_FOR_READY: Duration = Duration::from_millis(100);
 /// How long an ordinary browser command may take before the call gives up.
 pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
-const LOGIN_URL: &str = "https://www.instagram.com/accounts/login/";
+/// Instagram's login page, on the site every client points at: Instagram, or
+/// in a testing build the fake the tests serve (`snob_ig::client::site`).
+pub fn login_url() -> String {
+    snob_ig::client::site().join("accounts/login/").map_or_else(
+        |_| format!("{}/accounts/login/", snob_ig::BASE_URL),
+        String::from,
+    )
+}
 
 /// A browser we started, and the pipe the protocol travels on.
 ///
@@ -106,7 +113,7 @@ pub fn launch(browser: &Browser, profile: &Path) -> Result<Launched> {
         browser,
         profile,
         &["--test-type".to_string()],
-        LOGIN_URL,
+        &login_url(),
         false,
     )
 }
@@ -547,8 +554,15 @@ pub(crate) fn is_instagram(domain: &str) -> bool {
 ///
 /// Returns `None` until `sessionid` is there, which is what "logged in" means:
 /// the other cookies show up as soon as the login page loads.
+///
+/// A site that is not Instagram's is only ever the fake a testing build is
+/// pointed at, and its cookies are the ones that host is sent.
 fn collect(cookies: &[Value]) -> Option<BrowserCookies> {
-    collect_where(cookies, is_instagram)
+    let site = snob_ig::client::site();
+    match site.host_str() {
+        Some(host) if !is_instagram(host) => collect_for(cookies, host),
+        _ => collect_where(cookies, is_instagram),
+    }
 }
 
 /// The same, for the cookies a page on `host` is sent: those whose domain is

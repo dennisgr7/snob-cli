@@ -259,7 +259,7 @@ export const FEATURES_SECTION = {
 export const BEHAVIOR = {
   title: 'A light client,',
   accent: 'on purpose.',
-  lead: "It signs in as you and sends its requests from a Chrome, Edge, Brave or Chromium already on your machine, at a human pace. Your password never goes through snob, and it never reads your own browser's cookies.",
+  lead: "It signs in as you and sends its requests from a Chrome, Edge, Brave or Chromium already on your machine, at a human pace. snob never stores your password, and it never reads your own browser's cookies.",
   /** README, "Staying a light client", word for word. */
   honest:
     "There is no official API for most of this, so snob uses the same web API instagram.com uses, signed in as you. That is outside Instagram's Terms of Use, and the usual consequence is that Instagram asks the account to verify itself. snob keeps to modest volumes, sends only the web app's own requests, and stops at the first sign of push-back. Use it from the connection you normally browse from.",

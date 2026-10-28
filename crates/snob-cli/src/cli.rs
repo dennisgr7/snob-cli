@@ -473,6 +473,18 @@ pub struct LoginArgs {
     #[arg(long, group = "method")]
     pub browser: bool,
 
+    /// Log in from the browser of the computer you are at, through an SSH tunnel
+    ///
+    /// For a machine reached over SSH, where a browser window would open
+    /// nowhere you can see: snob's browser runs here without one, and prints
+    /// an ssh command that opens a tunnel from your computer and a link to
+    /// open there. You log in on the page that link shows, which is snob's
+    /// browser seen from afar, and the session stays on this machine as with
+    /// --browser. The link works once; the tunnel carries pictures and input,
+    /// never the session.
+    #[arg(long, group = "method")]
+    pub remote: bool,
+
     /// User-Agent of the session, for requests sent without the browser
     ///
     /// Only the requests sent directly (SNOB_NO_BROWSER) and the media
