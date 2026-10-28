@@ -3588,7 +3588,15 @@ fn a_window_over_ssh_with_no_display_points_at_the_tunnel() {
 #[test]
 fn a_login_with_no_terminal_over_ssh_names_the_tunnel() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = snob_with(tmp.path(), None, &[OVER_SSH], &["login"]);
+    // A display would put the person at this machine (`seat`), and then only
+    // `--paste` is named.
+    let out = command(tmp.path(), None)
+        .env(OVER_SSH.0, OVER_SSH.1)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .arg("login")
+        .output()
+        .expect("the binary runs");
     assert!(!out.status.success());
     let said = stderr(&out);
     assert!(said.contains("snob login --remote"), "{said}");
