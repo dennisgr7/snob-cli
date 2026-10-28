@@ -59,6 +59,15 @@
   const modifiers = (e) =>
     (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
 
+  // Windows reports AltGr as Ctrl and Alt held together, so the "@" of AltGr+2
+  // on a Spanish keyboard would arrive as a shortcut and type nothing. A key
+  // that AltGr turned into a character keeps neither: only Shift is left. A
+  // letter or a digit with Ctrl and Alt is a real shortcut and stays one.
+  const altGraph = (e) =>
+    (e.getModifierState && e.getModifierState("AltGraph")) ||
+    (e.ctrlKey && e.altKey && [...e.key].length === 1 && !/^[a-z0-9]$/i.test(e.key));
+  const keyModifiers = (e) => (altGraph(e) ? modifiers(e) & 8 : modifiers(e));
+
   function at(e) {
     const r = screen.getBoundingClientRect();
     const x = ((e.clientX - r.left) * size.w) / Math.max(r.width, 1);
@@ -186,7 +195,7 @@
       code: e.code,
       keyCode: e.keyCode,
       text: [...e.key].length === 1 ? e.key : "",
-      mods: modifiers(e),
+      mods: keyModifiers(e),
       repeat: e.repeat,
     });
   });
@@ -196,7 +205,7 @@
       return;
     }
     e.preventDefault();
-    send({ t: "key", down: false, key: e.key, code: e.code, keyCode: e.keyCode, mods: modifiers(e) });
+    send({ t: "key", down: false, key: e.key, code: e.code, keyCode: e.keyCode, mods: keyModifiers(e) });
   });
 
   // A paste arrives whole, as text: the clipboard of the person's machine
