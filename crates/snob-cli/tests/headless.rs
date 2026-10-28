@@ -2568,7 +2568,9 @@ async fn through_the_relay(far_end: &str, request: &str) -> String {
 /// reads frames off the event stream, and clicks and types into the fake's
 /// login page through the relay — and the session that page sets is the one
 /// stored. What reaches the relay's page is pictures; what comes back is the
-/// person's input, and the cookie is read off snob's own browser.
+/// person's input, and the cookie is read off snob's own browser. The
+/// relay hands the page a key in the fragment of its address, never a
+/// cookie, and takes nothing but that key.
 #[tokio::test]
 async fn a_login_through_the_relay_is_stored() {
     use std::io::BufRead;
@@ -2634,11 +2636,11 @@ async fn a_login_through_the_relay_is_stored() {
     )
     .await;
     assert!(opened.starts_with("HTTP/1.1 303"), "{opened}");
-    let cookie = opened
+    assert!(!opened.contains("Set-Cookie"), "{opened}");
+    let key = opened
         .lines()
-        .find_map(|l| l.strip_prefix("Set-Cookie: "))
-        .and_then(|c| c.split(';').next())
-        .expect("a cookie for the spent token")
+        .find_map(|l| l.strip_prefix("Location: /#"))
+        .expect("a key for the spent token")
         .to_string();
     let again = through_the_relay(
         far_end,
@@ -2649,24 +2651,22 @@ async fn a_login_through_the_relay_is_stored() {
         again.starts_with("HTTP/1.1 404"),
         "the link opens once: {again}"
     );
-    let reopened = through_the_relay(
+    assert!(!again.contains(&key), "the key is handed out once: {again}");
+    let page = through_the_relay(
         far_end,
-        &format!(
-            "GET /{token} HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\n\
-             Connection: close\r\n\r\n"
-        ),
+        &format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
     )
     .await;
     assert!(
-        reopened.starts_with("HTTP/1.1 303") && !reopened.contains("Set-Cookie"),
-        "the browser it was opened in goes back to the page: {reopened}"
+        page.starts_with("HTTP/1.1 200") && !page.contains(&key),
+        "the page holds nothing: {page}"
     );
 
     // The event stream, read until the login page is on it.
     let mut events = reach_the_relay(far_end).await;
     events
         .write_all(
-            format!("GET /events HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\n\r\n").as_bytes(),
+            format!("GET /events HTTP/1.1\r\nHost: {host}\r\nX-Snob-Key: {key}\r\n\r\n").as_bytes(),
         )
         .await
         .unwrap();
@@ -2720,7 +2720,7 @@ async fn a_login_through_the_relay_is_stored() {
     let posted = through_the_relay(
         far_end,
         &format!(
-            "POST /input HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\nX-Snob-Input: 1\r\n\
+            "POST /input HTTP/1.1\r\nHost: {host}\r\nX-Snob-Key: {key}\r\n\
              Origin: http://{host}\r\nContent-Type: application/json\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()

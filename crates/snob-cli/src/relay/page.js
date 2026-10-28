@@ -9,6 +9,42 @@
   const address = document.getElementById("address");
   const done = document.getElementById("done");
 
+  // The key the link was traded for comes in the fragment, which is sent
+  // nowhere, and is kept in this tab's session storage, which is this page's
+  // origin, port and all: a reload finds it there, and no other page on
+  // 127.0.0.1 can. Where storage is refused it stays in the fragment.
+  const key = (() => {
+    const given = location.hash.slice(1);
+    try {
+      if (given) {
+        sessionStorage.setItem("snob-relay-key", given);
+        history.replaceState(null, "", "/");
+      }
+      return sessionStorage.getItem("snob-relay-key") || given;
+    } catch (_) {
+      return given;
+    }
+  })();
+  const stale = 'open the link snob printed; for a new one, run "snob login --remote" again';
+  if (!key) {
+    address.textContent = stale;
+    return;
+  }
+
+  // The relay refused the key: a tab kept from an earlier login, or a
+  // fragment cut short. Nothing will change that but a new link, so the page
+  // says so and stops, rather than trying again for good.
+  let stopped = false;
+  function refused() {
+    stopped = true;
+    try {
+      sessionStorage.removeItem("snob-relay-key");
+    } catch (_) {
+      // Storage refused: nothing was kept to forget.
+    }
+    address.textContent = stale;
+  }
+
   // The tab's size in its own CSS pixels, which the coordinates are sent in.
   let size = { w: 1, h: 1 };
 
@@ -42,12 +78,17 @@
       }
       const batch = queue.splice(0, 64);
       try {
-        await fetch("/input", {
+        const response = await fetch("/input", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "X-Snob-Input": "1" },
+          headers: { "Content-Type": "application/json", "X-Snob-Key": key },
           body: JSON.stringify(batch),
-          credentials: "same-origin",
+          credentials: "omit",
         });
+        if (response.status === 403) {
+          refused();
+          queue.length = 0;
+          break;
+        }
       } catch (_) {
         queue.length = 0;
         break;
@@ -245,24 +286,84 @@
   document.getElementById("reload").addEventListener("click", () => send({ t: "reload" }));
   document.getElementById("keyboard").addEventListener("click", () => keys.focus());
 
-  const events = new EventSource("/events");
-  events.addEventListener("frame", (e) => {
-    const frame = JSON.parse(e.data);
-    if (frame.w && frame.h) {
-      size = { w: frame.w, h: frame.h };
+  const handlers = {
+    frame: (data) => {
+      const frame = JSON.parse(data);
+      if (frame.w && frame.h) {
+        size = { w: frame.w, h: frame.h };
+      }
+      screen.src = "data:image/jpeg;base64," + frame.data;
+    },
+    address: (data) => {
+      address.textContent = JSON.parse(data);
+    },
+  };
+
+  // The event stream, read with fetch so that the key goes in a header: an
+  // EventSource can only put it in the address, which a server that took the
+  // port after the tunnel dropped would write in its log. A dropped
+  // connection is tried again; an answer that is not the relay's is not.
+  async function stream() {
+    const response = await fetch("/events", {
+      headers: { "X-Snob-Key": key },
+      credentials: "omit",
+      cache: "no-store",
+    });
+    if (response.status === 403) {
+      refused();
+      return;
     }
-    screen.src = "data:image/jpeg;base64," + frame.data;
-  });
-  events.addEventListener("address", (e) => {
-    address.textContent = JSON.parse(e.data);
-  });
-  events.addEventListener("done", () => {
-    events.close();
-    done.hidden = false;
-  });
-  events.addEventListener("error", () => {
-    if (done.hidden) {
-      address.textContent = "lost the connection to snob; trying again...";
+    if (!response.ok || !(response.headers.get("Content-Type") || "").startsWith("text/event-stream")) {
+      stopped = true;
+      address.textContent = "something other than snob answers on this port; open the tunnel again and reload";
+      return;
     }
-  });
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffered = "";
+    for (;;) {
+      const { value, done: ended } = await reader.read();
+      if (ended) {
+        return;
+      }
+      buffered += decoder.decode(value, { stream: true });
+      let end;
+      while ((end = buffered.indexOf("\n\n")) >= 0) {
+        const block = buffered.slice(0, end);
+        buffered = buffered.slice(end + 2);
+        let name = "message";
+        const data = [];
+        for (const line of block.split("\n")) {
+          if (line.startsWith("event: ")) {
+            name = line.slice(7);
+          } else if (line.startsWith("data: ")) {
+            data.push(line.slice(6));
+          }
+        }
+        if (name === "done") {
+          stopped = true;
+          done.hidden = false;
+          reader.cancel().catch(() => {});
+          return;
+        }
+        if (data.length && handlers[name]) {
+          handlers[name](data.join("\n"));
+        }
+      }
+    }
+  }
+
+  (async () => {
+    while (!stopped) {
+      try {
+        await stream();
+      } catch (_) {
+        // A connection that would not open or that dropped: tried again below.
+      }
+      if (!stopped) {
+        address.textContent = "lost the connection to snob; trying again...";
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+      }
+    }
+  })();
 })();

@@ -614,8 +614,11 @@ the account's directory (DPAPI-sealed on Windows, 0600 elsewhere).
   out (`Page.startScreencast`), mouse, wheel, key and text events back
   (`relay::input`). It listens on a `0600` socket checked with `peer_cred` (a
   `127.0.0.1` port on Windows, and on Unix when the socket's path is too long or
-  holds what `ssh -L` cannot be given, which any local account can reach), behind a one-use 256-bit token traded for an
-  `HttpOnly` cookie. The cookies still come back over the pipe.
+  holds what `ssh -L` cannot be given, which any local account can reach), behind a
+  one-use 256-bit token traded for a key in the page address's fragment, which the
+  page keeps in its tab's session storage and sends back in a header, never in an
+  address; never a cookie, which every port of `127.0.0.1` would be sent. The
+  cookies still come back over the pipe.
 - **One browser profile per account**, `browser-profile/<pk>`, and two accounts
   never share one (`AppPaths::browser_profile_for`). The profile is the device.
 - **The session is checked from the page**: `PolarisViewer` on the tab's document,

@@ -34,14 +34,6 @@ impl Request {
         self.headers.get(name).map(String::as_str)
     }
 
-    /// The value of the cookie `name`, if the request carries it.
-    pub fn cookie(&self, name: &str) -> Option<&str> {
-        self.header("cookie")?.split(';').find_map(|pair| {
-            let (key, value) = pair.trim().split_once('=')?;
-            (key == name).then_some(value)
-        })
-    }
-
     /// Whether the connection is to be kept for another request.
     pub fn keeps_alive(&self) -> bool {
         !self
@@ -224,8 +216,7 @@ mod tests {
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/input");
         assert_eq!(request.header("host"), Some("127.0.0.1:8765"));
-        assert_eq!(request.cookie("snob"), Some("secret"));
-        assert_eq!(request.cookie("b"), None);
+        assert_eq!(request.header("cookie"), Some("a=1; snob=secret"));
         assert_eq!(request.body, b"[{}]");
         assert!(request.keeps_alive());
     }

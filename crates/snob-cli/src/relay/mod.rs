@@ -33,15 +33,21 @@
 //!   account on the machine can connect to that, so the next point is what
 //!   keeps them out.
 //! - Either way the printed link carries a token of 256 random bits, good for
-//!   one visit: the first request that brings it is answered with a cookie
-//!   of another 256 bits, `HttpOnly`, `SameSite=Strict` and kept no longer
-//!   than a login lasts, and the token is spent: the browser holding that
-//!   cookie may open the link again and is sent to the page, nobody else
-//!   may. Every other route asks for the cookie; the input route also asks
-//!   for a header of its own, which a page on another site cannot send
-//!   without a preflight this server never answers. A `Host` that is not a
-//!   loopback name is refused, which is what a site the person has open would
-//!   send after making its own name resolve to the tunnel (DNS rebinding).
+//!   one visit: the first request that brings it is sent to the page with a
+//!   key of another 256 bits in the address's fragment, which a browser never
+//!   sends anywhere, and the token is spent. The page keeps the key in its
+//!   tab's session storage, which belongs to its origin, port and all: a
+//!   cookie would have been sent to every port of `127.0.0.1` the browser
+//!   asks anything of while the login lasts, a developer's server or another
+//!   account's among them. The event stream and input take it in a header of
+//!   their own, never in an address, which a server that took the port after
+//!   the tunnel dropped would write in its log; a page on another site cannot
+//!   send that header without a preflight this server never answers. The
+//!   stream is read with `fetch` for that, since an `EventSource` sends no
+//!   header of its own. The page and its two files hold nothing and are served to
+//!   any loopback `Host`. A `Host` that is not a loopback name is refused,
+//!   which is what a site the person has open would send after making its own
+//!   name resolve to the tunnel (DNS rebinding).
 //!
 //! **What it leaves out.** The tab is a desktop's, 1920 by 1032 as every
 //! request's browser is (`headless`), whatever the screen it is watched on: the
@@ -77,14 +83,9 @@ const PAGE: &str = include_str!("page.html");
 const SCRIPT: &str = include_str!("page.js");
 const STYLE: &str = include_str!("page.css");
 
-/// The cookie the spent token is traded for, named per relay
-/// (`snob_relay_<id>`): cookies are kept per host and not per port, so two
-/// relays open in one browser at once would otherwise take each other's.
-const COOKIE: &str = "snob_relay";
-
-/// The header the input route asks for besides the cookie. A page on another
+/// The header the event stream and input carry the key in. A page on another
 /// site can only send it after a preflight, which nothing here answers.
-const INPUT_HEADER: &str = "x-snob-input";
+const KEY_HEADER: &str = "x-snob-key";
 
 /// How long a frame waits for a page to have sent it before the browser is
 /// told it was taken anyway.
@@ -120,22 +121,16 @@ const IDLE: Duration = Duration::from_secs(60);
 ///
 /// A limit on what is spent, not a boundary: on the port, any account on the
 /// machine can hold them all and shut the person's browser out until `IDLE`
-/// ends them, but no connection gets past the token or the cookie.
+/// ends them, but no connection gets past the token or the key.
 const MOST_CONNECTIONS: usize = 64;
 
 /// Where the relay listens, and the tunnel's near end to suggest for it.
 pub struct Relay {
     listener: Listener,
     token: String,
-    cookie: Cookie,
+    key: String,
     /// The port on the person's machine the instructions name.
     local_port: u16,
-}
-
-/// The cookie the spent token is traded for.
-struct Cookie {
-    name: String,
-    value: String,
 }
 
 impl Relay {
@@ -153,10 +148,7 @@ impl Relay {
         Ok(Self {
             listener,
             token: secret()?,
-            cookie: Cookie {
-                name: format!("{COOKIE}_{:08x}", fastrand::u32(..)),
-                value: secret()?,
-            },
+            key: secret()?,
             local_port,
         })
     }
@@ -195,13 +187,13 @@ impl Relay {
         let Self {
             listener,
             token,
-            cookie,
+            key,
             ..
         } = self;
         let shared = Arc::new(Shared {
             token,
             spent: AtomicBool::new(false),
-            cookie,
+            key,
             opened: watch::Sender::new(false),
             frame: watch::Sender::new(None),
             sent: watch::Sender::new(0),
@@ -334,10 +326,10 @@ async fn current_address(cdp: &Cdp, tab: &str) -> Option<String> {
 struct Shared {
     /// The link's token.
     token: String,
-    /// The token was traded for the cookie, which it is only once.
+    /// The token was traded for the key, which it is only once.
     spent: AtomicBool,
-    /// What the spent token was traded for.
-    cookie: Cookie,
+    /// What the spent token was traded for, which the page sends back.
+    key: String,
     /// The link was opened.
     opened: watch::Sender<bool>,
     /// The latest frame, for every page connected and the next to connect.
@@ -494,12 +486,12 @@ async fn route<S: AsyncWrite + Unpin>(
     if get && !matches!(path, "/" | "/page.js" | "/page.css" | "/events" | "/input") {
         return redeem(stream, request, shared).await;
     }
-    if !has_the_cookie(request, shared) {
+    if matches!(path, "/events" | "/input") && !has_the_key(request.header(KEY_HEADER), shared) {
         text(
             stream,
             "403 Forbidden",
-            "This browser has not opened the link snob printed. Each link opens once; \
-             run \"snob login --remote\" again for a new one.",
+            "This is not the page the link snob printed opened. Each link opens once, in \
+             one tab; run \"snob login --remote\" again for a new one.",
             keep,
         )
         .await?;
@@ -549,7 +541,7 @@ async fn route<S: AsyncWrite + Unpin>(
                     .strip_prefix("http://")
                     .is_some_and(|host| Some(host) == request.header("host"))
             });
-            if request.header(INPUT_HEADER) != Some("1") || !origin_is_ours {
+            if !origin_is_ours {
                 text(stream, "403 Forbidden", "Not from snob's page.", false).await?;
                 return Ok(Answered::Over);
             }
@@ -587,19 +579,16 @@ async fn route<S: AsyncWrite + Unpin>(
     Ok(Answered::Again)
 }
 
-/// Whether `request` carries the cookie the token was traded for.
-fn has_the_cookie(request: &http::Request, shared: &Shared) -> bool {
-    request
-        .cookie(&shared.cookie.name)
-        .is_some_and(|c| same(c.as_bytes(), shared.cookie.value.as_bytes()))
+/// Whether `given` is the key the token was traded for.
+fn has_the_key(given: Option<&str>, shared: &Shared) -> bool {
+    given.is_some_and(|key| same(key.as_bytes(), shared.key.as_bytes()))
 }
 
-/// The link's token traded for the cookie, once.
+/// The link's token traded for the key, once.
 ///
-/// The link opened again by the browser that holds the cookie — a reload, a
-/// second click, a tab opened again after the tunnel dropped — goes to the
-/// page, since that browser is the one it was opened in; anybody else is
-/// told it was opened already.
+/// The key is only ever handed out here: whoever opens the link again is told
+/// it was opened already, the tab it was opened in included, which still has
+/// the key and needs no link to reload.
 async fn redeem<S: AsyncWrite + Unpin>(
     stream: &mut S,
     request: &http::Request,
@@ -611,28 +600,12 @@ async fn redeem<S: AsyncWrite + Unpin>(
         && !shared.spent.swap(true, Ordering::SeqCst);
     if first {
         shared.opened.send_replace(true);
-        let cookie = format!(
-            "{}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict",
-            shared.cookie.name,
-            shared.cookie.value,
-            // The two waits of a login; nothing answers after them.
-            2 * cdp::LOGIN_TIMEOUT.as_secs()
-        );
+        let page = format!("/#{}", shared.key);
         http::respond(
             stream,
             "303 See Other",
             "text/plain",
-            &[("Location", "/"), ("Set-Cookie", &cookie)],
-            b"",
-            keep,
-        )
-        .await?;
-    } else if same(shared.token.as_bytes(), offered.as_bytes()) && has_the_cookie(request, shared) {
-        http::respond(
-            stream,
-            "303 See Other",
-            "text/plain",
-            &[("Location", "/")],
+            &[("Location", &page)],
             b"",
             keep,
         )
@@ -641,8 +614,8 @@ async fn redeem<S: AsyncWrite + Unpin>(
         text(
             stream,
             "404 Not Found",
-            "This link is not valid, or has been opened already in another browser. Each \
-             link opens once; run \"snob login --remote\" again for a new one.",
+            "This link is not valid, or has been opened already. Each link opens once, in one \
+             tab, which can be reloaded; run \"snob login --remote\" again for a new one.",
             keep,
         )
         .await?;
@@ -752,8 +725,8 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
-/// 256 random bits from the operating system, as text that fits in a path
-/// and a cookie.
+/// 256 random bits from the operating system, as text that fits in a path,
+/// a fragment, a query and a header.
 fn secret() -> Result<String> {
     use base64::Engine as _;
     let mut bytes = [0u8; 32];
@@ -945,10 +918,7 @@ mod tests {
         Shared {
             token: "the-token".to_string(),
             spent: AtomicBool::new(false),
-            cookie: Cookie {
-                name: "snob_relay_1".to_string(),
-                value: "the-cookie".to_string(),
-            },
+            key: "the-key".to_string(),
             opened: watch::Sender::new(false),
             frame: watch::Sender::new(None),
             sent: watch::Sender::new(0),
@@ -968,6 +938,8 @@ mod tests {
         String::from_utf8(written).unwrap()
     }
 
+    /// The token is traded for the key once, in the fragment of the page's
+    /// address, and never for a cookie.
     #[tokio::test]
     async fn the_token_opens_the_page_once() {
         let shared = shared(Connection::detached());
@@ -977,14 +949,8 @@ mod tests {
         )
         .await;
         assert!(first.starts_with("HTTP/1.1 303"), "{first}");
-        let lasting = 2 * cdp::LOGIN_TIMEOUT.as_secs();
-        assert!(
-            first.contains(&format!(
-                "Set-Cookie: snob_relay_1=the-cookie; Path=/; Max-Age={lasting}; HttpOnly; \
-                 SameSite=Strict"
-            )),
-            "{first}"
-        );
+        assert!(first.contains("Location: /#the-key\r\n"), "{first}");
+        assert!(!first.contains("Set-Cookie"), "{first}");
         assert!(*shared.opened.borrow());
 
         let again = answer(
@@ -994,41 +960,7 @@ mod tests {
         .await;
         assert!(again.starts_with("HTTP/1.1 404"), "{again}");
         assert!(again.contains("opened already"), "{again}");
-    }
-
-    /// The browser the link was opened in can open it again, and is sent to
-    /// the page without a new cookie.
-    #[tokio::test]
-    async fn the_link_opened_again_where_it_was_goes_to_the_page() {
-        let shared = shared(Connection::detached());
-        answer(
-            "GET /the-token HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n",
-            &shared,
-        )
-        .await;
-        let again = answer(
-            "GET /the-token HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\
-             Cookie: snob_relay_1=the-cookie\r\n\r\n",
-            &shared,
-        )
-        .await;
-        assert!(again.starts_with("HTTP/1.1 303"), "{again}");
-        assert!(again.contains("Location: /\r\n"), "{again}");
-        assert!(!again.contains("Set-Cookie"), "{again}");
-        let wrong = answer(
-            "GET /the-token HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\
-             Cookie: snob_relay_1=the-cooki\r\n\r\n",
-            &shared,
-        )
-        .await;
-        assert!(wrong.starts_with("HTTP/1.1 404"), "{wrong}");
-        let another = answer(
-            "GET /guess HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\
-             Cookie: snob_relay_1=the-cookie\r\n\r\n",
-            &shared,
-        )
-        .await;
-        assert!(another.starts_with("HTTP/1.1 404"), "{another}");
+        assert!(!again.contains("the-key"), "{again}");
     }
 
     #[tokio::test]
@@ -1036,35 +968,46 @@ mod tests {
         let shared = shared(Connection::detached());
         let wrong = answer("GET /guess HTTP/1.1\r\nHost: localhost\r\n\r\n", &shared).await;
         assert!(wrong.starts_with("HTTP/1.1 404"), "{wrong}");
+        assert!(!wrong.contains("the-key"), "{wrong}");
         assert!(!shared.spent.load(Ordering::SeqCst));
         assert!(!*shared.opened.borrow());
     }
 
-    /// The page and everything after it take the cookie, and nothing else.
+    /// The page holds nothing and is served to anybody on the loopback; the
+    /// event stream takes the key in its header, and never in its address.
     #[tokio::test]
-    async fn the_page_asks_for_the_cookie() {
+    async fn the_stream_asks_for_the_key_and_the_page_does_not() {
         let shared = shared(Connection::detached());
-        let without = answer("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", &shared).await;
-        assert!(without.starts_with("HTTP/1.1 403"), "{without}");
-        assert!(!without.contains("<html"), "{without}");
-        let wrong = answer(
-            "GET / HTTP/1.1\r\nHost: localhost\r\nCookie: snob_relay_1=the-cooki\r\n\r\n",
-            &shared,
-        )
-        .await;
-        assert!(wrong.starts_with("HTTP/1.1 403"), "{wrong}");
-        let with = answer(
-            "GET / HTTP/1.1\r\nHost: localhost\r\nCookie: snob_relay_1=the-cookie\r\n\r\n",
-            &shared,
-        )
-        .await;
-        assert!(with.starts_with("HTTP/1.1 200"), "{with}");
-        assert!(with.contains("<html"), "{with}");
+        let page = answer("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", &shared).await;
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        assert!(page.contains("<html"), "{page}");
+        assert!(!page.contains("the-key"), "{page}");
         assert!(
-            with.contains("Content-Security-Policy: default-src 'none'"),
-            "{with}"
+            page.contains("Content-Security-Policy: default-src 'none'"),
+            "{page}"
         );
-        assert!(with.contains("Cache-Control: no-store"), "{with}");
+        assert!(page.contains("Cache-Control: no-store"), "{page}");
+
+        for refused in [
+            "GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /events HTTP/1.1\r\nHost: localhost\r\nX-Snob-Key: the-kez\r\n\r\n",
+            "GET /events HTTP/1.1\r\nHost: localhost\r\nX-Snob-Key: the-ke\r\n\r\n",
+            "GET /events?key=the-key HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /events HTTP/1.1\r\nHost: localhost\r\nCookie: key=the-key\r\n\r\n",
+        ] {
+            let said = answer(refused, &shared).await;
+            assert!(said.starts_with("HTTP/1.1 403"), "{refused:?}: {said}");
+        }
+
+        // Done already, so the stream says so and ends.
+        shared.done.send_replace(true);
+        let stream = answer(
+            "GET /events HTTP/1.1\r\nHost: localhost\r\nX-Snob-Key: the-key\r\n\r\n",
+            &shared,
+        )
+        .await;
+        assert!(stream.starts_with("HTTP/1.1 200"), "{stream}");
+        assert!(stream.contains("event: done"), "{stream}");
     }
 
     /// A name that only resolves here is another site's page, whatever it
@@ -1084,12 +1027,12 @@ mod tests {
         );
     }
 
-    /// Input takes the cookie, the page's own header, and an origin that is
-    /// the page's.
+    /// Input takes the key in its own header, and an origin that is the
+    /// page's.
     #[tokio::test]
     async fn input_from_another_page_is_refused() {
         let shared = shared(Connection::detached());
-        let cookie = "Cookie: snob_relay_1=the-cookie\r\n";
+        let key = "X-Snob-Key: the-key\r\n";
         let body = r#"[{"t":"reload"}]"#;
         let post = |extra: &str| {
             format!(
@@ -1097,26 +1040,37 @@ mod tests {
                 body.len()
             )
         };
-        let no_header = answer(&post(cookie), &shared).await;
-        assert!(no_header.starts_with("HTTP/1.1 403"), "{no_header}");
+        for refused in [
+            "",
+            "X-Snob-Key: the-kez\r\n",
+            "X-Snob-Input: 1\r\n",
+            "Cookie: key=the-key\r\n",
+        ] {
+            let said = answer(&post(refused), &shared).await;
+            assert!(said.starts_with("HTTP/1.1 403"), "{refused:?}: {said}");
+        }
+        let in_the_query = answer(
+            &post(key)
+                .replacen("POST /input ", "POST /input?key=the-key ", 1)
+                .replacen(key, "", 1),
+            &shared,
+        )
+        .await;
+        assert!(in_the_query.starts_with("HTTP/1.1 403"), "{in_the_query}");
         let elsewhere = answer(
-            &post(&format!(
-                "{cookie}X-Snob-Input: 1\r\nOrigin: https://site.example\r\n"
-            )),
+            &post(&format!("{key}Origin: https://site.example\r\n")),
             &shared,
         )
         .await;
         assert!(elsewhere.starts_with("HTTP/1.1 403"), "{elsewhere}");
         let ours = answer(
-            &post(&format!(
-                "{cookie}X-Snob-Input: 1\r\nOrigin: http://127.0.0.1:8765\r\n"
-            )),
+            &post(&format!("{key}Origin: http://127.0.0.1:8765\r\n")),
             &shared,
         )
         .await;
         assert!(ours.starts_with("HTTP/1.1 204"), "{ours}");
         let garbage = format!(
-            "POST /input HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n{cookie}X-Snob-Input: 1\r\n\
+            "POST /input HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n{key}\
              Content-Length: 3\r\n\r\nnot"
         );
         let bad = answer(&garbage, &shared).await;
@@ -1158,7 +1112,7 @@ mod tests {
         // closes it unread.
         let served = async |mut stream: tokio::net::TcpStream| {
             stream
-                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
                 .await
                 .unwrap();
             let mut answer = Vec::new();
@@ -1194,8 +1148,8 @@ mod tests {
                        {"t":"mouse","kind":"move","x":2,"y":2},
                        {"t":"mouse","kind":"move","x":3,"y":3}]"#;
         let post = format!(
-            "POST /input HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nCookie: snob_relay_1=the-cookie\r\n\
-             X-Snob-Input: 1\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST /input HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nX-Snob-Key: the-key\r\n\
+             Content-Length: {}\r\n\r\n{body}",
             body.len()
         );
         let started = tokio::time::Instant::now();
