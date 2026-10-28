@@ -289,6 +289,10 @@ async fn relay(
 /// `ssh` told to forward `local_port` on the person's machine to `far_end`
 /// here, reaching this machine as `ssh` says the client did.
 ///
+/// The near end is bound to `127.0.0.1` by name: with no address `ssh` binds
+/// it wherever the person's own `GatewayPorts` says, which can be every
+/// interface, and a whole network could then hold the relay's connections.
+///
 /// The far end is quoted when it holds anything a shell would split or
 /// read: a Mac's data directory is under `Application Support`. Double
 /// quotes, which the shells and Windows' `cmd` and PowerShell all take.
@@ -303,7 +307,7 @@ fn tunnel_command(local_port: u16, far_end: &str, ssh: Option<&Ssh>) -> String {
         Some((_, port)) if *port != 22 => format!(" -p {port}"),
         _ => String::new(),
     };
-    let forward = format!("{local_port}:{far_end}");
+    let forward = format!("127.0.0.1:{local_port}:{far_end}");
     let plain = forward
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || "/._-:+@".contains(c));
@@ -1260,7 +1264,7 @@ mod tests {
         let tunnel = relay.tunnel(Some(&ssh));
         let port = relay.local_port.to_string();
         assert!(
-            tunnel.starts_with(&format!("ssh -N -L {port}:")),
+            tunnel.starts_with(&format!("ssh -N -L 127.0.0.1:{port}:")),
             "{tunnel}"
         );
         assert!(
@@ -1296,7 +1300,7 @@ mod tests {
                 "/Users/someone/Library/Application Support/snob-ig/relay-1.sock",
                 Some(&ssh)
             ),
-            "ssh -N -L \"51234:/Users/someone/Library/Application Support/snob-ig/relay-1.sock\" \
+            "ssh -N -L \"127.0.0.1:51234:/Users/someone/Library/Application Support/snob-ig/relay-1.sock\" \
              someone@192.168.1.50"
         );
         assert_eq!(
@@ -1305,11 +1309,11 @@ mod tests {
                 "/home/someone/.local/share/snob-ig/relay-1.sock",
                 None
             ),
-            "ssh -N -L 51234:/home/someone/.local/share/snob-ig/relay-1.sock this-machine"
+            "ssh -N -L 127.0.0.1:51234:/home/someone/.local/share/snob-ig/relay-1.sock this-machine"
         );
         assert_eq!(
             tunnel_command(51234, "127.0.0.1:40000", None),
-            "ssh -N -L 51234:127.0.0.1:40000 this-machine"
+            "ssh -N -L 127.0.0.1:51234:127.0.0.1:40000 this-machine"
         );
     }
 

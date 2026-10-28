@@ -2612,12 +2612,14 @@ async fn a_login_through_the_relay_is_stored() {
         printed.push(line);
     }
     let (tunnel, link) = (tunnel.unwrap(), link.unwrap());
-    // `ssh -N -L <near port>:<far end> <host>`
+    // `ssh -N -L 127.0.0.1:<near port>:<far end> <host>`
     let forward = tunnel
         .split_whitespace()
         .nth(3)
         .expect("a forward")
-        .trim_matches('"');
+        .trim_matches('"')
+        .strip_prefix("127.0.0.1:")
+        .expect("a near end on loopback");
     let (near_port, far_end) = forward.split_once(':').expect("port:far end");
     let token = link.rsplit('/').next().expect("a token");
     assert!(
