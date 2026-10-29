@@ -500,6 +500,11 @@ pub(crate) async fn mutuals(
         });
     }
 
+    // **A rest a sitting owes is paid first**, before the list is opened,
+    // as a list walk pays it: these pages are part of the account's sitting.
+    if rest_before_a_page(client).await? {
+        return Err(snob_ig::error::IgError::Canceled.into());
+    }
     // **Opened as a person opens it**: a look at the profile first, as long
     // as a list walk waits before its first page (`Pace::dwell`), and then
     // the app's navigation to the mutual tab, which has an address of its
@@ -517,18 +522,22 @@ pub(crate) async fn mutuals(
         // same one a list walk takes. The shared bucket alone lets a burst of
         // twenty through, which would make ten pages faster than any list is
         // read here.
-        if page_number > 0 && client.step_between(&Pace::default()).await {
+        if page_number > 0
+            && (rest_before_a_page(client).await? || client.step_between(&Pace::default()).await)
+        {
             return Err(snob_ig::error::IgError::Canceled.into());
         }
         let page = client
             .mutual_followers_page(pk, username, cursor.as_deref())
             .await?;
         people.extend(page.users.iter().map(User::from));
-        // Part of the sitting a list walk rests after. Whether this page
-        // filled it is not asked: opening a profile does not stop for a
-        // rest, and a sitting it filled is rested by the next list walk,
-        // after that walk's first page.
-        client.pacer().page_walked(&Pace::default());
+        // Part of the sitting a list walk rests after: a page that fills it
+        // owes the rest to the next page anybody walks, this list's next
+        // one included.
+        client
+            .pacer()
+            .page_walked(&Pace::default(), snob_core::clock::now_ms())
+            .await?;
         match page.next_max_id.filter(|c| !c.is_empty()) {
             Some(next) => cursor = Some(next),
             None => {
@@ -543,6 +552,21 @@ pub(crate) async fn mutuals(
         people,
         complete,
     })
+}
+
+/// Pays a rest the account's sitting owes before a page of the mutual list,
+/// saying so on standard error: no bar draws for this walk, and the command
+/// would otherwise stand still for minutes without a word. `true` when it
+/// was canceled.
+async fn rest_before_a_page(client: &IgClient) -> Result<bool> {
+    Ok(client
+        .rest_before_a_page(&Pace::default(), |left| {
+            crate::ui::info(&format!(
+                "Resting {} between sittings before the next page of the list.",
+                crate::report::rest_left(left)
+            ));
+        })
+        .await?)
 }
 
 fn render(profile: &Profile, format: Format, explicit_target: bool, hints: bool) -> Result<String> {

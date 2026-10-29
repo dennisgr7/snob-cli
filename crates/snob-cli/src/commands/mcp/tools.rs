@@ -132,7 +132,10 @@ pub fn specs(writes: bool) -> Vec<Spec> {
                     "max_pages": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Walk at most this many pages of twelve or so accounts."
+                        "description": "Walk at most this many pages of twelve or so accounts: \
+                                        a cap on what this one call spends. Every page still \
+                                        counts toward the rest after forty, so a list read in \
+                                        small calls rests as one read in a single call does."
                     },
                     "dry_run": {
                         "type": "boolean",

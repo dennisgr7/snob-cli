@@ -3406,6 +3406,73 @@ async fn a_dry_run_refuses_what_it_would_ignore() {
     assert_eq!(stdout(&out).lines().count(), 1, "{}", stdout(&out));
 }
 
+/// A command that walks the page that fills the account's sitting leaves
+/// the rest owed in the account's database, where the next command finds
+/// it: a dry run counts what is left of it, and the next walk pays it
+/// before its first page and begins a new sitting. The sitting it fills is
+/// one earlier commands left there, thirty-nine pages in.
+///
+/// Against a test server nothing is slept, so the rest is paid the moment
+/// it is found; that the next command found it is what this holds down.
+/// The walker's own tests (`pager.rs`) hold down that, against Instagram, a
+/// walk started during the rest sends nothing until it is over.
+#[tokio::test]
+async fn a_rest_owed_when_a_command_ends_is_kept_for_the_next_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let store = || snob_store::store::Store::open_at(&database(tmp.path())).unwrap();
+    let sitting = || snob_store::store::rate_budget::sitting(store().conn()).unwrap();
+    store()
+        .conn()
+        .execute(
+            "INSERT INTO sitting (id, pages, last_page_at, rest_until) VALUES (1, 39, ?1, NULL)",
+            [snob_core::clock::now_ms().get()],
+        )
+        .expect("the sitting can be written");
+    let minutes = |n: u64| std::time::Duration::from_secs(60 * n);
+
+    let before = snob_core::clock::now_ms();
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["followers", "--refresh", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let after = snob_core::clock::now_ms();
+    let owed = sitting().expect("a page was walked");
+    assert_eq!(owed.pages, 40, "the page counts in the stored sitting");
+    let until = owed.rest_until.expect("the fortieth page owes a rest");
+    assert!(
+        until >= before + minutes(5) && until <= after + minutes(15),
+        "a rest of five to fifteen minutes: {until} after {before}"
+    );
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["followers", "--dry-run", "--refresh", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let rest = json(&out)["rest_owed_seconds"].as_u64();
+    assert!(
+        rest.is_some_and(|rest| (1..=900).contains(&rest)),
+        "the dry run counts the rest owed: {rest:?}"
+    );
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["followers", "--refresh", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        sitting().map(|s| (s.pages, s.rest_until)),
+        Some((1, None)),
+        "the next command found the rest owed, paid it, and began a new sitting"
+    );
+}
+
 /// A dry run writes nothing: no database is made for an account that has
 /// none, as `status` makes none.
 #[tokio::test]

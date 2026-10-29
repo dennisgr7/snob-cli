@@ -69,7 +69,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use snob_core::EpochMs;
-use snob_core::budget::RateBudget;
+use snob_core::budget::{RateBudget, Sitting, SittingRule};
 
 /// Accounts asked for per list page: what the web app asks for, `count=12`
 /// on both lists, of which it gets eight to twelve back.
@@ -127,6 +127,13 @@ pub const PAGES_PER_SITTING: u32 = 40;
 /// a long list takes; short enough that the longest quiet stretch between
 /// two saved pages stays well inside a walk's claim (`CLAIM_TTL_SECS` in
 /// `snob-store`'s `snapshots.rs`).
+///
+/// **The rest is owed, not taken on the spot** ([`snob_core::budget::Sitting`]):
+/// the page that fills a sitting draws it and writes down when it ends, in
+/// the account's database, and whatever walks the account next pays what is
+/// left of it before its first page, in this process or another. The longest
+/// of the range is also how long a sitting that is not full has to be left
+/// alone before it ends on its own.
 pub const SITTING_PAUSE_MS: (u64, u64) = (300_000, 900_000);
 
 /// How long a walk that finds the machine slept waits for the network to come
@@ -219,6 +226,21 @@ impl Pace {
         jitter(self.sitting_pause_ms)
     }
 
+    /// The sitting this pace makes, with a rest drawn for the page that
+    /// fills it: kept only if this is that page.
+    fn sitting_rule(&self) -> SittingRule {
+        SittingRule {
+            pages: self.pages_per_sitting.max(1),
+            rest: self.sitting_pause(),
+            idle: self.longest_rest(),
+        }
+    }
+
+    /// The longest rest of [`Self::sitting_pause_ms`].
+    fn longest_rest(&self) -> Duration {
+        Duration::from_millis(self.sitting_pause_ms.0.max(self.sitting_pause_ms.1))
+    }
+
     pub(crate) fn backoff(&self, attempt: u32) -> Duration {
         let base = self.backoff_base_ms.saturating_mul(1u64 << attempt.min(6));
         Duration::from_millis(base)
@@ -252,9 +274,10 @@ pub struct Pacer {
     announce: Option<Arc<dyn Fn(Duration) + Send + Sync>>,
     /// How many requests have been paid for. See [`Pacer::spent`].
     spent: AtomicU32,
-    /// How many pages have been walked since the last rest. See
-    /// [`Pacer::page_walked`].
-    sitting_pages: AtomicU32,
+    /// The sitting, when the budget does not keep it
+    /// ([`RateBudget::keeps_sitting`]): counted in the process by the same
+    /// rule, which is all a test double needs. See [`Pacer::page_walked`].
+    sitting: std::sync::Mutex<Option<Sitting>>,
     /// How many actions have begun. See [`Pacer::begin_action`].
     actions: AtomicU32,
     /// The longest wait for the budget this run accepts. See
@@ -269,7 +292,7 @@ impl Pacer {
             cancel: CancelToken::default(),
             announce: None,
             spent: AtomicU32::new(0),
-            sitting_pages: AtomicU32::new(0),
+            sitting: std::sync::Mutex::new(None),
             actions: AtomicU32::new(0),
             max_wait: None,
         }
@@ -300,23 +323,64 @@ impl Pacer {
         self.actions.load(Ordering::Relaxed)
     }
 
-    /// Counts a page walked, and answers whether the sitting is full.
+    /// Counts a page of a list walked at `at`, in the sitting of the
+    /// account (`Sitting::after_page`); the page that fills it owes a rest
+    /// drawn from `pace`, paid before the next page anybody walks
+    /// ([`Self::rest_owed`]).
     ///
     /// Counted here rather than by each walk because a sitting is the
-    /// reading this process does, not one list's: `scan` walks two lists in
-    /// a row, and a profile's mutual followers are pages too, so a counter
-    /// per walk would let two walks of thirty pages go by as two short
-    /// sittings. A full sitting stays full until [`Self::sitting_rested`],
-    /// so one whose walk ended on it is rested after the next page anybody
-    /// walks.
-    pub fn page_walked(&self, pace: &Pace) -> bool {
-        let walked = self.sitting_pages.fetch_add(1, Ordering::Relaxed) + 1;
-        walked >= pace.pages_per_sitting.max(1)
+    /// account's reading, not one list's: `scan` walks two lists in a row,
+    /// a profile's mutual followers are pages too, and an agent reads a
+    /// list a page at a time, one process a page. Kept by the budget, in
+    /// the account's database, so it outlives the process; off the async
+    /// worker for the reason [`Self::off_thread`] gives, since it is a write
+    /// transaction after every page.
+    pub async fn page_walked(&self, pace: &Pace, at: EpochMs) -> Result<(), crate::error::IgError> {
+        let rule = pace.sitting_rule();
+        if self.budget.keeps_sitting() {
+            return self
+                .off_thread(move |budget| budget.sitting_page(at, rule).map(drop))
+                .await;
+        }
+        let mut sitting = self.sitting.lock().unwrap_or_else(|e| e.into_inner());
+        *sitting = Some(Sitting::after_page(*sitting, at, rule));
+        Ok(())
     }
 
-    /// Starts a new sitting, after its rest.
-    pub fn sitting_rested(&self) {
-        self.sitting_pages.store(0, Ordering::Relaxed);
+    /// The rest owed at `now`, if one is: when it ends, and what is left of
+    /// it. Asked before every page of every walk.
+    ///
+    /// What is left is never more than the longest rest of `pace`: a rest
+    /// ending further off than that was drawn by a clock that has since been
+    /// set back, and waiting for it would be waiting for the clock.
+    pub async fn rest_owed(
+        &self,
+        pace: &Pace,
+        now: EpochMs,
+    ) -> Result<Option<(EpochMs, Duration)>, crate::error::IgError> {
+        let until = if self.budget.keeps_sitting() {
+            self.off_thread(move |budget| budget.rest_owed(now)).await?
+        } else {
+            self.sitting
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .and_then(|s| s.rest_owed(now))
+        };
+        Ok(until.map(|until| {
+            let left = u64::try_from(until - now).unwrap_or(0);
+            (until, Duration::from_millis(left).min(pace.longest_rest()))
+        }))
+    }
+
+    /// Records that the rest ending at `until` was paid, by waiting it or,
+    /// against a test server, by passing it: the sitting starts again.
+    pub async fn rested(&self, until: EpochMs) -> Result<(), crate::error::IgError> {
+        if self.budget.keeps_sitting() {
+            return self.off_thread(move |budget| budget.rest_paid(until)).await;
+        }
+        let mut sitting = self.sitting.lock().unwrap_or_else(|e| e.into_inner());
+        *sitting = sitting.map(|s| s.rested(until));
+        Ok(())
     }
 
     /// How many requests have been paid for since the client was built.
@@ -343,9 +407,10 @@ impl Pacer {
     ///
     /// For a caller that cannot sit for hours, such as an agent's tool call.
     /// **Only waits for the budget**: the pace's own steps and the rest after
-    /// a sitting ([`Pace::sitting_pause`]) are not cut short, because the
-    /// sitting is counted in this process and a run stopped at its rest and
-    /// started again would begin a new one with no rest at all.
+    /// a sitting ([`Pace::sitting_pause`]) are not cut short. The rest is
+    /// owed in the account's database ([`Self::rest_owed`]), so a run that
+    /// refused it would not get past it either: the next run would owe what
+    /// is left of it, and pay that before its first page.
     #[must_use]
     pub fn waiting_at_most(mut self, limit: Option<Duration>) -> Self {
         self.max_wait = limit;
@@ -675,6 +740,67 @@ impl CancelToken {
     }
 }
 
+/// A budget that grants everything and keeps the sitting in memory, as the
+/// account's database keeps it: two pacers over one are two processes
+/// walking one account.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct KeptSitting {
+    sitting: std::sync::Mutex<Option<Sitting>>,
+}
+
+#[cfg(test)]
+impl KeptSitting {
+    /// The sitting as the last page or rest left it.
+    pub(crate) fn sitting(&self) -> Option<Sitting> {
+        *self.sitting.lock().unwrap()
+    }
+}
+
+#[cfg(test)]
+impl RateBudget for KeptSitting {
+    fn reserve(&self) -> Result<Duration, snob_core::budget::RateBudgetError> {
+        Ok(Duration::ZERO)
+    }
+    fn reserve_write(&self) -> Result<Duration, snob_core::budget::RateBudgetError> {
+        Ok(Duration::ZERO)
+    }
+    fn cooldown(&self) -> Result<Option<EpochMs>, snob_core::budget::RateBudgetError> {
+        Ok(None)
+    }
+    fn start_cooldown(
+        &self,
+        _reason: &str,
+        _minimum: Duration,
+    ) -> Result<EpochMs, snob_core::budget::RateBudgetError> {
+        Ok(EpochMs::new(0))
+    }
+    fn keeps_sitting(&self) -> bool {
+        true
+    }
+    fn sitting_page(
+        &self,
+        at: EpochMs,
+        rule: SittingRule,
+    ) -> Result<Sitting, snob_core::budget::RateBudgetError> {
+        let mut sitting = self.sitting.lock().unwrap();
+        let after = Sitting::after_page(*sitting, at, rule);
+        *sitting = Some(after);
+        Ok(after)
+    }
+    fn rest_owed(
+        &self,
+        now: EpochMs,
+    ) -> Result<Option<EpochMs>, snob_core::budget::RateBudgetError> {
+        Ok(self.sitting().and_then(|s| s.rest_owed(now)))
+    }
+    fn rest_paid(&self, until: EpochMs) -> Result<(), snob_core::budget::RateBudgetError> {
+        let mut sitting = self.sitting.lock().unwrap();
+        *sitting = sitting.map(|s| s.rested(until));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,20 +951,95 @@ mod tests {
         }
     }
 
-    /// A sitting is counted across walks, fills at its fortieth page, stays
-    /// full until it is rested, and starts over after.
-    #[test]
-    fn a_sitting_fills_at_its_fortieth_page_and_starts_over_after_its_rest() {
+    /// A sitting is counted across walks, fills at its fortieth page and
+    /// owes a rest from it, stays owed until it is paid, and starts over
+    /// after; a pacer over a budget that keeps nothing counts it the same.
+    #[tokio::test]
+    async fn a_sitting_fills_at_its_fortieth_page_and_starts_over_after_its_rest() {
         let pacer = Pacer::unlimited();
         let pace = Pace::default();
-        for page in 1..PAGES_PER_SITTING {
-            assert!(!pacer.page_walked(&pace), "page {page} is mid-sitting");
+        let at = EpochMs::new(1_800_000_000_000);
+        for _ in 1..PAGES_PER_SITTING {
+            pacer.page_walked(&pace, at).await.unwrap();
         }
-        assert!(pacer.page_walked(&pace), "the fortieth page fills it");
-        assert!(pacer.page_walked(&pace), "and it stays full until rested");
+        assert_eq!(
+            pacer.rest_owed(&pace, at).await.unwrap(),
+            None,
+            "mid-sitting"
+        );
 
-        pacer.sitting_rested();
-        assert!(!pacer.page_walked(&pace), "a rested sitting starts over");
+        pacer.page_walked(&pace, at).await.unwrap();
+        let (until, left) = pacer.rest_owed(&pace, at).await.unwrap().expect("full");
+        assert!(
+            (300_000..=900_000).contains(&(left.as_millis() as u64)),
+            "{left:?}"
+        );
+        pacer.page_walked(&pace, at).await.unwrap();
+        assert_eq!(
+            pacer.rest_owed(&pace, at).await.unwrap().map(|o| o.0),
+            Some(until),
+            "and it stays owed until paid"
+        );
+
+        pacer.rested(until).await.unwrap();
+        assert_eq!(pacer.rest_owed(&pace, at).await.unwrap(), None);
+        pacer.page_walked(&pace, at).await.unwrap();
+        assert_eq!(
+            pacer.rest_owed(&pace, at).await.unwrap(),
+            None,
+            "a new sitting"
+        );
+    }
+
+    /// A run that stopped once the page that filled its sitting was walked
+    /// leaves the rest owed in the budget: the next run, with a pacer of its
+    /// own, finds what is left of it before its first page, however few it
+    /// means to walk.
+    #[tokio::test]
+    async fn a_rest_owed_by_an_earlier_run_is_paid_before_the_next_page() {
+        let budget = Arc::new(KeptSitting::default());
+        let pace = Pace::default();
+        let at = EpochMs::new(1_800_000_000_000);
+
+        let earlier = Pacer::new(budget.clone());
+        for _ in 0..PAGES_PER_SITTING {
+            earlier.page_walked(&pace, at).await.unwrap();
+        }
+        drop(earlier);
+
+        let next = Pacer::new(budget.clone());
+        let minute_later = at + Duration::from_secs(60);
+        let (until, left) = next
+            .rest_owed(&pace, minute_later)
+            .await
+            .unwrap()
+            .expect("the rest is the account's, not the run's");
+        assert_eq!(Some(until), budget.sitting().unwrap().rest_until);
+        assert_eq!(left, Duration::from_millis((until - minute_later) as u64));
+        assert!(
+            left <= Duration::from_secs(14 * 60),
+            "a minute of it is gone"
+        );
+
+        next.rested(until).await.unwrap();
+        assert_eq!(budget.sitting().unwrap().pages, 0);
+        assert_eq!(next.rest_owed(&pace, minute_later).await.unwrap(), None);
+    }
+
+    /// A rest ending further off than the longest rest was drawn before the
+    /// clock went back, and is waited for no longer than the longest rest.
+    #[tokio::test]
+    async fn a_rest_owed_is_never_longer_than_the_longest_rest() {
+        let budget = Arc::new(KeptSitting::default());
+        let pacer = Pacer::new(budget.clone());
+        let pace = Pace::default();
+        let at = EpochMs::new(1_800_000_000_000);
+        for _ in 0..PAGES_PER_SITTING {
+            pacer.page_walked(&pace, at).await.unwrap();
+        }
+        let set_back = at - Duration::from_secs(86_400);
+        let (_, left) = pacer.rest_owed(&pace, set_back).await.unwrap().unwrap();
+        assert_eq!(left, Duration::from_millis(SITTING_PAUSE_MS.1));
     }
 
     /// An action is counted only when one begins: a request spent is not one.

@@ -211,10 +211,18 @@ with a documented reason in the same place.
   daily (about 2,000 requests), and writes (burst of 3, then one every 15 min).
   Lists read at most 2,000 accounts in any 24 h, 1,000 for a week after a
   push-back (`budget::accounts_per_day`); `--same-day` reads past it on
-  purpose. The budget outlives the process. `--max-wait` refuses a wait for
-  the budget (asked with `read_wait`/`write_wait` before the charge, so the
-  refusal costs nothing) and never cuts a sitting's rest, which is counted in
-  the process and would otherwise be skipped by stopping and starting again.
+  purpose. The budget outlives the process. **The sitting and the rest it
+  owes are kept in the account's database and outlive the process** (table
+  `sitting`, `snob_core::budget::Sitting`): the page that fills a sitting
+  draws its rest and writes down when it ends, whether or not its walk goes
+  on, and the next page any walk of that account reads (the pager, a
+  profile's mutual followers), in this process or another, waits for it
+  first. So a walk ending on its cap, a run stopped during its rest and a
+  list read a page at a time all still rest after 40 pages; a sitting not
+  full that is left alone for the longest rest (15 min) ends. `--max-wait`
+  refuses a wait for the budget (asked with `read_wait`/`write_wait` before
+  the charge, so the refusal costs nothing) and never cuts a sitting's rest,
+  which would only be owed again by the next run.
 - **Push-back is a hard stop.** The first refusal stops the run and starts a
   cooldown: 2 h for a throttle, 12 h for an action block, 30 min for a
   challenge (`snob_core::budget`, pinned by

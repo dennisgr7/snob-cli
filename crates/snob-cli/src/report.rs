@@ -534,6 +534,15 @@ pub const BATTERY_CRITICAL_SKIP: &str =
 pub const BATTERY_CRITICAL_HOLD: &str = "the battery is critical; the run that is due waits \
      until the machine is on power or charged again";
 
+/// What is left of a rest between sittings, as a person counts it: whole
+/// minutes, rounded up, since the walk does not go before it ends.
+pub fn rest_left(left: std::time::Duration) -> String {
+    match left.as_secs().div_ceil(60) {
+        1 => "1 minute".to_string(),
+        minutes => format!("{minutes} minutes"),
+    }
+}
+
 /// What a walk says when it finds the machine slept in the middle of it.
 pub fn slept_during_the_walk(slept: std::time::Duration) -> String {
     let minutes = slept.as_secs().div_ceil(60);
@@ -1026,6 +1035,17 @@ mod tests {
     use super::*;
     use crate::engine::ListOutcome;
     use snob_core::Pk;
+
+    /// What is left of a rest is said in whole minutes, never fewer than it
+    /// is: a second over a minute is two.
+    #[test]
+    fn the_rest_left_is_said_in_minutes_rounded_up() {
+        let secs = std::time::Duration::from_secs;
+        assert_eq!(rest_left(secs(1)), "1 minute");
+        assert_eq!(rest_left(secs(60)), "1 minute");
+        assert_eq!(rest_left(secs(61)), "2 minutes");
+        assert_eq!(rest_left(secs(483)), "9 minutes");
+    }
 
     /// Every string this module draws goes through the name filter, and the
     /// paragraph breaks it lays out survive it.

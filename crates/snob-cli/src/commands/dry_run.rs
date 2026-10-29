@@ -148,6 +148,9 @@ fn as_json(estimate: &Estimate) -> Value {
         "requests": { "least": estimate.requests.0, "most": estimate.requests.1 },
         "accounts": estimate.accounts,
         "seconds": { "least": estimate.seconds.0, "most": estimate.seconds.1 },
+        // What is left of a rest the account's sitting already owes, which
+        // the seconds above count before the first page.
+        "rest_owed_seconds": estimate.rest_owed,
         "unknown_pages": estimate.unknown(),
         "requests_left": estimate.requests_left,
         "accounts_left": estimate.accounts_left,
@@ -219,6 +222,13 @@ fn as_text(estimate: &Estimate, subject: &str) -> String {
         estimate.accounts,
         span(estimate.seconds)
     ));
+    if estimate.rest_owed > 0 && estimate.lists.iter().any(|list| list.pages.1 > 0) {
+        lines.push(format!(
+            "A rest between sittings is still owed, {} of it: a walk waits for it before its \
+             first page, and the time above counts it.",
+            report::rest_left(std::time::Duration::from_secs(estimate.rest_owed))
+        ));
+    }
     lines.push(format!(
         "Today has {} requests and {} accounts left.",
         estimate.requests_left, estimate.accounts_left
