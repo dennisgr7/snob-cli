@@ -4255,6 +4255,136 @@ async fn the_mcp_status_without_a_session_is_an_answer_with_a_hint() {
     assert!(posted(&instagram).await.is_empty(), "nothing was sent");
 }
 
+/// The usernames on a page a list call handed back.
+#[cfg(feature = "mcp")]
+fn usernames(told: &serde_json::Value) -> Vec<String> {
+    told["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a page: {told}"))
+        .iter()
+        .map(|item| item["username"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A list longer than a page comes back a page at a time, and every page
+/// after the first walks nothing, asks nothing and sends nothing: it is
+/// handed back from what the first call read, or, by a server that never
+/// read it, from the store.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_hands_a_long_list_back_a_page_at_a_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(450, 2).await;
+    log_in(tmp.path(), &instagram);
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let first = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(first["isError"], false, "{first}");
+    let told = &first["structuredContent"];
+    assert_eq!(told["count"], 450, "the whole list's: {told}");
+    assert_eq!(told["offset"], 0, "{told}");
+    let mut read = usernames(told);
+    assert!(read.len() < 450, "one page of it");
+    let mut next = told["next_offset"].as_u64().expect("a next page");
+    // Said in words too, for a client that shows the model only the text.
+    let says = |result: &serde_json::Value, next: u64| {
+        result["content"].as_array().unwrap().iter().any(|block| {
+            block["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(&format!("\"offset\": {next}")))
+        })
+    };
+    assert!(says(&first, next), "{first}");
+
+    let sent = posted(&instagram).await.len();
+    loop {
+        let later = client
+            .call(
+                "snob_list",
+                serde_json::json!({ "list": "followers", "offset": next }),
+            )
+            .await;
+        assert_eq!(later["isError"], false, "{later}");
+        let told = &later["structuredContent"];
+        assert_eq!(told["count"], 450, "{told}");
+        assert_eq!(told["offset"], next, "{told}");
+        read.extend(usernames(told));
+        match told["next_offset"].as_u64() {
+            Some(after) => {
+                assert!(says(&later, after), "{later}");
+                next = after;
+            }
+            None => break,
+        }
+    }
+    let every: Vec<String> = (0..450).map(|n| format!("user{n}")).collect();
+    assert_eq!(read, every, "every account once, in the order served");
+    assert_eq!(
+        posted(&instagram).await.len(),
+        sent,
+        "no page after the first sent anything"
+    );
+
+    // A server that never read the list hands the same page back from the
+    // store, and sends nothing for it either.
+    let mut other = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let stored = other
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "offset": 200 }),
+        )
+        .await;
+    assert_eq!(stored["isError"], false, "{stored}");
+    let page = usernames(&stored["structuredContent"]);
+    assert!(!page.is_empty());
+    assert_eq!(page[..], every[200..200 + page.len()]);
+
+    // Another account's list at a later page is not asked about and not
+    // walked: nothing of it is stored, and the answer says so.
+    let theirs = other
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "account": "someone", "offset": 200 }),
+        )
+        .await;
+    assert_eq!(theirs["isError"], true, "{theirs}");
+    assert!(
+        theirs["structuredContent"].get("status").is_none(),
+        "nothing asked: {theirs}"
+    );
+    // Nor is a refresh paged, which would walk it again.
+    let refresh = other
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "mode": "refresh", "offset": 200 }),
+        )
+        .await;
+    assert_eq!(
+        refresh["structuredContent"]["error"]["code"], "invalid_arguments",
+        "{refresh}"
+    );
+    assert_eq!(posted(&instagram).await.len(), sent, "and nothing was sent");
+
+    // A walk given max_pages may stop short, and what it read is then not
+    // stored as a whole list: its later pages come from the server that
+    // read it, and another server says it cannot hand them back.
+    let capped = serde_json::json!({ "list": "followers", "max_pages": 40 });
+    let first = client.call("snob_list", capped.clone()).await;
+    assert_eq!(first["isError"], false, "{first}");
+    let mut later = capped.clone();
+    later["offset"] = serde_json::json!(200);
+    let held = client.call("snob_list", later.clone()).await;
+    assert_eq!(held["isError"], false, "{held}");
+    assert_eq!(usernames(&held["structuredContent"])[0], "user200");
+    let gone = other.call("snob_list", later).await;
+    assert_eq!(
+        gone["structuredContent"]["error"]["code"], "page_unavailable",
+        "{gone}"
+    );
+}
+
 /// A server whose binary is moved aside under it, as WinGet and
 /// `install.ps1` do on an upgrade and Homebrew's cleanup does by removing it,
 /// refuses every call from then on and starts nothing, rather than run a

@@ -6,6 +6,13 @@
 //! someone's bio arriving as text nobody on screen can see. `printable` is the
 //! identity on everything a person can read, so filtering what was already
 //! filtered changes nothing.
+//!
+//! **A list is handed back a page at a time** ([`page`]): a client reads a
+//! tool's whole result into the model's context, and cuts what is too long
+//! (Claude Code at 25,000 tokens, `MAX_MCP_OUTPUT_TOKENS`, as its documents
+//! were quoted to us; not checked here). The page says the whole list's
+//! `count` and the `next_offset` to call again with, and the later pages are
+//! handed back from what was already read (`pages.rs`, `tools::Page`).
 
 use serde_json::{Value, json};
 
@@ -18,7 +25,22 @@ use crate::exit::ExitCode;
 pub struct Answer {
     pub failed: bool,
     pub body: Value,
+    /// The whole list, each item as its compact JSON, when `body` is one page
+    /// of a longer one: for the server to hold for the pages after it.
+    pub whole: Option<Vec<String>>,
 }
+
+/// The most accounts on a page.
+pub const PAGE: usize = 200;
+
+/// The most bytes of items on a page, as compact JSON, before the result
+/// is filtered. An account is 100 to 150 bytes without a picture's address
+/// and some 450 with one, whose signed query string tokenizes at about 3
+/// bytes a token; the result is sent twice, as the structured content and as
+/// its text (the specification asks for both), so 30,000 bytes keeps a page
+/// near 20,000 tokens in all, under the cut quoted above. Without addresses
+/// a page is [`PAGE`] accounts; with them, about 65.
+pub const PAGE_BYTES: usize = 30_000;
 
 /// What an agent is told when there is no session to act with.
 ///
@@ -34,6 +56,8 @@ pub const SIGN_IN: &str = "the person signs in with \"snob login\" in their own 
 /// Reads a finished child against what its plan counts as an answer.
 pub fn from(plan: &Plan, finished: Finished) -> Answer {
     let exit = finished.code;
+    let offset = plan.page.as_ref().map_or(0, |page| page.offset);
+    let mut whole = None;
     let mut body = if plan.answers.contains(&exit) {
         // A structured result is an object, so whatever else a command printed
         // goes under a key. **Never index into what came back before it is
@@ -42,7 +66,15 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
         // whole server gone, every call in flight with it, over one line a
         // command printed.
         match finished.json {
-            Some(Value::Array(items)) => json!({ "count": items.len(), "items": items }),
+            Some(Value::Array(items)) => {
+                let items = compact(&items);
+                // A call that takes no offset has no next page to offer.
+                let body = page(&items, offset, plan.page.is_some());
+                if !body["next_offset"].is_null() {
+                    whole = Some(items);
+                }
+                body
+            }
             Some(document @ Value::Object(_)) => document,
             Some(other) => json!({ "value": other }),
             None => json!({ "text": finished.text.trim() }),
@@ -78,9 +110,15 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
             failure["code"] = json!(reason);
         }
         // What a list walk kept is still worth having: it is stored, and the
-        // next call continues from it.
+        // next call continues from it. One page of it, with no next one:
+        // what a walk stopped short read is not stored as a whole list, so a
+        // later page could not be read back, and the next call for the list
+        // continues the walk instead.
         if let Some(partial) = finished.json {
-            failure["partial"] = partial;
+            failure["partial"] = match partial {
+                Value::Array(items) => page(&compact(&items), offset, false),
+                other => other,
+            };
         }
         if exit == ExitCode::NoSession {
             failure["hint"] = json!(SIGN_IN);
@@ -88,6 +126,7 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
         return Answer {
             failed: true,
             body: cleaned(json!({ "exit": exit.as_str(), "error": failure })),
+            whole: None,
         };
     };
     if exit != ExitCode::Ok {
@@ -107,7 +146,75 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
     Answer {
         failed: false,
         body: cleaned(body),
+        whole,
     }
+}
+
+/// The page at `offset` of a list the server holds (`pages.rs`), as the
+/// answer of a call that ran nothing.
+pub fn held(items: &[String], offset: usize) -> Answer {
+    Answer {
+        failed: false,
+        body: cleaned(page(items, offset, true)),
+        whole: None,
+    }
+}
+
+/// Each item as its compact JSON, which is what a page is measured in and
+/// what the server holds.
+fn compact(items: &[Value]) -> Vec<String> {
+    items.iter().map(Value::to_string).collect()
+}
+
+/// The page of `items` that starts at `offset`: as many as fit in
+/// [`PAGE_BYTES`], at most [`PAGE`] and at least one, so a page always moves
+/// on. `{count, offset, items, next_offset}`, where `count` is the whole
+/// list's and `next_offset` is null on the last page, or always when the
+/// call cannot be made again for another (`pages` false). An offset past the
+/// end is an empty page. **Sliced with `get`, never by indexing**: the offset
+/// is the client's number, and a panic here is the whole server gone.
+pub fn page(items: &[String], offset: usize, pages: bool) -> Value {
+    let count = items.len();
+    let rest = items.get(offset.min(count)..).unwrap_or_default();
+    let (mut taken, mut bytes) = (0, 0);
+    for item in rest.iter().take(PAGE) {
+        bytes += item.len();
+        if taken > 0 && bytes > PAGE_BYTES {
+            break;
+        }
+        taken += 1;
+    }
+    let shown: Vec<Value> = rest
+        .get(..taken)
+        .unwrap_or_default()
+        .iter()
+        // Read back from what `compact` wrote, so it does not fail; a null
+        // would still be better than a panic.
+        .map(|item| serde_json::from_str(item).unwrap_or(Value::Null))
+        .collect();
+    let end = offset.min(count) + taken;
+    let next_offset = (pages && end < count).then_some(end);
+    json!({
+        "count": count,
+        "offset": offset,
+        "items": shown,
+        "next_offset": next_offset,
+    })
+}
+
+/// What an agent is told of a page with another after it, beside the JSON:
+/// which accounts these are, and how the next ones are had. `None` for any
+/// other answer.
+pub fn next_page(body: &Value) -> Option<String> {
+    let next = body.get("next_offset")?.as_u64()?;
+    let count = body.get("count")?.as_u64()?;
+    let offset = body.get("offset")?.as_u64()?;
+    Some(format!(
+        "Accounts {first} to {next} of {count}. For the next ones, call snob_list again with \
+         the same arguments, no confirmation, and \"offset\": {next}; a later page is handed \
+         back from what was already read, and sends nothing and asks nothing.",
+        first = offset + 1,
+    ))
 }
 
 /// The last few lines of what a command said, which is where its sentence
@@ -143,7 +250,173 @@ mod tests {
             ask: None,
             answers,
             spends: crate::commands::mcp::tools::Spends::Nothing,
+            page: None,
         }
+    }
+
+    /// A list's plan, for the page at `offset`.
+    fn list_at(offset: usize) -> Plan {
+        Plan {
+            page: Some(crate::commands::mcp::tools::Page {
+                offset,
+                of: "the call".into(),
+                held_only: false,
+            }),
+            ..plan(&[ExitCode::Ok])
+        }
+    }
+
+    /// `n` accounts, as a list command prints them.
+    fn accounts(n: usize) -> Value {
+        Value::Array(
+            (0..n)
+                .map(|n| json!({"pk": n, "username": format!("user{n}")}))
+                .collect(),
+        )
+    }
+
+    fn usernames(body: &Value) -> Vec<String> {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["username"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_long_list_is_handed_back_a_page_at_a_time() {
+        let mut read = Vec::new();
+        let mut offset = 0;
+        let mut kept = None;
+        loop {
+            let told = from(
+                &list_at(offset),
+                finished(ExitCode::Ok, Some(accounts(450)), None),
+            );
+            assert!(!told.failed);
+            assert_eq!(told.body["count"], 450, "the whole list's");
+            assert_eq!(told.body["offset"], offset);
+            let page = usernames(&told.body);
+            assert!(page.len() <= PAGE);
+            read.extend(page);
+            if let Some(whole) = told.whole {
+                // What the server holds pages the same as the command did.
+                assert_eq!(held(&whole, offset).body, told.body);
+                kept = Some(whole);
+            }
+            match told.body["next_offset"].as_u64() {
+                Some(next) => {
+                    assert!(
+                        next_page(&told.body)
+                            .unwrap()
+                            .contains(&format!("\"offset\": {next}"))
+                    );
+                    offset = usize::try_from(next).unwrap();
+                }
+                None => break,
+            }
+        }
+        let every: Vec<String> = (0..450).map(|n| format!("user{n}")).collect();
+        assert_eq!(read, every, "each account once, in the order served");
+        assert_eq!(kept.unwrap().len(), 450);
+    }
+
+    #[test]
+    fn the_last_page_has_no_next_offset() {
+        let told = from(
+            &list_at(400),
+            finished(ExitCode::Ok, Some(accounts(450)), None),
+        );
+        assert_eq!(usernames(&told.body).len(), 50);
+        assert!(told.body["next_offset"].is_null());
+        assert!(next_page(&told.body).is_none());
+        assert!(told.whole.is_none(), "nothing after it to hold for");
+
+        // A list that fits on one page is the same shape, and held for nothing.
+        let short = from(&list_at(0), finished(ExitCode::Ok, Some(accounts(3)), None));
+        assert_eq!(short.body["count"], 3);
+        assert!(short.body["next_offset"].is_null());
+        assert!(short.whole.is_none());
+    }
+
+    #[test]
+    fn an_offset_past_the_end_is_an_empty_page() {
+        for offset in [450, 451, usize::MAX] {
+            let told = from(
+                &list_at(offset),
+                finished(ExitCode::Ok, Some(accounts(450)), None),
+            );
+            assert!(!told.failed, "{offset}");
+            assert_eq!(told.body["items"], json!([]), "{offset}");
+            assert_eq!(told.body["count"], 450, "{offset}");
+            assert!(told.body["next_offset"].is_null(), "{offset}");
+            assert_eq!(held(&[], offset).body["items"], json!([]), "{offset}");
+        }
+    }
+
+    #[test]
+    fn a_page_of_long_accounts_is_cut_by_its_size_and_still_moves_on() {
+        let long = |n: usize, length: usize| {
+            Value::Array(
+                (0..n)
+                    .map(|n| json!({"pk": n, "pfp_url": "x".repeat(length)}))
+                    .collect(),
+            )
+        };
+        let told = from(
+            &list_at(0),
+            finished(ExitCode::Ok, Some(long(300, 400)), None),
+        );
+        let shown = told.body["items"].as_array().unwrap().len();
+        assert!(shown < PAGE, "{shown}");
+        let bytes: usize = told.body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.to_string().len())
+            .sum();
+        assert!(bytes <= PAGE_BYTES, "{bytes}");
+        assert_eq!(told.body["next_offset"], shown);
+
+        // One account past the size on its own is a page of one, not none.
+        let huge = from(
+            &list_at(0),
+            finished(ExitCode::Ok, Some(long(2, PAGE_BYTES)), None),
+        );
+        assert_eq!(huge.body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(huge.body["next_offset"], 1);
+    }
+
+    #[test]
+    fn what_a_walk_stopped_short_read_is_one_page_with_none_after_it() {
+        let told = from(
+            &list_at(0),
+            finished(
+                ExitCode::Interrupted,
+                Some(accounts(450)),
+                Some(json!({"error": {"code": "interrupted"}})),
+            ),
+        );
+        assert!(told.failed);
+        let partial = &told.body["error"]["partial"];
+        assert_eq!(partial["count"], 450);
+        assert_eq!(usernames(partial).len(), PAGE);
+        assert!(partial["next_offset"].is_null());
+        assert!(told.whole.is_none());
+        assert!(next_page(&told.body).is_none());
+    }
+
+    #[test]
+    fn a_list_from_a_call_that_takes_no_offset_offers_no_next_page() {
+        let told = from(
+            &plan(&[ExitCode::Ok]),
+            finished(ExitCode::Ok, Some(accounts(450)), None),
+        );
+        assert_eq!(told.body["count"], 450);
+        assert_eq!(usernames(&told.body).len(), PAGE);
+        assert!(told.body["next_offset"].is_null());
+        assert!(told.whole.is_none());
     }
 
     fn finished(code: ExitCode, json: Option<Value>, error: Option<Value>) -> Finished {
@@ -241,7 +514,7 @@ mod tests {
             );
             assert!(told.failed, "{error}");
             assert_eq!(told.body["error"]["code"], "error", "{error}");
-            assert!(told.body["error"]["partial"].is_array(), "{error}");
+            assert!(told.body["error"]["partial"]["items"].is_array(), "{error}");
         }
         let told = from(
             &plan(&[ExitCode::Ok]),

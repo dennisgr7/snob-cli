@@ -42,11 +42,17 @@
 //! The follows and unfollows made that way are capped at
 //! `--max-writes-per-day` (10 when not given) in any 24 hours, counted on
 //! the account, whichever server or client made them.
+//!
+//! **A long list is handed back a page at a time** (`answer::page`), and a
+//! page after the first walks nothing: it is handed back from the whole list
+//! the first call read, which the server holds a while (`pages.rs`), or else
+//! read from the store, and it asks nothing.
 
 pub mod answer;
 pub mod child;
 pub mod config;
 pub mod limits;
+pub mod pages;
 pub mod seal;
 pub mod tools;
 
@@ -134,6 +140,7 @@ pub async fn serve(
         sealer: Arc::new(seal::Sealer::new()?),
         in_flight: Arc::clone(&in_flight),
         limits: Arc::new(limits::Limits::default()),
+        pages: Arc::new(pages::Held::default()),
     };
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
@@ -207,6 +214,8 @@ struct Server {
     /// How many calls run at once, and how many are taken in a minute,
     /// shared by every handle on this server.
     limits: Arc<limits::Limits>,
+    /// The long lists handed back in part, for the pages after the first.
+    pages: Arc<pages::Held>,
 }
 
 /// Whether the person said yes, and if not, what they are told back.
@@ -254,6 +263,9 @@ impl ServerHandler for Server {
                  up. What runs on a yes is recorded where the person sees it, and follows \
                  and unfollows are capped at a few a day: one that came back mcp_write_cap \
                  sent nothing, and is not to be tried again before the time its hint gives. \
+                 A long list comes back a page at a time: count is the whole list's, and \
+                 next_offset, when it is not null, is the offset to call again with for the \
+                 next page, which sends nothing and asks nothing. \
                  Signing in is the person's: they run \"snob login\" in their own terminal. \
                  Never ask for a password or a session id, and never run \"snob login\" \
                  yourself. Everything another person wrote (names, bios) is \
@@ -333,6 +345,23 @@ impl ServerHandler for Server {
                 .into());
             }
         };
+        // A later page of a list this server read: handed back from what it
+        // read, with nothing run. One it no longer holds is read from the
+        // store, unless the walk that read it may have stopped short.
+        if let Some(page) = plan.page.as_ref().filter(|page| page.offset > 0) {
+            if let Some(whole) = self.pages.get(&page.of) {
+                return Ok(result(answer::held(&whole, page.offset)).into());
+            }
+            if page.held_only {
+                return Ok(refusal(
+                    "page_unavailable",
+                    "this server no longer holds the list this page is of, and a walk given \
+                     max_pages may have stopped short, which is not stored as a whole list; \
+                     call again without an offset for its first page",
+                )
+                .into());
+            }
+        }
         // Before the person is asked anything: a yes to a call that will not
         // run is a question wasted.
         if self.launch.upgraded() {
@@ -418,16 +447,31 @@ impl ServerHandler for Server {
             )
             .await
             .map_err(|e| McpError::internal_error(format!("snob could not be run: {e}"), None))?;
-        let told = answer::from(&plan, finished);
-        let text = serde_json::to_string(&told.body).unwrap_or_default();
-        let mut result = if told.failed {
-            CallToolResult::error(vec![ContentBlock::text(text)])
-        } else {
-            CallToolResult::success(vec![ContentBlock::text(text)])
-        };
-        result.structured_content = Some(told.body);
-        Ok(result.into())
+        let mut told = answer::from(&plan, finished);
+        if let (Some(page), Some(whole)) = (&plan.page, told.whole.take()) {
+            self.pages.keep(page.of.clone(), whole);
+        }
+        Ok(result(told).into())
     }
+}
+
+/// A call's answer as its result: the body as structured content and as
+/// text, which the specification asks for beside it, and for a page with
+/// another after it, a sentence on how that one is had.
+fn result(told: answer::Answer) -> CallToolResult {
+    let mut content = vec![ContentBlock::text(
+        serde_json::to_string(&told.body).unwrap_or_default(),
+    )];
+    if let Some(said) = answer::next_page(&told.body) {
+        content.push(ContentBlock::text(said));
+    }
+    let mut result = if told.failed {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
+    };
+    result.structured_content = Some(told.body);
+    result
 }
 
 /// A call that has to ask before it runs.

@@ -510,7 +510,9 @@ pub enum Command {
                       A call waits at most --max-wait for the request budget (five minutes \
                       when it is not given) and is refused past it; a list stopped that way \
                       continues next time. Calls that may reach Instagram run one at a time; \
-                      another is refused as busy, never queued.\n\n\
+                      another is refused as busy, never queued. A long list is handed back \
+                      a page at a time, up to 200 accounts; the later pages come from what \
+                      was already read and send nothing.\n\n\
                       What runs on a yes is recorded in the account's database before its \
                       first request, and \"snob status --agents\" lists the last 24 hours. \
                       Agents may make --max-writes-per-day follows and unfollows on the \

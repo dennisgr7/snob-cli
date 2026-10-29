@@ -128,7 +128,9 @@ can read:
   yours or the agent's, so keep the writes on "ask" in the client's tool
   permissions. Each call runs one snob command, under the same budget and
   cooldown as the terminal. Calls run a few at a time, and only one that
-  can reach Instagram: another comes back busy rather than waiting.
+  can reach Instagram: another comes back busy rather than waiting. A long
+  list comes back a page at a time (up to 200 accounts), and the later pages
+  are handed back from what was already read, sending nothing.
   `snob status --agents` lists what agents were told yes to in the last 24
   hours, and agents may make at most ten follows and unfollows a day on the
   account (`--max-writes-per-day` to change it, up to 99); what you type in a

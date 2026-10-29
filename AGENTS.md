@@ -420,6 +420,25 @@ writes it.
   bucket allows in a day anyway (99, `rate_budget::WRITES_IN_A_DAY`).
   `snob status` (section `--agents`, `agents` in `--json`) lists the last
   day's acts: when, what, how the yes was given and through which client.
+- **A long list comes back a page at a time** (`answer::page`): at most 200
+  accounts (`answer::PAGE`) and 30,000 bytes of compact JSON
+  (`answer::PAGE_BYTES`, as a page of accounts with a picture's address is
+  some 65), since the result goes into the model's context twice (structured
+  and as text) and clients cut long ones (Claude Code at 25,000 tokens, as
+  quoted). `{count, offset, items, next_offset}`, `count` the whole list's;
+  a failure's `partial` is one page with no `next_offset`, since what a walk
+  stopped short read is not stored as a whole list. The client's `offset` is
+  sliced with `get`, never indexed. **A page past the first never walks**:
+  `offset` stays out of `Plan.args` (and the binding), and the call is
+  planned as the same list read with `--offline`, which asks nothing and
+  spends nothing (`tools::Page`); `offset` with `mode: "refresh"` or
+  `dry_run` is `invalid_arguments`. It is handed back from the whole list
+  the server holds from the call that read it (`commands/mcp/pages.rs`: in
+  memory, 4 lists, 30 min, 16 MiB), since the store would not always serve
+  the same list: a walk cut by `max_pages` is not a whole one, and a
+  crossing checked against Instagram on the first page is refused offline
+  when its lists were walked far apart. Not held, the page is read from the
+  store; for a call given `max_pages`, it is refused as `page_unavailable`.
 - A heartbeat (`notifications/progress`) is sent from the call's own task
   and awaited, never spawned, so none can reach the client after the result.
 - **Upgrades.** `snob mcp config` prints a path that outlives one
