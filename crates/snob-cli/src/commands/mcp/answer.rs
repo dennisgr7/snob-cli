@@ -20,6 +20,17 @@ pub struct Answer {
     pub body: Value,
 }
 
+/// What an agent is told when there is no session to act with.
+///
+/// **It replaces the command's own hint** (`run "snob login"`), which is
+/// advice to the person at the terminal: read by a model, it is an invitation
+/// to run `login` itself, which no tool offers and which needs the password
+/// or a browser window only the person has. The server's instructions
+/// (`mod.rs`, `get_info`) say the same, so a model that skipped one still
+/// reads the other.
+pub const SIGN_IN: &str = "the person signs in with \"snob login\" in their own terminal; \
+                           never ask them for a password or a session id";
+
 /// Reads a finished child against what its plan counts as an answer.
 pub fn from(plan: &Plan, finished: Finished) -> Answer {
     let exit = finished.code;
@@ -60,6 +71,9 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
         if let Some(partial) = finished.json {
             failure["partial"] = partial;
         }
+        if exit == ExitCode::NoSession {
+            failure["hint"] = json!(SIGN_IN);
+        }
         return Answer {
             failed: true,
             body: cleaned(json!({ "exit": exit.as_str(), "error": failure })),
@@ -67,6 +81,17 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
     };
     if exit != ExitCode::Ok {
         body["exit"] = json!(exit.as_str());
+    }
+    if exit == ExitCode::NoSession {
+        // `status` puts its error object beside the sections it could not
+        // fill; the hint goes in it when it is an object, and beside it
+        // otherwise, never by indexing into what is not known to be one.
+        match body.get_mut("error").and_then(Value::as_object_mut) {
+            Some(error) => {
+                error.insert("hint".into(), json!(SIGN_IN));
+            }
+            None => body["hint"] = json!(SIGN_IN),
+        }
     }
     Answer {
         failed: false,
@@ -201,6 +226,56 @@ mod tests {
             assert_eq!(told.body["value"], cleaned(document.clone()));
             assert_eq!(told.body["exit"], "rate_limited", "{document}");
         }
+    }
+
+    #[test]
+    fn no_session_tells_the_agent_that_the_person_signs_in() {
+        // `status --json` with no session: an answer, its error object given
+        // the hint in place of the one meant for a person.
+        let status = from(
+            &plan(&[ExitCode::Ok, ExitCode::NoSession, ExitCode::RateLimited]),
+            finished(
+                ExitCode::NoSession,
+                Some(json!({
+                    "session": null,
+                    "error": {"code": "no_session", "message": "no session is stored"},
+                    "viewer": null,
+                })),
+                None,
+            ),
+        );
+        assert!(!status.failed);
+        assert_eq!(status.body["exit"], "no_session");
+        assert_eq!(status.body["error"]["hint"], SIGN_IN);
+        assert_eq!(status.body["error"]["message"], "no session is stored");
+
+        // A document with no error object is given the hint beside it.
+        let bare = from(
+            &plan(&[ExitCode::Ok, ExitCode::NoSession]),
+            finished(ExitCode::NoSession, Some(json!({"error": "x"})), None),
+        );
+        assert_eq!(bare.body["hint"], SIGN_IN);
+        assert_eq!(bare.body["error"], "x");
+
+        // Any other call without a session fails, with the same hint over the
+        // command's own.
+        let list = from(
+            &plan(&[ExitCode::Ok]),
+            finished(
+                ExitCode::NoSession,
+                None,
+                Some(json!({"error": {"code": "no_session", "hint": "run \"snob login\""}})),
+            ),
+        );
+        assert!(list.failed);
+        assert_eq!(list.body["error"]["hint"], SIGN_IN);
+
+        // And nothing else is given it.
+        let throttled = from(
+            &plan(&[ExitCode::Ok, ExitCode::RateLimited]),
+            finished(ExitCode::RateLimited, Some(json!({"cooldown": {}})), None),
+        );
+        assert!(throttled.body.get("hint").is_none());
     }
 
     #[test]

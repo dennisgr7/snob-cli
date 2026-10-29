@@ -332,6 +332,11 @@ writes it.
   cannot ask cannot make those calls. Not offered, ever: `login`, `logout`,
   `purge`, the monitor, `--same-day`, downloads (outside the request budget),
   any flag that writes a file.
+- **Signing in is the person's.** The server's instructions say so, and
+  every answer that comes of having no session carries a hint that the
+  person runs `snob login` in their own terminal, in place of the command's
+  own (`answer::SIGN_IN`). `snob_status` with no session is an answer, not a
+  failure: exit 3 is what it was asked, as exit 5 is in a cooldown.
 - Arguments are checked, not passed through: an `account` must be a possible
   username, so it can never be read as a flag, and an unknown argument is
   refused rather than ignored. A tool that is not listed (the writes without

@@ -187,7 +187,8 @@ pub struct Plan {
     /// The question the person has to answer yes to first, if any.
     pub ask: Option<String>,
     /// The exit codes that are an answer rather than a failure: `status`
-    /// exits 5 while the account cools down, and that is what it was asked.
+    /// exits 5 while the account cools down and 3 with no session stored,
+    /// and each is what it was asked.
     pub answers: &'static [ExitCode],
 }
 
@@ -222,7 +223,11 @@ pub fn plan(name: &str, args: &Map<String, Value>, writes: bool) -> Result<Plan,
             Ok(Plan {
                 args: vec!["status".into(), "--json".into()],
                 ask: None,
-                answers: &[ExitCode::Ok, ExitCode::RateLimited],
+                // Having no session is an answer as well: `status --json`
+                // prints its document and exits 3, and an agent told that
+                // as a failure retries a call that had nothing wrong with
+                // it, rather than telling the person to sign in.
+                answers: &[ExitCode::Ok, ExitCode::NoSession, ExitCode::RateLimited],
             })
         }
         "snob_list" => Ok(list(args)?),
@@ -487,5 +492,14 @@ mod tests {
     fn status_in_cooldown_is_an_answer() {
         let status = call("snob_status", json!({})).unwrap();
         assert!(status.answers.contains(&ExitCode::RateLimited));
+    }
+
+    #[test]
+    fn status_without_a_session_is_an_answer() {
+        let status = call("snob_status", json!({})).unwrap();
+        assert!(status.answers.contains(&ExitCode::NoSession));
+        // Only `status`: a list asked for with no session did fail.
+        let list = call("snob_list", json!({"list": "followers"})).unwrap();
+        assert!(!list.answers.contains(&ExitCode::NoSession));
     }
 }

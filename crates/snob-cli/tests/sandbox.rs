@@ -3907,6 +3907,43 @@ async fn the_mcp_server_runs_the_commands_and_refuses_what_it_cannot_confirm() {
     assert!(client.child.id().is_some(), "the server is still up");
 }
 
+/// With nobody signed in, `snob_status` still answers (that is what it was
+/// asked), and every answer that comes of having no session tells the agent
+/// that signing in is the person's, in their own terminal.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_status_without_a_session_is_an_answer_with_a_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let hello = client.ask("tools/list", serde_json::json!({})).await;
+    assert!(hello["result"]["tools"].is_array(), "{hello}");
+
+    let status = client.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(status["isError"], false, "{status}");
+    let told = &status["structuredContent"];
+    assert_eq!(told["exit"], "no_session", "{status}");
+    assert_eq!(told["error"]["code"], "no_session", "{status}");
+    let hint = told["error"]["hint"].as_str().expect("a hint");
+    assert!(
+        hint.contains("snob login") && hint.contains("their own terminal"),
+        "{hint}"
+    );
+
+    // A list asked for with no session is a failure, with the same hint in
+    // place of the one meant for a person at the terminal.
+    let followers = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(followers["isError"], true, "{followers}");
+    assert_eq!(
+        followers["structuredContent"]["error"]["hint"], told["error"]["hint"],
+        "{followers}"
+    );
+    assert!(posted(&instagram).await.is_empty(), "nothing was sent");
+}
+
 /// On 2025-11-25 the yes is asked with `elicitation/create` while the call
 /// waits: no is nothing run, yes is the command run with `-y`.
 #[cfg(feature = "mcp")]
