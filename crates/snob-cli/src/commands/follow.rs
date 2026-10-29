@@ -18,6 +18,10 @@
 //! the question is asked before the request, and `-y` is how a script answers it
 //! in advance.
 //!
+//! A run an agent was told yes to through `snob mcp` (`--confirmed-via`) is
+//! recorded before its first request, and refused with nothing sent once the
+//! day's writes made that way reach the cap (`common::record_agent_act`).
+//!
 //! `--json` prints one object on standard output for every way the run ends
 //! (done, already so, declined), so a program never has to read the sentence;
 //! the failures are the JSON error `main` prints when `--json` was asked for.
@@ -65,7 +69,7 @@ pub async fn run(
     // budget for a quarter of an hour (from the browser, before the profile
     // is loaded), which is a wait to be told about in a sentence rather than
     // animated.
-    let app = common::app(&secrets, paths, false)?;
+    let mut app = common::app(&secrets, paths, false)?;
 
     // **Before anything is spent.** A session cannot write only when requests
     // are sent directly (SNOB_NO_BROWSER) and it was pasted without
@@ -108,11 +112,29 @@ pub async fn run(
         ));
     }
 
+    // **Before the first request**, for a run an agent was told yes to
+    // through `snob mcp`: recorded where the person sees it, and refused with
+    // nothing sent past the day's cap on an agent's writes. An attempt that
+    // then finds nothing to do, or is refused by Instagram, still counts.
+    let act = common::record_agent_act(
+        &mut app,
+        &args.agent,
+        verb.present(),
+        Some(&args.target),
+        args.mcp_write_cap,
+    )?;
+
     let known = target::known_pk(&app, &args.target)?;
     let profile = app
         .client()
         .profile_named(target::clean(&args.target), known)
         .await?;
+    if let Some(id) = act
+        && let Err(e) = snob_store::store::mcp_acts::resolved(app.db().conn(), id, profile.id)
+    {
+        // The act stays recorded by the name it was asked about.
+        tracing::debug!(error = %e, "the account an act was about could not be stored");
+    }
 
     // Instagram spells the name; the user typed a spelling of it. Everything
     // from here on uses Instagram's, filtered, because it is going to a

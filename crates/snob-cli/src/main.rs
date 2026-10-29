@@ -275,7 +275,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     std::env::current_exe()?,
                     mcp_globals(&cli, Some(commands::mcp::MAX_WAIT))?,
                 );
-                commands::mcp::serve(launch, args.allow_writes, args.confirm_in_chat).await
+                commands::mcp::serve(
+                    launch,
+                    args.allow_writes,
+                    args.confirm_in_chat,
+                    args.max_writes_per_day,
+                )
+                .await
             }
         };
     }

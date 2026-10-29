@@ -39,6 +39,13 @@ pub async fn run(
     let (filter, destination, browses) = common::prepare(&args.filter, &args.output, &args.browse)?;
 
     let mut app = common::open(&args.walk, &store.session_of(paths), paths)?;
+    common::record_agent_act(
+        &mut app,
+        &args.agent,
+        kind.as_str(),
+        args.target.as_deref(),
+        None,
+    )?;
     let walked = walk(
         &mut app,
         engine::ListQuery::from(&args),
@@ -294,6 +301,7 @@ mod tests {
                 consent: ConsentArgs { yes: true },
                 ..WalkArgs::default()
             },
+            agent: Default::default(),
         };
         let filter = Filter::default();
         let mut me = app_as(&server, 42, "me");

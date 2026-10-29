@@ -8,6 +8,7 @@
 
 pub mod accounts;
 pub mod deliveries;
+pub mod mcp_acts;
 mod migrations;
 pub mod rate_budget;
 pub mod shared;

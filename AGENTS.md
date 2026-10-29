@@ -294,11 +294,13 @@ with a documented reason in the same place.
   app name `snob-ig`): on Windows the Local, not Roaming, directory (WAL on a
   synced folder corrupts SQLite), created with a user-only DACL and
   `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED`. Per account under `accounts/<pk>/`;
-  `shared.db` for what accounts share; `accounts.toml` changed only through
-  `Registry::update` (file lock). `watch.toml` and `accounts.toml` are read
-  with serde and written from a hand-written template, tested to round-trip.
-  `snob status` and `--dry-run` write nothing. `snob purge` removes everything
-  but the binary.
+  `shared.db` for what accounts share; the account's database also keeps
+  what agents were told yes to through `snob mcp` (`mcp_acts`, a week of
+  rows, the last day shown by `snob status`); `accounts.toml` changed only
+  through `Registry::update` (file lock). `watch.toml` and `accounts.toml`
+  are read with serde and written from a hand-written template, tested to
+  round-trip. `snob status` and `--dry-run` write nothing. `snob purge`
+  removes everything but the binary.
 - **Migrations** (`snob-store/src/store/migrations.rs`): a published migration
   is never edited; add the next numbered file in `store/sql/` (and
   `store/sql/shared/` for `shared.db`). No `PRAGMA foreign_keys` inside a
@@ -397,6 +399,27 @@ writes it.
   the average across processes, but `STEP_MS` and `DWELL_MS` are waited per
   process, so two walks of one account interleave their requests and drain
   the burst at once. A command a person types takes no lock, for now.
+- **A record of every yes, and a cap on an agent's writes**
+  (`snob_store::store::mcp_acts`). Since nobody can prove who said yes, the
+  person sees what was done in their name and the volume stays human. A call
+  run on a yes gets the hidden `--confirmed-via form|elicitation|chat` and
+  `--confirmed-for=<client>` (the client's `name version`, from the request's
+  `_meta` or the handshake, through `printable`, cut to `[A-Za-z0-9 ._/-]`
+  and 64 characters; `tools::client_label`), and a write also
+  `--mcp-write-cap=<N>`, all after the binding is taken
+  (`tools::Plan::command_line`). The child records the act in the account's
+  `mcp_acts` table before its first request, in a transaction of its own
+  (`commands::common::record_agent_act`); a follow or unfollow is refused
+  with nothing sent and nothing recorded when the writes recorded in the
+  last 24 hours reach the cap: exit 1, `reason: "mcp_write_cap"`, a hint
+  with when the next frees. Attempts count (one Instagram refused, or that
+  found nothing to do, still did). Only follow and unfollow are writes, only
+  acts recorded this way are counted, on the account whichever server made
+  them; a command the person types records nothing. `--max-writes-per-day`
+  (10 by default, `mcp_acts::WRITES_A_DAY`) is bounded by what the write
+  bucket allows in a day anyway (99, `rate_budget::WRITES_IN_A_DAY`).
+  `snob status` (section `--agents`, `agents` in `--json`) lists the last
+  day's acts: when, what, how the yes was given and through which client.
 - A heartbeat (`notifications/progress`) is sent from the call's own task
   and awaited, never spawned, so none can reach the client after the result.
 - **Upgrades.** `snob mcp config` prints a path that outlives one
@@ -424,7 +447,7 @@ writes it.
 - When the result would have been JSON, a failure is also one JSON object on
   the last line of standard error (`main::wording_for`); its `code` is the
   exit's token, and `reason` a finer one when there is one
-  (`ExitError::with_reason`, e.g. `busy`).
+  (`ExitError::with_reason`, e.g. `busy`, `mcp_write_cap`).
 - **Exit codes are stable** (`exit.rs`, `snob_core::watch::RunOutcome`, the
   `watch_runs.outcome` column and the `--json` `outcome` field share one
   vocabulary): 0 worked (a list cut short by `--limit`/`--max-pages` is still

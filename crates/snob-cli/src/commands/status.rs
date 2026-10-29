@@ -23,7 +23,7 @@ use snob_store::registry::Registry;
 use snob_store::secrets::SecretStore;
 use snob_store::store::rate_budget::{self, BucketState, BudgetState};
 use snob_store::store::shared::Shared;
-use snob_store::store::{Store, accounts, snapshots, users, watch as watch_store};
+use snob_store::store::{Store, accounts, mcp_acts, snapshots, users, watch as watch_store};
 
 use crate::cli::{StatusArgs, StatusSections};
 use crate::exit::ExitCode;
@@ -104,6 +104,14 @@ pub fn run(
         }
     }
 
+    // What agents were told yes to, through `snob mcp`: the day the cap on
+    // their writes counts.
+    let acts = if sections.agents {
+        mcp_acts::last_day(store.conn(), now)?
+    } else {
+        Vec::new()
+    };
+
     let found = Found {
         sections,
         session: &session,
@@ -113,6 +121,7 @@ pub fn run(
         braked: &braked,
         lists: &lists,
         runs: &runs,
+        acts: &acts,
         now,
     };
     if args.output.json {
@@ -178,6 +187,7 @@ struct Found<'a> {
     braked: &'a [String],
     lists: &'a [Stored],
     runs: &'a [(watch_store::Run, Option<String>)],
+    acts: &'a [mcp_acts::Act],
     now: EpochMs,
 }
 
@@ -276,6 +286,32 @@ impl Found<'_> {
                 })
                 .collect();
             out.insert("watch".into(), json!({ "last_runs": runs }));
+        }
+        if self.sections.agents {
+            // The name is the one the agent's call gave, as the server
+            // checked it, and the client is the server's reduction of what
+            // the client said; both through `printable` all the same.
+            let acts: Vec<Value> = self
+                .acts
+                .iter()
+                .map(|act| {
+                    json!({
+                        "at": act.at.to_epoch(),
+                        "action": act.action,
+                        "write": act.is_write(),
+                        "target": {
+                            "pk": act.target_pk,
+                            "username": act.target_name.as_deref().map(printable),
+                        },
+                        "via": act.via,
+                        "client": act.client.as_deref().map(printable),
+                    })
+                })
+                .collect();
+            out.insert(
+                "agents".into(),
+                json!({ "writes": self.agent_writes(), "acts": acts }),
+            );
         }
         Value::Object(out)
     }
@@ -449,11 +485,37 @@ impl Found<'_> {
             }
             blocks.push(lines);
         }
+        if self.sections.agents {
+            let mut lines = vec!["Agents".to_string()];
+            if self.acts.is_empty() {
+                lines.push(
+                    "  Told yes to nothing through snob mcp in the last 24 hours".to_string(),
+                );
+            } else {
+                lines.push(row(
+                    "Writes",
+                    &format!("{} in the last 24 hours", self.agent_writes()),
+                ));
+            }
+            for act in self.acts {
+                lines.push(format!(
+                    "  {}  {}",
+                    report::stored_on(act.at.to_epoch()),
+                    told_yes(act)
+                ));
+            }
+            blocks.push(lines);
+        }
         blocks
             .iter()
             .map(|block| block.join("\n"))
             .collect::<Vec<_>>()
             .join("\n\n")
+    }
+
+    /// How many of the acts were follows or unfollows: what the cap counts.
+    fn agent_writes(&self) -> usize {
+        self.acts.iter().filter(|act| act.is_write()).count()
     }
 
     /// When a spent bucket lets the next one through, said after its count.
@@ -475,6 +537,29 @@ impl Found<'_> {
     }
 }
 
+/// One act an agent was told yes to, as a line: what, how the yes was
+/// given, and through which client.
+fn told_yes(act: &mcp_acts::Act) -> String {
+    let who = act
+        .target_name
+        .as_deref()
+        .map(|name| format!("@{}", printable(name)));
+    let what = match (act.action.as_str(), &who) {
+        (verb @ ("follow" | "unfollow"), Some(who)) => format!("{verb} {who}"),
+        (list, Some(who)) => format!("read {who}'s {}", printable(list)),
+        (list, None) => format!("read your {}", printable(list)),
+    };
+    let how = match act.via.as_str() {
+        "form" | "elicitation" => "yes given in a form".to_string(),
+        "chat" => "yes given in the chat".to_string(),
+        other => format!("yes given by {}", printable(other)),
+    };
+    match &act.client {
+        Some(client) => format!("{what}, {how}, through {}", printable(client)),
+        None => format!("{what}, {how}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,10 +578,10 @@ mod tests {
     #[test]
     fn the_sections_are_all_of_them_or_the_ones_named() {
         let all = args(&[]).sections();
-        assert!(all.session && all.budget && all.cooldown && all.lists && all.watch);
+        assert!(all.session && all.budget && all.cooldown && all.lists && all.watch && all.agents);
         let some = args(&["--budget", "--cooldown"]).sections();
         assert!(some.budget && some.cooldown);
-        assert!(!some.session && !some.lists && !some.watch);
+        assert!(!some.session && !some.lists && !some.watch && !some.agents);
     }
 
     /// The JSON carries only what was asked for.
@@ -520,6 +605,7 @@ mod tests {
             braked: &[],
             lists: &[],
             runs: &[],
+            acts: &[],
             now,
         };
         let out = found.json();
@@ -532,5 +618,67 @@ mod tests {
         );
         assert_eq!(out["budget"]["accounts_left"], 2_000);
         assert!(found.text().starts_with("Budget"));
+    }
+
+    #[test]
+    fn what_an_agent_was_told_yes_to_is_said_in_a_line_and_in_the_json() {
+        let now = snob_core::clock::now_ms();
+        let act =
+            |action: &str, target: Option<&str>, via: &str, client: Option<&str>| mcp_acts::Act {
+                at: now,
+                action: action.into(),
+                target_pk: None,
+                target_name: target.map(str::to_string),
+                via: via.into(),
+                client: client.map(str::to_string),
+            };
+        let acts = [
+            act("unfollow", Some("someone"), "chat", Some("test 0")),
+            act("followers", Some("other"), "form", None),
+            act("fans", None, "elicitation", Some("x")),
+        ];
+        assert_eq!(
+            told_yes(&acts[0]),
+            "unfollow @someone, yes given in the chat, through test 0"
+        );
+        assert_eq!(
+            told_yes(&acts[1]),
+            "read @other's followers, yes given in a form"
+        );
+        assert_eq!(
+            told_yes(&acts[2]),
+            "read your fans, yes given in a form, through x"
+        );
+
+        let session = snob_core::session::Session::from_sessionid(
+            "42%3AAbCdEfGh%3A20",
+            "Mozilla/5.0",
+            snob_core::session::SessionOrigin::Paste,
+        )
+        .unwrap();
+        let store = Store::in_memory().unwrap();
+        let budget = rate_budget::state(store.conn(), None, now).unwrap();
+        let found = Found {
+            sections: args(&["--agents"]).sections(),
+            session: &session,
+            storage: "file",
+            budget: &budget,
+            held: None,
+            braked: &[],
+            lists: &[],
+            runs: &[],
+            acts: &acts,
+            now,
+        };
+        let out = found.json();
+        assert_eq!(out["agents"]["writes"], 1);
+        assert_eq!(out["agents"]["acts"][0]["action"], "unfollow");
+        assert_eq!(out["agents"]["acts"][0]["write"], true);
+        assert_eq!(out["agents"]["acts"][0]["target"]["username"], "someone");
+        assert_eq!(out["agents"]["acts"][0]["via"], "chat");
+        assert_eq!(out["agents"]["acts"][1]["client"], Value::Null);
+        let text = found.text();
+        assert!(text.starts_with("Agents\n"), "{text}");
+        assert!(text.contains("1 in the last 24 hours"), "{text}");
     }
 }

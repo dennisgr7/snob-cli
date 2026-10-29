@@ -60,6 +60,10 @@ pub fn run(
         server_args.push("--confirm-in-chat".into());
         server_args.push(chat_flag(what));
     }
+    if let Some(writes) = args.max_writes_per_day {
+        server_args.push("--max-writes-per-day".into());
+        server_args.push(writes.to_string());
+    }
 
     let within = super::longest_call(max_wait);
     let (snippet, whereto) = render(args.client, &exe, &server_args, within);

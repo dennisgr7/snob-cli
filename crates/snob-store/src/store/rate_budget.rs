@@ -143,6 +143,12 @@ const WRITE_EMISSION_MS: i64 = 900_000;
 /// this budget is sized for.
 const WRITE_BURST_MS: i64 = WRITE_EMISSION_MS * 2;
 
+/// About the most writes the write bucket lets through in any 24 hours: the
+/// burst of three, then one every [`WRITE_EMISSION_MS`] for the rest of the
+/// day, 99. A cap on writes counted elsewhere (`mcp_acts`) past this would
+/// promise nothing the bucket does not already stop.
+pub const WRITES_IN_A_DAY: u32 = (DAY_MS / WRITE_EMISSION_MS) as u32 + 3;
+
 /// Slack before deciding the system clock has gone backwards.
 const CLOCK_SKEW_TOLERANCE_MS: i64 = 5_000;
 

@@ -87,7 +87,7 @@ snob fetch <cdn-address>         # one file by its address, no account needed
 snob follow someone
 snob unfollow someone
 snob watch                       # keep watching on a schedule, report changes
-snob status                      # budget left, cooldown, stored lists; sends nothing
+snob status                      # budget left, cooldown, stored lists, agents; sends nothing
 ```
 
 On a terminal most commands open a full-screen view you move through with the
@@ -129,6 +129,10 @@ can read:
   permissions. Each call runs one snob command, under the same budget and
   cooldown as the terminal. Calls run a few at a time, and only one that
   can reach Instagram: another comes back busy rather than waiting.
+  `snob status --agents` lists what agents were told yes to in the last 24
+  hours, and agents may make at most ten follows and unfollows a day on the
+  account (`--max-writes-per-day` to change it, up to 99); what you type in a
+  terminal is not counted.
   `snob mcp config claude-code` (or `claude-desktop`, `codex`, `cursor`,
   `vscode`) prints what to add to that client's configuration. After
   upgrading snob, reconnect the server in the client: a server whose binary

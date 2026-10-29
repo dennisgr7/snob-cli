@@ -66,6 +66,7 @@ pub fn args() -> ListArgs {
             consent: ConsentArgs { yes: true },
             ..WalkArgs::default()
         },
+        agent: Default::default(),
     }
 }
 

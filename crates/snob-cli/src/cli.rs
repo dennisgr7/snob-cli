@@ -300,13 +300,16 @@ pub enum Command {
     /// Show which account you are authenticated as
     Whoami(WhoamiArgs),
 
-    /// Where the account stands: session, request budget, cooldown, lists, monitor
+    /// Where the account stands: session, request budget, cooldown, lists, monitor, agents
     #[command(
         after_help = "Read from what is stored here; nothing is sent and nothing stored is \
                       changed, not even a database an older snob left, which is read as the \
                       current one without being migrated. With no section named, all of \
-                      them; --budget, --cooldown, --session, --lists and --watch narrow it \
-                      to those.\n\n\
+                      them; --budget, --cooldown, --session, --lists, --watch and --agents \
+                      narrow it to those. --agents is what agents were told yes to through \
+                      \"snob mcp\" in the last 24 hours: each follow, unfollow and walk of \
+                      another account's lists, how the yes was given and through which \
+                      client.\n\n\
                       It exits 5 while the account is in cooldown, whatever sections were \
                       asked for, so \"snob status --budget && snob scan\" runs the scan only \
                       when it may send; 3 with no session; 0 otherwise.\n\n\
@@ -508,6 +511,12 @@ pub enum Command {
                       when it is not given) and is refused past it; a list stopped that way \
                       continues next time. Calls that may reach Instagram run one at a time; \
                       another is refused as busy, never queued.\n\n\
+                      What runs on a yes is recorded in the account's database before its \
+                      first request, and \"snob status --agents\" lists the last 24 hours. \
+                      Agents may make --max-writes-per-day follows and unfollows on the \
+                      account in any 24 hours (ten when not given, at most 99), attempts \
+                      counted; past that the call is refused and nothing is sent. What you \
+                      type in a terminal is neither recorded nor counted.\n\n\
                       After upgrading snob, restart the server (reconnect it in the client): \
                       one whose binary changed under it refuses every call and runs nothing."
     )]
@@ -630,6 +639,10 @@ pub struct StatusArgs {
     #[arg(long)]
     pub watch: bool,
 
+    /// What agents were told yes to through snob mcp in the last 24 hours
+    #[arg(long)]
+    pub agents: bool,
+
     #[command(flatten)]
     pub output: StatusOutputArgs,
 }
@@ -642,6 +655,7 @@ pub struct StatusSections {
     pub cooldown: bool,
     pub lists: bool,
     pub watch: bool,
+    pub agents: bool,
 }
 
 impl StatusSections {
@@ -654,6 +668,7 @@ impl StatusSections {
             (self.cooldown, "cooldown"),
             (self.lists, "lists"),
             (self.watch, "watch"),
+            (self.agents, "agents"),
         ]
         .into_iter()
         .filter_map(|(shown, name)| shown.then_some(name))
@@ -670,8 +685,15 @@ impl StatusArgs {
             cooldown: self.cooldown,
             lists: self.lists,
             watch: self.watch,
+            agents: self.agents,
         };
-        if named.session || named.budget || named.cooldown || named.lists || named.watch {
+        if named.session
+            || named.budget
+            || named.cooldown
+            || named.lists
+            || named.watch
+            || named.agents
+        {
             named
         } else {
             StatusSections {
@@ -680,6 +702,7 @@ impl StatusArgs {
                 cooldown: true,
                 lists: true,
                 watch: true,
+                agents: true,
             }
         }
     }
@@ -762,6 +785,9 @@ pub struct ListArgs {
 
     #[command(flatten)]
     pub walk: WalkArgs,
+
+    #[command(flatten)]
+    pub agent: AgentArgs,
 }
 
 /// `snob scan`: [`ListArgs`] without `--limit`, because a summary of five
@@ -1586,6 +1612,69 @@ pub struct FollowArgs {
 
     #[command(flatten)]
     pub output: StatusOutputArgs,
+
+    #[command(flatten)]
+    pub agent: AgentArgs,
+
+    /// Refuse when this many writes confirmed through snob mcp were made
+    /// in the last 24 hours [default: 10]
+    // Hidden: plumbing for `snob mcp`, which passes its
+    // `--max-writes-per-day` here. Bounded by what the write bucket lets
+    // through in a day anyway, so no number given can promise more.
+    #[arg(
+        long,
+        hide = true,
+        requires = "confirmed_via",
+        value_name = "N",
+        value_parser = clap::value_parser!(u32)
+            .range(1..=i64::from(snob_store::store::mcp_acts::MOST_WRITES_A_DAY))
+    )]
+    pub mcp_write_cap: Option<u32>,
+}
+
+/// What a run of a command an agent was told yes to through `snob mcp`
+/// records about that yes (`snob_store::store::mcp_acts`), so that the person
+/// can see in `snob status` what was done in their name, and an agent's
+/// writes stay a few a day.
+///
+/// **Hidden: plumbing for `snob mcp`**, which adds them to a child's command
+/// line after the yes it obtained, and after what the yes is bound to was
+/// taken (`commands::mcp::tools::Plan::command_line`). A command a person
+/// types records nothing and counts toward no cap.
+#[derive(Args, Debug, Clone, Default)]
+pub struct AgentArgs {
+    /// How the yes this run is made on was given, through snob mcp
+    // Only with `-y`: the yes the server obtained is the one `-y` gives in
+    // advance, and a run that would still ask has nothing to record yet.
+    #[arg(long, value_enum, hide = true, requires = "yes", value_name = "HOW")]
+    pub confirmed_via: Option<ConfirmedVia>,
+
+    /// The client the yes came through, by its name and version
+    #[arg(long, hide = true, requires = "confirmed_via", value_name = "CLIENT")]
+    pub confirmed_for: Option<String>,
+}
+
+/// How `snob mcp` obtained a yes (`commands::mcp`, `consent`).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmedVia {
+    /// A form the client showed, answered in the call (2026-07-28 and later).
+    Form,
+    /// A form the client showed, asked with `elicitation/create` while the
+    /// call waited (the older revisions).
+    Elicitation,
+    /// A token the agent handed back after asking in the chat.
+    Chat,
+}
+
+impl ConfirmedVia {
+    /// The token stored and printed, which is also the flag's value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Form => "form",
+            Self::Elicitation => "elicitation",
+            Self::Chat => "chat",
+        }
+    }
 }
 
 /// `snob mcp`: serve, or print what a client needs to start it.
@@ -1611,6 +1700,18 @@ pub struct McpArgs {
     // would hide that the choice was never made.
     #[arg(long, value_enum, value_name = "WHAT")]
     pub confirm_in_chat: Option<ConfirmInChat>,
+
+    /// The follows and unfollows agents may make in any 24 hours on the
+    /// account, with --allow-writes [default: 10; at most 99, what the write
+    /// budget allows in a day anyway]
+    #[arg(
+        long,
+        requires = "allow_writes",
+        value_name = "N",
+        value_parser = clap::value_parser!(u32)
+            .range(1..=i64::from(snob_store::store::mcp_acts::MOST_WRITES_A_DAY))
+    )]
+    pub max_writes_per_day: Option<u32>,
 }
 
 /// What `snob mcp` takes a yes in the chat for (`commands::mcp`, `consent`).
@@ -1646,6 +1747,16 @@ pub struct McpConfigArgs {
     /// Start it with --confirm-in-chat
     #[arg(long, value_enum, value_name = "WHAT")]
     pub confirm_in_chat: Option<ConfirmInChat>,
+
+    /// Start it with --max-writes-per-day
+    #[arg(
+        long,
+        requires = "allow_writes",
+        value_name = "N",
+        value_parser = clap::value_parser!(u32)
+            .range(1..=i64::from(snob_store::store::mcp_acts::MOST_WRITES_A_DAY))
+    )]
+    pub max_writes_per_day: Option<u32>,
 }
 
 #[cfg(feature = "mcp")]

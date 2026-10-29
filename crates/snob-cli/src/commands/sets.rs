@@ -117,6 +117,13 @@ pub async fn run(
     let (filter, destination, browses) = common::prepare(&args.filter, &args.output, &args.browse)?;
 
     let mut app = common::open(&args.walk, &store.session_of(paths), paths)?;
+    common::record_agent_act(
+        &mut app,
+        &args.agent,
+        op.name(),
+        args.target.as_deref(),
+        None,
+    )?;
     let crossed = cross(
         &mut app,
         engine::ListQuery::from(&args),

@@ -410,6 +410,12 @@ impl App {
         &self.db
     }
 
+    /// The store, for a write that takes a transaction of its own (an act
+    /// an agent was told yes to, `commands::common::record_agent_act`).
+    pub fn db_mut(&mut self) -> &mut Store {
+        &mut self.db
+    }
+
     pub fn progress(&self) -> &Progress {
         &self.progress
     }

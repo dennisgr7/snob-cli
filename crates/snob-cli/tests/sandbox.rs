@@ -4624,3 +4624,199 @@ async fn a_stateless_retry_without_an_answer_is_asked_again() {
         .await;
     assert_eq!(done["result"]["isError"], false, "{done}");
 }
+
+/// Asks `tool` in the chat and calls it again with the token, as an agent
+/// does once the person said yes; the second call's result.
+#[cfg(feature = "mcp")]
+async fn confirmed_in_chat(
+    client: &mut McpClient,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let asking = client.call(tool, arguments.clone()).await;
+    let told = &asking["structuredContent"];
+    assert_eq!(told["status"], "confirmation_required", "{asking}");
+    let mut yes = arguments;
+    yes["confirmation"] = told["confirmation"].clone();
+    client.call(tool, yes).await
+}
+
+/// The acts recorded in the sandbox account's database, of any age.
+#[cfg(feature = "mcp")]
+fn acts_recorded(root: &Path) -> i64 {
+    let db = snob_store::store::Store::open_at(&database(root)).unwrap();
+    snob_store::store::mcp_acts::count(db.conn()).unwrap()
+}
+
+/// Ten follows and unfollows agents were told yes to in the last day are as
+/// many as a server allows when it was given no `--max-writes-per-day`: the
+/// eleventh is refused with nothing sent and nothing recorded. A write the
+/// person types is not counted, and a server given a higher cap lets it
+/// through.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_eleventh_agent_write_in_a_day_is_refused() {
+    use snob_store::store::mcp_acts::{NewAct, Recorded, record};
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    serve_an_unfollow(&instagram).await;
+    log_in_writing(tmp.path(), &instagram);
+    common::remember_doc_ids(tmp.path());
+    // Ten earlier today, as the children of a server record them.
+    let mut db = snob_store::store::Store::open_at(&database(tmp.path())).unwrap();
+    for _ in 0..10 {
+        let act = NewAct {
+            action: "follow",
+            target: Some("somebody"),
+            via: "chat",
+            client: Some("test 0"),
+        };
+        let recorded = record(&mut db, &act, None, snob_core::clock::now_ms()).unwrap();
+        assert!(matches!(recorded, Recorded::Done(_)));
+    }
+    drop(db);
+    let unfollow = serde_json::json!({ "account": "someone" });
+
+    let mut client = McpClient::start(tmp.path(), &instagram, &["--allow-writes"]).await;
+    let refused = confirmed_in_chat(&mut client, "snob_unfollow", unfollow.clone()).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    let error = &refused["structuredContent"]["error"];
+    assert_eq!(error["code"], "mcp_write_cap", "{refused}");
+    assert!(
+        error["hint"]
+            .as_str()
+            .unwrap()
+            .contains("--max-writes-per-day"),
+        "{refused}"
+    );
+    assert_eq!(writes_sent(&instagram).await, 0, "nothing was sent");
+    assert_eq!(acts_recorded(tmp.path()), 10, "nor recorded");
+
+    // Typed by the person, it is theirs: sent, and not recorded.
+    let typed = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["unfollow", "someone", "-y", "--json"],
+    );
+    assert_eq!(typed.status.code(), Some(0), "{}", stderr(&typed));
+    assert_eq!(writes_sent(&instagram).await, 1);
+    assert_eq!(acts_recorded(tmp.path()), 10);
+
+    // A server allowed eleven lets this one through, once.
+    let mut eleven = McpClient::start(
+        tmp.path(),
+        &instagram,
+        &["--allow-writes", "--max-writes-per-day", "11"],
+    )
+    .await;
+    let done = confirmed_in_chat(&mut eleven, "snob_unfollow", unfollow.clone()).await;
+    assert_eq!(done["isError"], false, "{done}");
+    assert_eq!(writes_sent(&instagram).await, 2);
+    assert_eq!(acts_recorded(tmp.path()), 11);
+    let twelfth = confirmed_in_chat(&mut eleven, "snob_unfollow", unfollow).await;
+    assert_eq!(
+        twelfth["structuredContent"]["error"]["code"], "mcp_write_cap",
+        "{twelfth}"
+    );
+    assert_eq!(writes_sent(&instagram).await, 2);
+
+    // And no server takes a cap past what the write bucket allows in a day.
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["mcp", "--allow-writes", "--max-writes-per-day", "100"],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+/// `snob status` shows what agents were told yes to in the last day: what,
+/// how the yes was given and through which client, an attempt that came to
+/// nothing included; and the agent's own `snob_status` says the same.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn status_shows_what_an_agent_was_told_yes_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    serve_an_unfollow(&instagram).await;
+    log_in_writing(tmp.path(), &instagram);
+    common::remember_doc_ids(tmp.path());
+
+    let mut chat = McpClient::start(tmp.path(), &instagram, &["--allow-writes"]).await;
+    let done = confirmed_in_chat(
+        &mut chat,
+        "snob_unfollow",
+        serde_json::json!({ "account": "@someone" }),
+    )
+    .await;
+    assert_eq!(done["isError"], false, "{done}");
+    // Any other name is the session's own account to the fake Instagram, and
+    // the command refuses to unfollow yourself after its first request: an
+    // attempt, recorded all the same.
+    let own = confirmed_in_chat(
+        &mut chat,
+        "snob_unfollow",
+        serde_json::json!({ "account": "nobody" }),
+    )
+    .await;
+    assert_eq!(own["isError"], true, "{own}");
+    assert_eq!(writes_sent(&instagram).await, 1);
+
+    // Asked in a form, on the older revision, while the call waits.
+    let mut form = McpClient::start_with(
+        tmp.path(),
+        &instagram,
+        &[],
+        serde_json::json!({ "elicitation": {} }),
+    )
+    .await;
+    form.answer = Some(serde_json::json!({ "action": "accept", "content": { "confirm": true } }));
+    let walked = form
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "fans", "account": "other" }),
+        )
+        .await;
+    assert_eq!(walked["isError"], false, "{walked}");
+    // What needs no yes is not recorded.
+    let own_list = form
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(own_list["isError"], false, "{own_list}");
+
+    let out = snob(tmp.path(), Some(&instagram), &["status", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let agents = &json(&out)["agents"];
+    assert_eq!(agents["writes"], 2, "{agents}");
+    let acts = agents["acts"].as_array().unwrap();
+    assert_eq!(acts.len(), 3, "{agents}");
+    assert_eq!(acts[0]["action"], "unfollow");
+    assert_eq!(acts[0]["write"], true);
+    assert_eq!(acts[0]["target"]["username"], "someone");
+    assert_eq!(acts[0]["target"]["pk"], 9001, "resolved once looked up");
+    assert_eq!(acts[0]["via"], "chat");
+    assert_eq!(acts[0]["client"], "test 0");
+    assert_eq!(acts[1]["target"]["username"], "nobody");
+    assert_eq!(acts[2]["action"], "fans");
+    assert_eq!(acts[2]["write"], false);
+    assert_eq!(acts[2]["target"]["username"], "other");
+    assert_eq!(acts[2]["via"], "elicitation");
+
+    let out = snob(tmp.path(), Some(&instagram), &["status", "--agents"]);
+    let said = stdout(&out);
+    assert!(said.starts_with("Agents\n"), "{said}");
+    assert!(said.contains("2 in the last 24 hours"), "{said}");
+    assert!(
+        said.contains("unfollow @someone, yes given in the chat, through test 0"),
+        "{said}"
+    );
+    assert!(
+        said.contains("read @other's fans, yes given in a form, through test 0"),
+        "{said}"
+    );
+
+    let status = chat.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(
+        status["structuredContent"]["agents"]["writes"], 2,
+        "{status}"
+    );
+}

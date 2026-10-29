@@ -26,6 +26,7 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::cli::ConfirmedVia;
 use crate::exit::ExitCode;
 
 /// One tool, as the client is told about it.
@@ -176,15 +177,21 @@ pub fn specs(writes: bool) -> Vec<Spec> {
                  call comes back with status confirmation_required and a question to put to \
                  them, word for word. One account per call: the write budget allows a burst \
                  of three and then one every fifteen minutes, and a call that would wait \
-                 longer than the server allows is refused with nothing sent. Following \
-                 notifies the other person, and unfollowing does not take that back.",
+                 longer than the server allows is refused with nothing sent. Agents may \
+                 make only a few follows and unfollows a day on the account (ten unless the \
+                 server was started with another --max-writes-per-day); past that the call \
+                 comes back mcp_write_cap with nothing sent, and the person can still make \
+                 it in their own terminal. Each one is recorded where the person sees it \
+                 (snob status). Following notifies the other person, and unfollowing does \
+                 not take that back.",
             ),
             (
                 "snob_unfollow",
                 "Unfollow an account",
                 "Unfollows one account, or withdraws a pending follow request, only after a yes \
                  from the person for that one call, every time, asked as for snob_follow. One \
-                 account per call, on the same write budget as following.",
+                 account per call, on the same write budget and the same daily cap as \
+                 following.",
             ),
         ] {
             specs.push(Spec {
@@ -246,16 +253,61 @@ impl Plan {
     /// What the child is run with, after the server's global flags: the
     /// command and, for one that may reach Instagram, `--spend-alone`, so it
     /// refuses while another child, of this server or of another, holds the
-    /// account. **Added here, after the binding is taken** (see `args`): it
-    /// is how the call runs, not what it does.
-    pub fn command_line(&self) -> Vec<String> {
-        let mut line = Vec::with_capacity(self.args.len() + 1);
+    /// account. For a call run on a yes, `confirmed` adds how the yes was
+    /// given and through which client, which the child records before its
+    /// first request (`cli::AgentArgs`), and for a write the day's cap on
+    /// them. **Added here, after the binding is taken** (see `args`): it is
+    /// how the call runs and what it is recorded as, not what it does.
+    pub fn command_line(&self, confirmed: Option<&Confirmed<'_>>) -> Vec<String> {
+        let mut line = Vec::with_capacity(self.args.len() + 4);
         if self.spends != Spends::Nothing {
             line.push("--spend-alone".to_string());
         }
         line.extend(self.args.iter().cloned());
+        if let Some(confirmed) = confirmed {
+            // `=`, so a value can never be read as a flag of its own.
+            line.push(format!("--confirmed-via={}", confirmed.via.as_str()));
+            if let Some(client) = confirmed.client {
+                line.push(format!("--confirmed-for={client}"));
+            }
+            if self.spends == Spends::Writes {
+                line.push(format!("--mcp-write-cap={}", confirmed.writes_a_day));
+            }
+        }
         line
     }
+}
+
+/// The yes a call was run on, as its child records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Confirmed<'a> {
+    pub via: ConfirmedVia,
+    /// The client, as [`client_label`] gave it.
+    pub client: Option<&'a str>,
+    /// `--max-writes-per-day`, for a write.
+    pub writes_a_day: u32,
+}
+
+/// How a client is named in the record of what it was told yes to: its name
+/// and version as it declared them, **through `printable`, then cut to
+/// letters, digits, spaces and `._/-`, and to 64 characters**. It is the
+/// client's own text, it becomes an argument of a command line, and the
+/// person reads it in `snob status`. `None` when nothing is left.
+pub fn client_label(name: &str, version: &str) -> Option<String> {
+    let said = snob_core::model::printable(&format!("{name} {version}"));
+    let kept: String = said
+        .chars()
+        .filter(|&c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '/' | '-'))
+        .collect();
+    let kept: String = kept
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(64)
+        .collect();
+    let kept = kept.trim_end();
+    (!kept.is_empty()).then(|| kept.to_string())
 }
 
 /// What a command may send to Instagram.
@@ -726,7 +778,7 @@ mod tests {
             // And exactly those children hold the account alone, with the
             // flag ahead of the command and outside what a yes is bound to.
             let plan = call(name, args.clone()).unwrap();
-            let line = plan.command_line();
+            let line = plan.command_line(None);
             assert_eq!(
                 line.first().map(String::as_str) == Some("--spend-alone"),
                 expected != Spends::Nothing,
@@ -735,6 +787,62 @@ mod tests {
             assert!(line.ends_with(&plan.args), "{name} {args}");
             assert!(!plan.binding(name).contains("spend-alone"), "{name}");
         }
+    }
+
+    #[test]
+    fn a_child_run_on_a_yes_is_told_how_it_was_given_after_the_binding() {
+        let follow = call("snob_follow", json!({"account": "someone"})).unwrap();
+        let confirmed = Confirmed {
+            via: ConfirmedVia::Chat,
+            client: Some("Claude Code 2.1"),
+            writes_a_day: 10,
+        };
+        assert_eq!(
+            follow.command_line(Some(&confirmed)),
+            [
+                "--spend-alone",
+                "follow",
+                "someone",
+                "-y",
+                "--json",
+                "--confirmed-via=chat",
+                "--confirmed-for=Claude Code 2.1",
+                "--mcp-write-cap=10",
+            ]
+        );
+        assert!(!follow.binding("snob_follow").contains("confirmed"));
+
+        // A walk is recorded, and takes no cap; no client, no flag for one.
+        let walk = call("snob_list", json!({"list": "fans", "account": "x"})).unwrap();
+        let line = walk.command_line(Some(&Confirmed {
+            via: ConfirmedVia::Form,
+            client: None,
+            writes_a_day: 10,
+        }));
+        assert!(
+            line.ends_with(&["--confirmed-via=form".to_string()]),
+            "{line:?}"
+        );
+        let mut plain = vec!["--spend-alone".to_string()];
+        plain.extend(walk.args.iter().cloned());
+        assert_eq!(walk.command_line(None), plain);
+    }
+
+    #[test]
+    fn a_client_is_named_in_a_few_plain_characters() {
+        assert_eq!(
+            client_label("claude-code", "2.1.0").as_deref(),
+            Some("claude-code 2.1.0")
+        );
+        // Controls, invisibles and anything else outside the set are gone,
+        // and what is left is one line of at most 64.
+        assert_eq!(
+            client_label("evil\u{202e}\n--yes; rm", "1\u{200b}.0").as_deref(),
+            Some("evil --yes rm 1.0")
+        );
+        assert_eq!(client_label(&"x".repeat(100), "1").unwrap().len(), 64);
+        assert_eq!(client_label("\u{202e}", ""), None);
+        assert_eq!(client_label("名前", "版"), None);
     }
 
     #[test]

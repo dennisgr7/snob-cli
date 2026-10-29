@@ -19,7 +19,9 @@ use snob_store::paths::{AccountPaths, AppPaths};
 use snob_store::secrets::{SecretStore, SessionStore};
 
 use crate::app::{App, Viewer};
-use crate::cli::{Attr, BrowseArgs, FilterArgs, Format, ListArgs, OutputArgs, ScanArgs, WalkArgs};
+use crate::cli::{
+    AgentArgs, Attr, BrowseArgs, FilterArgs, Format, ListArgs, OutputArgs, ScanArgs, WalkArgs,
+};
 use crate::engine::{self, ListOutcome};
 use crate::exit::{ExitCode, ExitError};
 use crate::output::{self, Presentation, Rendered};
@@ -127,6 +129,58 @@ pub fn app(secrets: &SessionStore, paths: &AccountPaths, with_progress: bool) ->
     App::open(secrets, paths, with_progress)?
         .map(Box::new)
         .ok_or_else(no_session)
+}
+
+/// Records what an agent was told yes to through `snob mcp`, for a run given
+/// `--confirmed-via` (`cli::AgentArgs`), **before the run sends anything**,
+/// and refuses a write past the day's cap with nothing sent. The id of the
+/// row, or `None` for a run that was not an agent's.
+///
+/// `action` is the command (`follow`, `followers`, ...), `target` the account
+/// as the call named it. `write_cap` is `--mcp-write-cap`, which counts only
+/// for a write, and is [`mcp_acts::WRITES_A_DAY`] when not given.
+///
+/// [`mcp_acts::WRITES_A_DAY`]: snob_store::store::mcp_acts::WRITES_A_DAY
+pub fn record_agent_act(
+    app: &mut App,
+    agent: &AgentArgs,
+    action: &str,
+    target: Option<&str>,
+    write_cap: Option<u32>,
+) -> Result<Option<i64>> {
+    use snob_store::store::mcp_acts::{self, NewAct, Recorded};
+    let Some(via) = agent.confirmed_via else {
+        return Ok(None);
+    };
+    let cap = mcp_acts::is_write(action).then(|| write_cap.unwrap_or(mcp_acts::WRITES_A_DAY));
+    let act = NewAct {
+        action,
+        target: target.map(engine::target::clean),
+        via: via.as_str(),
+        client: agent
+            .confirmed_for
+            .as_deref()
+            .filter(|client| !client.is_empty()),
+    };
+    match mcp_acts::record(app.db_mut(), &act, cap, snob_core::clock::now_ms())? {
+        Recorded::Done(id) => Ok(Some(id)),
+        Recorded::Capped { writes, free_at } => Err(ExitError::new(
+            ExitCode::Error,
+            format!(
+                "agents made {writes} follows and unfollows through snob mcp in the last 24 \
+                 hours, as many as it allows in a day; nothing was sent"
+            ),
+        )
+        // A token a program tells this refusal apart by: the MCP server
+        // hands it to the agent as the error's code.
+        .with_reason("mcp_write_cap")
+        .with_hint(format!(
+            "the next is allowed {}; the person can still follow and unfollow in their own \
+             terminal, or start the server with a higher --max-writes-per-day",
+            report::stored_on(free_at.to_epoch_not_before())
+        ))
+        .into()),
+    }
 }
 
 /// The refusal every command gives when there is no session.
