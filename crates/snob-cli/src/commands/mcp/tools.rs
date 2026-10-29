@@ -183,6 +183,15 @@ pub fn specs(writes: bool) -> Vec<Spec> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     /// The command's arguments, after the server's global flags.
+    ///
+    /// **What a yes is bound to** ([`Plan::binding`]), so they hold the
+    /// command and nothing about how the call is delivered: an argument that
+    /// only shapes the answer's delivery (a confirmation handed back, how
+    /// long to wait inline, which page of a result) stays out of them, and
+    /// the flags the server adds to every child (`child::Launch`) are added
+    /// after the binding is taken. A yes for one command is then good for
+    /// that command however the call is spelled (`@name` or `name`), and for
+    /// no other.
     pub args: Vec<String>,
     /// The question the person has to answer yes to first, if any.
     pub ask: Option<String>,
@@ -190,6 +199,15 @@ pub struct Plan {
     /// exits 5 while the account cools down and 3 with no session stored,
     /// and each is what it was asked.
     pub answers: &'static [ExitCode],
+}
+
+impl Plan {
+    /// What a yes to this call, made as `tool`, is bound to (`seal.rs`): the
+    /// tool and the command line, as JSON, which escapes every control
+    /// character and so cannot be made to run into the ticket's other fields.
+    pub fn binding(&self, tool: &str) -> String {
+        json!([tool, self.args]).to_string()
+    }
 }
 
 /// Why a call is not a command.
@@ -440,6 +458,36 @@ mod tests {
         let own = call("snob_list", json!({"list": "followers"})).unwrap();
         assert!(own.ask.is_none());
         assert!(!own.args.contains(&"-y".to_string()));
+    }
+
+    #[test]
+    fn a_yes_is_bound_to_the_command_however_the_call_spells_it() {
+        let bound = |name: &str, args: Value| call(name, args).unwrap().binding(name);
+        let plain = bound("snob_follow", json!({"account": "someone"}));
+        assert_eq!(
+            plain,
+            r#"["snob_follow",["follow","someone","-y","--json"]]"#
+        );
+        assert_eq!(bound("snob_follow", json!({"account": "@someone"})), plain);
+        assert_ne!(bound("snob_unfollow", json!({"account": "someone"})), plain);
+        assert_ne!(
+            bound("snob_follow", json!({"account": "someone_else"})),
+            plain
+        );
+
+        let theirs = json!({"list": "followers", "account": "x"});
+        assert_ne!(
+            bound("snob_list", theirs.clone()),
+            bound(
+                "snob_list",
+                json!({"list": "followers", "account": "x", "limit": 5})
+            ),
+            "a yes to the whole list is not a yes to part of it, nor the other way round"
+        );
+        assert_ne!(
+            bound("snob_list", theirs),
+            bound("snob_list", json!({"list": "following", "account": "x"}))
+        );
     }
 
     #[test]

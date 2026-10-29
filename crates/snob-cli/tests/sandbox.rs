@@ -4047,9 +4047,9 @@ async fn the_mcp_server_asks_an_older_client_while_the_call_waits() {
     assert_eq!(accepted["isError"], false, "{accepted}");
 }
 
-/// On 2026-07-28 the call answers with the question and a signed state; the
-/// answer counts only when it comes back with that state for those same
-/// arguments.
+/// On 2026-07-28 the call answers with the question and a ticket; the
+/// answer counts only when it comes back with that ticket for that same
+/// command, and only once.
 #[cfg(feature = "mcp")]
 #[tokio::test]
 async fn the_mcp_server_asks_a_stateless_client_in_the_call() {
@@ -4062,6 +4062,7 @@ async fn the_mcp_server_asks_a_stateless_client_in_the_call() {
         serde_json::json!({ "elicitation": {} }),
     );
     let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+    let before = posted(&instagram).await.len();
 
     let asking = client.call("snob_list", theirs.clone()).await;
     assert_eq!(asking["resultType"], "input_required", "{asking}");
@@ -4087,6 +4088,96 @@ async fn the_mcp_server_asks_a_stateless_client_in_the_call() {
         .await;
     assert_eq!(elsewhere["result"]["isError"], true, "{elsewhere}");
 
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // Spelled with the at sign, it is the same command, so the same yes.
+    let answered = serde_json::json!({
+        "name": "snob_list",
+        "arguments": { "list": "followers", "account": "@someone" },
+        "inputResponses": yes,
+        "requestState": state,
+    });
+    let done = client.ask("tools/call", answered.clone()).await;
+    assert_eq!(done["result"]["isError"], false, "{done}");
+    let sent = posted(&instagram).await.len();
+    assert!(sent > before, "the walk ran");
+
+    // The identical answered call again, as a client that retries a request
+    // it heard nothing back from: the yes was used, and nothing runs twice.
+    let again = client.ask("tools/call", answered).await;
+    assert_eq!(again["result"]["isError"], true, "{again}");
+    assert_eq!(
+        again["result"]["structuredContent"]["error"]["code"], "confirmation_used",
+        "{again}"
+    );
+    assert_eq!(
+        posted(&instagram).await.len(),
+        sent,
+        "nothing more was sent"
+    );
+}
+
+/// A call that comes back with the ticket and no answer is asked again, with
+/// a fresh ticket, and the old one is retired: one question open, not two.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_stateless_retry_without_an_answer_is_asked_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let mut client = McpClient::stateless(
+        tmp.path(),
+        &instagram,
+        serde_json::json!({ "elicitation": { "form": {} } }),
+    );
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+    let yes =
+        serde_json::json!({ "confirm": { "action": "accept", "content": { "confirm": true } } });
+    let before = posted(&instagram).await.len();
+
+    let first = client.call("snob_list", theirs.clone()).await;
+    let old = first["requestState"]
+        .as_str()
+        .expect("a ticket")
+        .to_string();
+
+    let retried = client
+        .ask(
+            "tools/call",
+            serde_json::json!({
+                "name": "snob_list",
+                "arguments": theirs.clone(),
+                "requestState": old.clone(),
+            }),
+        )
+        .await;
+    assert_eq!(
+        retried["result"]["resultType"], "input_required",
+        "{retried}"
+    );
+    let fresh = retried["result"]["requestState"]
+        .as_str()
+        .expect("a fresh ticket")
+        .to_string();
+    assert_ne!(fresh, old);
+
+    let with_old = client
+        .ask(
+            "tools/call",
+            serde_json::json!({
+                "name": "snob_list",
+                "arguments": theirs.clone(),
+                "inputResponses": yes.clone(),
+                "requestState": old,
+            }),
+        )
+        .await;
+    assert_eq!(
+        with_old["result"]["structuredContent"]["error"]["code"], "confirmation_used",
+        "{with_old}"
+    );
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
     let done = client
         .ask(
             "tools/call",
@@ -4094,7 +4185,7 @@ async fn the_mcp_server_asks_a_stateless_client_in_the_call() {
                 "name": "snob_list",
                 "arguments": theirs,
                 "inputResponses": yes,
-                "requestState": state,
+                "requestState": fresh,
             }),
         )
         .await;

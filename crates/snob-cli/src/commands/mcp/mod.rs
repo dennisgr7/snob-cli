@@ -12,10 +12,10 @@
 //! asking, because clients speak two revisions of the protocol. On 2026-07-28
 //! and later the server may not send a request of its own, so the call
 //! answers `input_required` with the question, and the client calls again
-//! with the answer and the state this server signed, which ties the answer to
-//! these exact arguments. On older revisions the server asks with
-//! `elicitation/create` while the call waits. A client that can do neither is
-//! told so, and nothing is run.
+//! with the answer and the ticket handed out with it (`seal.rs`), which is
+//! good once, for the command it was asked about, for ten minutes. On older
+//! revisions the server asks with `elicitation/create` while the call waits.
+//! A client that can do neither is told so, and nothing is run.
 
 pub mod answer;
 pub mod child;
@@ -29,10 +29,10 @@ use std::time::Duration;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ElicitRequest,
-    ElicitRequestParams, ElicitationAction, ElicitationSchema, Implementation, InputRequest,
-    InputRequiredResult, JsonObject, ListToolsResult, PaginatedRequestParams,
-    ProgressNotificationParam, ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
-    ToolAnnotations,
+    ElicitRequestParams, ElicitationAction, ElicitationCapability, ElicitationSchema,
+    Implementation, InputRequest, InputRequiredResult, JsonObject, ListToolsResult,
+    PaginatedRequestParams, ProgressNotificationParam, ProtocolVersion, ServerCapabilities,
+    ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt};
@@ -47,8 +47,8 @@ use child::Launch;
 const HEARTBEAT: Duration = Duration::from_secs(15);
 
 /// How long the person has to answer a question asked with
-/// `elicitation/create`, and how long a signed question stays good for an
-/// answer on the newer revision.
+/// `elicitation/create`, and how long a ticket handed out with a question
+/// stays good for an answer on the newer revision.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10 * 60);
 
 /// `--max-wait` for a tool call when the server was given none. A call that
@@ -72,7 +72,7 @@ pub fn longest_call(max_wait: Duration) -> Duration {
     ANSWER_WITHIN + max_wait + child::GRACE + Duration::from_secs(30)
 }
 
-/// The key the question's state is answered under, in `inputResponses`.
+/// The key the question is answered under, in `inputResponses`.
 const CONFIRM: &str = "confirm";
 
 /// Serves until the client closes standard input.
@@ -149,18 +149,11 @@ impl Drop for Running {
 struct Server {
     launch: Arc<Launch>,
     writes: bool,
-    /// Signs the state handed out with a question, with a key that lives as
-    /// long as this process: an answer is good only for the question this
-    /// server asked, about these arguments.
+    /// Hands out the ticket that goes with a question and redeems it once,
+    /// under a key that lives as long as this process: an answer is good
+    /// only for the question this server asked, about this command, once.
     sealer: Arc<seal::Sealer>,
     in_flight: Arc<InFlight>,
-}
-
-/// What a question was asked about, signed into the state handed out with it.
-#[derive(serde::Serialize, serde::Deserialize, PartialEq)]
-struct Asked {
-    tool: String,
-    arguments: JsonObject,
 }
 
 /// Whether the person said yes, and if not, what they are told back.
@@ -168,7 +161,20 @@ enum Consent {
     Given,
     /// Asked on the newer revision: the call answers with the question.
     Pending(InputRequiredResult),
-    Refused(String),
+    /// Nothing is run; `code` is the refusal's, for the agent to tell apart.
+    Refused {
+        code: &'static str,
+        why: String,
+    },
+}
+
+impl Consent {
+    fn refused(code: &'static str, why: impl Into<String>) -> Self {
+        Self::Refused {
+            code,
+            why: why.into(),
+        }
+    }
 }
 
 impl ServerHandler for Server {
@@ -252,13 +258,11 @@ impl ServerHandler for Server {
             .into());
         }
         if let Some(question) = &plan.ask {
-            match self
-                .consent(question, &request, &arguments, &context)
-                .await?
-            {
+            let binding = plan.binding(&request.name);
+            match self.consent(question, &request, &binding, &context).await? {
                 Consent::Given => {}
                 Consent::Pending(asking) => return Ok(asking.into()),
-                Consent::Refused(why) => return Ok(refusal("not_confirmed", &why).into()),
+                Consent::Refused { code, why } => return Ok(refusal(code, &why).into()),
             }
         }
 
@@ -306,25 +310,23 @@ impl ServerHandler for Server {
 
 impl Server {
     /// Asks the person `question`, in whichever way the client can be asked.
+    /// `binding` is the command the yes would be for (`tools::Plan::binding`).
     async fn consent(
         &self,
         question: &str,
         request: &CallToolRequestParams,
-        arguments: &JsonObject,
+        binding: &str,
         context: &RequestContext<RoleServer>,
     ) -> Result<Consent, McpError> {
-        let asked = Asked {
-            tool: request.name.to_string(),
-            arguments: arguments.clone(),
-        };
         let can_ask = context
             .client_capabilities()
-            .is_some_and(|capabilities| capabilities.elicitation.is_some());
+            .and_then(|capabilities| capabilities.elicitation)
+            .is_some_and(|elicitation| can_show_a_form(&elicitation));
         if !can_ask {
-            return Ok(Consent::Refused(
+            return Ok(Consent::refused(
+                "not_confirmed",
                 "this needs your confirmation, and this client cannot ask for it; run the \
-                 command in a terminal instead"
-                    .into(),
+                 command in a terminal instead",
             ));
         }
         let form = || {
@@ -346,28 +348,24 @@ impl Server {
         };
 
         if stateless(context.protocol_version()) {
-            // The answer, when this is the call coming back with one. Taken
-            // only with the state this server signed for these same arguments:
-            // an answer to some other question, or to this one about other
-            // arguments, is no answer.
-            if let (Some(responses), Some(state)) =
-                (&request.input_responses, &request.request_state)
-            {
-                let signed: Option<Asked> = self.sealer.open(state, now());
-                if signed.as_ref() != Some(&asked) {
-                    return Ok(Consent::Refused(
-                        "the answer does not belong to this call; ask again".into(),
-                    ));
+            // The call coming back with a ticket. **Redeemed whatever it
+            // carries**, so a ticket is spent by the first call that brings
+            // it back for its own command: the answer counts once, and a
+            // retry that brought no answer retires it before a fresh one is
+            // handed out, leaving one question open, not two.
+            if let Some(ticket) = &request.request_state {
+                let spent = self.sealer.redeem(seal::Kind::Form, ticket, binding);
+                let answer = request
+                    .input_responses
+                    .as_ref()
+                    .and_then(|responses| responses.get(CONFIRM));
+                if let Some(answer) = answer {
+                    return Ok(redeemed(spent, accepted_value(answer)));
                 }
-                return Ok(match responses.get(CONFIRM) {
-                    Some(answer) if accepted_value(answer) => Consent::Given,
-                    _ => Consent::Refused("you did not confirm it, so nothing was done".into()),
-                });
             }
-            let until = now().saturating_add(ANSWER_WITHIN.as_secs() as i64);
-            let state = self
+            let ticket = self
                 .sealer
-                .seal(&asked, until)
+                .issue(seal::Kind::Form, binding, ANSWER_WITHIN)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             let mut asking = std::collections::BTreeMap::new();
             asking.insert(
@@ -376,19 +374,20 @@ impl Server {
             );
             return Ok(Consent::Pending(InputRequiredResult::new(
                 Some(asking),
-                Some(state),
+                Some(ticket.token),
             )));
         }
 
         // Raced against the call being canceled: a person who never answers
-        // is not a reason to hold a canceled call for ten minutes.
+        // is not a reason to hold a canceled call for ten minutes. No ticket
+        // here: the answer comes back to this very call, which runs once.
         let asking = context
             .peer
             .create_elicitation_with_timeout(form()?, Some(ANSWER_WITHIN));
         let answer = tokio::select! {
             answer = asking => answer,
             () = context.ct.cancelled() => { // spelling-allow: the SDK's name
-                return Ok(Consent::Refused("the call was canceled".into()));
+                return Ok(Consent::refused("not_confirmed", "the call was canceled"));
             }
         };
         Ok(match answer {
@@ -403,10 +402,49 @@ impl Server {
             {
                 Consent::Given
             }
-            Ok(_) => Consent::Refused("you did not confirm it, so nothing was done".into()),
-            Err(e) => Consent::Refused(format!("the confirmation could not be asked: {e}")),
+            Ok(_) => Consent::refused("not_confirmed", NOT_CONFIRMED),
+            Err(e) => Consent::refused(
+                "not_confirmed",
+                format!("the confirmation could not be asked: {e}"),
+            ),
         })
     }
+}
+
+/// What the person is told when they did not say yes.
+const NOT_CONFIRMED: &str = "you did not confirm it, so nothing was done";
+
+/// What an answer brought back with a ticket comes to: a yes only when the
+/// ticket was this call's, in time and never used, and the answer was yes.
+fn redeemed(spent: Result<(), seal::Spoiled>, yes: bool) -> Consent {
+    match spent {
+        Ok(()) if yes => Consent::Given,
+        Ok(()) => Consent::refused("not_confirmed", NOT_CONFIRMED),
+        // The same answered call sent again, as a client that retries a
+        // request it heard nothing back from would: it ran once already.
+        Err(seal::Spoiled::Used) => Consent::refused(
+            "confirmation_used",
+            "this answer was already used for one call, so nothing was done this time; \
+             a new call asks again",
+        ),
+        Err(seal::Spoiled::NotThisCall | seal::Spoiled::Expired) => Consent::refused(
+            "not_confirmed",
+            "the answer does not belong to this call, or came too late; ask again",
+        ),
+        Err(seal::Spoiled::Crowded) => Consent::refused(
+            "not_confirmed",
+            "too many answers are outstanding to take another now; ask again in a few minutes",
+        ),
+    }
+}
+
+/// Whether a client that declared `elicitation` can show a form: it said
+/// `form`, or said neither `form` nor `url`, as a client declares it that was
+/// written before the modes existed, and which the SDK reads as form for
+/// that reason (`Peer::supported_elicitation_modes`). A client that offers
+/// only `url` cannot show the box to tick.
+fn can_show_a_form(capability: &ElicitationCapability) -> bool {
+    capability.form.is_some() || capability.url.is_none()
 }
 
 /// Whether the call was made on a revision where the server may not send
@@ -414,13 +452,6 @@ impl Server {
 /// their order is the order of their names.
 fn stateless(version: Option<ProtocolVersion>) -> bool {
     version.is_some_and(|version| version.as_str() >= ProtocolVersion::V_2026_07_28.as_str())
-}
-
-/// Seconds since the epoch, for the life of a signed question.
-fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs() as i64)
 }
 
 /// Whether an answer in `inputResponses` is a yes: accepted, with the box
@@ -451,6 +482,42 @@ mod tests {
         assert!(stateless(Some(ProtocolVersion::V_2026_07_28)));
         assert!(!stateless(Some(ProtocolVersion::V_2025_11_25)));
         assert!(!stateless(None));
+    }
+
+    #[test]
+    fn a_form_is_what_an_empty_or_form_capability_offers() {
+        let offers = |declared: Value| {
+            can_show_a_form(&serde_json::from_value::<ElicitationCapability>(declared).unwrap())
+        };
+        assert!(offers(json!({})), "declared before modes existed");
+        assert!(offers(json!({ "form": {} })));
+        assert!(offers(json!({ "form": {}, "url": {} })));
+        assert!(
+            !offers(json!({ "url": {} })),
+            "a link to open is no box to tick"
+        );
+    }
+
+    #[test]
+    fn an_answer_counts_only_with_a_ticket_good_for_it() {
+        let code = |consent: Consent| match consent {
+            Consent::Given => "given",
+            Consent::Pending(_) => "pending",
+            Consent::Refused { code, .. } => code,
+        };
+        assert_eq!(code(redeemed(Ok(()), true)), "given");
+        assert_eq!(code(redeemed(Ok(()), false)), "not_confirmed");
+        assert_eq!(
+            code(redeemed(Err(seal::Spoiled::Used), true)),
+            "confirmation_used"
+        );
+        for spoiled in [
+            seal::Spoiled::NotThisCall,
+            seal::Spoiled::Expired,
+            seal::Spoiled::Crowded,
+        ] {
+            assert_eq!(code(redeemed(Err(spoiled), true)), "not_confirmed");
+        }
     }
 
     #[test]

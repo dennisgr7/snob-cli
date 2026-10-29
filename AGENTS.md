@@ -332,6 +332,18 @@ writes it.
   cannot ask cannot make those calls. Not offered, ever: `login`, `logout`,
   `purge`, the monitor, `--same-day`, downloads (outside the request budget),
   any flag that writes a file.
+- **A yes counts once, for the command it was given for** (`seal.rs`). On
+  the stateless revision the question goes out with a ticket: a random
+  nonce, a deadline ten minutes on in seconds of the process's monotonic
+  clock, and an HMAC under a key drawn at start over its kind, the nonce,
+  the deadline and the command line (`tools::Plan::binding`, the tool and
+  `Plan.args`, which hold nothing about how a call is delivered). Redeeming
+  puts the nonce in a set of spent ones, kept until it would have expired
+  and at most 4096 (full is refused, never forgotten): the same answered
+  call sent twice runs once and then answers `confirmation_used`; a ticket
+  for another command, kind or server spends nothing. A call back with the
+  ticket and no answer retires it and is asked again. No ticket outlives
+  the process.
 - **Signing in is the person's.** The server's instructions say so, and
   every answer that comes of having no session carries a hint that the
   person runs `snob login` in their own terminal, in place of the command's
