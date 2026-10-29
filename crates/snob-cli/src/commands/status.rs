@@ -111,6 +111,16 @@ pub fn run(
     } else {
         Vec::new()
     };
+    // The walks agents left running, read from their files and their locks,
+    // which asking does not write (`jobs::look`).
+    let jobs: Vec<crate::jobs::Seen> = if sections.jobs {
+        crate::jobs::all(&account, now.get())?
+            .into_iter()
+            .filter(|seen| !seen.status.finished())
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let found = Found {
         sections,
@@ -122,6 +132,7 @@ pub fn run(
         lists: &lists,
         runs: &runs,
         acts: &acts,
+        jobs: &jobs,
         now,
     };
     if args.output.json {
@@ -188,6 +199,7 @@ struct Found<'a> {
     lists: &'a [Stored],
     runs: &'a [(watch_store::Run, Option<String>)],
     acts: &'a [mcp_acts::Act],
+    jobs: &'a [crate::jobs::Seen],
     now: EpochMs,
 }
 
@@ -312,6 +324,32 @@ impl Found<'_> {
                 "agents".into(),
                 json!({ "writes": self.agent_writes(), "acts": acts }),
             );
+        }
+        if self.sections.jobs {
+            // What `snob jobs --json` says of each, narrowed to what a status
+            // is asked for: what, since when, how far, and for whom.
+            let running: Vec<Value> = self
+                .jobs
+                .iter()
+                .map(|seen| {
+                    let record = crate::jobs::show::record(seen, self.now.get());
+                    let mut kept = serde_json::Map::new();
+                    for key in [
+                        "job_id",
+                        "status",
+                        "command",
+                        "account",
+                        "created_at",
+                        "started_by",
+                        "progress",
+                        "eta_seconds",
+                    ] {
+                        kept.insert(key.into(), record[key].clone());
+                    }
+                    Value::Object(kept)
+                })
+                .collect();
+            out.insert("jobs".into(), json!({ "running": running }));
         }
         Value::Object(out)
     }
@@ -506,6 +544,19 @@ impl Found<'_> {
             }
             blocks.push(lines);
         }
+        if self.sections.jobs {
+            let mut lines = vec!["Jobs".to_string()];
+            if self.jobs.is_empty() {
+                lines.push("  No walk is running as a job".to_string());
+            }
+            for seen in self.jobs {
+                lines.push(format!(
+                    "  {}",
+                    crate::jobs::show::line(seen, self.now.get())
+                ));
+            }
+            blocks.push(lines);
+        }
         blocks
             .iter()
             .map(|block| block.join("\n"))
@@ -579,9 +630,11 @@ mod tests {
     fn the_sections_are_all_of_them_or_the_ones_named() {
         let all = args(&[]).sections();
         assert!(all.session && all.budget && all.cooldown && all.lists && all.watch && all.agents);
+        assert!(all.jobs);
         let some = args(&["--budget", "--cooldown"]).sections();
         assert!(some.budget && some.cooldown);
-        assert!(!some.session && !some.lists && !some.watch && !some.agents);
+        assert!(!some.session && !some.lists && !some.watch && !some.agents && !some.jobs);
+        assert_eq!(args(&["--jobs"]).sections().names(), ["jobs"]);
     }
 
     /// The JSON carries only what was asked for.
@@ -606,6 +659,7 @@ mod tests {
             lists: &[],
             runs: &[],
             acts: &[],
+            jobs: &[],
             now,
         };
         let out = found.json();
@@ -668,6 +722,7 @@ mod tests {
             lists: &[],
             runs: &[],
             acts: &acts,
+            jobs: &[],
             now,
         };
         let out = found.json();

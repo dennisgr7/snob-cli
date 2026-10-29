@@ -88,6 +88,7 @@ snob follow someone
 snob unfollow someone
 snob watch                       # keep watching on a schedule, report changes
 snob status                      # budget left, cooldown, stored lists, agents; sends nothing
+snob jobs                        # walks an agent left running, and "snob jobs cancel <id>"
 ```
 
 On a terminal most commands open a full-screen view you move through with the
@@ -135,6 +136,10 @@ can read:
   hours, and agents may make at most ten follows and unfollows a day on the
   account (`--max-writes-per-day` to change it, up to 99); what you type in a
   terminal is not counted.
+  A walk can run as a job that goes on after the agent's call has answered:
+  one at a time per account, listed by `snob jobs` and in `snob status`,
+  stopped like Ctrl+C by `snob jobs cancel <id>`, and stopped by `snob
+  logout` and `snob purge` before they remove anything.
   `snob mcp config claude-code` (or `claude-desktop`, `codex`, `cursor`,
   `vscode`) prints what to add to that client's configuration. After
   upgrading snob, reconnect the server in the client: a server whose binary

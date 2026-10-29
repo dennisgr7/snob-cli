@@ -30,8 +30,9 @@ use crate::exit::ExitCode;
 /// How long a child asked to stop gets before it is killed. A walk stops
 /// between two requests, and a request in flight is raced against the
 /// cancellation, so seconds are plenty; a write in flight is the one thing
-/// that is not abandoned, and its answer comes back well inside this.
-pub const GRACE: Duration = Duration::from_secs(30);
+/// that is not abandoned, and its answer comes back well inside this. The
+/// same grace a job's walk gets, from the one home it has (`jobs`).
+pub const GRACE: Duration = crate::jobs::GRACE;
 
 /// The longest one heartbeat may take to reach the client before the call
 /// goes on without it. A client that has stopped reading would otherwise hold
@@ -263,17 +264,7 @@ fn read(code: Option<i32>, out: &[u8], err: &str) -> Finished {
 /// The exit code a number stands for. One a child cannot exit with (it was
 /// killed by a signal, or it is newer than this server) is a failure.
 fn from_number(number: i32) -> ExitCode {
-    [
-        ExitCode::Ok,
-        ExitCode::Error,
-        ExitCode::NoSession,
-        ExitCode::Challenge,
-        ExitCode::RateLimited,
-        ExitCode::Interrupted,
-    ]
-    .into_iter()
-    .find(|code| i32::from(crate::exit::code(*code)) == number)
-    .unwrap_or(ExitCode::Error)
+    crate::exit::outcome_of(number).unwrap_or(ExitCode::Error)
 }
 
 #[cfg(test)]

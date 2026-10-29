@@ -475,14 +475,23 @@ pub fn refuse_cooldown_mid_walk(held: &Held) -> anyhow::Error {
 }
 
 /// A list another snob is walking right now, awake or asleep on the budget.
+///
+/// Exit 1 with `walked_elsewhere` as the reason a program reads
+/// (`ExitError::with_reason`), so a job's start and an agent can tell it from
+/// any other failure: it is the one that goes away by itself.
 pub fn walked_elsewhere(target: Option<&str>, kind: ListKind) -> anyhow::Error {
     let who = crate::app::target_label(target);
     let minutes = snob_store::store::snapshots::CLAIM_TTL_SECS / 60;
-    anyhow::anyhow!(
-        "another snob is walking {who}'s {kind} list right now; run this again \
-         once it has finished, and it will use what that walk stored.\n\
-         A walk that stopped without letting go is taken over after {minutes} minutes."
+    ExitError::new(
+        ExitCode::Error,
+        format!(
+            "another snob is walking {who}'s {kind} list right now; run this again \
+             once it has finished, and it will use what that walk stored.\n\
+             A walk that stopped without letting go is taken over after {minutes} minutes."
+        ),
     )
+    .with_reason("walked_elsewhere")
+    .into()
 }
 
 /// What somebody is agreeing to when they let a run read a stranger's lists.

@@ -52,6 +52,40 @@ pub fn run(
         ));
     }
 
+    let (viewer, estimate) = estimate_for(walk, target, secrets, paths, kinds)?;
+    let subject = crate::engine::target::label_for(&viewer, target.as_deref());
+
+    let rendered = match format {
+        Format::Json | Format::Ndjson => {
+            let mut out = as_json(&estimate);
+            out["viewer"] = viewer.json();
+            let text = if format == Format::Json {
+                serde_json::to_string_pretty(&out)?
+            } else {
+                serde_json::to_string(&out)?
+            };
+            Rendered::Text(format!("{text}\n"))
+        }
+        _ => Rendered::Text(format!("{}\n", as_text(&estimate, &subject))),
+    };
+    output::write_rendered(&rendered, destination)?;
+    Ok(if estimate.held.is_some() {
+        ExitCode::RateLimited
+    } else {
+        ExitCode::Ok
+    })
+}
+
+/// The estimate of the walks of `kinds` of `target`, or of the viewer, out of
+/// what is stored here, **writing nothing and sending nothing**: what
+/// `--dry-run` prints, and what a job is started with (`jobs::start`).
+pub fn estimate_for(
+    walk: &WalkArgs,
+    target: &Option<String>,
+    secrets: &SessionStore,
+    paths: &AccountPaths,
+    kinds: &[ListKind],
+) -> Result<(Viewer, Estimate)> {
     let Some(session) = secrets.load()? else {
         return Err(common::no_session());
     };
@@ -91,27 +125,7 @@ pub fn run(
     };
     let query = common::query(target, walk);
     let estimate = estimate::compute(&estimate::gather(&standing, &query, kinds)?);
-    let subject = crate::engine::target::label_for(&viewer, target.as_deref());
-
-    let rendered = match format {
-        Format::Json | Format::Ndjson => {
-            let mut out = as_json(&estimate);
-            out["viewer"] = viewer.json();
-            let text = if format == Format::Json {
-                serde_json::to_string_pretty(&out)?
-            } else {
-                serde_json::to_string(&out)?
-            };
-            Rendered::Text(format!("{text}\n"))
-        }
-        _ => Rendered::Text(format!("{}\n", as_text(&estimate, &subject))),
-    };
-    output::write_rendered(&rendered, destination)?;
-    Ok(if estimate.held.is_some() {
-        ExitCode::RateLimited
-    } else {
-        ExitCode::Ok
-    })
+    Ok((viewer, estimate))
 }
 
 fn fate_token(fate: Fate) -> &'static str {
@@ -124,7 +138,8 @@ fn fate_token(fate: Fate) -> &'static str {
     }
 }
 
-fn as_json(estimate: &Estimate) -> Value {
+/// The estimate as `--dry-run --format json` gives it, without the viewer.
+pub fn as_json(estimate: &Estimate) -> Value {
     let lists: Vec<Value> = estimate
         .lists
         .iter()

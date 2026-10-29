@@ -21,6 +21,8 @@ pub mod engine;
 pub mod exit;
 pub mod headless;
 pub(crate) mod interrupt;
+/// A list walk that outlives the call that started it, and `snob jobs`.
+pub mod jobs;
 pub mod media;
 pub mod output;
 /// The one process that runs the browsers for every command of this user's.

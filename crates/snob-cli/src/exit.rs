@@ -26,6 +26,22 @@ pub fn code(outcome: ExitCode) -> u8 {
     }
 }
 
+/// The outcome a process exit number stands for, read back from a child or a
+/// job; `None` for one no run of this program exits with (a signal, clap's 2,
+/// or a newer build's).
+pub fn outcome_of(number: i32) -> Option<ExitCode> {
+    [
+        ExitCode::Ok,
+        ExitCode::Error,
+        ExitCode::NoSession,
+        ExitCode::Challenge,
+        ExitCode::RateLimited,
+        ExitCode::Interrupted,
+    ]
+    .into_iter()
+    .find(|outcome| i32::from(code(*outcome)) == number)
+}
+
 /// The code for what Instagram said, when a walk stopped because it said
 /// something.
 ///

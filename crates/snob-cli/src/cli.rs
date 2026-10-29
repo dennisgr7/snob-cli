@@ -65,6 +65,15 @@ pub struct Cli {
     #[arg(long, global = true, hide = true)]
     pub spend_alone: bool,
 
+    /// Say how a walk goes as one JSON line on standard error per page and
+    /// per wait, instead of drawing a bar
+    // Hidden: plumbing for a job's supervisor (`jobs/supervise.rs`), which
+    // reads the walk's progress back from its log (`jobs::show`). Wins over
+    // `--no-progress`, which the walk's command line may carry
+    // (`progress::progress_json`).
+    #[arg(long, global = true, hide = true)]
+    pub progress_json: bool,
+
     /// Store the session in a protected file instead of the system keyring.
     /// For environments without a desktop session.
     // Ordered last, with `verbose`. Both are global, so without this they are
@@ -300,16 +309,17 @@ pub enum Command {
     /// Show which account you are authenticated as
     Whoami(WhoamiArgs),
 
-    /// Where the account stands: session, request budget, cooldown, lists, monitor, agents
+    /// Where the account stands: session, budget, cooldown, lists, monitor, agents, jobs
     #[command(
         after_help = "Read from what is stored here; nothing is sent and nothing stored is \
                       changed, not even a database an older snob left, which is read as the \
                       current one without being migrated. With no section named, all of \
-                      them; --budget, --cooldown, --session, --lists, --watch and --agents \
-                      narrow it to those. --agents is what agents were told yes to through \
-                      \"snob mcp\" in the last 24 hours: each follow, unfollow and walk of \
-                      another account's lists, how the yes was given and through which \
-                      client.\n\n\
+                      them; --budget, --cooldown, --session, --lists, --watch, --agents and \
+                      --jobs narrow it to those. --agents is what agents were told yes to \
+                      through \"snob mcp\" in the last 24 hours: each follow, unfollow and walk \
+                      of another account's lists, how the yes was given and through which \
+                      client. --jobs is the walks an agent left running as jobs (\"snob \
+                      jobs\").\n\n\
                       It exits 5 while the account is in cooldown, whatever sections were \
                       asked for, so \"snob status --budget && snob scan\" runs the scan only \
                       when it may send; 3 with no session; 0 otherwise.\n\n\
@@ -481,6 +491,21 @@ pub enum Command {
     )]
     Watch(WatchArgs),
 
+    /// The walks running as jobs for an agent: list them, see one, stop one
+    #[command(
+        args_conflicts_with_subcommands = true,
+        after_help = "A walk an agent starts through \"snob mcp\" may run as a job, which goes \
+                      on after the agent's call has answered and is asked about by its id. One \
+                      runs at a time per account. Each is kept with its result for a day, \
+                      and its record for a week.\n\n\
+                      With no subcommand, the jobs not finished yet; --all, every one kept. \
+                      \"snob jobs cancel <id>\" stops a walk as Ctrl+C stops it: what it read is \
+                      kept, and the next walk of the list continues from there. Nothing here \
+                      sends anything; \"snob logout\" and \"snob purge\" stop the account's jobs \
+                      first."
+    )]
+    Jobs(JobsArgs),
+
     /// Read Instagram's own data export, with no session and no request
     #[command(
         subcommand,
@@ -528,6 +553,111 @@ pub enum Command {
     /// Started by the commands themselves; nobody types it.
     #[command(name = crate::owner::COMMAND, hide = true)]
     BrowserOwner,
+
+    /// A job's own processes (`jobs`): started by the commands and by
+    /// `snob mcp`; nobody types them.
+    #[command(name = crate::jobs::start::COMMAND, hide = true, subcommand)]
+    Job(JobCommand),
+}
+
+/// `snob __job`: what starts, runs and reads a job (`jobs`).
+#[derive(Subcommand, Debug)]
+pub enum JobCommand {
+    /// Start a list walk as a job, and answer with one JSON document
+    Start(JobStartArgs),
+    /// Run a job: the supervisor, started detached by `start`
+    Run(JobRunArgs),
+    /// One job, and its result once it has one
+    Show(JobShowArgs),
+    /// The jobs not finished yet
+    List(JobListArgs),
+    /// Ask a job to stop
+    Cancel(JobCancelArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct JobStartArgs {
+    /// Answer with the result if the walk ends within this long
+    #[arg(long, value_name = "DURATION", default_value = "0s", value_parser = duration)]
+    pub wait: std::time::Duration,
+
+    /// The tool call the job is for, recorded with it
+    #[arg(long, value_name = "NAME")]
+    pub tool: Option<String>,
+
+    /// The call's arguments, as a JSON object, recorded with it
+    #[arg(long, value_name = "JSON")]
+    pub arguments: Option<String>,
+
+    /// The client that started it, by name and version
+    #[arg(long, value_name = "CLIENT")]
+    pub started_by: Option<String>,
+
+    /// The walk, after `--`: one of the list commands and its flags
+    #[arg(last = true, required = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct JobRunArgs {
+    pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct JobsArgs {
+    #[command(subcommand)]
+    pub command: Option<JobsCommand>,
+
+    #[command(flatten)]
+    pub list: JobListArgs,
+}
+
+/// `snob jobs`: reading and stopping only. A job is started by an agent's
+/// call, never typed.
+#[derive(Subcommand, Debug)]
+pub enum JobsCommand {
+    /// The jobs not finished yet, or every one kept
+    List(JobListArgs),
+    /// One job: what it walks, how far it is, and how it ended
+    Show(JobShowArgs),
+    /// Stop a job as Ctrl+C stops a walk, keeping what it read
+    Cancel(JobCancelArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct JobShowArgs {
+    /// The job's id, as "snob jobs" lists it
+    pub id: String,
+
+    /// Wait up to this long for it to finish
+    #[arg(long, value_name = "DURATION", default_value = "0s", value_parser = duration)]
+    pub wait: std::time::Duration,
+
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct JobListArgs {
+    /// Every job kept, the finished ones too
+    #[arg(long)]
+    pub all: bool,
+
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct JobCancelArgs {
+    /// The job's id, as "snob jobs" lists it
+    pub id: String,
+
+    /// Wait up to this long for it to have stopped
+    #[arg(long, value_name = "DURATION", default_value = "0s", value_parser = duration)]
+    pub wait: std::time::Duration,
+
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 }
 
 #[derive(Args, Debug)]
@@ -645,6 +775,10 @@ pub struct StatusArgs {
     #[arg(long)]
     pub agents: bool,
 
+    /// The walks running as jobs, what they walk, since when and for whom
+    #[arg(long)]
+    pub jobs: bool,
+
     #[command(flatten)]
     pub output: StatusOutputArgs,
 }
@@ -658,6 +792,7 @@ pub struct StatusSections {
     pub lists: bool,
     pub watch: bool,
     pub agents: bool,
+    pub jobs: bool,
 }
 
 impl StatusSections {
@@ -671,6 +806,7 @@ impl StatusSections {
             (self.lists, "lists"),
             (self.watch, "watch"),
             (self.agents, "agents"),
+            (self.jobs, "jobs"),
         ]
         .into_iter()
         .filter_map(|(shown, name)| shown.then_some(name))
@@ -688,6 +824,7 @@ impl StatusArgs {
             lists: self.lists,
             watch: self.watch,
             agents: self.agents,
+            jobs: self.jobs,
         };
         if named.session
             || named.budget
@@ -695,6 +832,7 @@ impl StatusArgs {
             || named.lists
             || named.watch
             || named.agents
+            || named.jobs
         {
             named
         } else {
@@ -705,6 +843,7 @@ impl StatusArgs {
                 lists: true,
                 watch: true,
                 agents: true,
+                jobs: true,
             }
         }
     }

@@ -58,7 +58,7 @@ async fn main() -> std::process::ExitCode {
 /// a list into JSON on its own. A program reading one stream should not
 /// have to read the other in English.
 fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
-    use snob_cli::cli::{AccountCommand, Format, WatchCommand};
+    use snob_cli::cli::{AccountCommand, Format, JobsCommand, WatchCommand};
     use snob_cli::output::effective_format;
     use snob_cli::report::Wording;
 
@@ -112,6 +112,16 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
         | Command::Pfp(_)
         | Command::Fetch(_)
         | Command::BrowserOwner => false,
+        // A job's own processes answer in JSON, as the server reading them
+        // does (`jobs::start`); the supervisor's errors go to its log.
+        Command::Job(snob_cli::cli::JobCommand::Run(_)) => false,
+        Command::Job(_) => true,
+        Command::Jobs(args) => match &args.command {
+            None => args.list.output.json,
+            Some(JobsCommand::List(list)) => list.output.json,
+            Some(JobsCommand::Show(show)) => show.output.json,
+            Some(JobsCommand::Cancel(cancel)) => cancel.output.json,
+        },
         // The protocol is on standard output; its failures are JSON-RPC.
         #[cfg(feature = "mcp")]
         Command::Mcp(_) => false,
@@ -259,6 +269,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     if cli.spend_alone {
         snob_cli::app::spend_alone();
     }
+    if cli.progress_json {
+        snob_cli::app::progress_json();
+    }
     // Before the layout, the owner and the session: the server spends nothing
     // and stores nothing itself. Each tool call is a child `snob`, which does
     // all of that for itself.
@@ -325,6 +338,12 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                  with \"snob login\". It may still be active on Instagram."
             ));
         }
+    }
+
+    // The jobs send nothing themselves and use no browser: a walk a job runs
+    // is a process of its own, which comes through here again.
+    if matches!(cli.command, Command::Job(_) | Command::Jobs(_)) {
+        return snob_cli::jobs::dispatch(&cli, &store, &paths).await;
     }
 
     // Every request to Instagram goes out from a browser from here on, unless
@@ -417,12 +436,10 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
         }
         Command::Purge(args) => match cli.account.as_deref() {
             Some(name) => commands::purge::run_for_account(args, store, paths, name).await,
-            None => {
-                // The whole data directory goes, the owner's log with it, so
-                // the owner is asked to leave, not only to close its browsers.
-                snob_cli::owner::quit(paths).await;
-                commands::purge::run(args, store, paths)
-            }
+            // The whole data directory goes, the owner's log with it, so the
+            // owner is asked to leave, not only to close its browsers, once
+            // the jobs that would start it again have stopped.
+            None => commands::purge::run_everything(args, store, paths).await,
         },
         Command::Account(command) => commands::account::run(
             command,
@@ -484,8 +501,8 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
             };
             commands::fetch::run(args, account_ua).await
         }
-        // Answered at the top.
-        Command::BrowserOwner => Ok(ExitCode::Ok),
+        // Answered at the top, and in `run`.
+        Command::BrowserOwner | Command::Job(_) | Command::Jobs(_) => Ok(ExitCode::Ok),
         // Answered in `run`.
         #[cfg(feature = "mcp")]
         Command::Mcp(_) => Ok(ExitCode::Ok),

@@ -5017,3 +5017,615 @@ async fn status_shows_what_an_agent_was_told_yes_to() {
         "{status}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Jobs: a walk that outlives the call that started it (`jobs`).
+//
+// **Every test here stops its jobs and waits for their locks before its
+// `TempDir` drops** (`Jobs`, below, on drop, a panic included): a job is a
+// detached process, and one left running would go on writing into a
+// directory being removed, and on Windows keep it from being removed.
+// ---------------------------------------------------------------------------
+
+/// A fake Instagram whose followers list answers after `delay`, the first
+/// `times` it is asked, and at once after that: a walk that is still going
+/// when it is asked about, and one that finishes when it is walked again.
+async fn fake_instagram_slow(followers: u64, delay: std::time::Duration, times: u64) -> MockServer {
+    let server = fake_instagram(followers, 2).await;
+    let users: Vec<String> = (0..followers)
+        .map(|n| format!(r#"{{"pk":{},"username":"user{n}"}}"#, 1_000 + n))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!(r#"{{"users":[{}]}}"#, users.join(",")))
+                .set_delay(delay),
+        )
+        .up_to_n_times(times)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// The walk the tests start as a job, as the MCP server will start it.
+const FOLLOWERS_JOB: [&str; 6] = [
+    "--",
+    "followers",
+    "--format",
+    "json",
+    "--no-interactive",
+    "--no-progress",
+];
+
+/// How many times the walk asked for a page of followers.
+async fn followers_asked(instagram: &MockServer) -> usize {
+    instagram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/followers/"))
+        .count()
+}
+
+/// Waits until the walk has asked for a page `at_least` times.
+async fn until_asked(instagram: &MockServer, at_least: usize) {
+    let since = std::time::Instant::now();
+    while followers_asked(instagram).await < at_least {
+        assert!(
+            since.elapsed() < std::time::Duration::from_secs(60),
+            "the job's walk never asked for its page"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// The jobs of one sandbox, stopped and waited for when this goes.
+struct Jobs<'a> {
+    root: &'a Path,
+    instagram: &'a MockServer,
+}
+
+impl Jobs<'_> {
+    /// `snob __job start --wait <wait> <command>`, and the one document it
+    /// answers with.
+    fn start(&self, wait: &str, command: &[&str]) -> (Output, Option<serde_json::Value>) {
+        let mut args = vec!["__job", "start", "--wait", wait, "--tool", "snob_list"];
+        args.extend_from_slice(command);
+        let out = snob(self.root, Some(self.instagram), &args);
+        let told = serde_json::from_str(&stdout(&out)).ok();
+        (out, told)
+    }
+
+    /// A start that has to have answered: its record.
+    fn started(&self, wait: &str, command: &[&str]) -> serde_json::Value {
+        let (out, told) = self.start(wait, command);
+        assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+        let told = told.unwrap_or_else(|| panic!("one JSON document: {}", stdout(&out)));
+        assert_eq!(
+            stdout(&out).trim().lines().count(),
+            1,
+            "exactly one compact document: {}",
+            stdout(&out)
+        );
+        told
+    }
+
+    /// `snob __job <verb> …`, read as its JSON.
+    fn ask(&self, args: &[&str]) -> serde_json::Value {
+        let mut all = vec!["__job"];
+        all.extend_from_slice(args);
+        let out = snob(self.root, Some(self.instagram), &all);
+        assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+        json(&out)
+    }
+
+    /// The job, once it is over, within a minute.
+    fn finished(&self, id: &str) -> serde_json::Value {
+        let told = self.ask(&["show", id, "--wait", "60s", "--json"]);
+        assert!(
+            !matches!(told["status"].as_str(), Some("running" | "queued")),
+            "still going after a minute: {told}"
+        );
+        told
+    }
+
+    /// Every job of every account of the sandbox's, by its directory.
+    fn dirs(&self) -> Vec<std::path::PathBuf> {
+        let app = snob_store::paths::AppPaths::rooted_at(self.root);
+        app.account_dirs()
+            .into_iter()
+            .flat_map(|pk| {
+                std::fs::read_dir(app.account(pk).jobs_dir())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|entry| entry.path().is_dir())
+                    .map(|entry| entry.path())
+            })
+            .collect()
+    }
+}
+
+impl Drop for Jobs<'_> {
+    fn drop(&mut self) {
+        for dir in self.dirs() {
+            let _ = std::fs::write(dir.join("stop"), b"");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while self.dirs().iter().any(|dir| {
+            snob_store::paths::lock_is_held(&dir.join("lock"))
+                .ok()
+                .flatten()
+                .unwrap_or(false)
+        }) {
+            if std::time::Instant::now() > deadline {
+                // Not a panic inside a drop that may be unwinding already.
+                eprintln!("a job did not stop within a minute");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+/// A walk that ends within the wait is answered with its result, inline,
+/// as one document: the record, and the walk's own answer under `finished`.
+#[tokio::test]
+async fn a_job_that_finishes_within_the_wait_answers_inline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+
+    let told = jobs.started("60s", &FOLLOWERS_JOB);
+    assert_eq!(told["status"], "succeeded", "{told}");
+    assert_eq!(told["reused"], false);
+    assert_eq!(told["command"], "followers");
+    assert_eq!(told["tool"], "snob_list");
+    assert!(told["detached"].is_string(), "{told}");
+    assert!(told["estimate"]["dry_run"] == true, "{told}");
+    assert_eq!(told["finished"]["exit"], "ok", "{told}");
+    let output = told["finished"]["output"].to_string();
+    for user in ["user0", "user1", "user2"] {
+        assert!(output.contains(user), "{output}");
+    }
+    let id = told["job_id"].as_str().unwrap();
+    assert!(snob_store::paths::JobId::parse(id).is_some(), "{id}");
+    // Its walk said how it went, a line a page, and asked once.
+    assert!(told["progress"]["event"] == "finished", "{told}");
+    assert_eq!(followers_asked(&instagram).await, 1);
+    // `--no-progress` was taken out of what it ran.
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(jobs.dirs()[0].join("job.json")).unwrap()).unwrap();
+    assert!(
+        !record["argv"].to_string().contains("no-progress"),
+        "{record}"
+    );
+}
+
+/// A walk that takes longer than the wait is answered with its record while
+/// it runs, and asked about later gives what the walk answered.
+#[tokio::test]
+async fn a_job_polled_to_its_end_gives_the_walks_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(3), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+
+    let told = jobs.started("0s", &FOLLOWERS_JOB);
+    assert!(
+        matches!(told["status"].as_str(), Some("running" | "queued")),
+        "{told}"
+    );
+    assert!(told["finished"].is_null(), "{told}");
+    let id = told["job_id"].as_str().unwrap().to_string();
+
+    // The person sees it, in `snob jobs` and in `snob status`.
+    let listed = jobs.ask(&["list", "--json"]);
+    assert_eq!(listed["jobs"][0]["job_id"], id.as_str(), "{listed}");
+    let out = snob(tmp.path(), Some(&instagram), &["jobs"]);
+    assert!(stdout(&out).contains(&id), "{}", stdout(&out));
+    assert!(stdout(&out).contains("your followers"), "{}", stdout(&out));
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["status", "--jobs", "--json"],
+    );
+    assert_eq!(json(&out)["jobs"]["running"][0]["job_id"], id.as_str());
+
+    let done = jobs.finished(&id);
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert_eq!(done["finished"]["exit"], "ok");
+    assert!(done["finished"]["output"].to_string().contains("user2"));
+    // And `snob jobs show` says the same to a person.
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["jobs", "show", &id, "--json"],
+    );
+    assert_eq!(json(&out)["status"], "succeeded");
+    // Over, it is no longer one `snob jobs` lists, and is with `--all`.
+    assert_eq!(jobs.ask(&["list", "--json"])["jobs"], serde_json::json!([]));
+    assert_eq!(
+        jobs.ask(&["list", "--all", "--json"])["jobs"][0]["job_id"],
+        id.as_str()
+    );
+}
+
+/// Canceling a job stops its walk as Ctrl+C does, which lets go of the list,
+/// so the next walk of it is not refused as walked elsewhere.
+#[tokio::test]
+async fn canceling_a_job_stops_it_like_ctrl_c_and_the_walk_resumes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+
+    let id = jobs.started("0s", &FOLLOWERS_JOB)["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    until_asked(&instagram, 1).await;
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["jobs", "cancel", &id, "--wait", "60s", "--json"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let canceled = json(&out);
+    assert_eq!(canceled["status"], "canceled", "{canceled}");
+    assert_eq!(canceled["exit_number"], 130, "{canceled}");
+    assert_eq!(canceled["finished"]["exit"], "interrupted");
+    // Asked again, nothing changes: it is over.
+    let again = jobs.ask(&["cancel", &id, "--json"]);
+    assert_eq!(again["status"], "canceled");
+
+    // The list was let go of, so it is walked again, and this time answers.
+    let told = jobs.started("60s", &FOLLOWERS_JOB);
+    assert_eq!(told["status"], "succeeded", "{told}");
+    assert_ne!(told["job_id"], id.as_str());
+}
+
+/// The process that started a job is gone long before the walk ends, and the
+/// walk goes on without it.
+#[tokio::test]
+async fn a_job_outlives_the_process_that_started_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(5), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+
+    let since = std::time::Instant::now();
+    let told = jobs.started("0s", &FOLLOWERS_JOB);
+    assert!(
+        since.elapsed() < std::time::Duration::from_secs(5),
+        "the start waited for the walk"
+    );
+    let id = told["job_id"].as_str().unwrap().to_string();
+    assert_eq!(jobs.finished(&id)["status"], "succeeded");
+}
+
+/// A start whose standard input closes before it has answered, as when the
+/// tool call is canceled or the client goes away, stops the job it made:
+/// nobody would ever be told its id.
+#[tokio::test]
+async fn closing_starts_stdin_before_it_answered_stops_the_job() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+
+    let mut args = vec![
+        "--stop-when-stdin-closes",
+        "__job",
+        "start",
+        "--wait",
+        "600s",
+    ];
+    args.extend_from_slice(&FOLLOWERS_JOB);
+    let mut child = command(tmp.path(), Some(&instagram))
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    until_asked(&instagram, 1).await;
+    drop(child.stdin.take());
+    let out = tokio::task::spawn_blocking(move || child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(130), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "", "no id was handed over");
+
+    let listed = jobs.ask(&["list", "--all", "--json"]);
+    let id = listed["jobs"][0]["job_id"].as_str().unwrap().to_string();
+    // Already, without waiting: the start saw it stop before it left.
+    let over = jobs.ask(&["show", &id, "--json"]);
+    assert_eq!(over["status"], "canceled", "{over}");
+    assert_eq!(over["exit_number"], 130, "{over}");
+}
+
+/// `purge` stops the jobs before anything goes: they are listed in what it
+/// will do, stopped, and only then is everything removed.
+#[tokio::test]
+async fn purge_stops_running_jobs_before_releasing_the_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let id = jobs.started("0s", &FOLLOWERS_JOB)["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    until_asked(&instagram, 1).await;
+
+    // Listed, and a dry run stops nothing.
+    let out = snob(tmp.path(), Some(&instagram), &["purge", "--dry-run"]);
+    assert!(stdout(&out).contains(&id), "{}", stdout(&out));
+    assert_eq!(jobs.ask(&["show", &id, "--json"])["status"], "running");
+
+    let out = snob(tmp.path(), Some(&instagram), &["purge", "--yes"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(
+        stdout(&out).contains("Stopped 1 job first."),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        !tmp.path().join("data").exists(),
+        "the data directory, the job's with it, is gone"
+    );
+}
+
+/// `logout` stops the account's jobs too: a walk would otherwise go on with
+/// a session being deleted.
+#[tokio::test]
+async fn logout_stops_running_jobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let id = jobs.started("0s", &FOLLOWERS_JOB)["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    until_asked(&instagram, 1).await;
+
+    let out = snob(tmp.path(), Some(&instagram), &["logout"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(
+        stdout(&out).contains("Stopped 1 job first."),
+        "{}",
+        stdout(&out)
+    );
+    // Read straight from its files: with nobody signed in, no command acts as
+    // the account any more.
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(jobs.dirs()[0].join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["status"], "canceled", "{state}");
+    assert!(jobs.dirs()[0].ends_with(&id));
+}
+
+/// One job runs at a time per account: the same walk again is the job already
+/// running, and another walk is refused with nothing started.
+#[tokio::test]
+async fn a_second_job_for_the_account_is_refused_or_reused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let first = jobs.started("0s", &FOLLOWERS_JOB);
+    let again = jobs.started("0s", &FOLLOWERS_JOB);
+    assert_eq!(again["job_id"], first["job_id"]);
+    assert_eq!(again["reused"], true);
+
+    let (out, _) = jobs.start(
+        "0s",
+        &["--", "following", "--format", "json", "--no-interactive"],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    let told: serde_json::Value =
+        serde_json::from_str(stderr(&out).trim().lines().last().unwrap()).unwrap();
+    assert_eq!(told["error"]["reason"], "too_many_jobs", "{told}");
+    assert_eq!(jobs.dirs().len(), 1);
+}
+
+/// Two starts at once make one job: the count and the making are one step,
+/// under the account's jobs lock.
+#[tokio::test]
+async fn two_concurrent_starts_make_one_job() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let spawn = || {
+        let mut args = vec!["__job", "start", "--wait", "0s"];
+        args.extend_from_slice(&FOLLOWERS_JOB);
+        command(tmp.path(), Some(&instagram))
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("the binary runs")
+    };
+    let (one, two) = (spawn(), spawn());
+    let one = json(&one.wait_with_output().unwrap());
+    let two = json(&two.wait_with_output().unwrap());
+    assert_eq!(one["job_id"], two["job_id"], "{one} {two}");
+    assert_ne!(one["reused"], two["reused"], "one made it, one found it");
+    assert_eq!(jobs.dirs().len(), 1);
+}
+
+/// A job is looked for in the account's own jobs alone: an agent served for
+/// one account cannot read, or stop, another account's walk by its id.
+#[tokio::test]
+async fn a_job_of_another_account_is_no_such_job() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = two_accounts(tmp.path()).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(120)))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut args = vec!["--account", "other", "__job", "start", "--wait", "0s"];
+    args.extend_from_slice(&FOLLOWERS_JOB);
+    let out = snob(tmp.path(), Some(&instagram), &args);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let id = json(&out)["job_id"].as_str().unwrap().to_string();
+
+    for verb in ["show", "cancel"] {
+        let out = snob(
+            tmp.path(),
+            Some(&instagram),
+            &["--account", "me", "__job", verb, &id, "--json"],
+        );
+        assert_eq!(out.status.code(), Some(1), "{verb}: {}", stdout(&out));
+        let told: serde_json::Value =
+            serde_json::from_str(stderr(&out).trim().lines().last().unwrap()).unwrap();
+        assert_eq!(told["error"]["reason"], "no_such_job", "{told}");
+    }
+    let theirs = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["--account", "other", "__job", "show", &id, "--json"],
+    );
+    let theirs = json(&theirs);
+    assert!(
+        matches!(theirs["status"].as_str(), Some("running" | "queued")),
+        "the cancel as another account stopped nothing: {theirs}"
+    );
+    assert!(!jobs.dirs()[0].join("stop").exists());
+}
+
+/// A job's record is a file anybody running as this user can edit; what it
+/// says to run is checked again where it runs, and a command no job may run
+/// runs nothing.
+#[tokio::test]
+async fn a_hand_edited_job_json_runs_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let told = jobs.started("60s", &FOLLOWERS_JOB);
+    assert_eq!(told["status"], "succeeded");
+    let dir = jobs.dirs()[0].clone();
+    let before = instagram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .len();
+
+    for argv in [
+        serde_json::json!(["unfollow", "someone", "-y", "--json"]),
+        serde_json::json!(["followers", "-o", "elsewhere.json"]),
+        serde_json::json!(["followers", "--sandbox-root", "elsewhere"]),
+    ] {
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("job.json")).unwrap()).unwrap();
+        record["argv"] = argv.clone();
+        std::fs::write(dir.join("job.json"), record.to_string()).unwrap();
+        for name in ["state.json", "out.json"] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        let id = dir.file_name().unwrap().to_str().unwrap();
+        let out = snob(tmp.path(), Some(&instagram), &["__job", "run", id]);
+        assert!(out.status.success(), "{argv}: {}", stderr(&out));
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(state["status"], "failed", "{argv}: {state}");
+        assert_eq!(state["failure"], "refused_argv", "{argv}: {state}");
+    }
+    assert_eq!(
+        instagram
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len(),
+        before,
+        "nothing was sent"
+    );
+    assert!(!tmp.path().join("elsewhere").exists());
+}
+
+/// A job that died without letting go of its list, killed with its client,
+/// holds the list until its claim runs out; a start of a walk of that list
+/// says until when, and starts nothing. Another list is walked.
+#[tokio::test]
+async fn a_lost_job_with_a_live_claim_says_when_it_frees() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    // A finished job, made lost by hand: its ending taken away, as though
+    // its supervisor had been killed while it ran.
+    let told = jobs.started("60s", &FOLLOWERS_JOB);
+    let id = told["job_id"].as_str().unwrap().to_string();
+    let dir = jobs.dirs()[0].clone();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+    state["status"] = "running".into();
+    state["finished_at"] = serde_json::Value::Null;
+    state["updated_at"] = snob_core::clock::now_ms().get().into();
+    std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
+    assert_eq!(jobs.ask(&["show", &id, "--json"])["status"], "lost");
+
+    let (out, _) = jobs.start("0s", &["--", "unfollowers", "--format", "json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let told: serde_json::Value =
+        serde_json::from_str(stderr(&out).trim().lines().last().unwrap()).unwrap();
+    assert_eq!(told["error"]["reason"], "walked_elsewhere", "{told}");
+    let said = told["error"]["message"].as_str().unwrap();
+    assert!(said.contains(&id) && said.contains("until"), "{said}");
+    assert_eq!(jobs.dirs().len(), 1, "nothing was started");
+
+    // A list it never walked is another matter.
+    let told = jobs.started(
+        "60s",
+        &["--", "following", "--format", "json", "--no-interactive"],
+    );
+    assert_eq!(told["status"], "succeeded", "{told}");
+}

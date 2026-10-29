@@ -330,27 +330,9 @@ pub struct Confirmed<'a> {
     pub writes_a_day: u32,
 }
 
-/// How a client is named in the record of what it was told yes to: its name
-/// and version as it declared them, **through `printable`, then cut to
-/// letters, digits, spaces and `._/-`, and to 64 characters**. It is the
-/// client's own text, it becomes an argument of a command line, and the
-/// person reads it in `snob status`. `None` when nothing is left.
-pub fn client_label(name: &str, version: &str) -> Option<String> {
-    let said = snob_core::model::printable(&format!("{name} {version}"));
-    let kept: String = said
-        .chars()
-        .filter(|&c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '/' | '-'))
-        .collect();
-    let kept: String = kept
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(64)
-        .collect();
-    let kept = kept.trim_end();
-    (!kept.is_empty()).then(|| kept.to_string())
-}
+/// How a client is named (`commands::common::client_label`, its one home: a
+/// job records its client the same way, and jobs build without this module).
+pub use crate::commands::common::client_label;
 
 /// What a command may send to Instagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

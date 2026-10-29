@@ -126,6 +126,10 @@ pub fn wait_at_most(limit: Option<std::time::Duration>) {
 /// setting `main` hands every pacer, through the cancellation token.
 pub use crate::interrupt::stop_when_stdin_closes;
 
+/// `--progress-json`, the third: every progress stack this run builds says
+/// how its walks go in JSON lines rather than drawing a bar.
+pub use crate::progress::progress_json;
+
 /// `--spend-alone`, set once by `main` before any command runs.
 static SPEND_ALONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

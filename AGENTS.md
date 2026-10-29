@@ -61,7 +61,7 @@ Rust 2024 edition, resolver 3. Dependency direction is one-way:
 | `crates/snob-core` | Domain: `Pk`, models (the JSON contract), set arithmetic, `watch` diff, schedule (cron and `--on/--at/--every`), webhook signing (HMAC-SHA256), `Secret`, `Session`, the `RateBudget` trait and cooldown policy, `clock` | **No I/O.** No file, database, network or directory; `clock` is the single exception |
 | `crates/snob-ig` | Instagram web client: `client/` (`read.rs`, `write.rs`, `transport.rs`, `headers.rs`, `cdn.rs`, `media.rs`, `page.rs`, `ask.rs`, `posts.rs`), `web.rs` (calls built as the web app builds them), `allowlist.rs`, `pager.rs` (list walks), `pace.rs`, `graphql.rs`, `error.rs` (classifying answers), `http.rs` (the only place `reqwest` is configured; re-exported) | No SQLite, no keyring, no browser driving (it defines the page request shape only) |
 | `crates/snob-store` | SQLite (`store/`, migrations in `store/sql/`), platform paths, keyring/file secret store, account registry (`accounts.toml`), the monitor's `watch.toml`, layout migration | Domain logic that belongs in `snob-core` |
-| `crates/snob-cli` | `cli.rs` (clap), `main.rs`, `app.rs` (wires everything), `commands/`, `engine/` (rules: cache, consent, cooldown, walks, estimates, monitor), `output/`, `report.rs` (shared sentences), `ui/` (ratatui views), `headless/` + `cdp/` + `pipe.rs` (the browser), `owner/` (one background process that owns the browsers), `detach.rs` (starting a process that outlives its command, with nothing of the command's), `relay/` (`login --remote`), `power/`, `watch/webhook.rs`, `commands/mcp/` (the MCP server, feature `mcp`) | |
+| `crates/snob-cli` | `cli.rs` (clap), `main.rs`, `app.rs` (wires everything), `commands/`, `engine/` (rules: cache, consent, cooldown, walks, estimates, monitor), `output/`, `report.rs` (shared sentences), `ui/` (ratatui views), `headless/` + `cdp/` + `pipe.rs` (the browser), `owner/` (one background process that owns the browsers), `detach.rs` (starting a process that outlives its command, with nothing of the command's), `jobs/` (a list walk run as a job that outlives the call that started it: the hidden `__job start|run|show|list|cancel`, and `snob jobs`), `relay/` (`login --remote`), `power/`, `watch/webhook.rs`, `commands/mcp/` (the MCP server, feature `mcp`) | |
 
 Layering rules inside `snob-cli`:
 
@@ -148,6 +148,13 @@ Locally:
   answers 400 to a malformed form). `IgClient::is_live` decides by address, so
   every wait and pace is off against a local server and on against
   instagram.com, and no caller can choose otherwise.
+- **Jobs in tests** (`tests/sandbox.rs`): a walk still going when it is asked
+  about is a followers mock with `set_delay` at a higher priority
+  (`fake_instagram_slow`), answered at once after its first `n` times.
+  **Every job test stops its jobs and waits for their locks before its
+  `TempDir` drops** (`Jobs`, on drop, a panic included): a job is a detached
+  process, and one left running writes into a directory being removed, and on
+  Windows keeps it from being removed.
 - **The `testing` feature** (`snob-cli/testing` -> `snob-ig/testing`) adds the
   hidden seam: `--sandbox-root`, `--ig-base-url` (requires `--sandbox-root`),
   `--through-the-browser` (requires `--ig-base-url`), `point_every_client_at`,
@@ -304,7 +311,12 @@ with a documented reason in the same place.
   `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED`. Per account under `accounts/<pk>/`;
   `shared.db` for what accounts share; the account's database also keeps
   what agents were told yes to through `snob mcp` (`mcp_acts`, a week of
-  rows, the last day shown by `snob status`); `accounts.toml` changed only
+  rows, the last day shown by `snob status`); its jobs under
+  `accounts/<pk>/jobs/<id>/` (`job.json`, `state.json`, the walk's output and
+  log, `0600` on Unix; a finished job's result kept a day, the job a week, at
+  most 50), which `snob logout` stops and `snob purge` stops and removes,
+  both before the owner of the browsers is released, so no walk starts it
+  again into what is going; `accounts.toml` changed only
   through `Registry::update` (file lock). `watch.toml` and `accounts.toml`
   are read with serde and written from a hand-written template, tested to
   round-trip. `snob status` and `--dry-run` write nothing. `snob purge`
@@ -413,7 +425,7 @@ writes it.
   run on a yes gets the hidden `--confirmed-via form|elicitation|chat` and
   `--confirmed-for=<client>` (the client's `name version`, from the request's
   `_meta` or the handshake, through `printable`, cut to `[A-Za-z0-9 ._/-]`
-  and 64 characters; `tools::client_label`), and a write also
+  and 64 characters; `commands::common::client_label`), and a write also
   `--mcp-write-cap=<N>`, all after the binding is taken
   (`tools::Plan::command_line`). The child records the act in the account's
   `mcp_acts` table before its first request, in a transaction of its own
@@ -447,6 +459,30 @@ writes it.
   crossing checked against Instagram on the first page is refused offline
   when its lists were walked far apart. Not held, the page is read from the
   store; for a call given `max_pages`, it is refused as `page_unavailable`.
+- **A walk can outlive the call that started it, as a job** (`jobs/`, in
+  every build: `std` processes and threads, no `mcp` feature). `snob __job
+  start` checks the walk, makes the job under the account's `jobs/.lock`
+  (one running per account: the same command again is `reused`, another is
+  `too_many_jobs`; a list a lost job may still hold is `walked_elsewhere`,
+  with until when), starts its supervisor detached (`detach.rs`) and answers
+  with **one** compact JSON document: the record, and the walk's answer under
+  `finished` when it ended within `--wait`. Asked to stop before it answered
+  (its standard input closing), it stops the job it made, since nobody would
+  ever be told the id. The supervisor, `__job run <id>`, holds the job's
+  `lock` all its life (a held lock is a running job, `jobs::derive`; asking
+  writes nothing, `paths::lock_is_held`), **runs itself** (`current_exe`,
+  never a path from disk) with its own global flags (`argv::globals`), and
+  **checks the stored command line again** (`argv::check`: the five list
+  commands, judged by clap, and an allowlist of flags; anything else ends
+  `failed`, `refused_argv`, nothing run). Its walk gets `--spend-alone`,
+  `--stop-when-stdin-closes` on a pipe it holds, and `--progress-json`, which
+  wins over `--no-progress` and is what `show` reads progress and the time
+  left from. Stopping is a `stop` file, read every second; the supervisor
+  closes the walk's input and kills it through its own handle only after
+  the grace. No pid read from a file is ever signaled. `show`, `list` and
+  `cancel` look only in the jobs of the account the run acts as: another
+  account's id is `no_such_job`. A Windows job object that refuses breakaway
+  takes the job with its client: `detached: "in_client_job"`.
 - A heartbeat (`notifications/progress`) is sent from the call's own task
   and awaited, never spawned, so none can reach the client after the result.
 - **Upgrades.** `snob mcp config` prints a path that outlives one
@@ -474,7 +510,9 @@ writes it.
 - When the result would have been JSON, a failure is also one JSON object on
   the last line of standard error (`main::wording_for`); its `code` is the
   exit's token, and `reason` a finer one when there is one
-  (`ExitError::with_reason`, e.g. `busy`, `mcp_write_cap`).
+  (`ExitError::with_reason`, e.g. `busy`, `mcp_write_cap`,
+  `walked_elsewhere`, and a job's `too_many_jobs`, `no_such_job`,
+  `refused_argv`).
 - **Exit codes are stable** (`exit.rs`, `snob_core::watch::RunOutcome`, the
   `watch_runs.outcome` column and the `--json` `outcome` field share one
   vocabulary): 0 worked (a list cut short by `--limit`/`--max-pages` is still

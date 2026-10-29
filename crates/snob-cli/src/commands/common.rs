@@ -131,6 +131,29 @@ pub fn app(secrets: &SessionStore, paths: &AccountPaths, with_progress: bool) ->
         .ok_or_else(no_session)
 }
 
+/// How a client is named in the record of what it was told yes to: its name
+/// and version as it declared them, **through `printable`, then cut to
+/// letters, digits, spaces and `._/-`, and to 64 characters**. It is the
+/// client's own text, it becomes an argument of a command line, and the
+/// person reads it in `snob status` and `snob jobs`. `None` when nothing is
+/// left.
+pub fn client_label(name: &str, version: &str) -> Option<String> {
+    let said = snob_core::model::printable(&format!("{name} {version}"));
+    let kept: String = said
+        .chars()
+        .filter(|&c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '/' | '-'))
+        .collect();
+    let kept: String = kept
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(64)
+        .collect();
+    let kept = kept.trim_end();
+    (!kept.is_empty()).then(|| kept.to_string())
+}
+
 /// Records what an agent was told yes to through `snob mcp`, for a run given
 /// `--confirmed-via` (`cli::AgentArgs`), **before the run sends anything**,
 /// and refuses a write past the day's cap with nothing sent. The id of the

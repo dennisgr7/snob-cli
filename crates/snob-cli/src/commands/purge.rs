@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use snob_core::Pk;
-use snob_store::paths::{self, AppPaths};
+use snob_store::paths::{self, AccountPaths, AppPaths, JobId};
 use snob_store::registry::Registry;
 use snob_store::secrets::{Kind, SecretStore};
 use snob_store::store::shared::Shared;
@@ -52,6 +52,11 @@ pub struct Plan {
     /// The one account `purge --account` removes, its place in the registry
     /// with it; `None` is everything.
     pub only: Option<Viewer>,
+    /// The jobs still running in what goes, which are stopped before
+    /// anything is removed (`jobs`): a walk left running would write into
+    /// the directories as they went, and start the owner of the browsers
+    /// again into them.
+    pub jobs: Vec<JobId>,
 }
 
 impl Plan {
@@ -91,6 +96,14 @@ impl Plan {
             ));
         }
         lines.extend(self.directories.iter().map(|d| d.display().to_string()));
+        if !self.jobs.is_empty() {
+            let ids: Vec<&str> = self.jobs.iter().map(JobId::as_str).collect();
+            lines.push(format!(
+                "the {} still running ({}), stopped first",
+                if ids.len() == 1 { "job" } else { "jobs" },
+                ids.join(", ")
+            ));
+        }
         if let Some(account) = &self.only {
             lines.push(format!(
                 "{} from the accounts signed in here",
@@ -127,7 +140,23 @@ pub fn survey(store: &SecretStore, app_paths: &AppPaths) -> Plan {
             })
             .collect(),
         only: None,
+        jobs: app_paths
+            .account_dirs()
+            .into_iter()
+            .flat_map(|pk| running_jobs(&app_paths.account(pk)))
+            .collect(),
     }
+}
+
+/// The jobs of `account`'s not over yet, read without writing anything.
+fn running_jobs(account: &AccountPaths) -> Vec<JobId> {
+    let now = snob_core::clock::now_ms().get();
+    crate::jobs::all(account, now)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|seen| !seen.status.is_over())
+        .map(|seen| seen.id)
+        .collect()
 }
 
 /// What `purge --account` removes: one account's session, its directory and
@@ -143,6 +172,7 @@ pub fn survey_account(store: &SecretStore, app_paths: &AppPaths, account: Viewer
             .into_iter()
             .filter(|dir| dir.exists() && paths::is_safe_to_remove(dir))
             .collect(),
+        jobs: running_jobs(&paths),
         only: Some(account),
     }
 }
@@ -310,12 +340,48 @@ pub async fn run_for_account(
 ) -> Result<ExitCode> {
     let account = crate::account::named(name, &Registry::load(app_paths)?)
         .map_err(crate::account::Unresolved::into_error)?;
-    // Its browser would write into the profile as it went, or keep Windows
-    // from removing it. The owner and the other accounts' browsers stay.
-    crate::owner::release(app_paths, Some(account.pk)).await;
     warn_about_watched(app_paths, &account);
+    let pk = account.pk;
     let plan = survey_account(&store, app_paths, account);
-    carry_out(args, &plan, &store, app_paths, ui::can_be_asked())
+    if let Some(code) = ask(&args, &plan, ui::can_be_asked())? {
+        return Ok(code);
+    }
+    // Its jobs first, so none starts a browser again; then its browser, which
+    // would write into the profile as it went, or keep Windows from removing
+    // it. The owner and the other accounts' browsers stay.
+    let stopping = crate::jobs::stop_before_leaving(vec![app_paths.account(pk)]).await?;
+    crate::owner::release(app_paths, Some(pk)).await;
+    // Let go of before the removal, which Windows refuses while a file in it
+    // is open. The session goes first in `finish`, and a job is started only
+    // with one, so none starts in between.
+    drop(stopping);
+    finish(&plan, &store, app_paths)
+}
+
+/// `purge` of everything, from the command line: what [`run`] does, with
+/// every account's jobs stopped and the owner of the browsers asked to leave
+/// between the question and the removal.
+pub async fn run_everything(
+    args: PurgeArgs,
+    store: SecretStore,
+    app_paths: &AppPaths,
+) -> Result<ExitCode> {
+    let plan = survey(&store, app_paths);
+    if let Some(code) = ask(&args, &plan, ui::can_be_asked())? {
+        return Ok(code);
+    }
+    let accounts = app_paths
+        .account_dirs()
+        .into_iter()
+        .map(|pk| app_paths.account(pk))
+        .collect();
+    let stopping = crate::jobs::stop_before_leaving(accounts).await?;
+    // The whole data directory goes, the owner's log with it, so the owner is
+    // asked to leave, not only to close its browsers; after the jobs, which
+    // would start it again.
+    crate::owner::quit(app_paths).await;
+    drop(stopping);
+    finish(&plan, &store, app_paths)
 }
 
 /// Says which of the monitor's entries name `account` as their viewer.
@@ -346,10 +412,19 @@ fn carry_out(
     app_paths: &AppPaths,
     someone_is_there: bool,
 ) -> Result<ExitCode> {
+    match ask(&args, plan, someone_is_there)? {
+        Some(code) => Ok(code),
+        None => finish(plan, store, app_paths),
+    }
+}
+
+/// Shows the plan and asks: `Some` with the exit code when nothing is to be
+/// removed (nothing there, a dry run, or a no), `None` to go on.
+fn ask(args: &PurgeArgs, plan: &Plan, someone_is_there: bool) -> Result<Option<ExitCode>> {
     if plan.is_empty() {
         crate::ui::say!("There is nothing of snob's stored on this computer.");
         report_the_binary();
-        return Ok(ExitCode::Ok);
+        return Ok(Some(ExitCode::Ok));
     }
 
     crate::ui::say!("This will delete, from this computer:");
@@ -359,7 +434,7 @@ fn carry_out(
 
     if args.dry_run {
         crate::ui::say!("\nNothing was deleted (--dry-run).");
-        return Ok(ExitCode::Ok);
+        return Ok(Some(ExitCode::Ok));
     }
 
     // With no terminal, `confirm` keeps its default without asking anything —
@@ -395,9 +470,14 @@ fn carry_out(
     // not had its purge, and 0 said it had.
     if !args.consent.yes && !ui::confirm("\nDelete all of it?", false)? {
         crate::ui::say!("Nothing was deleted.");
-        return Ok(ExitCode::Interrupted);
+        return Ok(Some(ExitCode::Interrupted));
     }
 
+    Ok(None)
+}
+
+/// Removes what the plan says, and says how it went.
+fn finish(plan: &Plan, store: &SecretStore, app_paths: &AppPaths) -> Result<ExitCode> {
     let failures = execute(plan, store, app_paths);
 
     if failures.is_empty() {
@@ -496,6 +576,7 @@ mod tests {
             secrets: vec![],
             directories: vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")],
             only: None,
+            jobs: vec![],
         };
         let lines = plan.lines();
         assert_eq!(lines.len(), 3);
@@ -516,6 +597,7 @@ mod tests {
             secrets: vec![Kind::WatchToken, Kind::WatchSigningKey],
             directories: vec![],
             only: None,
+            jobs: vec![],
         };
         assert!(!plan.is_empty(), "two live credentials are not nothing");
 
