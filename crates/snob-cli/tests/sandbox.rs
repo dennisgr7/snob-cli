@@ -65,7 +65,12 @@ const PK: Pk = Pk::new(42);
 /// not this test's, and neither is the SSH session the suite may be run from,
 /// which changes what `login` offers (`seat`).
 fn command(root: &Path, instagram: Option<&MockServer>) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_snob"));
+    command_of(Path::new(env!("CARGO_BIN_EXE_snob")), root, instagram)
+}
+
+/// The same, for a copy of the binary at `program`.
+fn command_of(program: &Path, root: &Path, instagram: Option<&MockServer>) -> Command {
+    let mut command = Command::new(program);
     command.arg("--sandbox-root").arg(root);
     if let Some(server) = instagram {
         command.arg("--ig-base-url").arg(server.uri());
@@ -3732,8 +3737,19 @@ impl McpClient {
         args: &[&str],
         capabilities: serde_json::Value,
     ) -> Self {
-        let mut client = Self::spawn(root, instagram, args);
-        let hello = client
+        let client = Self::spawn(root, instagram, args);
+        client.initialize(capabilities).await
+    }
+
+    /// A server started from a copy of the binary at `program`.
+    async fn start_from(program: &Path, root: &Path, instagram: &MockServer) -> Self {
+        let client = Self::spawn_from(program, root, instagram, &[]);
+        client.initialize(serde_json::json!({})).await
+    }
+
+    /// The handshake of a client on 2025-11-25, declaring `capabilities`.
+    async fn initialize(mut self, capabilities: serde_json::Value) -> Self {
+        let hello = self
             .ask(
                 "initialize",
                 serde_json::json!({
@@ -3744,10 +3760,9 @@ impl McpClient {
             )
             .await;
         assert_eq!(hello["result"]["serverInfo"]["name"], "snob", "{hello}");
-        client
-            .send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        self.send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
             .await;
-        client
+        self
     }
 
     /// A client on 2026-07-28: no `initialize`, and the revision and the
@@ -3763,8 +3778,12 @@ impl McpClient {
     }
 
     fn spawn(root: &Path, instagram: &MockServer, args: &[&str]) -> Self {
+        Self::spawn_from(Path::new(env!("CARGO_BIN_EXE_snob")), root, instagram, args)
+    }
+
+    fn spawn_from(program: &Path, root: &Path, instagram: &MockServer, args: &[&str]) -> Self {
         use tokio::io::AsyncBufReadExt;
-        let mut command = tokio::process::Command::from(command(root, Some(instagram)));
+        let mut command = tokio::process::Command::from(command_of(program, root, Some(instagram)));
         command
             .arg("mcp")
             .args(args)
@@ -3942,6 +3961,61 @@ async fn the_mcp_status_without_a_session_is_an_answer_with_a_hint() {
         "{followers}"
     );
     assert!(posted(&instagram).await.is_empty(), "nothing was sent");
+}
+
+/// A server whose binary is moved aside under it, as WinGet and
+/// `install.ps1` do on an upgrade and Homebrew's cleanup does by removing it,
+/// refuses every call from then on and starts nothing, rather than run a
+/// child of whatever is at its path now.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_refuses_calls_once_its_binary_is_upgraded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let original = Path::new(env!("CARGO_BIN_EXE_snob"));
+    let program = bin.path().join(original.file_name().unwrap());
+    std::fs::copy(original, &program).unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut client = McpClient::start_from(&program, tmp.path(), &instagram).await;
+
+    let before = client.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(before["isError"], false, "{before}");
+    assert_eq!(
+        before["structuredContent"]["exit"], "no_session",
+        "{before}"
+    );
+
+    // Renaming a running program is allowed on every platform, Windows
+    // included; removing it is not, there.
+    std::fs::rename(&program, bin.path().join("snob.old")).unwrap();
+    for (tool, arguments) in [
+        ("snob_status", serde_json::json!({})),
+        ("snob_list", serde_json::json!({ "list": "followers" })),
+    ] {
+        let after = client.call(tool, arguments).await;
+        assert_eq!(after["isError"], true, "{tool}: {after}");
+        assert_eq!(
+            after["structuredContent"]["error"]["code"], "upgraded",
+            "{tool}: {after}"
+        );
+        let message = after["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap();
+        assert!(message.contains("restart the MCP server"), "{message}");
+    }
+    assert!(posted(&instagram).await.is_empty(), "nothing was sent");
+
+    // Stopped before the directory goes, which Windows would refuse while
+    // the program in it runs.
+    let McpClient {
+        mut child, stdin, ..
+    } = client;
+    drop(stdin);
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait())
+        .await
+        .expect("the server stops when its input closes")
+        .unwrap();
+    assert!(ended.success(), "{ended:?}");
 }
 
 /// On 2025-11-25 the yes is asked with `elicitation/create` while the call

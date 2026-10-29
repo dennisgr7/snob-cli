@@ -262,14 +262,16 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     #[cfg(feature = "mcp")]
     if let Command::Mcp(args) = &cli.command {
         return match &args.command {
-            Some(snob_cli::cli::McpCommand::Config(config)) => {
-                commands::mcp::config::run(config, mcp_globals(&cli, None)?)
-            }
+            Some(snob_cli::cli::McpCommand::Config(config)) => commands::mcp::config::run(
+                config,
+                mcp_globals(&cli, None)?,
+                cli.max_wait.unwrap_or(commands::mcp::MAX_WAIT),
+            ),
             None => {
-                let launch = commands::mcp::child::Launch {
-                    exe: std::env::current_exe()?,
-                    globals: mcp_globals(&cli, Some(MCP_MAX_WAIT))?,
-                };
+                let launch = commands::mcp::child::Launch::new(
+                    std::env::current_exe()?,
+                    mcp_globals(&cli, Some(commands::mcp::MAX_WAIT))?,
+                );
                 commands::mcp::serve(launch, args.allow_writes).await
             }
         };
@@ -552,13 +554,6 @@ fn mcp_globals(
     Ok(args)
 }
 
-/// `--max-wait` for a tool call when the server was given none. A call that
-/// sat for the hours the daily ceiling can impose would outlast the client's
-/// patience and the person's; refused, it says how long the wait is and the
-/// agent can say so.
-#[cfg(feature = "mcp")]
-const MCP_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-
 /// Gives the cursor back if the process dies with a menu on screen.
 ///
 /// The release profile is `panic = "abort"`, so nothing runs on the way out —
@@ -695,7 +690,7 @@ mod mcp_tests {
     #[test]
     fn a_max_wait_of_zero_reaches_the_children_as_zero() {
         let cli = Cli::try_parse_from(["snob", "--max-wait", "0", "mcp"]).expect("it parses");
-        let globals = mcp_globals(&cli, Some(MCP_MAX_WAIT)).expect("no path to resolve");
+        let globals = mcp_globals(&cli, Some(commands::mcp::MAX_WAIT)).expect("no path to resolve");
         let at = globals
             .iter()
             .position(|arg| arg == "--max-wait")
@@ -704,7 +699,7 @@ mod mcp_tests {
 
         // And the server's own default when none was given.
         let cli = Cli::try_parse_from(["snob", "mcp"]).expect("it parses");
-        let globals = mcp_globals(&cli, Some(MCP_MAX_WAIT)).expect("no path to resolve");
+        let globals = mcp_globals(&cli, Some(commands::mcp::MAX_WAIT)).expect("no path to resolve");
         assert!(globals.iter().any(|arg| arg == "300s"), "{globals:?}");
     }
 }

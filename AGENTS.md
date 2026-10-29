@@ -349,6 +349,17 @@ writes it.
   indexing panic is the server gone, with every call in flight.
 - A heartbeat (`notifications/progress`) is sent from the call's own task
   and awaited, never spawned, so none can reach the client after the result.
+- **Upgrades.** `snob mcp config` prints a path that outlives one
+  (`config::stable_exe`: Homebrew's link, Scoop's `current`, or the first
+  `snob` on `PATH`), each candidate taken only if it leads to the running
+  binary, and warns when what it prints is in a directory named after a
+  version. A running server whose binary was moved, removed or replaced
+  (size and modification time, `child::Launch::upgraded`) refuses every
+  call with `upgraded` and starts nothing; the client restarts it.
+- Codex's snippet carries `tool_timeout_sec` from `mcp::longest_call`: the
+  person's answer (`ANSWER_WITHIN`), `--max-wait` (`mcp::MAX_WAIT` when not
+  given), the child's grace and a margin. It does not bound a list walked
+  inline, whose pace `--max-wait` does not cover.
 
 ## Output contract
 

@@ -73,9 +73,70 @@ pub struct Finished {
 pub struct Launch {
     pub exe: std::path::PathBuf,
     pub globals: Vec<OsString>,
+    /// What `exe` was when the server started, to tell an upgrade by.
+    started_from: Option<Stamp>,
+}
+
+/// A binary as an upgrade would change it: its size and modification time,
+/// the same two facts the browser owner tells builds apart by
+/// (`owner::wire::build`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl Stamp {
+    fn of(path: &std::path::Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+/// Whether the binary a server started from is gone or has changed, given
+/// what it was then and what is at its path now (`None`: nothing is).
+///
+/// Every installer does one of the two: Homebrew's and Scoop's cleanup
+/// remove the old version's directory, WinGet and `install.ps1` move the
+/// running file aside and put the new one in its place, and `install.sh`
+/// and a package replace the file at the same path.
+fn upgraded(then: Option<&Stamp>, now: Option<&Stamp>) -> bool {
+    match (then, now) {
+        (_, None) => true,
+        (Some(then), Some(now)) => then != now,
+        // Unreadable at the start and readable now: nothing to compare.
+        (None, Some(_)) => false,
+    }
 }
 
 impl Launch {
+    /// Children of `exe`, started with `globals` in front of their own
+    /// arguments; `exe` is read now, to tell later whether it was upgraded.
+    pub fn new(exe: std::path::PathBuf, globals: Vec<OsString>) -> Self {
+        let started_from = Stamp::of(&exe);
+        Self {
+            exe,
+            globals,
+            started_from,
+        }
+    }
+
+    /// Whether the binary this server runs its children from is no longer
+    /// the one it started from.
+    ///
+    /// **Then nothing is started**, rather than a child of whatever is at the
+    /// path now: a newer child may read the arguments this server built in a
+    /// way this server never checked, and a removed file starts nothing (nor
+    /// could a child started through `/proc/self/exe` start the browser
+    /// owner, which reads `current_exe` again). Restarting the server, which
+    /// the client does when it reconnects it, is the whole fix.
+    pub fn upgraded(&self) -> bool {
+        upgraded(self.started_from.as_ref(), Stamp::of(&self.exe).as_ref())
+    }
+
     /// Runs `snob <globals> <args>` to its end, or until `stop` resolves.
     ///
     /// `tick` is called every `every` while it runs, with how long it has run,
@@ -252,6 +313,34 @@ mod tests {
         let finished = read(Some(1), b"", &long);
         assert!(finished.said.len() <= STDERR_KEPT);
         assert!(finished.said.ends_with('\u{2192}'));
+    }
+
+    #[test]
+    fn a_deleted_binary_is_reported_as_an_upgrade() {
+        let at = |len, secs| Stamp {
+            len,
+            modified: Some(std::time::UNIX_EPOCH + Duration::from_secs(secs)),
+        };
+        // Removed, or moved aside.
+        assert!(upgraded(Some(&at(10, 1)), None));
+        assert!(upgraded(None, None));
+        // Replaced at the same path.
+        assert!(upgraded(Some(&at(10, 1)), Some(&at(10, 2))));
+        assert!(upgraded(Some(&at(10, 1)), Some(&at(11, 1))));
+        // Untouched.
+        assert!(!upgraded(Some(&at(10, 1)), Some(&at(10, 1))));
+        assert!(!upgraded(None, Some(&at(10, 1))));
+    }
+
+    #[test]
+    fn a_binary_moved_aside_is_an_upgrade_and_one_left_alone_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("snob");
+        std::fs::write(&exe, b"one").unwrap();
+        let launch = Launch::new(exe.clone(), Vec::new());
+        assert!(!launch.upgraded());
+        std::fs::rename(&exe, tmp.path().join("snob.old")).unwrap();
+        assert!(launch.upgraded());
     }
 
     #[test]

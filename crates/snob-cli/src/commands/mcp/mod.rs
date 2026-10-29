@@ -51,6 +51,27 @@ const HEARTBEAT: Duration = Duration::from_secs(15);
 /// answer on the newer revision.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10 * 60);
 
+/// `--max-wait` for a tool call when the server was given none. A call that
+/// sat for the hours the daily ceiling can impose would outlast the client's
+/// patience and the person's; refused, it says how long the wait is and the
+/// agent can say so. `main` hands it to the children, and `config` counts it
+/// into the longest call.
+pub const MAX_WAIT: Duration = Duration::from_secs(5 * 60);
+
+/// The longest one tool call may take when children wait at most `max_wait`
+/// for the budget, for a client that cuts calls short (`config`, Codex's
+/// `tool_timeout_sec`): the person's answer to the question, asked with
+/// `elicitation/create` while the call waits ([`ANSWER_WITHIN`]), then the
+/// wait for the budget, then the grace a stopped child gets, and half a
+/// minute for the request itself.
+///
+/// **Not a bound on a list's walk**: `--max-wait` bounds the waits for the
+/// budget, not the deliberate pace between pages or a sitting's rest, so a
+/// long walk run inline can still outlast it.
+pub fn longest_call(max_wait: Duration) -> Duration {
+    ANSWER_WITHIN + max_wait + child::GRACE + Duration::from_secs(30)
+}
+
 /// The key the question's state is answered under, in `inputResponses`.
 const CONFIRM: &str = "confirm";
 
@@ -220,6 +241,16 @@ impl ServerHandler for Server {
                 return Ok(refusal("invalid_arguments", &why).into());
             }
         };
+        // Before the person is asked anything: a yes to a call that will not
+        // run is a question wasted.
+        if self.launch.upgraded() {
+            return Ok(refusal(
+                "upgraded",
+                "snob was upgraded while this server ran, so nothing was run; restart the \
+                 MCP server (reconnect it in the client)",
+            )
+            .into());
+        }
         if let Some(question) = &plan.ask {
             match self
                 .consent(question, &request, &arguments, &context)

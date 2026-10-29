@@ -124,7 +124,9 @@ can read:
   unfollow, each confirmed by you in the client every time. Each call runs
   one snob command, under the same budget and cooldown as the terminal.
   `snob mcp config claude-code` (or `claude-desktop`, `codex`, `cursor`,
-  `vscode`) prints what to add to that client's configuration.
+  `vscode`) prints what to add to that client's configuration. After
+  upgrading snob, reconnect the server in the client: a server whose binary
+  changed under it refuses every call.
 
 ## Staying a light client
 

@@ -492,7 +492,9 @@ pub enum Command {
                       download.\n\n\
                       A call waits at most --max-wait for the request budget (five minutes \
                       when it is not given) and is refused past it; a list stopped that way \
-                      continues next time."
+                      continues next time.\n\n\
+                      After upgrading snob, restart the server (reconnect it in the client): \
+                      one whose binary changed under it refuses every call and runs nothing."
     )]
     Mcp(McpArgs),
 
