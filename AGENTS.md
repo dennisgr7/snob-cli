@@ -326,12 +326,29 @@ writes it.
   input and kills it only after a grace period, so a walk saves its page and
   gives back its claim. `SNOB_IGNORE_COOLDOWN` is removed from a child's
   environment.
-- **Reads only, unless `--allow-writes`**: status, lists, profiles. Walking
-  another account's lists, and every follow or unfollow, needs the person's
-  yes asked through the client (elicitation) on every call; a client that
-  cannot ask cannot make those calls. Not offered, ever: `login`, `logout`,
-  `purge`, the monitor, `--same-day`, downloads (outside the request budget),
-  any flag that writes a file.
+- **Reads only, unless `--allow-writes`**: status, lists, profiles. One tool
+  list for every client, from the server's flags alone. Walking another
+  account's lists, and every follow or unfollow, needs a yes for that one
+  call, asked in this order (`mod.rs`, `Server::consent`): a form the client
+  shows (elicitation, either revision); else, for a client that declared no
+  form or answers `elicitation/create` with method-not-found, the chat: the
+  call answers, not as an error, with `status: "confirmation_required"`, the
+  question and a `confirmation` token, which the agent puts to the person
+  word for word and hands back on the same call only on a yes. A decline, a
+  dismissal or a timeout in a form is a no, never a reason to ask in the
+  chat. `--confirm-in-chat none|lists|all` (`all` when not given on stdio)
+  says what the chat may cover; past it the call is `cannot_confirm`. Not
+  offered, ever: `login`, `logout`, `purge`, the monitor, `--same-day`,
+  downloads (outside the request budget), any flag that writes a file.
+- **The yes comes from the client, not provably from the person.** The
+  client declares what it can show, and an agent can type a yes in the chat
+  itself (or be steered to by a bio it read). The tickets keep a yes to the
+  call it was asked about, once; the real gate on a write is the client's
+  own permission prompt, so keep `snob_follow` and `snob_unfollow` on "ask"
+  (`snob mcp config --allow-writes` says so). The question is composed of
+  snob's words and the validated username only (`tools::Question`), never a
+  display name, a bio or any other string another person wrote, since it is
+  read out to the person in snob's voice.
 - **A yes counts once, for the command it was given for** (`seal.rs`). On
   the stateless revision the question goes out with a ticket: a random
   nonce, a deadline ten minutes on in seconds of the process's monotonic
@@ -342,8 +359,13 @@ writes it.
   and at most 4096 (full is refused, never forgotten): the same answered
   call sent twice runs once and then answers `confirmation_used`; a ticket
   for another command, kind or server spends nothing. A call back with the
-  ticket and no answer retires it and is asked again. No ticket outlives
-  the process.
+  ticket and no answer retires it and is asked again. A chat token is a
+  ticket of the other kind, carried in the `confirmation` argument, which
+  stays out of `Plan.args`; brought to a call that asks nothing it is
+  `invalid_arguments`, and one for another call or past its time is no yes
+  (the call is asked again, with `previous` saying why). Where a transport
+  has sessions, the chat ticket is bound to the session too; stdio has none.
+  No ticket outlives the process.
 - **Signing in is the person's.** The server's instructions say so, and
   every answer that comes of having no session carries a hint that the
   person runs `snob login` in their own terminal, in place of the command's

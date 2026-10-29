@@ -2299,40 +2299,7 @@ async fn a_write_nobody_could_confirm_is_not_made() {
 async fn a_confirmed_unfollow_sends_one_post() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
-    // The page that hands out the tokens a mutation needs, served to the
-    // session's account, and the mutation.
-    Mock::given(method("GET"))
-        .and(url_path("/someone/"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            r#"<html>{"define":[["DTSGInitData",[],{"token":"DTSG"},1],
-               ["LSD",[],{"token":"LSD"},2],
-               ["PolarisViewer",[],{"data":{"id":"42","username":"me","fbid":"17841400000000042"},"id":"42"},3]]}
-               <script src="https://static.cdninstagram.com/rsrc.php/v4/a.js"></script></html>"#,
-        ))
-        .with_priority(1)
-        .mount(&instagram)
-        .await;
-    Mock::given(method("POST"))
-        .and(url_path("/api/graphql"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(r#"{"result":"unfollowed","status":"ok"}"#),
-        )
-        .mount(&instagram)
-        .await;
-    // The profile has to say the relationship exists, or the command correctly
-    // decides there is nothing to do and sends nothing.
-    Mock::given(method("GET"))
-        .and(url_path("/api/v1/users/web_profile_info/"))
-        .and(query_param("username", "someone"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            r#"{"data":{"user":{"id":"9001","username":"someone","followed_by_viewer":true}}}"#,
-        ))
-        // Ahead of the catch-all mounted by `fake_instagram`, which answers for
-        // any username with the session's own account. At equal priority
-        // wiremock takes the first matching mount, and that one is first.
-        .with_priority(1)
-        .mount(&instagram)
-        .await;
+    serve_an_unfollow(&instagram).await;
     log_in_writing(tmp.path(), &instagram);
     common::remember_doc_ids(tmp.path());
 
@@ -3718,6 +3685,9 @@ struct McpClient {
     next: u64,
     /// What the person answers when the server asks with
     /// `elicitation/create`; `None` is a client that never expects to be asked.
+    /// An object with an `error` key is sent back as a JSON-RPC error rather
+    /// than a result, as a client that declared elicitation and cannot do it
+    /// answers.
     answer: Option<serde_json::Value>,
     /// The `_meta` every request carries on the stateless revision, which
     /// starts with no `initialize`.
@@ -3829,9 +3799,14 @@ impl McpClient {
                 let message: serde_json::Value = serde_json::from_str(&line).unwrap();
                 if message["method"] == "elicitation/create" {
                     let answer = self.answer.clone().expect("the server asked, unexpectedly");
-                    let reply = serde_json::json!({
-                        "jsonrpc": "2.0", "id": message["id"].clone(), "result": answer
-                    });
+                    let reply = match answer.get("error") {
+                        Some(error) => serde_json::json!({
+                            "jsonrpc": "2.0", "id": message["id"].clone(), "error": error
+                        }),
+                        None => serde_json::json!({
+                            "jsonrpc": "2.0", "id": message["id"].clone(), "result": answer
+                        }),
+                    };
                     self.send(reply).await;
                     continue;
                 }
@@ -3858,11 +3833,11 @@ impl McpClient {
 }
 
 /// The server offers the reads and not the writes, answers each call with
-/// what the command it runs printed, and refuses what needs a yes the client
-/// cannot ask for, before anything is run.
+/// what the command it runs printed, runs nothing that needs a yes before it
+/// has one, and answers a tool it does not offer as the protocol says.
 #[cfg(feature = "mcp")]
 #[tokio::test]
-async fn the_mcp_server_runs_the_commands_and_refuses_what_it_cannot_confirm() {
+async fn the_mcp_server_runs_the_commands_and_nothing_it_was_not_told_yes_to() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
     log_in(tmp.path(), &instagram);
@@ -3891,7 +3866,8 @@ async fn the_mcp_server_runs_the_commands_and_refuses_what_it_cannot_confirm() {
     assert_eq!(followers["structuredContent"]["count"], 3, "{followers}");
 
     // Somebody else's list needs a yes, and this client declared no way to
-    // ask for one: refused, and no walk of that account was started.
+    // ask for one: the question comes back to be asked in the chat, and no
+    // walk of that account was started.
     let before = posted(&instagram).await.len();
     let theirs = client
         .call(
@@ -3899,10 +3875,9 @@ async fn the_mcp_server_runs_the_commands_and_refuses_what_it_cannot_confirm() {
             serde_json::json!({ "list": "followers", "account": "someone" }),
         )
         .await;
-    assert_eq!(theirs["isError"], true, "{theirs}");
     assert_eq!(
-        theirs["structuredContent"]["error"]["code"],
-        "not_confirmed"
+        theirs["structuredContent"]["status"], "confirmation_required",
+        "{theirs}"
     );
     assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
 
@@ -3924,6 +3899,293 @@ async fn the_mcp_server_runs_the_commands_and_refuses_what_it_cannot_confirm() {
     let again = client.call("snob_status", serde_json::json!({})).await;
     assert_eq!(again["isError"], false, "{again}");
     assert!(client.child.id().is_some(), "the server is still up");
+}
+
+/// The mocks a confirmed unfollow of `someone` needs: the page that hands
+/// out the tokens a mutation needs, served to the session's account, the
+/// mutation, and a profile saying the relationship exists (without it the
+/// command correctly decides there is nothing to do and sends nothing).
+async fn serve_an_unfollow(instagram: &MockServer) {
+    Mock::given(method("GET"))
+        .and(url_path("/someone/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<html>{"define":[["DTSGInitData",[],{"token":"DTSG"},1],
+               ["LSD",[],{"token":"LSD"},2],
+               ["PolarisViewer",[],{"data":{"id":"42","username":"me","fbid":"17841400000000042"},"id":"42"},3]]}
+               <script src="https://static.cdninstagram.com/rsrc.php/v4/a.js"></script></html>"#,
+        ))
+        .with_priority(1)
+        .mount(instagram)
+        .await;
+    Mock::given(method("POST"))
+        .and(url_path("/api/graphql"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"result":"unfollowed","status":"ok"}"#),
+        )
+        .mount(instagram)
+        .await;
+    Mock::given(method("GET"))
+        .and(url_path("/api/v1/users/web_profile_info/"))
+        .and(query_param("username", "someone"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":{"user":{"id":"9001","username":"someone","followed_by_viewer":true}}}"#,
+        ))
+        // Ahead of the catch-all mounted by `fake_instagram`, which answers for
+        // any username with the session's own account. At equal priority
+        // wiremock takes the first matching mount, and that one is first.
+        .with_priority(1)
+        .mount(instagram)
+        .await;
+}
+
+/// The POSTs Instagram was sent, which are the writes.
+#[cfg(feature = "mcp")]
+async fn writes_sent(instagram: &MockServer) -> usize {
+    posted(instagram)
+        .await
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::POST)
+        .count()
+}
+
+/// A client that cannot show a form is handed the question to put to the
+/// person in the chat, with a token good once, for that call; the call runs
+/// when the token comes back with it, and never twice.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_asks_in_the_chat_when_the_client_cannot_ask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+    let with = |token: &str, account: &str| serde_json::json!({ "list": "followers", "account": account, "confirmation": token });
+    let before = posted(&instagram).await.len();
+
+    // Asked, and nothing done: an answer, not an error.
+    let asking = client.call("snob_list", theirs.clone()).await;
+    assert_eq!(asking["isError"], false, "{asking}");
+    let told = &asking["structuredContent"];
+    assert_eq!(told["status"], "confirmation_required", "{asking}");
+    assert_eq!(told["done"], false, "{asking}");
+    assert!(told["previous"].is_null(), "{asking}");
+    let question = told["question"].as_str().unwrap();
+    assert!(question.contains("@someone's followers"), "{question}");
+    let token = told["confirmation"].as_str().expect("a token").to_string();
+    let said = asking["content"][0]["text"].as_str().unwrap();
+    assert!(said.contains(question) && said.contains(&token), "{said}");
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // The token for another account's call, or no token at all, is no yes:
+    // that call is asked again, and says why.
+    for (offered, account) in [(token.as_str(), "somebody_else"), ("garbage", "someone")] {
+        let other = client.call("snob_list", with(offered, account)).await;
+        assert_eq!(
+            other["structuredContent"]["status"], "confirmation_required",
+            "{other}"
+        );
+        assert_eq!(
+            other["structuredContent"]["previous"], "not_for_this_call",
+            "{other}"
+        );
+        assert_ne!(other["structuredContent"]["confirmation"], token.as_str());
+    }
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // Brought back with its own call, spelled with the at sign or not, it
+    // is the yes: the walk runs.
+    let done = client.call("snob_list", with(&token, "@someone")).await;
+    assert_eq!(done["isError"], false, "{done}");
+    assert_eq!(done["structuredContent"]["count"], 3, "{done}");
+    let sent = posted(&instagram).await.len();
+    assert!(sent > before, "the walk ran");
+
+    // Once.
+    let again = client.call("snob_list", with(&token, "someone")).await;
+    assert_eq!(again["isError"], true, "{again}");
+    assert_eq!(
+        again["structuredContent"]["error"]["code"], "confirmation_used",
+        "{again}"
+    );
+    assert_eq!(
+        posted(&instagram).await.len(),
+        sent,
+        "nothing more was sent"
+    );
+
+    // A call that asks nothing takes no confirmation.
+    let status = client
+        .call("snob_status", serde_json::json!({ "confirmation": token }))
+        .await;
+    assert_eq!(
+        status["structuredContent"]["error"]["code"], "invalid_arguments",
+        "{status}"
+    );
+    let own = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "confirmation": "x" }),
+        )
+        .await;
+    assert_eq!(
+        own["structuredContent"]["error"]["code"], "invalid_arguments",
+        "{own}"
+    );
+    let not_text = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "account": "someone", "confirmation": 7 }),
+        )
+        .await;
+    assert_eq!(
+        not_text["structuredContent"]["error"]["code"], "invalid_arguments",
+        "{not_text}"
+    );
+
+    // On the stateless revision, a client with no form is asked in the
+    // chat the same way.
+    let mut stateless = McpClient::stateless(tmp.path(), &instagram, serde_json::json!({}));
+    let asking = stateless.call("snob_list", theirs).await;
+    assert_eq!(
+        asking["structuredContent"]["status"], "confirmation_required",
+        "{asking}"
+    );
+}
+
+/// A yes given in the chat sends one unfollow, and the same token again
+/// sends nothing more.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_yes_given_in_the_chat_sends_one_unfollow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    serve_an_unfollow(&instagram).await;
+    log_in_writing(tmp.path(), &instagram);
+    common::remember_doc_ids(tmp.path());
+    let mut client = McpClient::start(tmp.path(), &instagram, &["--allow-writes"]).await;
+
+    let asking = client
+        .call("snob_unfollow", serde_json::json!({ "account": "someone" }))
+        .await;
+    let told = &asking["structuredContent"];
+    assert_eq!(told["status"], "confirmation_required", "{asking}");
+    assert_eq!(told["question"], "Unfollow @someone on Instagram?");
+    let token = told["confirmation"].as_str().unwrap().to_string();
+    assert_eq!(writes_sent(&instagram).await, 0, "nothing was sent");
+
+    let yes = serde_json::json!({ "account": "someone", "confirmation": token });
+    let done = client.call("snob_unfollow", yes.clone()).await;
+    assert_eq!(done["isError"], false, "{done}");
+    assert_eq!(done["structuredContent"]["outcome"], "unfollowed", "{done}");
+    assert_eq!(writes_sent(&instagram).await, 1, "one yes, one write");
+
+    let again = client.call("snob_unfollow", yes).await;
+    assert_eq!(
+        again["structuredContent"]["error"]["code"], "confirmation_used",
+        "{again}"
+    );
+    assert_eq!(writes_sent(&instagram).await, 1, "and never a second");
+}
+
+/// `--confirm-in-chat` says what a yes in the chat may cover, and a call it
+/// does not cover, from a client that cannot show a form, runs nothing.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn confirm_in_chat_none_refuses_a_client_that_cannot_ask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+    let follow = serde_json::json!({ "account": "someone" });
+    let before = posted(&instagram).await.len();
+
+    let mut none = McpClient::start(
+        tmp.path(),
+        &instagram,
+        &["--allow-writes", "--confirm-in-chat", "none"],
+    )
+    .await;
+    for (tool, arguments) in [("snob_list", &theirs), ("snob_follow", &follow)] {
+        let refused = none.call(tool, arguments.clone()).await;
+        assert_eq!(refused["isError"], true, "{tool}: {refused}");
+        assert_eq!(
+            refused["structuredContent"]["error"]["code"], "cannot_confirm",
+            "{tool}: {refused}"
+        );
+    }
+
+    // `lists`: the walk is asked in the chat, the write is not.
+    let mut lists = McpClient::start(
+        tmp.path(),
+        &instagram,
+        &["--allow-writes", "--confirm-in-chat", "lists"],
+    )
+    .await;
+    let walk = lists.call("snob_list", theirs).await;
+    assert_eq!(
+        walk["structuredContent"]["status"], "confirmation_required",
+        "{walk}"
+    );
+    let write = lists.call("snob_follow", follow.clone()).await;
+    let refusal = &write["structuredContent"]["error"];
+    assert_eq!(refusal["code"], "cannot_confirm", "{write}");
+    assert!(
+        refusal["message"]
+            .as_str()
+            .unwrap()
+            .contains("--confirm-in-chat all"),
+        "{write}"
+    );
+    // And a token from the server that took it is none here.
+    let token = walk["structuredContent"]["confirmation"].as_str().unwrap();
+    let forged = lists
+        .call(
+            "snob_follow",
+            serde_json::json!({ "account": "someone", "confirmation": token }),
+        )
+        .await;
+    assert_eq!(
+        forged["structuredContent"]["error"]["code"], "cannot_confirm",
+        "{forged}"
+    );
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+}
+
+/// A client on 2025-11-25 that declared elicitation and answers the request
+/// with "no such method" is asked in the chat instead; one that declines is
+/// not.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn an_older_client_that_cannot_answer_the_form_is_asked_in_the_chat() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let mut client = McpClient::start_with(
+        tmp.path(),
+        &instagram,
+        &[],
+        serde_json::json!({ "elicitation": {} }),
+    )
+    .await;
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+    let before = posted(&instagram).await.len();
+
+    client.answer = Some(serde_json::json!({
+        "error": { "code": -32601, "message": "Method not found" }
+    }));
+    let asking = client.call("snob_list", theirs.clone()).await;
+    assert_eq!(
+        asking["structuredContent"]["status"], "confirmation_required",
+        "{asking}"
+    );
+
+    client.answer = Some(serde_json::json!({ "action": "decline" }));
+    let declined = client.call("snob_list", theirs).await;
+    assert_eq!(
+        declined["structuredContent"]["error"]["code"], "not_confirmed",
+        "{declined}"
+    );
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
 }
 
 /// With nobody signed in, `snob_status` still answers (that is what it was

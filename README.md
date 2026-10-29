@@ -121,8 +121,13 @@ can read:
   as lines instead.
 - `snob mcp` is an MCP server for AI agents, on standard input and output:
   the status, the lists and profiles, and with `--allow-writes` follow and
-  unfollow, each confirmed by you in the client every time. Each call runs
-  one snob command, under the same budget and cooldown as the terminal.
+  unfollow. Those, and walking another account's lists, run only after a yes
+  for that one call: asked in the client when it can show a form, or put to
+  you by the agent in the chat (`--confirm-in-chat none|lists|all` says what
+  that may cover; `all` by default). snob cannot tell whether that yes was
+  yours or the agent's, so keep the writes on "ask" in the client's tool
+  permissions. Each call runs one snob command, under the same budget and
+  cooldown as the terminal.
   `snob mcp config claude-code` (or `claude-desktop`, `codex`, `cursor`,
   `vscode`) prints what to add to that client's configuration. After
   upgrading snob, reconnect the server in the client: a server whose binary

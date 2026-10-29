@@ -487,8 +487,12 @@ pub enum Command {
                       prints what to add to its configuration. Each tool call runs one snob \
                       command, so the budget, the cooldown and consent hold exactly as they do \
                       in a terminal. It offers the status, the lists and profiles; with \
-                      --allow-writes, follow and unfollow too, each confirmed by you in the \
-                      client every time it is called. Never login, purge, the monitor or a \
+                      --allow-writes, follow and unfollow too. Each of those, and walking \
+                      another account's lists, runs only after a yes for that one call, \
+                      asked in the client when it can show a form, or else put to you by the \
+                      agent in the chat (--confirm-in-chat narrows what that may cover). \
+                      snob cannot tell who gave the yes, so keep the writes on \"ask\" in the \
+                      client's permissions. Never login, purge, the monitor or a \
                       download.\n\n\
                       A call waits at most --max-wait for the request budget (five minutes \
                       when it is not given) and is refused past it; a list stopped that way \
@@ -1581,10 +1585,33 @@ pub struct McpArgs {
     #[command(subcommand)]
     pub command: Option<McpCommand>,
 
-    /// Offer follow and unfollow as well, each confirmed by you in the client
-    /// when it is called
+    /// Offer follow and unfollow as well, each only after a yes for that call,
+    /// asked in the client or by the agent in the chat
     #[arg(long)]
     pub allow_writes: bool,
+
+    /// What a yes the agent relays from the chat may confirm, for a client
+    /// that cannot show a form: none, reading other accounts' lists, or that
+    /// and the writes too [default: all]
+    //
+    // An `Option` rather than a default value, so that whoever reads it can
+    // tell "not given" from "all": a transport other than standard input
+    // and output would want a narrower default, and one value for both
+    // would hide that the choice was never made.
+    #[arg(long, value_enum, value_name = "WHAT")]
+    pub confirm_in_chat: Option<ConfirmInChat>,
+}
+
+/// What `snob mcp` takes a yes in the chat for (`commands::mcp`, `consent`).
+#[cfg(feature = "mcp")]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmInChat {
+    /// Nothing: a call that needs a yes needs a client that can show a form.
+    None,
+    /// Walking another account's lists, and not the writes.
+    Lists,
+    /// The walks and the writes.
+    All,
 }
 
 #[cfg(feature = "mcp")]
@@ -1604,6 +1631,10 @@ pub struct McpConfigArgs {
     /// Start it with --allow-writes
     #[arg(long)]
     pub allow_writes: bool,
+
+    /// Start it with --confirm-in-chat
+    #[arg(long, value_enum, value_name = "WHAT")]
+    pub confirm_in_chat: Option<ConfirmInChat>,
 }
 
 #[cfg(feature = "mcp")]

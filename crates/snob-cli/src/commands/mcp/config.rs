@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::cli::{McpClient, McpConfigArgs};
+use crate::cli::{ConfirmInChat, McpClient, McpConfigArgs};
 use crate::exit::ExitCode;
 use crate::ui;
 
@@ -56,11 +56,24 @@ pub fn run(
     if args.allow_writes {
         server_args.push("--allow-writes".into());
     }
+    if let Some(what) = args.confirm_in_chat {
+        server_args.push("--confirm-in-chat".into());
+        server_args.push(chat_flag(what));
+    }
 
     let within = super::longest_call(max_wait);
     let (snippet, whereto) = render(args.client, &exe, &server_args, within);
     ui::say!("{snippet}");
     ui::info(whereto);
+    if args.allow_writes {
+        // The real gate on a write: the yes snob is handed may have been
+        // typed by the agent itself (`mod.rs`, `consent`), and the client's
+        // own prompt before a tool runs is the one an agent cannot answer.
+        ui::info(
+            "Keep snob_follow and snob_unfollow on \"ask\" in the client's tool permissions: \
+             snob cannot tell whether the yes it is handed came from you or from the agent.",
+        );
+    }
     Ok(ExitCode::Ok)
 }
 
@@ -139,6 +152,14 @@ pub fn stable_exe(
         .map(|dir| dir.join(typed))
         .find(|candidate| leads_here(candidate))
         .unwrap_or_else(|| current.to_path_buf())
+}
+
+/// `--confirm-in-chat`'s value for `what`, as the command line spells it.
+fn chat_flag(what: ConfirmInChat) -> String {
+    use clap::ValueEnum as _;
+    what.to_possible_value()
+        .map(|value| value.get_name().to_string())
+        .unwrap_or_default()
 }
 
 /// `path` with its last `levels` names taken off.
