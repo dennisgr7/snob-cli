@@ -126,6 +126,10 @@ pub struct ExitError {
     /// put it on its own `hint:` line rather than under `error:`, where it
     /// would read as more of the complaint.
     hint: Option<String>,
+    /// A finer token than the code, for a program to tell this failure apart
+    /// from others with the same exit status (`busy`: another run holds the
+    /// account, `--spend-alone`). The JSON failure carries it as `reason`.
+    reason: Option<&'static str>,
 }
 
 impl ExitError {
@@ -134,6 +138,7 @@ impl ExitError {
             code,
             message: message.into(),
             hint: None,
+            reason: None,
         }
     }
 
@@ -148,6 +153,17 @@ impl ExitError {
 
     pub fn hint(&self) -> Option<&str> {
         self.hint.as_deref()
+    }
+
+    /// Adds the finer token a program tells this failure apart by.
+    #[must_use]
+    pub fn with_reason(mut self, reason: &'static str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    pub fn reason(&self) -> Option<&'static str> {
+        self.reason
     }
 }
 

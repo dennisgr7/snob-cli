@@ -320,6 +320,15 @@ impl AccountPaths {
         self.app.browser_profile_for(self.pk)
     }
 
+    /// Held, with [`try_lock_file`], by a run that may send requests for this
+    /// account only while no other such run does (`--spend-alone`). The lock
+    /// is the operating system's and goes with the process, so a run that
+    /// was killed leaves nothing held; the empty file it leaves behind means
+    /// nothing.
+    pub fn spend_lock(&self) -> PathBuf {
+        self.dir().join("spend.lock")
+    }
+
     /// Creates the data directory and the account's, both private.
     pub fn ensure_dirs(&self) -> Result<(), PathError> {
         self.app.ensure_dirs()?;
@@ -468,6 +477,22 @@ pub fn lock_file(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)?;
     file.lock()?;
     Ok(file)
+}
+
+/// [`lock_file`] that does not wait: `None` when another holder has the lock,
+/// in this process or another, and the lock otherwise, held until the file is
+/// dropped.
+pub fn try_lock_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
 }
 
 /// Creates a file only its owner can read, at exactly this name, and syncs
@@ -966,6 +991,19 @@ mod tests {
             "the run has to be named in the path: {}",
             mine.display()
         );
+    }
+
+    /// A lock somebody holds is refused at once rather than waited for, by a
+    /// second handle in the same process as by another process, and is free
+    /// again once its holder lets go.
+    #[test]
+    fn a_held_lock_is_refused_without_waiting_and_free_once_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spend.lock");
+        let held = try_lock_file(&path).unwrap().expect("nobody holds it yet");
+        assert!(try_lock_file(&path).unwrap().is_none(), "it is held");
+        drop(held);
+        assert!(try_lock_file(&path).unwrap().is_some(), "it was let go");
     }
 
     /// The scratch root is on the list `purge` reads. It is the only thing this

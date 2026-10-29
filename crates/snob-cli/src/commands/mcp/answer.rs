@@ -66,6 +66,17 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
             },
             _ => said(),
         };
+        // A finer reason the command gave (`busy`, from `--spend-alone`) is
+        // the code an agent tells this failure apart by, the same one the
+        // server's own refusal of a busy call has; `exit` keeps the exit's
+        // token. `failure` is an object on every branch above.
+        if let Some(reason) = failure
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            failure["code"] = json!(reason);
+        }
         // What a list walk kept is still worth having: it is stored, and the
         // next call continues from it.
         if let Some(partial) = finished.json {
@@ -131,6 +142,7 @@ mod tests {
             args: vec![],
             ask: None,
             answers,
+            spends: crate::commands::mcp::tools::Spends::Nothing,
         }
     }
 
@@ -167,6 +179,31 @@ mod tests {
         assert!(told.failed);
         assert_eq!(told.body["error"]["code"], "rate_limited");
         assert_eq!(told.body["exit"], "rate_limited");
+    }
+
+    #[test]
+    fn a_reason_the_command_gave_is_the_code_the_agent_reads() {
+        let told = from(
+            &plan(&[ExitCode::Ok]),
+            finished(
+                ExitCode::Error,
+                None,
+                Some(json!({"error": {"code": "error", "reason": "busy", "message": "held"}})),
+            ),
+        );
+        assert!(told.failed);
+        assert_eq!(told.body["error"]["code"], "busy");
+        assert_eq!(told.body["exit"], "error");
+        // And none given changes nothing.
+        let plain = from(
+            &plan(&[ExitCode::Ok]),
+            finished(
+                ExitCode::Error,
+                None,
+                Some(json!({"error": {"code": "error", "reason": null}})),
+            ),
+        );
+        assert_eq!(plain.body["error"]["code"], "error");
     }
 
     #[test]

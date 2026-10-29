@@ -127,7 +127,8 @@ can read:
   that may cover; `all` by default). snob cannot tell whether that yes was
   yours or the agent's, so keep the writes on "ask" in the client's tool
   permissions. Each call runs one snob command, under the same budget and
-  cooldown as the terminal.
+  cooldown as the terminal. Calls run a few at a time, and only one that
+  can reach Instagram: another comes back busy rather than waiting.
   `snob mcp config claude-code` (or `claude-desktop`, `codex`, `cursor`,
   `vscode`) prints what to add to that client's configuration. After
   upgrading snob, reconnect the server in the client: a server whose binary

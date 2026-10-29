@@ -108,7 +108,9 @@ pub enum Wording {
 /// prose prints, in the same order; `hint` is the advice the prose sets
 /// apart; `url` is the address a challenge has to be cleared at;
 /// `cooldown_until` is when a cooldown that refused the run lifts, and only
-/// that: a push-back met in this run starts one this does not look up.
+/// that: a push-back met in this run starts one this does not look up;
+/// `reason` is a finer token than `code` when the failure has one
+/// (`ExitError::with_reason`: `busy`), and null otherwise.
 /// Printed as one line, the last on standard error. Filtered line by line
 /// like the prose, and for the same reason -- a name is filtered before
 /// anything draws it, and a JSON consumer may well print it. `viewer`, beside
@@ -138,6 +140,10 @@ fn error_json_for(error: &anyhow::Error, viewer: Option<&Viewer>) -> serde_json:
             "hint": hint,
             "url": url,
             "cooldown_until": lifts,
+            "reason": error
+                .chain()
+                .find_map(|c| c.downcast_ref::<ExitError>())
+                .and_then(ExitError::reason),
         }
     })
 }
@@ -1235,6 +1241,15 @@ mod tests {
         assert_eq!(json["error"]["code"], "no_session");
         assert_eq!(json["error"]["hint"], "run \"snob login\"");
         assert!(json["error"]["url"].is_null());
+        assert!(json["error"]["reason"].is_null());
+
+        // A finer token than the exit's, beside it, never in its place.
+        let busy: anyhow::Error = ExitError::new(ExitCode::Error, "held elsewhere")
+            .with_reason("busy")
+            .into();
+        let json = error_json_for(&busy, None);
+        assert_eq!(json["error"]["code"], "error");
+        assert_eq!(json["error"]["reason"], "busy");
     }
 
     /// A failure names the account the run acted as, beside the error, so a

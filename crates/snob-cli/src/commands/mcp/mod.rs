@@ -30,10 +30,15 @@
 //! about and to one run of it, and the real gate on a write is the client's
 //! own permission prompt before a tool runs, which `snob mcp config` says to
 //! keep on "ask".
+//!
+//! **A few calls at a time, and one that may reach Instagram** (`limits.rs`),
+//! decided before anything is asked; a call past a limit answers `busy` and
+//! is never queued.
 
 pub mod answer;
 pub mod child;
 pub mod config;
+pub mod limits;
 pub mod seal;
 pub mod tools;
 
@@ -115,6 +120,7 @@ pub async fn serve(
         in_chat: in_chat.unwrap_or(ConfirmInChat::All),
         sealer: Arc::new(seal::Sealer::new()?),
         in_flight: Arc::clone(&in_flight),
+        limits: Arc::new(limits::Limits::default()),
     };
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
@@ -182,6 +188,9 @@ struct Server {
     /// only for the question this server asked, about this command, once.
     sealer: Arc<seal::Sealer>,
     in_flight: Arc<InFlight>,
+    /// How many calls run at once, and how many are taken in a minute,
+    /// shared by every handle on this server.
+    limits: Arc<limits::Limits>,
 }
 
 /// Whether the person said yes, and if not, what they are told back.
@@ -222,7 +231,9 @@ impl ServerHandler for Server {
                  today's request budget is left and whether the account is cooling down. \
                  Prefer stored answers (mode \"stored\") and dry runs when the budget is low. \
                  Never retry a call that came back rate_limited or in cooldown; say when the \
-                 wait ends instead. When a call comes back with status \
+                 wait ends instead. Calls that may reach Instagram run one at a time: one \
+                 that came back busy ran nothing, so call it again once the other has \
+                 finished, not beside it. When a call comes back with status \
                  confirmation_required, nothing was done: put its question to the person \
                  word for word, and call again with its confirmation token only if they say \
                  yes in this conversation; never answer it yourself, and never make a token \
@@ -315,6 +326,14 @@ impl ServerHandler for Server {
             )
             .into());
         }
+        // Before the person is asked, too: a yes to a call then refused as
+        // busy is a question wasted, and the ticket it came back with would
+        // be spent on nothing. Held until this call returns, which is after
+        // its child has exited.
+        let _permits = match self.limits.take(plan.spends) {
+            Ok(permits) => permits,
+            Err(busy) => return Ok(refusal("busy", &busy.why()).into()),
+        };
         if let Some(question) = &plan.ask {
             let asked = Asked {
                 tool: &request.name,
@@ -360,9 +379,10 @@ impl ServerHandler for Server {
                 }
             }
         };
+        let stop = context.ct.cancelled(); // spelling-allow: the SDK's name
         let finished = self
             .launch
-            .run(&plan.args, context.ct.cancelled(), HEARTBEAT, tick) // spelling-allow: SDK name
+            .run(&plan.command_line(), stop, HEARTBEAT, tick)
             .await
             .map_err(|e| McpError::internal_error(format!("snob could not be run: {e}"), None))?;
         let told = answer::from(&plan, finished);

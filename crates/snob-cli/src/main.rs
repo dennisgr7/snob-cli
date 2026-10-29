@@ -256,6 +256,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     if cli.stop_when_stdin_closes {
         snob_cli::app::stop_when_stdin_closes();
     }
+    if cli.spend_alone {
+        snob_cli::app::spend_alone();
+    }
     // Before the layout, the owner and the session: the server spends nothing
     // and stores nothing itself. Each tool call is a child `snob`, which does
     // all of that for itself.

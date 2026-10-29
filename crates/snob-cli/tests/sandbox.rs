@@ -3784,6 +3784,13 @@ impl McpClient {
 
     /// Sends a request and waits for its answer, stepping over notifications.
     async fn ask(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let id = self.send_raw(method, params).await;
+        self.read_until(id, method).await
+    }
+
+    /// Sends a request and returns its id, without waiting for the answer:
+    /// for a call that is to be left asking while another is made.
+    async fn send_raw(&mut self, method: &str, params: serde_json::Value) -> u64 {
         self.next += 1;
         let id = self.next;
         let mut params = params;
@@ -3794,6 +3801,29 @@ impl McpClient {
             serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
         )
         .await;
+        id
+    }
+
+    /// Reads until the server asks a question with `elicitation/create`, and
+    /// hands it back unanswered, stepping over everything else.
+    async fn question(&mut self) -> serde_json::Value {
+        let asked = async {
+            while let Some(line) = self.lines.next_line().await.unwrap() {
+                let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if message["method"] == "elicitation/create" {
+                    return message;
+                }
+            }
+            panic!("the server went away before asking");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), asked)
+            .await
+            .expect("a question within a minute")
+    }
+
+    /// Reads until the answer to request `id` (sent as `method`), answering
+    /// a question the server asks on the way with [`McpClient::answer`].
+    async fn read_until(&mut self, id: u64, method: &str) -> serde_json::Value {
         let answer = async {
             while let Some(line) = self.lines.next_line().await.unwrap() {
                 let message: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -4307,6 +4337,147 @@ async fn the_mcp_server_asks_an_older_client_while_the_call_waits() {
     client.answer = Some(serde_json::json!({ "action": "accept", "content": { "confirm": true } }));
     let accepted = client.call("snob_list", theirs).await;
     assert_eq!(accepted["isError"], false, "{accepted}");
+}
+
+/// While a write waits for the person's answer, it holds the server's one
+/// call that may reach Instagram: a second write, or a walk, is refused as
+/// busy at once, before anything is asked, and nothing is queued; the status
+/// and a stored list go on beside it. Once the first is answered, the next
+/// call that spends runs.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_second_write_while_one_is_asked_is_refused_as_busy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let mut client = McpClient::start_with(
+        tmp.path(),
+        &instagram,
+        &["--allow-writes"],
+        serde_json::json!({ "elicitation": {} }),
+    )
+    .await;
+    // Stored first, so the stored list below has something to answer with.
+    let walked = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(walked["isError"], false, "{walked}");
+
+    let follow = client
+        .send_raw(
+            "tools/call",
+            serde_json::json!({ "name": "snob_follow", "arguments": { "account": "someone" } }),
+        )
+        .await;
+    // Asked, and left unanswered: the call is holding its permits now.
+    let question = client.question().await;
+
+    for (tool, arguments) in [
+        ("snob_unfollow", serde_json::json!({ "account": "other" })),
+        ("snob_follow", serde_json::json!({ "account": "other" })),
+        ("snob_list", serde_json::json!({ "list": "following" })),
+        ("snob_profile", serde_json::json!({})),
+    ] {
+        // `call` would answer a question with `answer`, which is `None`
+        // here: a second question would fail the test, not be answered.
+        let busy = client.call(tool, arguments).await;
+        assert_eq!(busy["isError"], true, "{tool}: {busy}");
+        assert_eq!(
+            busy["structuredContent"]["error"]["code"], "busy",
+            "{tool}: {busy}"
+        );
+    }
+    let status = client.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(status["isError"], false, "{status}");
+    let stored = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "mode": "stored" }),
+        )
+        .await;
+    assert_eq!(stored["isError"], false, "{stored}");
+    assert_eq!(stored["structuredContent"]["count"], 3, "{stored}");
+
+    client
+        .send(serde_json::json!({
+            "jsonrpc": "2.0", "id": question["id"].clone(), "result": { "action": "decline" }
+        }))
+        .await;
+    let declined = client.read_until(follow, "tools/call").await;
+    assert_eq!(
+        declined["result"]["structuredContent"]["error"]["code"], "not_confirmed",
+        "{declined}"
+    );
+    assert_eq!(writes_sent(&instagram).await, 0, "nothing was written");
+
+    // Given back: the next call that spends runs.
+    let again = client
+        .call("snob_list", serde_json::json!({ "list": "following" }))
+        .await;
+    assert_eq!(again["isError"], false, "{again}");
+}
+
+/// A child given `--spend-alone` refuses, before any request, while another
+/// run holds the account, with exit 1 and `busy` as the reason; the server
+/// gives the flag to the children that may reach Instagram, and an agent is
+/// told `busy`. A stored list, and a command a person types, take no lock.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_child_given_spend_alone_refuses_while_another_holds_the_account() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let followers = ["followers", "--format", "json", "--no-interactive"];
+    let first = snob(tmp.path(), Some(&instagram), &followers);
+    assert!(first.status.success(), "{}", stderr(&first));
+
+    let lock = snob_store::paths::AppPaths::rooted_at(tmp.path())
+        .account(PK)
+        .spend_lock();
+    let held = snob_store::paths::try_lock_file(&lock)
+        .unwrap()
+        .expect("nothing holds the account between runs");
+    let before = posted(&instagram).await.len();
+
+    let alone: Vec<&str> = std::iter::once("--spend-alone").chain(followers).collect();
+    let refused = snob(tmp.path(), Some(&instagram), &alone);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    let told: serde_json::Value =
+        serde_json::from_str(stderr(&refused).lines().last().unwrap_or_default())
+            .expect("the last line of standard error is JSON");
+    assert_eq!(told["error"]["code"], "error", "{told}");
+    assert_eq!(told["error"]["reason"], "busy", "{told}");
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // Through the server: the walk is refused as busy, the stored list is
+    // read beside the run that holds the account.
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let busy = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(busy["isError"], true, "{busy}");
+    assert_eq!(busy["structuredContent"]["error"]["code"], "busy", "{busy}");
+    assert_eq!(busy["structuredContent"]["exit"], "error", "{busy}");
+    let stored = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "mode": "stored" }),
+        )
+        .await;
+    assert_eq!(stored["isError"], false, "{stored}");
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // A person's own command does not take the lock in this release.
+    let typed = snob(tmp.path(), Some(&instagram), &followers);
+    assert!(typed.status.success(), "{}", stderr(&typed));
+
+    drop(held);
+    let freed = snob(tmp.path(), Some(&instagram), &alone);
+    assert!(freed.status.success(), "{}", stderr(&freed));
+    let walked = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(walked["isError"], false, "{walked}");
 }
 
 /// On 2026-07-28 the call answers with the question and a ticket; the

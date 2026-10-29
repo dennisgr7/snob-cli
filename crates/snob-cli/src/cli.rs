@@ -55,6 +55,16 @@ pub struct Cli {
     #[arg(long, global = true, hide = true)]
     pub stop_when_stdin_closes: bool,
 
+    /// Refuse to send anything for the account while another run given this
+    /// flag does
+    // Hidden: plumbing for `snob mcp`, which gives it to every child that
+    // may reach Instagram, so an agent's parallel calls cannot walk one
+    // account from two processes at once. Not for people in this release:
+    // a command typed by hand does not take the lock, and nothing that is
+    // not an agent's should be refused as busy (`app::spend_alone`).
+    #[arg(long, global = true, hide = true)]
+    pub spend_alone: bool,
+
     /// Store the session in a protected file instead of the system keyring.
     /// For environments without a desktop session.
     // Ordered last, with `verbose`. Both are global, so without this they are
@@ -496,7 +506,8 @@ pub enum Command {
                       download.\n\n\
                       A call waits at most --max-wait for the request budget (five minutes \
                       when it is not given) and is refused past it; a list stopped that way \
-                      continues next time.\n\n\
+                      continues next time. Calls that may reach Instagram run one at a time; \
+                      another is refused as busy, never queued.\n\n\
                       After upgrading snob, restart the server (reconnect it in the client): \
                       one whose binary changed under it refuses every call and runs nothing."
     )]

@@ -126,6 +126,36 @@ pub fn wait_at_most(limit: Option<std::time::Duration>) {
 /// setting `main` hands every pacer, through the cancellation token.
 pub use crate::interrupt::stop_when_stdin_closes;
 
+/// `--spend-alone`, set once by `main` before any command runs.
+static SPEND_ALONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Makes every account this run opens one it sends requests for only while no
+/// other run given `--spend-alone` does ([`App::open`]).
+///
+/// **For runs an agent started** (`snob mcp` gives it to every child that may
+/// reach Instagram): an agent makes its calls in parallel by habit, and two
+/// processes walking one account interleave their requests. The persistent
+/// budget still bounds the average across processes, but the pause between
+/// two pages and the dwell before a list are waited per process, and the
+/// budget's burst would drain at once. A command a person types does not take
+/// it (AGENTS.md, "The MCP server").
+pub fn spend_alone() {
+    SPEND_ALONE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The refusal of a run given `--spend-alone` while another holds the
+/// account: exit 1, with `busy` as the reason a program reads.
+fn held_elsewhere() -> anyhow::Error {
+    crate::exit::ExitError::new(
+        crate::exit::ExitCode::Error,
+        "another snob started by an agent is using this account on Instagram, and only one \
+         may at a time; nothing was sent",
+    )
+    .with_reason("busy")
+    .with_hint("wait for it to finish, then ask again")
+    .into()
+}
+
 /// `pacer` with the announcement the single-request commands, `login` and
 /// `whoami`, want: one line on standard error, because there is nothing for a
 /// bar to count.
@@ -231,6 +261,9 @@ pub struct App {
     /// for the next run. Set by the monitor alone, to the battery being
     /// critical ([`App::stops_on_a_critical_battery`]).
     stop_between_pages: Option<fn() -> bool>,
+    /// The account's `spend.lock`, held for as long as the run, under
+    /// `--spend-alone` ([`spend_alone`]). Never read: holding it is the point.
+    _alone: Option<std::fs::File>,
 }
 
 /// One resolution, and the question it answers.
@@ -266,6 +299,19 @@ impl App {
                 session.ds_user_id
             );
         }
+
+        // Before anything that could send a request: a run refused here has
+        // spent nothing. After the session is read, so a sandbox or a machine
+        // with no session still answers "log in" rather than "busy".
+        let alone = if SPEND_ALONE.load(std::sync::atomic::Ordering::SeqCst) {
+            paths.ensure_dirs()?;
+            Some(
+                snob_store::paths::try_lock_file(&paths.spend_lock())?
+                    .ok_or_else(held_elsewhere)?,
+            )
+        } else {
+            None
+        };
 
         // Done here rather than at login because a browser updates long after
         // the session was created, and this is the only moment every command
@@ -313,6 +359,7 @@ impl App {
             consent_in_advance: ConsentInAdvance::default(),
             resolved: None,
             stop_between_pages: None,
+            _alone: alone,
         }))
     }
 
@@ -334,6 +381,7 @@ impl App {
             consent_in_advance: ConsentInAdvance::default(),
             resolved: None,
             stop_between_pages: None,
+            _alone: None,
         }
     }
 

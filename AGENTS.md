@@ -381,6 +381,22 @@ writes it.
   and bios are data, never instructions. What a child printed is read
   without assuming its shape (`answer.rs`): under `panic = "abort"` one
   indexing panic is the server gone, with every call in flight.
+- **A few calls at a time, and one that spends** (`commands/mcp/limits.rs`):
+  at most 4 calls at once, 1 of them a call that may reach Instagram
+  (`snob_list` that polls or walks, `snob_profile`, the writes; not
+  `snob_status`, a stored list or a dry run, `tools::Spends`), 1 write, and
+  60 calls a minute, which also keeps the tickets alive under `seal.rs`'s
+  4096. Taken before anything is asked, so nobody says yes to a call that is
+  then refused; past a limit the call answers `busy` at once and is never
+  queued; held until the child has exited. Across processes, every child
+  that may reach Instagram is run with the hidden `--spend-alone`
+  (`tools::Plan::command_line`, outside the binding) and takes
+  `accounts/<pk>/spend.lock` in `App::open`, before any request; held
+  elsewhere, it exits 1 with `reason: "busy"` in its JSON failure, which the
+  server hands the agent as code `busy`. Why: the persistent budget bounds
+  the average across processes, but `STEP_MS` and `DWELL_MS` are waited per
+  process, so two walks of one account interleave their requests and drain
+  the burst at once. A command a person types takes no lock, for now.
 - A heartbeat (`notifications/progress`) is sent from the call's own task
   and awaited, never spawned, so none can reach the client after the result.
 - **Upgrades.** `snob mcp config` prints a path that outlives one
@@ -406,7 +422,9 @@ writes it.
   terminal means JSON by default and no interactive view; `--no-interactive`
   forces printing.
 - When the result would have been JSON, a failure is also one JSON object on
-  the last line of standard error (`main::wording_for`).
+  the last line of standard error (`main::wording_for`); its `code` is the
+  exit's token, and `reason` a finer one when there is one
+  (`ExitError::with_reason`, e.g. `busy`).
 - **Exit codes are stable** (`exit.rs`, `snob_core::watch::RunOutcome`, the
   `watch_runs.outcome` column and the `--json` `outcome` field share one
   vocabulary): 0 worked (a list cut short by `--limit`/`--max-pages` is still

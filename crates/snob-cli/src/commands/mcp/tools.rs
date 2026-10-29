@@ -229,6 +229,10 @@ pub struct Plan {
     /// exits 5 while the account cools down and 3 with no session stored,
     /// and each is what it was asked.
     pub answers: &'static [ExitCode],
+    /// What the command may send to Instagram, which decides the permits the
+    /// call takes (`limits.rs`) and whether its child holds the
+    /// account alone.
+    pub spends: Spends,
 }
 
 impl Plan {
@@ -238,6 +242,31 @@ impl Plan {
     pub fn binding(&self, tool: &str) -> String {
         json!([tool, self.args]).to_string()
     }
+
+    /// What the child is run with, after the server's global flags: the
+    /// command and, for one that may reach Instagram, `--spend-alone`, so it
+    /// refuses while another child, of this server or of another, holds the
+    /// account. **Added here, after the binding is taken** (see `args`): it
+    /// is how the call runs, not what it does.
+    pub fn command_line(&self) -> Vec<String> {
+        let mut line = Vec::with_capacity(self.args.len() + 1);
+        if self.spends != Spends::Nothing {
+            line.push("--spend-alone".to_string());
+        }
+        line.extend(self.args.iter().cloned());
+        line
+    }
+}
+
+/// What a command may send to Instagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spends {
+    /// Nothing at all: the status, a stored list, an estimate.
+    Nothing,
+    /// Reads: a list that is polled or walked, a profile.
+    Reads,
+    /// A follow or an unfollow, which reads too.
+    Writes,
 }
 
 /// What a call has to ask before it runs.
@@ -296,6 +325,7 @@ pub fn plan(name: &str, args: &Map<String, Value>, writes: bool) -> Result<Plan,
                 // as a failure retries a call that had nothing wrong with
                 // it, rather than telling the person to sign in.
                 answers: &[ExitCode::Ok, ExitCode::NoSession, ExitCode::RateLimited],
+                spends: Spends::Nothing,
             })
         }
         "snob_list" => Ok(list(args)?),
@@ -308,6 +338,7 @@ pub fn plan(name: &str, args: &Map<String, Value>, writes: bool) -> Result<Plan,
                 args: command,
                 ask: None,
                 answers: &[ExitCode::Ok],
+                spends: Spends::Reads,
             })
         }
         "snob_follow" | "snob_unfollow" if writes => {
@@ -333,6 +364,7 @@ pub fn plan(name: &str, args: &Map<String, Value>, writes: bool) -> Result<Plan,
                     about: About::Write,
                 }),
                 answers: &[ExitCode::Ok],
+                spends: Spends::Writes,
             })
         }
         _ => Err(Unplannable::NoSuchTool(name.to_string())),
@@ -384,10 +416,12 @@ fn list(args: &Map<String, Value>) -> Result<Plan, String> {
         if let Some(pages) = max_pages {
             command.extend(["--max-pages".into(), pages.to_string()]);
         }
+        // An estimate reads what is stored and the budget, and sends nothing.
         return Ok(Plan {
             args: command,
             ask: None,
             answers: &[ExitCode::Ok],
+            spends: Spends::Nothing,
         });
     }
 
@@ -432,6 +466,13 @@ fn list(args: &Map<String, Value>) -> Result<Plan, String> {
         args: command,
         ask,
         answers: &[ExitCode::Ok],
+        // A stored list is read with `--offline`; every other mode polls the
+        // counter at least.
+        spends: if mode == "stored" {
+            Spends::Nothing
+        } else {
+            Spends::Reads
+        },
     })
 }
 
@@ -653,6 +694,46 @@ mod tests {
                 one.chars().all(|c| c == ' ' || c.is_ascii_graphic()),
                 "{one}"
             );
+        }
+    }
+
+    #[test]
+    fn only_calls_that_may_reach_instagram_take_the_spending_permit() {
+        let spends = |name: &str, args: Value| call(name, args).unwrap().spends;
+        for (name, args, expected) in [
+            ("snob_status", json!({}), Spends::Nothing),
+            (
+                "snob_list",
+                json!({"list": "fans", "mode": "stored"}),
+                Spends::Nothing,
+            ),
+            (
+                "snob_list",
+                json!({"list": "fans", "dry_run": true}),
+                Spends::Nothing,
+            ),
+            ("snob_list", json!({"list": "fans"}), Spends::Reads),
+            (
+                "snob_list",
+                json!({"list": "fans", "account": "x", "mode": "refresh"}),
+                Spends::Reads,
+            ),
+            ("snob_profile", json!({}), Spends::Reads),
+            ("snob_follow", json!({"account": "x"}), Spends::Writes),
+            ("snob_unfollow", json!({"account": "x"}), Spends::Writes),
+        ] {
+            assert_eq!(spends(name, args.clone()), expected, "{name} {args}");
+            // And exactly those children hold the account alone, with the
+            // flag ahead of the command and outside what a yes is bound to.
+            let plan = call(name, args.clone()).unwrap();
+            let line = plan.command_line();
+            assert_eq!(
+                line.first().map(String::as_str) == Some("--spend-alone"),
+                expected != Spends::Nothing,
+                "{name} {args}"
+            );
+            assert!(line.ends_with(&plan.args), "{name} {args}");
+            assert!(!plan.binding(name).contains("spend-alone"), "{name}");
         }
     }
 
