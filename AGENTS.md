@@ -61,7 +61,7 @@ Rust 2024 edition, resolver 3. Dependency direction is one-way:
 | `crates/snob-core` | Domain: `Pk`, models (the JSON contract), set arithmetic, `watch` diff, schedule (cron and `--on/--at/--every`), webhook signing (HMAC-SHA256), `Secret`, `Session`, the `RateBudget` trait and cooldown policy, `clock` | **No I/O.** No file, database, network or directory; `clock` is the single exception |
 | `crates/snob-ig` | Instagram web client: `client/` (`read.rs`, `write.rs`, `transport.rs`, `headers.rs`, `cdn.rs`, `media.rs`, `page.rs`, `ask.rs`, `posts.rs`), `web.rs` (calls built as the web app builds them), `allowlist.rs`, `pager.rs` (list walks), `pace.rs`, `graphql.rs`, `error.rs` (classifying answers), `http.rs` (the only place `reqwest` is configured; re-exported) | No SQLite, no keyring, no browser driving (it defines the page request shape only) |
 | `crates/snob-store` | SQLite (`store/`, migrations in `store/sql/`), platform paths, keyring/file secret store, account registry (`accounts.toml`), the monitor's `watch.toml`, layout migration | Domain logic that belongs in `snob-core` |
-| `crates/snob-cli` | `cli.rs` (clap), `main.rs`, `app.rs` (wires everything), `commands/`, `engine/` (rules: cache, consent, cooldown, walks, estimates, monitor), `output/`, `report.rs` (shared sentences), `ui/` (ratatui views), `headless/` + `cdp/` + `pipe.rs` (the browser), `owner/` (one background process that owns the browsers), `relay/` (`login --remote`), `power/`, `watch/webhook.rs`, `commands/mcp/` (the MCP server, feature `mcp`) | |
+| `crates/snob-cli` | `cli.rs` (clap), `main.rs`, `app.rs` (wires everything), `commands/`, `engine/` (rules: cache, consent, cooldown, walks, estimates, monitor), `output/`, `report.rs` (shared sentences), `ui/` (ratatui views), `headless/` + `cdp/` + `pipe.rs` (the browser), `owner/` (one background process that owns the browsers), `detach.rs` (starting a process that outlives its command, with nothing of the command's), `relay/` (`login --remote`), `power/`, `watch/webhook.rs`, `commands/mcp/` (the MCP server, feature `mcp`) | |
 
 Layering rules inside `snob-cli`:
 
@@ -561,16 +561,19 @@ touches all four.
 Platform-specific code, all of it reached only by the CI job on that OS:
 
 - Windows (`windows-sys`): launching the browser with an explicit handle list
-  and a job object (`pipe.rs`), the owner's named pipe and its DACL
+  and a job object (`pipe.rs`), starting a process detached with its own
+  handle list and out of the command's job where the job allows it
+  (`detach.rs`), the owner's named pipe and its DACL
   (`owner/socket.rs`, `snob-store/src/windows_user.rs`), the hidden window that
   hears the end of a session (`owner/end_of_session.rs`), power requests,
   EcoQoS, the data directory's ACL, the keyring's local persistence, the
   language preference, `QueryUnbiasedInterruptTime` for sleep detection
   (`snob_ig::awake`). Static CRT and `/Brepro` via `.cargo/config.toml`.
-- Unix (`libc`): `dup2` of the CDP pipe ends onto fds 3 and 4, the owner's
-  socket with `peer_cred`. Linux adds a logind `idle` inhibitor (`zbus`) and
-  `SCHED_BATCH`/`uclamp_max`; macOS uses `caffeinate -i -w <pid>` and leaves
-  the browser's scheduling alone.
+- Unix (`libc`): `dup2` of the CDP pipe ends onto fds 3 and 4, `setsid`
+  for a detached start (`detach.rs`), the owner's socket with `peer_cred`.
+  Linux adds a logind `idle` inhibitor (`zbus`) and `SCHED_BATCH`/`uclamp_max`;
+  macOS uses `caffeinate -i -w <pid>` and leaves the browser's scheduling
+  alone.
 - TLS backend and `--strict-roots` differ on Windows ARM64 (see above).
 
 ## Known walls

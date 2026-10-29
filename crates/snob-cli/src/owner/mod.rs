@@ -714,7 +714,12 @@ fn start_one(paths: &AppPaths, args: &[OsString]) -> Result<spawn::Started> {
     let program = std::env::current_exe().context("could not find this program to start it")?;
     let started = spawn::spawn(&program, args, &log_of(paths))
         .context("could not start the owner of the browsers")?;
-    tracing::debug!("started the owner of the browsers");
+    // Said, because an owner left in the command's job ends with it: a
+    // client that ends its process tree takes the browsers along.
+    tracing::debug!(
+        left_job = started.left_job,
+        "started the owner of the browsers"
+    );
     Ok(started)
 }
 

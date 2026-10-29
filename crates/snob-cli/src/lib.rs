@@ -14,6 +14,9 @@ pub mod browser;
 pub mod cdp;
 pub mod cli;
 pub mod commands;
+/// Starting a process that outlives the command that started it, with
+/// nothing of the command's: its output, its terminal, its job.
+pub(crate) mod detach;
 pub mod engine;
 pub mod exit;
 pub mod headless;
