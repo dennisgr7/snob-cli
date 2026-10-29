@@ -3887,10 +3887,23 @@ async fn the_mcp_server_runs_the_commands_and_refuses_what_it_cannot_confirm() {
     );
     assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
 
-    let write = client
-        .call("snob_follow", serde_json::json!({ "account": "someone" }))
-        .await;
-    assert_eq!(write["isError"], true, "{write}");
+    // A tool that was never listed is no tool at all: a protocol error, as
+    // for a name made up, and not a result the model reads as the tool's.
+    for name in ["snob_follow", "snob_nothing"] {
+        let write = client
+            .ask(
+                "tools/call",
+                serde_json::json!({ "name": name, "arguments": { "account": "someone" } }),
+            )
+            .await;
+        assert_eq!(write["error"]["code"], -32602, "{write}");
+        assert!(write.get("result").is_none(), "{write}");
+    }
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // And the server answers the next call: none of it took it down.
+    let again = client.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(again["isError"], false, "{again}");
     assert!(client.child.id().is_some(), "the server is still up");
 }
 

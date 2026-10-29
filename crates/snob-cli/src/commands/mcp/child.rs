@@ -33,6 +33,11 @@ use crate::exit::ExitCode;
 /// that is not abandoned, and its answer comes back well inside this.
 pub const GRACE: Duration = Duration::from_secs(30);
 
+/// The longest one heartbeat may take to reach the client before the call
+/// goes on without it. A client that has stopped reading would otherwise hold
+/// the call, and the child's stop with it, for as long as it does not read.
+const TICK_WITHIN: Duration = Duration::from_secs(5);
+
 /// The most of standard error kept for a failure that did not end in the JSON
 /// error line: enough for the sentences, not a log.
 const STDERR_KEPT: usize = 4 * 1024;
@@ -74,14 +79,21 @@ impl Launch {
     /// Runs `snob <globals> <args>` to its end, or until `stop` resolves.
     ///
     /// `tick` is called every `every` while it runs, with how long it has run,
-    /// so the caller can tell the client the call is alive.
-    pub async fn run(
+    /// so the caller can tell the client the call is alive, and **its future
+    /// is awaited here**, in the call's own task, before the loop goes on. So
+    /// a heartbeat has reached the client before the result can: the
+    /// specification has progress notifications stop once a request is
+    /// answered, and a send spawned off carries no order with the result.
+    pub async fn run<F>(
         &self,
         args: &[String],
         stop: impl std::future::Future<Output = ()>,
         every: Duration,
-        mut tick: impl FnMut(Duration),
-    ) -> anyhow::Result<Finished> {
+        mut tick: impl FnMut(Duration) -> F,
+    ) -> anyhow::Result<Finished>
+    where
+        F: std::future::Future<Output = ()>,
+    {
         let mut command = Command::new(&self.exe);
         command
             .args(&self.globals)
@@ -114,6 +126,9 @@ impl Launch {
 
         let started = tokio::time::Instant::now();
         let mut beat = tokio::time::interval_at(started + every, every);
+        // A beat that was late, because the one before it waited on the
+        // client, is not made up for with a burst of them.
+        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tokio::pin!(stop);
         let status = loop {
             tokio::select! {
@@ -128,7 +143,15 @@ impl Launch {
                         }
                     }
                 }
-                _ = beat.tick() => tick(started.elapsed()),
+                // **Never send to the client from a spawned task**: the send
+                // would race the result (see above), and rmcp keeps which
+                // request a message belongs to in a task-local
+                // (`ORIGINATING_REQUEST`) that does not cross `tokio::spawn`.
+                // Bounded, so a client that stopped reading cannot keep the
+                // child's exit or its stop from being seen.
+                _ = beat.tick() => {
+                    let _ = tokio::time::timeout(TICK_WITHIN, tick(started.elapsed())).await;
+                }
             }
         };
 

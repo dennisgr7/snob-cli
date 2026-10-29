@@ -334,10 +334,16 @@ writes it.
   any flag that writes a file.
 - Arguments are checked, not passed through: an `account` must be a possible
   username, so it can never be read as a flag, and an unknown argument is
-  refused rather than ignored.
+  refused rather than ignored. A tool that is not listed (the writes without
+  `--allow-writes` included) is a JSON-RPC error, -32602, as the protocol
+  asks, not an `isError` result.
 - Everything a child prints is passed through `printable` string by string
   before it reaches the client; tool descriptions tell the model that names
-  and bios are data, never instructions.
+  and bios are data, never instructions. What a child printed is read
+  without assuming its shape (`answer.rs`): under `panic = "abort"` one
+  indexing panic is the server gone, with every call in flight.
+- A heartbeat (`notifications/progress`) is sent from the call's own task
+  and awaited, never spawned, so none can reach the client after the result.
 
 ## Output contract
 

@@ -24,22 +24,36 @@ pub struct Answer {
 pub fn from(plan: &Plan, finished: Finished) -> Answer {
     let exit = finished.code;
     let mut body = if plan.answers.contains(&exit) {
+        // A structured result is an object, so whatever else a command printed
+        // goes under a key. **Never index into what came back before it is
+        // known to be an object**: `serde_json` panics on `value["key"] = ...`
+        // for a string or a number, and under `panic = "abort"` that is the
+        // whole server gone, every call in flight with it, over one line a
+        // command printed.
         match finished.json {
-            // A structured result is an object, so a list goes under a key.
             Some(Value::Array(items)) => json!({ "count": items.len(), "items": items }),
-            Some(other) => other,
+            Some(document @ Value::Object(_)) => document,
+            Some(other) => json!({ "value": other }),
             None => json!({ "text": finished.text.trim() }),
         }
     } else {
-        let mut failure = match finished.error {
-            Some(Value::Object(mut error)) => match error.remove("error") {
-                Some(inner) => inner,
-                None => Value::Object(error),
-            },
-            _ => json!({
+        let said = || {
+            json!({
                 "code": exit.as_str(),
                 "message": last_lines(&finished.said),
-            }),
+            })
+        };
+        // `main::wording_for` prints an object under `error`, but the line is
+        // only known to be JSON with that key: `{"error":"x"}` is read here
+        // too, and its `error` is put in an object rather than indexed into.
+        let mut failure = match finished.error {
+            Some(Value::Object(mut error)) => match error.remove("error") {
+                Some(inner @ Value::Object(_)) => inner,
+                Some(Value::Null) => said(),
+                Some(other) => json!({ "code": exit.as_str(), "message": other }),
+                None => Value::Object(error),
+            },
+            _ => said(),
         };
         // What a list walk kept is still worth having: it is stored, and the
         // next call continues from it.
@@ -148,6 +162,45 @@ mod tests {
         );
         assert!(!told.failed);
         assert_eq!(told.body["exit"], "rate_limited");
+    }
+
+    #[test]
+    fn an_error_line_whose_error_is_not_an_object_is_still_an_answer() {
+        for error in [json!("x"), json!(7), json!(["x"]), json!(null)] {
+            let told = from(
+                &plan(&[ExitCode::Ok]),
+                finished(
+                    ExitCode::Error,
+                    // With a partial result too, which is the field that was
+                    // set by indexing.
+                    Some(json!([{"username": "a"}])),
+                    Some(json!({ "error": error.clone() })),
+                ),
+            );
+            assert!(told.failed, "{error}");
+            assert_eq!(told.body["error"]["code"], "error", "{error}");
+            assert!(told.body["error"]["partial"].is_array(), "{error}");
+        }
+        let told = from(
+            &plan(&[ExitCode::Ok]),
+            finished(ExitCode::Error, None, Some(json!({"error": "x"}))),
+        );
+        assert_eq!(told.body["error"]["message"], "x");
+    }
+
+    #[test]
+    fn a_document_that_is_not_an_object_is_put_under_a_key() {
+        for document in [json!("a string"), json!(3), json!(true), json!(null)] {
+            // Under a code the plan counts as an answer but that is not 0,
+            // which is where `exit` was set by indexing.
+            let told = from(
+                &plan(&[ExitCode::Ok, ExitCode::RateLimited]),
+                finished(ExitCode::RateLimited, Some(document.clone()), None),
+            );
+            assert!(!told.failed, "{document}");
+            assert_eq!(told.body["value"], cleaned(document.clone()));
+            assert_eq!(told.body["exit"], "rate_limited", "{document}");
+        }
     }
 
     #[test]

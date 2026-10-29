@@ -204,7 +204,19 @@ impl ServerHandler for Server {
         let arguments = request.arguments.clone().unwrap_or_default();
         let plan = match tools::plan(&request.name, &arguments, self.writes) {
             Ok(plan) => plan,
-            Err(why) => return Ok(refusal("invalid_arguments", &why).into()),
+            // The name is the client's, and the message goes back to a model.
+            Err(tools::Unplannable::NoSuchTool(name)) => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "there is no tool called {}",
+                        snob_core::model::printable(&name)
+                    ),
+                    None,
+                ));
+            }
+            Err(tools::Unplannable::Invalid(why)) => {
+                return Ok(refusal("invalid_arguments", &why).into());
+            }
         };
         if let Some(question) = &plan.ask {
             match self
@@ -226,15 +238,20 @@ impl ServerHandler for Server {
 
         let progress = context.meta.get_progress_token();
         let peer = context.peer.clone();
+        // Awaited by `Launch::run` in this task, not spawned: the
+        // notification is written before the result can be (`Peer::
+        // send_notification` resolves once the transport has sent it).
         let tick = move |ran: Duration| {
-            if let Some(token) = progress.clone() {
-                let peer = peer.clone();
+            let said = progress.clone().map(|token| {
                 let seconds = ran.as_secs();
-                tokio::spawn(async move {
-                    let said = ProgressNotificationParam::new(token, seconds as f64)
-                        .with_message(format!("still running after {seconds} s"));
+                ProgressNotificationParam::new(token, seconds as f64)
+                    .with_message(format!("still running after {seconds} s"))
+            });
+            let peer = peer.clone();
+            async move {
+                if let Some(said) = said {
                     let _ = peer.notify_progress(said).await;
-                });
+                }
             }
         };
         let finished = self

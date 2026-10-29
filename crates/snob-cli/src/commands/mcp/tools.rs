@@ -191,11 +191,31 @@ pub struct Plan {
     pub answers: &'static [ExitCode],
 }
 
+/// Why a call is not a command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unplannable {
+    /// No tool of that name is on offer. **A protocol error, not a tool
+    /// result**: the specification answers a call to an unknown tool with
+    /// JSON-RPC's invalid params (-32602), and a client reads that as a
+    /// mistake in the call rather than as something the tool said.
+    NoSuchTool(String),
+    /// The tool exists and the arguments are not ones it takes. A tool
+    /// result (`isError`), so the model reads why and can call again.
+    Invalid(String),
+}
+
+impl From<String> for Unplannable {
+    fn from(why: String) -> Self {
+        Self::Invalid(why)
+    }
+}
+
 /// Turns a call into the command it stands for, or says why it cannot be one.
 ///
 /// `writes` is whether the server offers the writes at all: a client that
-/// calls a tool it was never listed is refused here too.
-pub fn plan(name: &str, args: &Map<String, Value>, writes: bool) -> Result<Plan, String> {
+/// calls a tool it was never listed is told there is no such tool, as for any
+/// other name it made up.
+pub fn plan(name: &str, args: &Map<String, Value>, writes: bool) -> Result<Plan, Unplannable> {
     match name {
         "snob_status" => {
             no_more(args, &[])?;
@@ -205,7 +225,7 @@ pub fn plan(name: &str, args: &Map<String, Value>, writes: bool) -> Result<Plan,
                 answers: &[ExitCode::Ok, ExitCode::RateLimited],
             })
         }
-        "snob_list" => list(args),
+        "snob_list" => Ok(list(args)?),
         "snob_profile" => {
             no_more(args, &["account"])?;
             let mut command = vec!["profile".to_string()];
@@ -237,7 +257,7 @@ pub fn plan(name: &str, args: &Map<String, Value>, writes: bool) -> Result<Plan,
                 answers: &[ExitCode::Ok],
             })
         }
-        _ => Err(format!("there is no tool called {name}")),
+        _ => Err(Unplannable::NoSuchTool(name.to_string())),
     }
 }
 
@@ -311,10 +331,10 @@ fn list(args: &Map<String, Value>) -> Result<Plan, String> {
         command.extend(["--max-pages".into(), pages.to_string()]);
     }
     // Another account's lists need consent, and a stored answer does not: it
-    // enumerates nothing new (`consent.rs`, "a cached answer about somebody
-    // else needs no terminal"). The question is asked whenever an account is
-    // named, the person's own included, because which name is theirs is not
-    // known here without a request.
+    // enumerates nothing new (`engine/mod.rs`, `decide`: "`--offline` is not
+    // asked about, because there is nothing to agree to"). The question is
+    // asked whenever an account is named, the person's own included, because
+    // which name is theirs is not known here without a request.
     let ask = match (&whose, mode) {
         (Some(who), "auto" | "refresh") => {
             command.push("-y".into());
@@ -379,7 +399,7 @@ fn no_more(args: &Map<String, Value>, known: &[&str]) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn call(name: &str, args: Value) -> Result<Plan, String> {
+    fn call(name: &str, args: Value) -> Result<Plan, Unplannable> {
         plan(name, args.as_object().unwrap(), true)
     }
 
@@ -388,12 +408,22 @@ mod tests {
         let names = |writes| specs(writes).iter().map(|s| s.name).collect::<Vec<_>>();
         assert!(!names(false).contains(&"snob_follow"));
         assert!(names(true).contains(&"snob_follow"));
+        // Not listed is not there: the same answer as for a name made up.
         let refused = plan(
             "snob_follow",
             json!({"account": "x"}).as_object().unwrap(),
             false,
         );
-        assert!(refused.is_err());
+        assert_eq!(refused, Err(Unplannable::NoSuchTool("snob_follow".into())));
+        assert_eq!(
+            call("snob_nothing", json!({})),
+            Err(Unplannable::NoSuchTool("snob_nothing".into()))
+        );
+        // A tool that is there, called wrongly, is a different answer.
+        assert!(matches!(
+            call("snob_follow", json!({})),
+            Err(Unplannable::Invalid(_))
+        ));
     }
 
     #[test]

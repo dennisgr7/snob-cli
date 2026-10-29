@@ -530,9 +530,12 @@ fn mcp_globals(
             args.push(std::path::absolute(root)?.into());
         }
     }
+    // Whole seconds, which is all `--max-wait` can be written in. **Zero
+    // stays zero**: it means "never wait for the budget", and a floor of one
+    // second here would hand every child a wait the person did not allow.
     if let Some(max_wait) = cli.max_wait.or(default_max_wait) {
         args.push("--max-wait".into());
-        args.push(format!("{}s", max_wait.as_secs().max(1)).into());
+        args.push(format!("{}s", max_wait.as_secs()).into());
     }
     #[cfg(feature = "testing")]
     if let Some(root) = &cli.sandbox_root {
@@ -681,6 +684,28 @@ mod filter_tests {
         let typo = log_filter(false, Some("snob_ig=loud"), false);
         assert!(typo.would_enable("snob_ig::client", &Level::WARN));
         assert!(!typo.would_enable("snob_ig::client", &Level::INFO));
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod mcp_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn a_max_wait_of_zero_reaches_the_children_as_zero() {
+        let cli = Cli::try_parse_from(["snob", "--max-wait", "0", "mcp"]).expect("it parses");
+        let globals = mcp_globals(&cli, Some(MCP_MAX_WAIT)).expect("no path to resolve");
+        let at = globals
+            .iter()
+            .position(|arg| arg == "--max-wait")
+            .expect("the limit is passed on");
+        assert_eq!(globals[at + 1], "0s");
+
+        // And the server's own default when none was given.
+        let cli = Cli::try_parse_from(["snob", "mcp"]).expect("it parses");
+        let globals = mcp_globals(&cli, Some(MCP_MAX_WAIT)).expect("no path to resolve");
+        assert!(globals.iter().any(|arg| arg == "300s"), "{globals:?}");
     }
 }
 
