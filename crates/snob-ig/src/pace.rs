@@ -257,6 +257,9 @@ pub struct Pacer {
     sitting_pages: AtomicU32,
     /// How many actions have begun. See [`Pacer::begin_action`].
     actions: AtomicU32,
+    /// The longest wait for the budget this run accepts. See
+    /// [`Pacer::waiting_at_most`].
+    max_wait: Option<Duration>,
 }
 
 impl Pacer {
@@ -268,6 +271,7 @@ impl Pacer {
             spent: AtomicU32::new(0),
             sitting_pages: AtomicU32::new(0),
             actions: AtomicU32::new(0),
+            max_wait: None,
         }
     }
 
@@ -330,6 +334,44 @@ impl Pacer {
     pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
         self.cancel = cancel;
         self
+    }
+
+    /// Refuses, with [`crate::error::IgError::WaitTooLong`], any wait for the
+    /// budget longer than `limit`, instead of sleeping through it: the
+    /// buckets' waits here, before the reservation is committed, and the
+    /// day's accounts in the pager. `None` waits as long as the budget says.
+    ///
+    /// For a caller that cannot sit for hours, such as an agent's tool call.
+    /// **Only waits for the budget**: the pace's own steps and the rest after
+    /// a sitting ([`Pace::sitting_pause`]) are not cut short, because the
+    /// sitting is counted in this process and a run stopped at its rest and
+    /// started again would begin a new one with no rest at all.
+    #[must_use]
+    pub fn waiting_at_most(mut self, limit: Option<Duration>) -> Self {
+        self.max_wait = limit;
+        self
+    }
+
+    /// The limit [`Self::waiting_at_most`] set, if any.
+    pub fn max_wait(&self) -> Option<Duration> {
+        self.max_wait
+    }
+
+    /// `Err` when `wait` is past [`Self::max_wait`].
+    ///
+    /// **A refusal stops the run**, by canceling its token, as Ctrl+C does:
+    /// the limit is the caller's, and every later request would meet the
+    /// same budget. Without it a monitor tick would go on to its next list
+    /// and its next account, paying for their lookups and polls before each
+    /// was refused in turn.
+    pub(crate) fn within_the_limit(&self, wait: Duration) -> Result<(), crate::error::IgError> {
+        match self.max_wait {
+            Some(limit) if wait > limit => {
+                self.cancel.cancel();
+                Err(crate::error::IgError::WaitTooLong { wait, limit })
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Sets who gets told about a wait the budget imposed.
@@ -459,7 +501,17 @@ impl Pacer {
     /// Before the reservation, not after: refusing to send and charging for it
     /// anyway is the one combination that helps nobody.
     pub(crate) async fn clear_to_send(&self) -> Result<(), crate::error::IgError> {
-        self.clear(false).await
+        self.clear(false, true).await
+    }
+
+    /// Pays for a read that has **already been sent**: a redirect hop the
+    /// browser followed on its own (`IgClient::pay_for_hops`). The same as
+    /// [`Self::clear_to_send`] but for the limit on the wait, which is a
+    /// reason not to send and cannot un-send anything: refusing to pay would
+    /// leave a request the budget never counted, and throw away the answer
+    /// it brought.
+    pub(crate) async fn pay_for_sent(&self) -> Result<(), crate::error::IgError> {
+        self.clear(false, false).await
     }
 
     /// The same for a write, which pays the read budgets and the write bucket.
@@ -469,7 +521,7 @@ impl Pacer {
     /// calling and not by an argument somebody could pass wrongly. There is no
     /// way to send a follow or an unfollow that goes through the cheaper one.
     pub(crate) async fn clear_to_send_write(&self) -> Result<(), crate::error::IgError> {
-        self.clear(true).await
+        self.clear(true, true).await
     }
 
     /// Waits until a write would be sent without waiting, and spends
@@ -492,6 +544,7 @@ impl Pacer {
         if owed.is_zero() {
             return Ok(());
         }
+        self.within_the_limit(owed)?;
         if let Some(announce) = &self.announce {
             announce(owed);
         }
@@ -501,7 +554,7 @@ impl Pacer {
         Ok(())
     }
 
-    async fn clear(&self, write: bool) -> Result<(), crate::error::IgError> {
+    async fn clear(&self, write: bool, limited: bool) -> Result<(), crate::error::IgError> {
         if self.cancel.is_canceled() {
             return Err(crate::error::IgError::Canceled);
         }
@@ -526,6 +579,25 @@ impl Pacer {
         // itself helps nobody.
         if let Some(until_ms) = self.cooldown_off_thread().await? {
             return Err(crate::error::IgError::InCooldown { until_ms });
+        }
+
+        // A limit on the wait is asked before the charge, for the reason the
+        // cooldown is: the reservation is committed whether or not the request
+        // goes, and a refusal that pays for itself helps nobody. Another
+        // process can still take a slot between the two, so the wait charged
+        // may come out a little longer than the one asked about; it is slept
+        // through, being a reservation already made.
+        if limited && self.max_wait.is_some() {
+            let owed = self
+                .off_thread(move |budget| {
+                    if write {
+                        budget.write_wait()
+                    } else {
+                        budget.read_wait()
+                    }
+                })
+                .await?;
+            self.within_the_limit(owed)?;
         }
 
         // `charge` opens an immediate transaction against a database other
@@ -606,6 +678,81 @@ impl CancelToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A budget that is always a quarter of an hour away, and counts what it
+    /// was charged.
+    #[derive(Default)]
+    struct Rationing {
+        charged: AtomicU32,
+    }
+
+    impl RateBudget for Rationing {
+        fn reserve(&self) -> Result<Duration, snob_core::budget::RateBudgetError> {
+            self.charged.fetch_add(1, Ordering::Relaxed);
+            Ok(Duration::from_secs(900))
+        }
+        fn reserve_write(&self) -> Result<Duration, snob_core::budget::RateBudgetError> {
+            self.reserve()
+        }
+        fn read_wait(&self) -> Result<Duration, snob_core::budget::RateBudgetError> {
+            Ok(Duration::from_secs(900))
+        }
+        fn write_wait(&self) -> Result<Duration, snob_core::budget::RateBudgetError> {
+            Ok(Duration::from_secs(900))
+        }
+        fn cooldown(&self) -> Result<Option<EpochMs>, snob_core::budget::RateBudgetError> {
+            Ok(None)
+        }
+        fn start_cooldown(
+            &self,
+            _reason: &str,
+            _minimum: Duration,
+        ) -> Result<EpochMs, snob_core::budget::RateBudgetError> {
+            Ok(EpochMs::new(0))
+        }
+    }
+
+    /// Past the limit, a read and a write are refused before the charge, so
+    /// a refusal costs nothing; with no limit nothing is refused.
+    #[tokio::test]
+    async fn a_wait_past_the_limit_is_refused_before_anything_is_charged() {
+        let budget = Arc::new(Rationing::default());
+        let limited = || Pacer::new(budget.clone()).waiting_at_most(Some(Duration::from_secs(60)));
+
+        let (read, write, rested) = (limited(), limited(), limited());
+        for refused in [
+            read.clear_to_send().await,
+            write.clear_to_send_write().await,
+            rested.rested_for_a_write().await,
+        ] {
+            assert!(
+                matches!(refused, Err(crate::error::IgError::WaitTooLong { .. })),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(budget.charged.load(Ordering::Relaxed), 0);
+        assert_eq!(read.spent(), 0);
+
+        // The refusal stops the run, as Ctrl+C does: nothing after it goes.
+        assert!(read.cancel_token().is_canceled());
+        assert!(matches!(
+            read.clear_to_send().await,
+            Err(crate::error::IgError::Canceled)
+        ));
+
+        // What was already sent is paid for past the limit.
+        let sent = Pacer::new(budget.clone()).waiting_at_most(Some(Duration::from_secs(60)));
+        let paid = tokio::time::timeout(Duration::from_millis(50), sent.pay_for_sent()).await;
+        assert!(
+            paid.is_err(),
+            "it waits for the charge rather than refusing"
+        );
+        assert_eq!(budget.charged.load(Ordering::Relaxed), 1);
+
+        let generous = Pacer::new(budget).waiting_at_most(Some(Duration::from_secs(3600)));
+        assert!(generous.within_the_limit(Duration::from_secs(900)).is_ok());
+        assert!(Pacer::unlimited().within_the_limit(Duration::MAX).is_ok());
+    }
 
     #[test]
     fn jitter_lands_inside_the_range() {

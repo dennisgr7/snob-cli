@@ -10,7 +10,7 @@
 //! announcement goes; and the pacer has to exist before the client, because a
 //! client without one cannot be built at all.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use snob_core::{EpochMs, Pk};
@@ -105,8 +105,26 @@ fn pacer(
     Store::open(paths)?;
     Ok(Pacer::new(Arc::new(SqliteRateBudget::open(paths)?))
         .with_cancel(interrupt::install())
+        .waiting_at_most(MAX_WAIT.get().copied().flatten())
         .announcing(announce))
 }
+
+/// `--max-wait`, set once by `main` before any command runs.
+///
+/// Process-wide, like the cancellation token beside it: it is a property of
+/// the run, and every pacer the run builds has to obey it, including the ones
+/// built deep inside the monitor.
+static MAX_WAIT: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+
+/// Sets `--max-wait` for every pacer this run builds. A second call changes
+/// nothing.
+pub fn wait_at_most(limit: Option<std::time::Duration>) {
+    let _ = MAX_WAIT.set(limit);
+}
+
+/// `--stop-when-stdin-closes`, beside `--max-wait`: the other run-wide
+/// setting `main` hands every pacer, through the cancellation token.
+pub use crate::interrupt::stop_when_stdin_closes;
 
 /// `pacer` with the announcement the single-request commands, `login` and
 /// `whoami`, want: one line on standard error, because there is nothing for a

@@ -132,6 +132,7 @@ impl IgClient {
             Ok(told) => told,
             Err(
                 e @ (IgError::Canceled
+                | IgError::WaitTooLong { .. }
                 | IgError::InCooldown { .. }
                 | IgError::RateLimited
                 | IgError::FeedbackRequired

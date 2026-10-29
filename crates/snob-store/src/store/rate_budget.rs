@@ -375,6 +375,18 @@ impl SqliteRateBudget {
         Ok(decide(Self::stored_tat(conn, bucket, now)?, now, emission, burst).1)
     }
 
+    /// The longest wait any of `buckets` (name, emission, burst) would hand
+    /// back now, charged nothing: what `write_wait` and `read_wait` share.
+    fn longest_wait(&self, buckets: &[(&str, i64, i64)]) -> Result<Duration, RateBudgetError> {
+        let now = now_ms();
+        let conn = self.conn();
+        let mut wait = 0;
+        for &(bucket, emission, burst) in buckets {
+            wait = wait.max(Self::bucket_wait(&conn, bucket, emission, burst, now)?);
+        }
+        Ok(Duration::from_millis(wait.max(0) as u64))
+    }
+
     /// The theoretical instant `bucket` holds at `now`, as the next charge
     /// would read it: `now` for a bucket never charged, and for one written
     /// by a clock that has since gone backwards.
@@ -616,17 +628,19 @@ impl RateBudget for SqliteRateBudget {
     /// The longest of the three waits a write would be handed now: the
     /// buckets `reserve_buckets` charges for one, read and not charged.
     fn write_wait(&self) -> Result<Duration, RateBudgetError> {
-        let now = now_ms();
-        let conn = self.conn();
-        let mut wait = 0;
-        for (bucket, emission, burst) in [
+        self.longest_wait(&[
             (PACE_BUCKET, PACE_EMISSION_MS, PACE_BURST_MS),
             (DAILY_BUCKET, DAILY_EMISSION_MS, DAILY_BURST_MS),
             (WRITE_BUCKET, WRITE_EMISSION_MS, WRITE_BURST_MS),
-        ] {
-            wait = wait.max(Self::bucket_wait(&conn, bucket, emission, burst, now)?);
-        }
-        Ok(Duration::from_millis(wait.max(0) as u64))
+        ])
+    }
+
+    /// The same for a read, which pays the first two.
+    fn read_wait(&self) -> Result<Duration, RateBudgetError> {
+        self.longest_wait(&[
+            (PACE_BUCKET, PACE_EMISSION_MS, PACE_BURST_MS),
+            (DAILY_BUCKET, DAILY_EMISSION_MS, DAILY_BURST_MS),
+        ])
     }
 
     /// How long until the last day holds room for `accounts` more: the moment

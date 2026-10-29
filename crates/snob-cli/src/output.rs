@@ -548,6 +548,27 @@ fn write_stdout(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The users with their names through `printable`, for the JSON formats.
+///
+/// **JSON is read by programs that hand it on, and one of them is a model.**
+/// `serde_json` escapes `Cc`, so a terminal escape cannot survive it, but it
+/// writes `Cf` as it is: a right-to-left override still reverses a name in
+/// whatever shows it, and the tag block still carries invisible ASCII into an
+/// agent's context, where it reads as text nobody on screen can see. The table,
+/// Markdown and CSV already filter both names; this is the same filter, so no
+/// format is the one left uncovered. The picture address is left alone: it is
+/// Instagram's, not a person's.
+fn readable(users: &[User]) -> Vec<User> {
+    users
+        .iter()
+        .map(|user| User {
+            username: user.safe_username(),
+            full_name: user.safe_full_name(),
+            ..user.clone()
+        })
+        .collect()
+}
+
 fn render(users: &[User], format: Format, presentation: Presentation) -> Result<Rendered> {
     if format == Format::Xlsx {
         #[cfg(feature = "xlsx")]
@@ -562,14 +583,14 @@ fn render(users: &[User], format: Format, presentation: Presentation) -> Result<
         Format::Table if presentation.interactive => table::table(users, presentation),
         Format::Table => table::plain(users),
         Format::Json => {
-            let mut s = serde_json::to_string_pretty(users)?;
+            let mut s = serde_json::to_string_pretty(&readable(users))?;
             s.push('\n');
             s
         }
         Format::Ndjson => {
             let mut s = String::new();
-            for u in users {
-                s.push_str(&serde_json::to_string(u)?);
+            for u in readable(users) {
+                s.push_str(&serde_json::to_string(&u)?);
                 s.push('\n');
             }
             s
@@ -641,6 +662,22 @@ mod tests {
         let out = text(&users(), Format::Json);
         assert!(out.contains("\"is_verified\": true"));
         assert!(!out.contains("null"));
+    }
+
+    /// A right-to-left override and a tag-block payload, which `serde_json`
+    /// would write as they are, reach neither JSON format.
+    #[test]
+    fn the_json_formats_carry_no_invisible_characters_in_a_name() {
+        let mut list = users();
+        list[0].full_name = Some("\u{202e}enO\u{e0049}\u{e0067}".into());
+        for format in [Format::Json, Format::Ndjson] {
+            let out = text(&list, format);
+            assert!(out.contains("\"enO\""), "{out}");
+            assert!(
+                !out.contains('\u{202e}') && !out.contains('\u{e0049}'),
+                "{out}"
+            );
+        }
     }
 
     #[test]

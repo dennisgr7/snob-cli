@@ -31,6 +31,30 @@ pub struct Cli {
     #[arg(long, global = true, display_order = 899, value_name = "USER")]
     pub account: Option<String>,
 
+    /// Stop rather than wait longer than this for the request budget
+    ///
+    /// A list stopped this way is kept and continues where it left off, a
+    /// follow is not sent, and the run exits 130 with the wait in the message.
+    /// The pace's own steps and the rest after a long stretch of pages are
+    /// never cut short.
+    // For callers that cannot sit for hours: a script with a deadline, an
+    // agent's tool call (`snob mcp` passes it to every command it runs).
+    #[arg(
+        long,
+        global = true,
+        display_order = 898,
+        value_name = "DURATION",
+        value_parser = duration
+    )]
+    pub max_wait: Option<std::time::Duration>,
+
+    /// Stop, as Ctrl+C stops, when standard input reaches its end
+    // Hidden: plumbing for a parent that runs snob and cannot send it a
+    // signal, which on Windows is every parent (`snob mcp`, a script's
+    // timeout). `interrupt::stop_when_stdin_closes` says the rest.
+    #[arg(long, global = true, hide = true)]
+    pub stop_when_stdin_closes: bool,
+
     /// Store the session in a protected file instead of the system keyring.
     /// For environments without a desktop session.
     // Ordered last, with `verbose`. Both are global, so without this they are
@@ -455,6 +479,22 @@ pub enum Command {
                       it shows describes the moment Instagram built the export."
     )]
     Import(crate::commands::import::ImportCommand),
+
+    /// Offer snob to an AI agent as an MCP server, on standard input and output
+    #[cfg(feature = "mcp")]
+    #[command(
+        after_help = "Started by the agent's client, not typed: \"snob mcp config <client>\" \
+                      prints what to add to its configuration. Each tool call runs one snob \
+                      command, so the budget, the cooldown and consent hold exactly as they do \
+                      in a terminal. It offers the status, the lists and profiles; with \
+                      --allow-writes, follow and unfollow too, each confirmed by you in the \
+                      client every time it is called. Never login, purge, the monitor or a \
+                      download.\n\n\
+                      A call waits at most --max-wait for the request budget (five minutes \
+                      when it is not given) and is refused past it; a list stopped that way \
+                      continues next time."
+    )]
+    Mcp(McpArgs),
 
     /// The process that runs the browsers for every command (`owner`).
     /// Started by the commands themselves; nobody types it.
@@ -1526,6 +1566,52 @@ pub struct FollowArgs {
 
     #[command(flatten)]
     pub consent: ConsentArgs,
+
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
+}
+
+/// `snob mcp`: serve, or print what a client needs to start it.
+#[cfg(feature = "mcp")]
+#[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct McpArgs {
+    #[command(subcommand)]
+    pub command: Option<McpCommand>,
+
+    /// Offer follow and unfollow as well, each confirmed by you in the client
+    /// when it is called
+    #[arg(long)]
+    pub allow_writes: bool,
+}
+
+#[cfg(feature = "mcp")]
+#[derive(Subcommand, Debug)]
+pub enum McpCommand {
+    /// Print what to add to a client's configuration to start this server
+    Config(McpConfigArgs),
+}
+
+#[cfg(feature = "mcp")]
+#[derive(Args, Debug)]
+pub struct McpConfigArgs {
+    /// The client that will start it
+    #[arg(value_enum)]
+    pub client: McpClient,
+
+    /// Start it with --allow-writes
+    #[arg(long)]
+    pub allow_writes: bool,
+}
+
+#[cfg(feature = "mcp")]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpClient {
+    ClaudeCode,
+    ClaudeDesktop,
+    Codex,
+    Cursor,
+    Vscode,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

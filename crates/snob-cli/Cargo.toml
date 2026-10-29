@@ -17,7 +17,7 @@ path = "src/main.rs"
 # flags nor the code behind them. `cargo test --features testing` is what turns
 # them on, and `crates/snob-cli/tests/sandbox.rs` is what they are for.
 [features]
-default = ["xlsx"]
+default = ["xlsx", "mcp"]
 # The `.xlsx` export and the `zip` crate behind it. On by default, and the
 # released binary carries it; what the feature buys is that somebody building
 # from source can leave it out -- `rust_xlsxwriter` and `zopfli` are the
@@ -26,6 +26,11 @@ default = ["xlsx"]
 # export zip through the same feature, being the only other reader of `zip`;
 # without it the import still reads the folder the zip was extracted into.
 xlsx = ["dep:rust_xlsxwriter", "dep:zip"]
+# `snob mcp`, the stdio server an agent's client starts (`commands::mcp`).
+# On by default, so the released binary has it; `--no-default-features`
+# leaves out `rmcp` and what it brings. `tokio/process` is how each tool call
+# runs its child `snob` and is told when it ends, without a thread per call.
+mcp = ["dep:rmcp", "tokio/process"]
 testing = ["snob-ig/testing"]
 
 [dependencies]
@@ -65,6 +70,12 @@ comfy-table = { workspace = true, features = ["custom_styling"] }
 csv.workspace = true
 rust_xlsxwriter = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
+# `server` is the protocol's server half; `transport-io` serves it over this
+# process's standard input and output, the transport every client can start;
+# `elicitation` is the question a write is confirmed with. Not
+# `request-state`: its sealer brings a second copy of the RustCrypto crates,
+# and `commands::mcp::seal` signs with the webhook's HMAC instead.
+rmcp = { workspace = true, optional = true, features = ["server", "transport-io", "elicitation"] }
 chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

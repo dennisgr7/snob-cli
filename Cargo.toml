@@ -120,6 +120,12 @@ indicatif = "0.18"
 supports-hyperlinks = "3"
 csv = "1"
 rust_xlsxwriter = "0.97"
+# The Model Context Protocol SDK behind `snob mcp`. Pinned to the exact
+# version: it moves fast (eight releases in the two months before this one),
+# the protocol revision it speaks is part of what `snob mcp` promises a
+# client, and a minor bump is a change to read before taking. No default
+# features: those add the tool macros, which this crate does without.
+rmcp = { version = "=3.8.0", default-features = false }
 # Only to read Instagram's export. Deflate is what a zip holding JSON uses;
 # rust_xlsxwriter already pulls this crate in, so the features are kept narrow
 # rather than adding a second copy of the compression code.

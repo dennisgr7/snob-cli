@@ -569,10 +569,10 @@ impl IgClient {
     }
 
     /// Pays for hops a navigation already followed, stopping at the first
-    /// charge refused.
+    /// charge refused. Past the limit on the wait too: they were sent.
     async fn pay_for_hops(&self, hops: u32) -> Result<(), IgError> {
         for _ in 0..hops {
-            self.pacer.clear_to_send().await?;
+            self.pacer.pay_for_sent().await?;
         }
         Ok(())
     }

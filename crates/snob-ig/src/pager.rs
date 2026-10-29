@@ -429,6 +429,11 @@ impl<'a> ListWalker<'a> {
                         .accounts_wait(page * PAGES_AFTER_A_PAUSE)
                         .await
                         .map_err(WalkError::Budget)?;
+                    // Past the caller's limit, the walk stops here as it
+                    // would at Ctrl+C, with every page so far kept.
+                    if let Err(e) = pacer.within_the_limit(wait) {
+                        break self.stop_reason_for(e, &mut state);
+                    }
                     if self.sleep_through_the_day(wait, &mut observe).await? {
                         break StopReason::Canceled;
                     }
@@ -701,6 +706,10 @@ impl<'a> ListWalker<'a> {
                 // client rather than through the token, and it is still the
                 // user stopping rather than anything going wrong.
                 IgError::Canceled => StopReason::Canceled,
+                // A wait past the caller's limit is the caller stopping the
+                // walk, as Ctrl+C is: kept, resumable, and not a failure of
+                // the network or a word from Instagram.
+                IgError::WaitTooLong { .. } => StopReason::Canceled,
                 // The backstop in `Pacer::clear` refusing, which is throttling
                 // and not a network failure however it arrives. Its reaction is
                 // `Abort` — retrying a wait measured in hours is the one thing

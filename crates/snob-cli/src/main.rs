@@ -93,6 +93,7 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
         Command::Whoami(args) => args.output.json,
         Command::Status(args) => args.output.json,
         Command::Account(AccountCommand::List(args)) => args.output.json,
+        Command::Follow(args) | Command::Unfollow(args) => args.output.json,
         // It takes no format flag and answers in JSON down a pipe, the way
         // `commands::import::run` decides it.
         Command::Import(_) => document(None, None),
@@ -110,9 +111,10 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
         | Command::Purge(_)
         | Command::Pfp(_)
         | Command::Fetch(_)
-        | Command::Follow(_)
-        | Command::Unfollow(_)
         | Command::BrowserOwner => false,
+        // The protocol is on standard output; its failures are JSON-RPC.
+        #[cfg(feature = "mcp")]
+        Command::Mcp(_) => false,
     };
     if json { Wording::Json } else { Wording::Prose }
 }
@@ -250,6 +252,28 @@ fn sandbox_keyring_namespace(root: &std::path::Path) -> String {
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let (paths, no_keyring, keyring_namespace) = wiring(&cli)?;
+    snob_cli::app::wait_at_most(cli.max_wait);
+    if cli.stop_when_stdin_closes {
+        snob_cli::app::stop_when_stdin_closes();
+    }
+    // Before the layout, the owner and the session: the server spends nothing
+    // and stores nothing itself. Each tool call is a child `snob`, which does
+    // all of that for itself.
+    #[cfg(feature = "mcp")]
+    if let Command::Mcp(args) = &cli.command {
+        return match &args.command {
+            Some(snob_cli::cli::McpCommand::Config(config)) => {
+                commands::mcp::config::run(config, mcp_globals(&cli, None)?)
+            }
+            None => {
+                let launch = commands::mcp::child::Launch {
+                    exe: std::env::current_exe()?,
+                    globals: mcp_globals(&cli, Some(MCP_MAX_WAIT))?,
+                };
+                commands::mcp::serve(launch, args.allow_writes).await
+            }
+        };
+    }
     if let Command::BrowserOwner = cli.command {
         let linger = if keyring_namespace.is_some() {
             snob_cli::owner::Linger::for_a_sandbox()
@@ -451,6 +475,9 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
         }
         // Answered at the top.
         Command::BrowserOwner => Ok(ExitCode::Ok),
+        // Answered in `run`.
+        #[cfg(feature = "mcp")]
+        Command::Mcp(_) => Ok(ExitCode::Ok),
     }
 }
 
@@ -473,6 +500,61 @@ fn owner_args(cli: &Cli) -> anyhow::Result<Vec<std::ffi::OsString>> {
     args.push(snob_cli::owner::COMMAND.into());
     Ok(args)
 }
+
+/// What every command `snob mcp` runs for a tool call is started with, ahead
+/// of its own arguments: the global flags the server was given, so the child
+/// lands on the same files, account and trust, and the limit on a wait.
+///
+/// `snob mcp config` prints the same flags in front of `mcp`, so the server
+/// a client starts is the one this command line describes; `--max-wait` only
+/// when it was given, since the server supplies its own default.
+///
+/// `default_max_wait` is what a child gets when the server was given none.
+#[cfg(feature = "mcp")]
+fn mcp_globals(
+    cli: &Cli,
+    default_max_wait: Option<std::time::Duration>,
+) -> anyhow::Result<Vec<std::ffi::OsString>> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(account) = &cli.account {
+        args.push("--account".into());
+        args.push(account.into());
+    }
+    if cli.no_keyring {
+        args.push("--no-keyring".into());
+    }
+    if cli.strict_roots {
+        args.push("--strict-roots".into());
+        for root in &cli.tls_extra_root {
+            args.push("--tls-extra-root".into());
+            args.push(std::path::absolute(root)?.into());
+        }
+    }
+    if let Some(max_wait) = cli.max_wait.or(default_max_wait) {
+        args.push("--max-wait".into());
+        args.push(format!("{}s", max_wait.as_secs().max(1)).into());
+    }
+    #[cfg(feature = "testing")]
+    if let Some(root) = &cli.sandbox_root {
+        args.push("--sandbox-root".into());
+        args.push(std::path::absolute(root)?.into());
+        if let Some(base) = &cli.ig_base_url {
+            args.push("--ig-base-url".into());
+            args.push(base.as_str().into());
+        }
+        if cli.through_the_browser {
+            args.push("--through-the-browser".into());
+        }
+    }
+    Ok(args)
+}
+
+/// `--max-wait` for a tool call when the server was given none. A call that
+/// sat for the hours the daily ceiling can impose would outlast the client's
+/// patience and the person's; refused, it says how long the wait is and the
+/// agent can say so.
+#[cfg(feature = "mcp")]
+const MCP_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Gives the cursor back if the process dies with a menu on screen.
 ///

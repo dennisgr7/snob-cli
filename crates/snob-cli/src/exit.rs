@@ -50,6 +50,9 @@ pub fn from_ig_error(e: &IgError) -> ExitCode {
         // error — and it is still the user stopping, which `from_stop_reason`
         // answers with 130 for the very same event.
         IgError::Canceled => ExitCode::Interrupted,
+        // The same stop at a limit the caller set rather than a key, so the
+        // same code `from_stop_reason` gives the walk it ends (`Canceled`).
+        IgError::WaitTooLong { .. } => ExitCode::Interrupted,
         _ => ExitCode::Error,
     }
 }

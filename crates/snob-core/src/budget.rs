@@ -67,6 +67,16 @@ pub trait RateBudget: Send + Sync {
         Ok(Duration::ZERO)
     }
 
+    /// How long [`Self::reserve`] would wait if it were asked now. Zero means
+    /// now. Asks without spending, so a caller with a limit on how long it
+    /// may wait can refuse before the reservation is committed rather than
+    /// after (`Pacer::waiting_at_most`).
+    ///
+    /// The default is none, which is what every test double wants.
+    fn read_wait(&self) -> Result<Duration, RateBudgetError> {
+        Ok(Duration::ZERO)
+    }
+
     /// Until when the account is in cooldown.
     fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError>;
 

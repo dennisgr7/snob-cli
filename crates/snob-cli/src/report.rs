@@ -837,6 +837,10 @@ fn advice_for(error: &snob_ig::error::IgError) -> Option<&'static str> {
     use snob_ig::error::IgError;
     match error {
         IgError::SessionExpired => Some("run \"snob login\" again"),
+        IgError::WaitTooLong { .. } => Some(
+            "run it again later, or with a longer --max-wait; \"snob status --budget\" says \
+             when the budget has room",
+        ),
         IgError::NoCsrfToken => Some(
             "run \"snob login --browser\", or, with SNOB_NO_BROWSER, pass the token with \
              \"snob login --paste --csrftoken\"",

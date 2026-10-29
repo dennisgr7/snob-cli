@@ -366,14 +366,18 @@ pub(super) struct HeldTray {
 /// Whether `error`, on a call sent beside the one asked for (the reads that
 /// open a profile, a navigation, a `show_many`), has to end what is going
 /// on: Instagram objected to the account, the session is dead, the person
-/// asked to stop, or snob tried to send what it may not. Anything else is
-/// that call's alone.
+/// asked to stop (or the caller's limit on a wait was reached, which stops
+/// the run the same way), or snob tried to send what it may not. Anything
+/// else is that call's alone.
 fn must_stop(error: &IgError) -> bool {
     error.is_push_back()
         || error.invalidates_session()
         || matches!(
             error,
-            IgError::Canceled | IgError::NotAllowed(_) | IgError::Budget(_)
+            IgError::Canceled
+                | IgError::WaitTooLong { .. }
+                | IgError::NotAllowed(_)
+                | IgError::Budget(_)
         )
 }
 

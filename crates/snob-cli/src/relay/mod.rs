@@ -735,13 +735,13 @@ fn secret() -> Result<String> {
 }
 
 #[cfg(unix)]
-fn fill_random(bytes: &mut [u8]) -> std::io::Result<()> {
+pub(crate) fn fill_random(bytes: &mut [u8]) -> std::io::Result<()> {
     use std::io::Read as _;
     std::fs::File::open("/dev/urandom")?.read_exact(bytes)
 }
 
 #[cfg(windows)]
-fn fill_random(bytes: &mut [u8]) -> std::io::Result<()> {
+pub(crate) fn fill_random(bytes: &mut [u8]) -> std::io::Result<()> {
     use windows_sys::Win32::Security::Cryptography::{
         BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
     };

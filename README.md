@@ -100,7 +100,8 @@ can read:
 
 - `--format json|ndjson|csv|xlsx|md|table` and `-o <file>` for anything that
   prints a list or a document; `--json` for status commands such as `whoami`
-  and `status`.
+  and `status`, and for `follow` and `unfollow`, whose object says what
+  happened in one word (`followed`, `requested`, `already_following`, ...).
 - `snob status --budget` says what can still be sent today, for no request, and
   exits 5 while the account is cooling down. `--dry-run` on a list command says
   what its walks would cost against that, and sends nothing.
@@ -109,12 +110,21 @@ can read:
 - `--no-interactive` always prints. Down a pipe this is the default, and the
   default format is JSON.
 - `-y` answers the one confirmation a command may ask, in advance.
+- `--max-wait <duration>` stops a command, with exit 130, rather than let it
+  wait longer than that for the request budget; a list stopped this way
+  continues where it left off next time.
 - Exit codes are stable: 0 worked, 1 failed, 2 bad command line, 3 log in
   again, 4 the account needs verifying, 5 rate limited or cooling down, 130
   stopped. When the output was going to be JSON, a failure is also one JSON
   object on the last line of standard error.
 - `snob watch --webhook <url>` posts each report as JSON; `--json` writes them
   as lines instead.
+- `snob mcp` is an MCP server for AI agents, on standard input and output:
+  the status, the lists and profiles, and with `--allow-writes` follow and
+  unfollow, each confirmed by you in the client every time. Each call runs
+  one snob command, under the same budget and cooldown as the terminal.
+  `snob mcp config claude-code` (or `claude-desktop`, `codex`, `cursor`,
+  `vscode`) prints what to add to that client's configuration.
 
 ## Staying a light client
 

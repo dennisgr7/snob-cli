@@ -17,6 +17,10 @@
 //! is a growth-hacking trick rather than the housekeeping this tool is for. So
 //! the question is asked before the request, and `-y` is how a script answers it
 //! in advance.
+//!
+//! `--json` prints one object on standard output for every way the run ends
+//! (done, already so, declined), so a program never has to read the sentence;
+//! the failures are the JSON error `main` prints when `--json` was asked for.
 
 use anyhow::{Result, anyhow};
 use snob_core::model::printable;
@@ -125,9 +129,8 @@ pub async fn run(
     // Nothing to do is worth saying rather than doing. It also saves the write
     // budget for a write that changes something, which matters when a slot is
     // fifteen minutes.
-    if let Some(settled) = already_done(verb, &profile, &name) {
-        ui::info(&settled);
-        return Ok(ExitCode::Ok);
+    if let Some(settled) = already_done(verb, &profile) {
+        return tell(&args, verb, &profile, &name, settled, None);
     }
 
     let question = match verb {
@@ -143,6 +146,7 @@ pub async fn run(
     // events. The guard above is what keeps that unreachable here, so this
     // branch only ever runs with somebody at the keyboard.
     if !args.consent.yes && !ui::confirm(&question, false)? {
+        tell(&args, verb, &profile, &name, Outcome::Declined, None)?;
         return Ok(ExitCode::Interrupted);
     }
 
@@ -152,7 +156,120 @@ pub async fn run(
         Verb::Follow => client.follow(pk, username, &ids).await?,
         Verb::Unfollow => client.unfollow(pk, username, &ids).await?,
     };
-    ui::info(&outcome(verb, &status, &name));
+    tell(
+        &args,
+        verb,
+        &profile,
+        &name,
+        outcome(verb, &status),
+        Some(&status),
+    )
+}
+
+/// How a run ended, as a word a program can match on and a sentence a person
+/// can read. One list, so `--json` and the sentence cannot describe two
+/// different runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    AlreadyFollowing,
+    AlreadyRequested,
+    NotFollowing,
+    /// The question was asked and answered no; nothing was sent.
+    Declined,
+    Followed,
+    /// A private account: following it asks, and they have to accept.
+    Requested,
+    Unfollowed,
+    /// Instagram took the write and reported the relationship as it was.
+    Unchanged,
+}
+
+impl Outcome {
+    /// The `outcome` field of `--json`. Part of the JSON contract.
+    fn token(self) -> &'static str {
+        match self {
+            Self::AlreadyFollowing => "already_following",
+            Self::AlreadyRequested => "already_requested",
+            Self::NotFollowing => "not_following",
+            Self::Declined => "declined",
+            Self::Followed => "followed",
+            Self::Requested => "requested",
+            Self::Unfollowed => "unfollowed",
+            Self::Unchanged => "unchanged",
+        }
+    }
+
+    /// Whether this run changed anything on Instagram.
+    fn changed(self) -> bool {
+        matches!(self, Self::Followed | Self::Requested | Self::Unfollowed)
+    }
+
+    /// The sentence a person is told. `None` for a refusal they gave
+    /// themselves, which needs no telling back.
+    fn sentence(self, verb: Verb, name: &str) -> Option<String> {
+        Some(match self {
+            Self::AlreadyFollowing => format!("You already follow @{name}."),
+            Self::AlreadyRequested => {
+                format!("You have already asked to follow @{name}, and they have not answered yet.")
+            }
+            Self::NotFollowing => format!("You do not follow @{name}."),
+            Self::Declined => return None,
+            Self::Followed => format!("Now following @{name}."),
+            Self::Requested => format!("Asked to follow @{name}. They have to accept it."),
+            Self::Unfollowed => format!("No longer following @{name}."),
+            // Instagram answered, and answered that nothing is different.
+            // Better said plainly than dressed up as success.
+            Self::Unchanged => match verb {
+                Verb::Follow => {
+                    format!("Instagram accepted the request, but @{name} is still not followed.")
+                }
+                Verb::Unfollow => {
+                    format!("Instagram accepted the request, but @{name} is still followed.")
+                }
+            },
+        })
+    }
+}
+
+/// Says how the run ended, as a sentence on standard error or, with `--json`,
+/// as one object on standard output. Exit 0 for everything but `Declined`,
+/// whose 130 the caller returns.
+fn tell(
+    args: &FollowArgs,
+    verb: Verb,
+    profile: &snob_ig::model::WebProfileInfo,
+    name: &str,
+    outcome: Outcome,
+    status: Option<&FriendshipStatus>,
+) -> Result<ExitCode> {
+    if args.output.json {
+        // What the relationship is now: Instagram's answer to the write when
+        // there was one, and the profile's own fields when there was not
+        // (`null` where the profile left them out, as `already_done` reads
+        // them).
+        let (following, requested) = match status {
+            Some(status) => (Some(status.following), Some(status.outgoing_request)),
+            None => (profile.followed_by_viewer, profile.requested_by_viewer),
+        };
+        ui::say!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "action": verb.present(),
+                "target": {
+                    "pk": profile.id,
+                    "username": name,
+                    "is_private": profile.is_private,
+                },
+                "outcome": outcome.token(),
+                "changed": outcome.changed(),
+                "following": following,
+                "requested": requested,
+                "viewer": crate::report::acting_as().map(|viewer| viewer.json()),
+            }))?
+        );
+    } else if let Some(sentence) = outcome.sentence(verb, name) {
+        ui::info(&sentence);
+    }
     Ok(ExitCode::Ok)
 }
 
@@ -163,18 +280,12 @@ pub async fn run(
 /// endpoint omits them on some answers, and `None` means unknown. Unknown must
 /// send the request rather than assume: refusing on a missing field would make
 /// the command stop working the day Instagram drops it from the response.
-fn already_done(
-    verb: Verb,
-    profile: &snob_ig::model::WebProfileInfo,
-    name: &str,
-) -> Option<String> {
+fn already_done(verb: Verb, profile: &snob_ig::model::WebProfileInfo) -> Option<Outcome> {
     match verb {
-        Verb::Follow if profile.followed_by_viewer == Some(true) => {
-            Some(format!("You already follow @{name}."))
+        Verb::Follow if profile.followed_by_viewer == Some(true) => Some(Outcome::AlreadyFollowing),
+        Verb::Follow if profile.requested_by_viewer == Some(true) => {
+            Some(Outcome::AlreadyRequested)
         }
-        Verb::Follow if profile.requested_by_viewer == Some(true) => Some(format!(
-            "You have already asked to follow @{name}, and they have not answered yet."
-        )),
         // Both facts have to be *known*: an absent `requested_by_viewer` is not
         // "no pending request", which is the assumption the doc-comment above
         // forbids -- an unfollow that would withdraw a pending request must
@@ -183,7 +294,7 @@ fn already_done(
             if profile.followed_by_viewer == Some(false)
                 && profile.requested_by_viewer == Some(false) =>
         {
-            Some(format!("You do not follow @{name}."))
+            Some(Outcome::NotFollowing)
         }
         _ => None,
     }
@@ -229,21 +340,12 @@ fn key(friendly_name: &str) -> String {
 /// **Following a private account does not follow it — it asks.** Saying
 /// "Followed" there would be the command lying about the one thing it was run
 /// to do, and the user would go looking for stories that will not be there.
-fn outcome(verb: Verb, status: &FriendshipStatus, name: &str) -> String {
+fn outcome(verb: Verb, status: &FriendshipStatus) -> Outcome {
     match verb {
-        Verb::Follow if status.following => format!("Now following @{name}."),
-        Verb::Follow if status.outgoing_request => {
-            format!("Asked to follow @{name}. They have to accept it.")
-        }
-        // Instagram answered, and answered that nothing is different. Better
-        // said plainly than dressed up as success.
-        Verb::Follow => {
-            format!("Instagram accepted the request, but @{name} is still not followed.")
-        }
-        Verb::Unfollow if !status.following && !status.outgoing_request => {
-            format!("No longer following @{name}.")
-        }
-        Verb::Unfollow => format!("Instagram accepted the request, but @{name} is still followed."),
+        Verb::Follow if status.following => Outcome::Followed,
+        Verb::Follow if status.outgoing_request => Outcome::Requested,
+        Verb::Unfollow if !status.following && !status.outgoing_request => Outcome::Unfollowed,
+        _ => Outcome::Unchanged,
     }
 }
 
@@ -286,9 +388,9 @@ mod tests {
 
     #[test]
     fn a_relationship_that_already_holds_costs_no_request() {
-        assert!(already_done(Verb::Follow, &profile(Some(true), None), "x").is_some());
-        assert!(already_done(Verb::Unfollow, &profile(Some(false), Some(false)), "x").is_some());
-        assert!(already_done(Verb::Follow, &profile(Some(false), Some(true)), "x").is_some());
+        assert!(already_done(Verb::Follow, &profile(Some(true), None)).is_some());
+        assert!(already_done(Verb::Unfollow, &profile(Some(false), Some(false))).is_some());
+        assert!(already_done(Verb::Follow, &profile(Some(false), Some(true))).is_some());
     }
 
     /// The endpoint omits these fields on some answers. Unknown has to mean
@@ -296,18 +398,18 @@ mod tests {
     /// drops the field.
     #[test]
     fn an_unknown_relationship_is_not_treated_as_settled() {
-        assert!(already_done(Verb::Follow, &profile(None, None), "x").is_none());
-        assert!(already_done(Verb::Unfollow, &profile(None, None), "x").is_none());
+        assert!(already_done(Verb::Follow, &profile(None, None)).is_none());
+        assert!(already_done(Verb::Unfollow, &profile(None, None)).is_none());
         // Half-known is still unknown: not following, but with the pending
         // request unreported, unfollow may still have a request to withdraw.
-        assert!(already_done(Verb::Unfollow, &profile(Some(false), None), "x").is_none());
+        assert!(already_done(Verb::Unfollow, &profile(Some(false), None)).is_none());
     }
 
     /// A pending request is not a follow, and unfollow has something to do
     /// about it: withdrawing the request.
     #[test]
     fn a_pending_request_is_still_something_to_withdraw() {
-        assert!(already_done(Verb::Unfollow, &profile(Some(false), Some(true)), "x").is_none());
+        assert!(already_done(Verb::Unfollow, &profile(Some(false), Some(true))).is_none());
     }
 
     #[test]
@@ -317,7 +419,9 @@ mod tests {
             outgoing_request: true,
             ..Default::default()
         };
-        let said = outcome(Verb::Follow, &asked, "someone");
+        let told = outcome(Verb::Follow, &asked);
+        assert_eq!(told, Outcome::Requested);
+        let said = told.sentence(Verb::Follow, "someone").unwrap();
         assert!(said.contains("Asked to follow"), "{said}");
         assert!(!said.contains("Now following"), "{said}");
     }
@@ -325,7 +429,9 @@ mod tests {
     #[test]
     fn a_write_instagram_accepted_but_did_not_apply_is_not_called_a_success() {
         let unchanged = FriendshipStatus::default();
-        let said = outcome(Verb::Follow, &unchanged, "someone");
+        let told = outcome(Verb::Follow, &unchanged);
+        assert!(!told.changed());
+        let said = told.sentence(Verb::Follow, "someone").unwrap();
         assert!(said.contains("still not followed"), "{said}");
     }
 }

@@ -1681,6 +1681,61 @@ async fn a_walk_asked_to_stop_by_the_system_stops_as_for_ctrl_c() {
     }
 }
 
+/// With `--stop-when-stdin-closes`, the parent closing the pipe stops a walk
+/// mid-request the way a signal does, on every platform: the one way a parent
+/// on Windows has to stop it in order rather than kill it.
+#[tokio::test]
+async fn a_walk_stops_as_for_ctrl_c_when_its_stdin_closes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(120)))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    let walks = || async {
+        instagram
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/followers/"))
+            .count()
+    };
+
+    let mut child = command(tmp.path(), Some(&instagram))
+        .args(["followers", "--stop-when-stdin-closes"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the binary runs");
+    let asked = std::time::Instant::now();
+    while walks().await == 0 {
+        assert!(
+            asked.elapsed() < std::time::Duration::from_secs(30),
+            "the walk never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    drop(child.stdin.take());
+
+    let stopped = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            stopped.elapsed() < std::time::Duration::from_secs(15),
+            "closing standard input did not stop the walk"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(status.code(), Some(130));
+}
+
 #[tokio::test]
 async fn the_whole_tool_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2214,6 +2269,17 @@ async fn a_write_nobody_could_confirm_is_not_made() {
         stdout(&out),
         stderr(&out)
     );
+    // Asked for JSON, the refusal is the JSON error a program can read.
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["follow", "someone", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(130), "{}", stderr(&out));
+    let told: serde_json::Value =
+        serde_json::from_str(stderr(&out).lines().last().unwrap_or_default())
+            .expect("the last line of standard error is JSON");
+    assert_eq!(told["error"]["code"], "interrupted", "{told}");
     assert!(
         posted(&instagram)
             .await
@@ -2265,8 +2331,18 @@ async fn a_confirmed_unfollow_sends_one_post() {
     log_in_writing(tmp.path(), &instagram);
     common::remember_doc_ids(tmp.path());
 
-    let out = snob(tmp.path(), Some(&instagram), &["unfollow", "someone", "-y"]);
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["unfollow", "someone", "-y", "--json"],
+    );
     assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    // `--json` says what happened in a word, on standard output.
+    let told = json(&out);
+    assert_eq!(told["action"], "unfollow", "{told}");
+    assert_eq!(told["outcome"], "unfollowed", "{told}");
+    assert_eq!(told["changed"], true, "{told}");
+    assert_eq!(told["target"]["username"], "someone", "{told}");
 
     let writes: Vec<_> = posted(&instagram)
         .await
@@ -2321,6 +2397,16 @@ async fn unfollowing_somebody_you_do_not_follow_sends_nothing() {
     );
     assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
     assert!(stderr(&out).contains("do not follow"), "{}", stderr(&out));
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["unfollow", "stranger", "-y", "--json"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let told = json(&out);
+    assert_eq!(told["outcome"], "not_following", "{told}");
+    assert_eq!(told["changed"], false, "{told}");
 
     assert!(
         posted(&instagram)
@@ -3615,4 +3701,278 @@ fn the_tunnel_is_one_method_among_three() {
         let out = snob(tmp.path(), None, both);
         assert_eq!(out.status.code(), Some(2), "{both:?}: {}", stderr(&out));
     }
+}
+
+/// One `snob mcp` over its standard input and output, spoken to as a client
+/// on the 2025-11-25 revision does.
+#[cfg(feature = "mcp")]
+struct McpClient {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    next: u64,
+    /// What the person answers when the server asks with
+    /// `elicitation/create`; `None` is a client that never expects to be asked.
+    answer: Option<serde_json::Value>,
+    /// The `_meta` every request carries on the stateless revision, which
+    /// starts with no `initialize`.
+    meta: Option<serde_json::Value>,
+}
+
+#[cfg(feature = "mcp")]
+impl McpClient {
+    async fn start(root: &Path, instagram: &MockServer, args: &[&str]) -> Self {
+        Self::start_with(root, instagram, args, serde_json::json!({})).await
+    }
+
+    /// The same, declaring `capabilities` at `initialize`.
+    async fn start_with(
+        root: &Path,
+        instagram: &MockServer,
+        args: &[&str],
+        capabilities: serde_json::Value,
+    ) -> Self {
+        let mut client = Self::spawn(root, instagram, args);
+        let hello = client
+            .ask(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": capabilities,
+                    "clientInfo": { "name": "test", "version": "0" }
+                }),
+            )
+            .await;
+        assert_eq!(hello["result"]["serverInfo"]["name"], "snob", "{hello}");
+        client
+            .send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        client
+    }
+
+    /// A client on 2026-07-28: no `initialize`, and the revision and the
+    /// capabilities in the `_meta` of every request.
+    fn stateless(root: &Path, instagram: &MockServer, capabilities: serde_json::Value) -> Self {
+        let mut client = Self::spawn(root, instagram, &[]);
+        client.meta = Some(serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": capabilities,
+            "io.modelcontextprotocol/clientInfo": { "name": "test", "version": "0" }
+        }));
+        client
+    }
+
+    fn spawn(root: &Path, instagram: &MockServer, args: &[&str]) -> Self {
+        use tokio::io::AsyncBufReadExt;
+        let mut command = tokio::process::Command::from(command(root, Some(instagram)));
+        command
+            .arg("mcp")
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("the binary runs");
+        let stdin = child.stdin.take().unwrap();
+        let lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        Self {
+            child,
+            stdin,
+            lines,
+            next: 0,
+            answer: None,
+            meta: None,
+        }
+    }
+
+    async fn send(&mut self, message: serde_json::Value) {
+        use tokio::io::AsyncWriteExt;
+        let mut line = message.to_string();
+        line.push('\n');
+        self.stdin.write_all(line.as_bytes()).await.unwrap();
+        self.stdin.flush().await.unwrap();
+    }
+
+    /// Sends a request and waits for its answer, stepping over notifications.
+    async fn ask(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        self.next += 1;
+        let id = self.next;
+        let mut params = params;
+        if let Some(meta) = &self.meta {
+            params["_meta"] = meta.clone();
+        }
+        self.send(
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+        )
+        .await;
+        let answer = async {
+            while let Some(line) = self.lines.next_line().await.unwrap() {
+                let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if message["method"] == "elicitation/create" {
+                    let answer = self.answer.clone().expect("the server asked, unexpectedly");
+                    let reply = serde_json::json!({
+                        "jsonrpc": "2.0", "id": message["id"].clone(), "result": answer
+                    });
+                    self.send(reply).await;
+                    continue;
+                }
+                if message["id"] == id {
+                    return message;
+                }
+            }
+            panic!("the server went away before answering {method}");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), answer)
+            .await
+            .expect("an answer within a minute")
+    }
+
+    async fn call(&mut self, tool: &str, arguments: serde_json::Value) -> serde_json::Value {
+        let answer = self
+            .ask(
+                "tools/call",
+                serde_json::json!({ "name": tool, "arguments": arguments }),
+            )
+            .await;
+        answer["result"].clone()
+    }
+}
+
+/// The server offers the reads and not the writes, answers each call with
+/// what the command it runs printed, and refuses what needs a yes the client
+/// cannot ask for, before anything is run.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_runs_the_commands_and_refuses_what_it_cannot_confirm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let listed = client.ask("tools/list", serde_json::json!({})).await;
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"snob_status") && names.contains(&"snob_list"),
+        "{names:?}"
+    );
+    assert!(!names.contains(&"snob_follow"), "{names:?}");
+
+    let status = client.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(status["isError"], false, "{status}");
+
+    let followers = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(followers["isError"], false, "{followers}");
+    assert_eq!(followers["structuredContent"]["count"], 3, "{followers}");
+
+    // Somebody else's list needs a yes, and this client declared no way to
+    // ask for one: refused, and no walk of that account was started.
+    let before = posted(&instagram).await.len();
+    let theirs = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "account": "someone" }),
+        )
+        .await;
+    assert_eq!(theirs["isError"], true, "{theirs}");
+    assert_eq!(
+        theirs["structuredContent"]["error"]["code"],
+        "not_confirmed"
+    );
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    let write = client
+        .call("snob_follow", serde_json::json!({ "account": "someone" }))
+        .await;
+    assert_eq!(write["isError"], true, "{write}");
+    assert!(client.child.id().is_some(), "the server is still up");
+}
+
+/// On 2025-11-25 the yes is asked with `elicitation/create` while the call
+/// waits: no is nothing run, yes is the command run with `-y`.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_asks_an_older_client_while_the_call_waits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let mut client = McpClient::start_with(
+        tmp.path(),
+        &instagram,
+        &[],
+        serde_json::json!({ "elicitation": {} }),
+    )
+    .await;
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+
+    client.answer = Some(serde_json::json!({ "action": "decline" }));
+    let declined = client.call("snob_list", theirs.clone()).await;
+    assert_eq!(
+        declined["structuredContent"]["error"]["code"], "not_confirmed",
+        "{declined}"
+    );
+
+    client.answer = Some(serde_json::json!({ "action": "accept", "content": { "confirm": true } }));
+    let accepted = client.call("snob_list", theirs).await;
+    assert_eq!(accepted["isError"], false, "{accepted}");
+}
+
+/// On 2026-07-28 the call answers with the question and a signed state; the
+/// answer counts only when it comes back with that state for those same
+/// arguments.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_asks_a_stateless_client_in_the_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let mut client = McpClient::stateless(
+        tmp.path(),
+        &instagram,
+        serde_json::json!({ "elicitation": {} }),
+    );
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+
+    let asking = client.call("snob_list", theirs.clone()).await;
+    assert_eq!(asking["resultType"], "input_required", "{asking}");
+    let state = asking["requestState"]
+        .as_str()
+        .expect("a signed state")
+        .to_string();
+    assert!(asking["inputRequests"]["confirm"].is_object(), "{asking}");
+    let yes =
+        serde_json::json!({ "confirm": { "action": "accept", "content": { "confirm": true } } });
+
+    // The same yes, offered for another account, is no answer.
+    let elsewhere = client
+        .ask(
+            "tools/call",
+            serde_json::json!({
+                "name": "snob_list",
+                "arguments": { "list": "followers", "account": "somebody_else" },
+                "inputResponses": yes.clone(),
+                "requestState": state.clone(),
+            }),
+        )
+        .await;
+    assert_eq!(elsewhere["result"]["isError"], true, "{elsewhere}");
+
+    let done = client
+        .ask(
+            "tools/call",
+            serde_json::json!({
+                "name": "snob_list",
+                "arguments": theirs,
+                "inputResponses": yes,
+                "requestState": state,
+            }),
+        )
+        .await;
+    assert_eq!(done["result"]["isError"], false, "{done}");
 }
