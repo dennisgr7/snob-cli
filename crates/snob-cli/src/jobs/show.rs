@@ -15,7 +15,7 @@
 //! (`main::wording_for`), which is how the MCP server reads a walk it ran
 //! itself (`commands::mcp::child`).
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::Duration;
 
@@ -153,35 +153,69 @@ fn tail_of(path: &Path, bytes: u64) -> Option<String> {
 }
 
 /// The lists a walk has answered with so far, by name, from the `served`
-/// lines of its log (`Progress::served`): for a crossing, the lists it is
+/// lines of its log ([`served_lines`]): for a crossing, the lists it is
 /// done with.
 pub fn served_lists(dir: &Path) -> Vec<String> {
-    let Some(tail) = tail_of(&file(dir, "err.log"), 4 * TAIL) else {
-        return Vec::new();
-    };
-    tail.lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
-        .filter_map(|value| value.get("progress").cloned())
-        .filter(|progress| progress["event"] == "served")
+    served_lines(dir)
+        .into_iter()
         .filter_map(|progress| progress["list"].as_str().map(str::to_string))
         .collect()
+}
+
+/// Every `served` line of the walk's log, oldest first, the object under
+/// `progress` (`Progress::served`). **Read through the whole log, not its
+/// tail**: a crossing's first list says it before the second list's pages,
+/// a line each, which a walk that waits out the day's accounts may write
+/// by the thousand, and a tail would then lose the first list, which the
+/// time left would count again and `finished` would not say was stored. A
+/// line at a time, keeping only those, so what is held is what they are.
+fn served_lines(dir: &Path) -> Vec<Value> {
+    let Ok(log) = std::fs::File::open(file(dir, "err.log")) else {
+        return Vec::new();
+    };
+    let mut reader = std::io::BufReader::new(log);
+    let mut line = Vec::new();
+    let mut served = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        // Most lines are pages, which need no parsing to be passed over.
+        if !line.windows(8).any(|w| w == b"\"served\"") {
+            continue;
+        }
+        if let Some(progress) = serde_json::from_slice::<Value>(&line)
+            .ok()
+            .and_then(|value| value.get("progress").cloned())
+            .filter(|progress| progress["event"] == "served")
+        {
+            served.push(progress);
+        }
+    }
+    served
 }
 
 /// How long the walk has left, the fewest and the most seconds, from where
 /// its newest progress line puts it, timed by the pace alone
 /// (`engine::estimate::walks_seconds`):
 ///
-/// - the pages left of the list it is on, and **of the lists of a crossing
-///   it has not reached**, from the estimate it was started with (a list
-///   that may be reused counts none at least), each with its dwell;
+/// - the pages left of the list it is on, **no more than its `--max-pages`
+///   and `HARD_PAGE_CAP` let it read**, and **of the lists of a crossing it
+///   has not reached**, from the estimate it was started with (a list that
+///   may be reused counts none at least; one of a size not known when it
+///   started, at least a page, and at most as many as the list under way),
+///   each with its dwell;
 /// - **from where the account's sitting is**, as the newest line says it
 ///   (`sitting`, `rest_until`), not from where the walk began: a walk that
 ///   starts on a sitting earlier work left part full rests sooner;
 /// - and what is left of a wait it is in.
 ///
-/// Before its first line, the estimate it was started with, less the time
-/// since. `None` when there is nothing to tell it by. `served` names the
-/// lists it is done with ([`served_lists`]).
+/// Before its first line, and before its first page while the lines do not
+/// yet say where the sitting is, the estimate it was started with, which
+/// read the sitting, less the time since. `None` when there is nothing to
+/// tell it by. `served` names the lists it is done with ([`served_lists`]).
 pub fn eta(
     seen: &Seen,
     progress: Option<&Value>,
@@ -191,8 +225,10 @@ pub fn eta(
     if seen.status.is_over() {
         return None;
     }
-    let Some(progress) = progress else {
-        let estimate = seen.job.as_ref()?.estimate.as_ref()?;
+    let job = seen.job.as_ref();
+    let estimate = job.and_then(|job| job.estimate.as_ref());
+    let from_estimate = || {
+        let estimate = estimate?;
         let since = seen
             .state
             .as_ref()
@@ -200,16 +236,33 @@ pub fn eta(
         let gone = u64::try_from(now.saturating_sub(since) / 1000).unwrap_or(0);
         let least = estimate["seconds"]["least"].as_u64()?;
         let most = estimate["seconds"]["most"].as_u64()?;
-        return Some((least.saturating_sub(gone), most.saturating_sub(gone)));
+        Some((least.saturating_sub(gone), most.saturating_sub(gone)))
     };
+    let Some(progress) = progress else {
+        return from_estimate();
+    };
+    // The most pages a walk of one list reads in this run, as the pager
+    // stops it (`ListRequest::max_pages`, `HARD_PAGE_CAP`); a crossing walks
+    // each of its lists with the same.
+    let cap = u64::from(
+        job.and_then(|job| argv::check(&job.argv).ok())
+            .and_then(|checked| checked.list.walk.max_pages)
+            .map_or(snob_ig::pager::HARD_PAGE_CAP, |most| {
+                most.min(snob_ig::pager::HARD_PAGE_CAP)
+            }),
+    );
+    let per_page = u64::from(snob_ig::pace::ACCOUNTS_PER_PAGE);
+    // The pages of the list under way, from its size: what a list of a size
+    // not known when the walk started is guessed at most, since an
+    // account's two lists are more often than not of an order.
+    let under_way = progress["of"]
+        .as_u64()
+        .map_or(0, |of| of.div_ceil(per_page).min(cap));
     let current = progress["list"].as_str();
     // The lists of the estimate not yet reached: neither answered with nor
     // the one under way. A crossing's estimate names both, in the order they
     // are read.
-    let to_come: Vec<(u64, u64)> = seen
-        .job
-        .as_ref()
-        .and_then(|job| job.estimate.as_ref())
+    let to_come: Vec<(u64, u64)> = estimate
         .and_then(|estimate| estimate["lists"].as_array())
         .into_iter()
         .flatten()
@@ -223,10 +276,15 @@ pub fn eta(
             match list["fate"].as_str()? {
                 "walked" => Some((least, most)),
                 "reused_unless_moved" => Some((0, most)),
+                // Never read here when the walk started (no counter
+                // stored), so the estimate counted its first page alone:
+                // that at least, and at most the list under way's.
+                "unknown" => Some((least, most.max(under_way))),
                 _ => None,
             }
         })
         .collect();
+    let page = progress["page"].as_u64().unwrap_or(0);
     let pages = if progress["event"] == "finished" {
         // Between two lists: nothing left of the one that ended.
         if to_come.is_empty() {
@@ -236,8 +294,10 @@ pub fn eta(
     } else {
         let of = progress["of"].as_u64()?;
         let read = progress["accounts"].as_u64().unwrap_or(0);
+        // The walk stops at its cap whatever the list's size.
         of.saturating_sub(read)
-            .div_ceil(u64::from(snob_ig::pace::ACCOUNTS_PER_PAGE))
+            .div_ceil(per_page)
+            .min(cap.saturating_sub(page))
     };
     let waited = progress["at"]
         .as_i64()
@@ -259,13 +319,26 @@ pub fn eta(
     } else {
         (owed, wait_left.div_ceil(1000))
     };
+    // Where the account's sitting is, a line first says once a page has
+    // left it (`Event::Page`): before the walk's first page, `started` and
+    // the waits before it say nothing, and a sitting earlier work left part
+    // full would be timed as a fresh one. The estimate read the sitting, so
+    // it is what tells, with a wait for the budget on top, which it leaves
+    // out (a rest owed is in it).
+    if progress["sitting"].is_null()
+        && page == 0
+        && progress["event"] != "finished"
+        && let Some((least, most)) = from_estimate()
+    {
+        return Some((least + other, most + other));
+    }
     // The account's sitting, as the newest page left it; an older line that
     // does not say it is read as the walk's own pages. A full one whose rest
     // is over is a new sitting.
     let into_sitting = match progress["sitting"].as_u64() {
         Some(pages) if pages >= full && rest == 0 => 0,
         Some(pages) => pages,
-        None => progress["page"].as_u64().unwrap_or(0) % full,
+        None => page % full,
     };
     let mut walks = vec![(pages, pages)];
     walks.extend(to_come);
@@ -335,13 +408,8 @@ pub fn finished(seen: &Seen) -> Option<Value> {
                 .unwrap_or_else(|_| Value::String(text.into()))
         });
     let log = tail_of(&file(&seen.dir, "err.log"), 4 * TAIL).unwrap_or_default();
-    // Where each list came from, as the walk said it (`Progress::served`).
-    let served: Vec<Value> = log
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
-        .filter_map(|value| value.get("progress").cloned())
-        .filter(|progress| progress["event"] == "served")
-        .collect();
+    // Where each list came from, as the walk said it, from the whole log.
+    let served = served_lines(&seen.dir);
     let lines = sentences(
         log.lines()
             .filter(|line| !line.trim().is_empty())
@@ -681,5 +749,135 @@ mod tests {
         });
         let (least, _) = eta(&seen, Some(&full), &[], now).unwrap();
         assert!(least >= 600, "{least}");
+    }
+
+    /// A walk given `--max-pages` stops there whatever the list's size, so
+    /// the time left counts no page past it.
+    #[test]
+    fn the_time_left_counts_no_page_past_the_walks_cap() {
+        let now = snob_core::clock::now_ms().get();
+        let mut seen = crossing(json!([
+            {"list": "followers", "fate": "walked", "pages": {"least": 40, "most": 40}},
+        ]));
+        seen.job.as_mut().unwrap().argv = ["followers", "--format", "json", "--max-pages", "40"]
+            .map(String::from)
+            .to_vec();
+        let line = json!({
+            "event": "page", "at": now, "page": 5, "accounts": 60, "of": 5000,
+            "list": "followers", "sitting": 5, "rest_until": null,
+        });
+        assert_eq!(
+            eta(&seen, Some(&line), &[], now).unwrap(),
+            walking(&[(35, 35)], 5)
+        );
+        seen.job.as_mut().unwrap().argv = ["followers", "--max-pages=1"].map(String::from).to_vec();
+        let first = json!({
+            "event": "page", "at": now, "page": 1, "accounts": 12, "of": 5000,
+            "list": "followers", "sitting": 1, "rest_until": null,
+        });
+        assert_eq!(
+            eta(&seen, Some(&first), &[], now).unwrap(),
+            walking(&[(0, 0)], 1)
+        );
+    }
+
+    /// The second list of a crossing on an account never read here is of a
+    /// size nobody knew when the job started: it is counted all the same,
+    /// at least a page and at most as many as the list under way.
+    #[test]
+    fn a_second_list_of_unknown_size_is_counted() {
+        let now = snob_core::clock::now_ms().get();
+        let seen = crossing(json!([
+            {"list": "followers", "fate": "unknown", "size": null, "pages": {"least": 1, "most": 1}},
+            {"list": "following", "fate": "unknown", "size": null, "pages": {"least": 1, "most": 1}},
+        ]));
+        let line = json!({
+            "event": "page", "at": now, "page": 10, "accounts": 120, "of": 240,
+            "list": "followers", "sitting": 10, "rest_until": null,
+        });
+        assert_eq!(
+            eta(&seen, Some(&line), &[], now).unwrap(),
+            walking(&[(10, 10), (1, 20)], 10)
+        );
+    }
+
+    /// Before the walk's first page no line says where the account's
+    /// sitting is, so the estimate it was started with, which counted a
+    /// rest owed after that page, is what the time left is.
+    #[test]
+    fn before_the_first_page_the_estimate_tells_the_time_left() {
+        let now = snob_core::clock::now_ms().get();
+        let mut seen = crossing(json!([
+            {"list": "followers", "fate": "walked", "pages": {"least": 3, "most": 3}},
+        ]));
+        seen.job.as_mut().unwrap().estimate.as_mut().unwrap()["seconds"] =
+            json!({"least": 302, "most": 913});
+        let started = json!({
+            "event": "started", "at": now, "page": 0, "accounts": 0, "of": 36,
+            "list": "followers", "sitting": null, "rest_until": null,
+        });
+        let (least, most) = eta(&seen, Some(&started), &[], now).unwrap();
+        assert!(least >= 301 && most >= 912, "{least}..{most}");
+        // Once a page says where the sitting is, it is timed from there.
+        let page = json!({
+            "event": "page", "at": now, "page": 1, "accounts": 12, "of": 36,
+            "list": "followers", "sitting": 1, "rest_until": null,
+        });
+        assert_eq!(
+            eta(&seen, Some(&page), &[], now).unwrap(),
+            walking(&[(2, 2)], 1)
+        );
+    }
+
+    /// A crossing's first list is said to be done with before the second
+    /// list's pages, which may run far past any tail of the log: it is still
+    /// known, to the time left and to what the walk answered with.
+    #[test]
+    fn a_crossing_remembers_its_first_list_past_a_long_second() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = snob_core::clock::now_ms().get();
+        let mut text = String::new();
+        text.push_str(
+            "{\"progress\":{\"event\":\"served\",\"list\":\"followers\",\"from\":\"stored\"}}\n",
+        );
+        for page in 1..=400 {
+            text.push_str(&format!(
+                "{{\"progress\":{{\"event\":\"page\",\"at\":{now},\"list\":\"following\",\
+                 \"page\":{page},\"accounts\":{},\"of\":5000,\"sitting\":{},\
+                 \"rest_until\":null}}}}\n",
+                page * 12,
+                page % 40
+            ));
+        }
+        assert!(text.len() as u64 > 4 * TAIL);
+        std::fs::write(tmp.path().join("err.log"), &text).unwrap();
+        assert_eq!(served_lists(tmp.path()), ["followers"]);
+
+        let mut seen = crossing(json!([
+            {"list": "followers", "fate": "walked", "pages": {"least": 417, "most": 417}},
+            {"list": "following", "fate": "walked", "pages": {"least": 417, "most": 417}},
+        ]));
+        seen.dir = tmp.path().to_path_buf();
+        let newest = newest_progress(tmp.path()).unwrap();
+        assert_eq!(
+            eta(&seen, Some(&newest), &served_lists(tmp.path()), now).unwrap(),
+            walking(&[(17, 17)], 400 % 40)
+        );
+
+        seen.status = Status::Succeeded;
+        seen.state = Some(super::super::State {
+            status: Status::Succeeded,
+            started_at: now,
+            updated_at: now,
+            finished_at: Some(now),
+            exit_number: Some(0),
+            cancel: false,
+            failure: None,
+            supervisor_pid: None,
+            child_pid: None,
+        });
+        let finished = finished(&seen).unwrap();
+        assert_eq!(finished["served"][0]["list"], "followers");
+        assert_eq!(finished["served"][0]["from"], "stored");
     }
 }

@@ -52,8 +52,9 @@ const KEEP: Duration = crate::jobs::KEEP_JOB;
 const POLL_AT_LEAST: Duration = Duration::from_secs(5);
 const POLL_AT_MOST: Duration = Duration::from_secs(60);
 
-/// The poll asked for when the walk's end cannot be estimated yet (before
-/// its first page, or between the two lists of a crossing): a quarter of the
+/// The poll asked for when the walk's end cannot be estimated
+/// (`jobs::show::eta`: a job recorded with no estimate, or a list under way
+/// whose size nobody knows): a quarter of the
 /// most, so a walk about to end is not left long, and a long one is asked
 /// about a few times a minute.
 const POLL_UNKNOWN: Duration = Duration::from_secs(15);
