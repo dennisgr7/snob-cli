@@ -386,6 +386,19 @@ pub fn look(account: &AccountPaths, id: &JobId, now: i64) -> io::Result<Option<S
 /// Every job of `account`'s, oldest first. A directory whose name is not a
 /// job's is not one of ours and is left out, and alone.
 pub fn all(account: &AccountPaths, now: i64) -> io::Result<Vec<Seen>> {
+    let mut seen = Vec::new();
+    for id in ids(account)? {
+        if let Some(job) = look(account, &id, now)? {
+            seen.push(job);
+        }
+    }
+    Ok(seen)
+}
+
+/// The ids of `account`'s jobs, oldest first, none of them read yet: what
+/// [`all`] reads one by one, and what [`Stopping::every_job_of`] reads so
+/// that one job it cannot read keeps no other from being asked to stop.
+fn ids(account: &AccountPaths) -> io::Result<Vec<JobId>> {
     let entries = match std::fs::read_dir(account.jobs_dir()) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -396,13 +409,7 @@ pub fn all(account: &AccountPaths, now: i64) -> io::Result<Vec<Seen>> {
         .filter_map(|entry| JobId::parse(entry.file_name().to_str()?))
         .collect();
     ids.sort();
-    let mut seen = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(job) = look(account, &id, now)? {
-            seen.push(job);
-        }
-    }
-    Ok(seen)
+    Ok(ids)
 }
 
 /// Takes the lock every start and every sweep of `account`'s jobs holds
@@ -511,8 +518,11 @@ impl Stopping {
     /// jobs directory or `.lock` that cannot be made or taken (a stray file
     /// in its place, a full disk, an ACL that refuses) is warned about and
     /// taken as no jobs to stop: where the lock cannot be taken, no job can
-    /// start either (`start::make` takes the same one). A job that cannot be
-    /// read or told to stop is warned about and not waited for.
+    /// start either (`start::make` takes the same one). **Each job is read
+    /// on its own**: one that cannot be read (its `lock` cannot be opened,
+    /// say) is warned about, still sent a `stop` in case it is running, and
+    /// not waited for, and every other is asked to stop as usual. A job that
+    /// cannot be told to stop is warned about and not waited for either.
     pub fn every_job_of(account: &AccountPaths) -> Self {
         let none = || Self {
             ids: Vec::new(),
@@ -531,7 +541,7 @@ impl Stopping {
             }
         };
         let now = snob_core::clock::now_ms().get();
-        let jobs = all(account, now).unwrap_or_else(|e| {
+        let every = ids(account).unwrap_or_else(|e| {
             crate::ui::warn(&format!(
                 "could not read the jobs of {}: {e}; going on without stopping them",
                 account.dir().display()
@@ -539,7 +549,25 @@ impl Stopping {
             Vec::new()
         });
         let mut ids = Vec::new();
-        for seen in jobs {
+        for id in every {
+            let seen = match look(account, &id, now) {
+                Ok(Some(seen)) => seen,
+                Ok(None) => continue,
+                Err(e) => {
+                    // What it is doing is unknown, so it is asked all the
+                    // same; a `stop` in a job that is over changes nothing.
+                    let asked = private_marker(&file(&account.job_dir(&id), "stop"));
+                    crate::ui::warn(&format!(
+                        "could not read job {}: {e}; {}, and going on",
+                        id.as_str(),
+                        match asked {
+                            Ok(()) => "asked it to stop",
+                            Err(_) => "could not ask it to stop either",
+                        }
+                    ));
+                    continue;
+                }
+            };
             if seen.status.is_over() {
                 continue;
             }
@@ -841,6 +869,26 @@ mod tests {
         assert!(!account.job_dir(&done).join("stop").exists());
         // A queued job nobody runs is not over until it is lost.
         assert!(!stopping.wait(Duration::from_millis(200)));
+    }
+
+    /// A job that cannot be read (its `lock` a directory, which cannot be
+    /// opened) keeps no other from being asked to stop: before it, a
+    /// `logout` that met one asked none of the account's jobs to stop and
+    /// deleted the session under their walks. It is sent a `stop` itself,
+    /// in case it runs, and not waited for.
+    #[test]
+    fn a_job_that_cannot_be_read_keeps_no_other_from_being_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = account(&tmp);
+        let now = snob_core::clock::now_ms().get();
+        let unreadable = made(&account, now - 1, None);
+        std::fs::create_dir(file(&account.job_dir(&unreadable), "lock")).unwrap();
+        assert!(look(&account, &unreadable, now).is_err());
+        let queued = made(&account, now, None);
+        let stopping = Stopping::every_job_of(&account);
+        assert_eq!(stopping.ids, std::slice::from_ref(&queued));
+        assert!(account.job_dir(&queued).join("stop").exists());
+        assert!(account.job_dir(&unreadable).join("stop").exists());
     }
 
     /// An account that has never run a job is still held while it is left,
