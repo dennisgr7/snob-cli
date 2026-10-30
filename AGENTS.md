@@ -433,9 +433,12 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   hint that is advice to the person at a terminal is replaced the same
   way**, by the failure's `reason` (`answer::agent_hint`: `too_many_jobs`,
   `no_such_job`, `job_stopping`, `nothing_stored`, `budget_wait`, `busy`,
-  `mcp_write_cap`), with the tools that do it instead, and a push-back the
-  call met itself, whose cooldown the failure does not date, by
-  `answer::PUSHED_BACK` (ask `snob_status` when it lifts); a failure's
+  `mcp_write_cap`, `walked_elsewhere`), with the tools that do it instead,
+  and a push-back the call met itself, whose cooldown the failure does not
+  date, by `answer::PUSHED_BACK` (ask `snob_status` when it lifts); so
+  every refusal a cooldown already held is behind carries
+  `cooldown_until`, a crossing's of two stored lists too far apart
+  included (`engine::cooldown::check_same_moment_dated`); a failure's
   message is its sentences, the records of the log and the progress lines
   left out (`jobs::show::sentences`).
 - **`snob_profile` stays inline, not a job**: its walk of the mutual
@@ -546,7 +549,8 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   (one running per account: the same command again is `reused`, the
   `--confirmed-*` aside, another is `too_many_jobs`, and one asked to stop
   that has not yet is `job_stopping`, never reused; a list a lost job may
-  still hold is `walked_elsewhere`, with until when), starts its supervisor
+  still hold is `walked_elsewhere`, with until when, `retry_at` for a
+  program), starts its supervisor
   detached (`detach.rs`) and answers with **one** compact JSON document:
   the record, and the walk's answer under
   `finished` when it ended within `--wait`. Asked to stop before it answered

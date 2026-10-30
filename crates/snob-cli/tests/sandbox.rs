@@ -6175,6 +6175,13 @@ async fn a_lost_job_with_a_live_claim_says_when_it_frees() {
     assert_eq!(told["error"]["reason"], "walked_elsewhere", "{told}");
     let said = told["error"]["message"].as_str().unwrap();
     assert!(said.contains(&id) && said.contains("until"), "{said}");
+    // The same moment for a program, which the lost job's record names too.
+    // `retry_at` is rounded up to the second, so it is never too early.
+    let frees = jobs.ask(&["show", &id, "--json"])["claim_frees_at"]
+        .as_i64()
+        .unwrap();
+    let retry_at = told["error"]["retry_at"].as_i64().expect("retry_at");
+    assert!((frees..=frees + 1).contains(&retry_at), "{told}");
     assert_eq!(jobs.dirs().len(), 1, "nothing was started");
 
     // A list it never walked is another matter.

@@ -101,6 +101,12 @@ fn agent_hint(reason: &str) -> Option<&'static str> {
              them in a day: do not call this again before retry_at (seconds since the \
              epoch); tell the person, who can make it in their own terminal"
         }
+        "walked_elsewhere" => {
+            "another walk holds this list and nothing was started: when retry_at is set \
+             (seconds since the epoch), a job that stopped without letting go holds it until \
+             then, so call this again only after it; otherwise call it again once that walk \
+             has finished, and it uses what the walk stored"
+        }
         "budget_wait" => {
             "the request budget has no room within the wait this server allows: call it again \
              later; snob_status says when the budget has room"
@@ -568,6 +574,7 @@ mod tests {
             ("budget_wait", ExitCode::Interrupted, "snob_status"),
             ("busy", ExitCode::Error, "snob_job_cancel"),
             ("mcp_write_cap", ExitCode::Error, "retry_at"),
+            ("walked_elsewhere", ExitCode::Error, "retry_at"),
         ] {
             let told = from(
                 &plan(&[ExitCode::Ok]),

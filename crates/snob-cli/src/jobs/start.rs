@@ -283,6 +283,9 @@ fn vet(jobs: &[super::Seen], checked: &argv::Checked, now: i64) -> Result<Found>
         )
         .with_reason("walked_elsewhere")
         .with_hint("ask again after that, and the walk continues where it stopped")
+        // The same moment for a program, in no zone (`retry_at`): the one
+        // above is this machine's, and an agent may be in another.
+        .with_retry_at(snob_core::EpochMs::new(lost.claim_frees_at()))
         .into());
     }
     Ok(Found::Free)

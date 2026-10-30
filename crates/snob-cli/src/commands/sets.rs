@@ -197,7 +197,9 @@ async fn cross(
     app.progress().finish();
     let (base, base_outcome) = second?;
 
-    engine::cooldown::check_same_moment(&against_outcome, &base_outcome)?;
+    engine::cooldown::check_same_moment_dated(&against_outcome, &base_outcome, || {
+        app.held().ok().flatten().map(|held| held.until_ms)
+    })?;
 
     let result = match op {
         SetOp::Unfollowers | SetOp::Fans => sets::difference(&base, &against),

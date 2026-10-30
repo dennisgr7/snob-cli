@@ -205,7 +205,9 @@ async fn scan(app: &mut App, query: engine::ListQuery) -> Result<Scanned> {
     .await;
     app.progress().finish();
     let (following, following_outcome) = second?;
-    engine::cooldown::check_same_moment(&followers_outcome, &following_outcome)?;
+    engine::cooldown::check_same_moment_dated(&followers_outcome, &following_outcome, || {
+        app.held().ok().flatten().map(|held| held.until_ms)
+    })?;
     let name = common::walked_name(app, typed.as_deref(), followers_outcome.account_pk)?;
     Ok(Scanned {
         target,

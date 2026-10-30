@@ -100,6 +100,31 @@ pub fn check_same_moment(a: &ListOutcome, b: &ListOutcome) -> Result<()> {
     ))
 }
 
+/// [`check_same_moment`] for a run, with a refusal over a list a cooldown
+/// served dated by when that cooldown lifts (`held`, asked only then), as
+/// every refusal a cooldown is behind is (`ExitError::with_cooldown_until`).
+/// Undated, the refusal exits 5 like a push-back met by the run itself, and
+/// an agent is told one was (`commands::mcp::answer::PUSHED_BACK`) when
+/// nothing was sent at all.
+pub fn check_same_moment_dated(
+    a: &ListOutcome,
+    b: &ListOutcome,
+    held: impl FnOnce() -> Option<snob_core::EpochMs>,
+) -> Result<()> {
+    check_same_moment(a, b).map_err(|error| {
+        if a.provenance != Provenance::Cooldown && b.provenance != Provenance::Cooldown {
+            return error;
+        }
+        match error.downcast::<crate::exit::ExitError>() {
+            Ok(refused) => match held() {
+                Some(until) => refused.with_cooldown_until(until).into(),
+                None => refused.into(),
+            },
+            Err(error) => error,
+        }
+    })
+}
+
 /// How much dead time there may be between two walks and still be one moment:
 /// fifteen minutes of an account's life, the drift this tool treats as a
 /// single instant.
@@ -304,5 +329,35 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(crate::exit::from_chain(&asked_for), Some(ExitCode::Error));
+    }
+
+    /// Lists a cooldown served, too far apart to cross, are refused with
+    /// when it lifts, so the refusal reads as the cooldown's and not as a
+    /// push-back the run met; a refusal no cooldown is behind is not dated,
+    /// and the cooldown is not even asked about.
+    #[test]
+    fn a_refusal_over_lists_a_cooldown_served_says_when_it_lifts() {
+        let until = snob_core::EpochMs::new(7_000_000_000);
+        let throttled = check_same_moment_dated(
+            &outcome(Provenance::Cooldown, 0),
+            &outcome(Provenance::CounterVerified, 5_000_000),
+            || Some(until),
+        )
+        .unwrap_err();
+        let refused = throttled.downcast_ref::<crate::exit::ExitError>().unwrap();
+        assert_eq!(refused.cooldown_until(), Some(until));
+        assert_eq!(
+            crate::exit::from_chain(&throttled),
+            Some(ExitCode::RateLimited)
+        );
+
+        let asked_for = check_same_moment_dated(
+            &outcome(Provenance::CacheFlag, 0),
+            &outcome(Provenance::CacheFlag, 5_000_000),
+            || panic!("no cooldown is behind it"),
+        )
+        .unwrap_err();
+        let refused = asked_for.downcast_ref::<crate::exit::ExitError>().unwrap();
+        assert_eq!(refused.cooldown_until(), None);
     }
 }
