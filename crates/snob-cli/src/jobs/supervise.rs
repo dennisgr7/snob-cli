@@ -20,13 +20,33 @@
 //! ended, and its errors to `err.log`.
 //!
 //! **Stopping is closing that pipe.** Every second it asks whether a `stop`
-//! file is there, or whether it was itself asked to stop (`SIGTERM`, `SIGHUP`,
-//! the session ending: `interrupt::install`); then it closes the walk's
-//! standard input, which stops the walk as Ctrl+C does, its page saved and its
-//! claim given back, and kills it through its own handle only after
-//! [`GRACE`]. It never signals a process id it read from a file. **A walk it
-//! killed ended as asked** ([`status_for`]), whatever exit the kill left it
-//! with: none on Unix, 1 on Windows, where a kill is `TerminateProcess`.
+//! file is there, or whether it was itself asked to stop (`interrupt::install`:
+//! on Unix `SIGTERM` and `SIGHUP`, which reach it in its own session at the
+//! end of the person's); then it closes the walk's standard input, which
+//! stops the walk as Ctrl+C does, its page saved and its claim given back,
+//! and kills it through its own handle only after [`GRACE`]. It never
+//! signals a process id it read from a file. **A walk it killed ended as
+//! asked** ([`status_for`]), whatever exit the kill left it with: none on
+//! Unix, 1 on Windows, where a kill is `TerminateProcess`.
+//!
+//! **On Windows it hears no end of session.** Started detached, it has no
+//! console, so it is sent none of the console's events, and a process with
+//! no window is simply ended at sign-out or shutdown (as
+//! `owner/end_of_session.rs` says of the owner). Its job is then read as
+//! `lost`, and the list it walked is refused as `walked_elsewhere` until its
+//! claim frees. The owner's remedy, a hidden window that hears
+//! `WM_ENDSESSION`, is not taken here: the walk is ended at the same moment,
+//! within the few seconds Windows allows, so its claim on the list would
+//! stay all the same, and the job would read `stopped` rather than `lost`
+//! for no gain to whoever asks next. The walk runs with a console of its
+//! own and may give its claim back if it hears the console's end.
+//!
+//! **A job read as lost stays lost** ([`gone_already`]): a supervisor that
+//! comes to a job after another one ran it and went away, or later than
+//! [`super::LOST_AFTER`] after the job was made, by when every reader (a
+//! waiter, `tasks/get`, a start's check of the list) has taken it as over,
+//! writes `lost` and runs nothing, rather than revive it beside a job that
+//! may have started since.
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -63,7 +83,8 @@ pub async fn run(cli: &Cli, account: &AccountPaths, id: &str) -> Result<ExitCode
         tracing::warn!(job = %id, "another supervisor holds this job");
         return Ok(ExitCode::Error);
     };
-    if read::<State>(&dir, "state.json").is_some_and(|state| state.status.is_over()) {
+    let before = read::<State>(&dir, "state.json");
+    if before.as_ref().is_some_and(|state| state.status.is_over()) {
         return Ok(ExitCode::Ok);
     }
 
@@ -95,6 +116,21 @@ pub async fn run(cli: &Cli, account: &AccountPaths, id: &str) -> Result<ExitCode
             return end(&dir, state, Status::Failed, None, Some("refused_argv"));
         }
     };
+    let created_at = job.as_ref().map_or(now, |job| job.created_at);
+    if gone_already(before.as_ref(), created_at, now) {
+        tracing::warn!(job = %id, "the job was already read as lost; not running it");
+        // When it was last alive is what it was, not now: a lost job's
+        // claim on its list is counted from then (`Seen::claim_frees_at`),
+        // and nothing was walked since.
+        let alive = before.as_ref().map_or(created_at, |s| s.updated_at);
+        state.status = Status::Lost;
+        state.started_at = before.as_ref().map_or(alive, |s| s.started_at);
+        state.updated_at = alive;
+        state.finished_at = Some(now);
+        state.failure = Some("started_late".into());
+        write(&dir, "state.json", &state)?;
+        return Ok(ExitCode::Ok);
+    }
     if file(&dir, "stop").exists() {
         state.cancel = true;
         return end(&dir, state, Status::Canceled, None, None);
@@ -206,6 +242,13 @@ fn now() -> i64 {
     snob_core::clock::now_ms().get()
 }
 
+/// Whether the job, not over, is one every reader already takes as lost
+/// (`jobs::derive` with its lock free): another supervisor wrote it running
+/// and went away, or none came within [`super::LOST_AFTER`] of its making.
+fn gone_already(before: Option<&State>, created_at: i64, now: i64) -> bool {
+    super::derive(before, false, created_at, now) == Status::Lost
+}
+
 /// The job's lock, tried for [`LOCK_WITHIN`]; `None` when somebody keeps it.
 async fn take_lock(path: &std::path::Path) -> Result<Option<std::fs::File>> {
     let deadline = Instant::now() + LOCK_WITHIN;
@@ -255,5 +298,29 @@ mod tests {
         assert_eq!(status_for(Some(130), false, false), Status::Stopped);
         assert_eq!(status_for(Some(1), false, true), Status::Failed);
         assert_eq!(status_for(None, false, false), Status::Failed);
+    }
+
+    /// A supervisor runs a job only as long as nobody has taken it for lost:
+    /// one that comes past the wait for it, or after another ran it and went
+    /// away, leaves it lost.
+    #[test]
+    fn a_job_read_as_lost_is_not_run_again() {
+        let made = 1_000_000;
+        let lost_after = super::super::LOST_AFTER.as_millis() as i64;
+        assert!(!gone_already(None, made, made + 10));
+        assert!(!gone_already(None, made, made + lost_after));
+        assert!(gone_already(None, made, made + lost_after + 1));
+        let running = State {
+            status: Status::Running,
+            started_at: made,
+            updated_at: made,
+            finished_at: None,
+            exit_number: None,
+            cancel: false,
+            failure: None,
+            supervisor_pid: None,
+            child_pid: None,
+        };
+        assert!(gone_already(Some(&running), made, made + 10));
     }
 }

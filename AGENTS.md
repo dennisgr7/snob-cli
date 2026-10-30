@@ -565,7 +565,11 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   the grace. No pid read from a file is ever signaled. `show`, `list` and
   `cancel` look only in the jobs of the account the run acts as: another
   account's id is `no_such_job`. A Windows job object that refuses breakaway
-  takes the job with its client: `detached: "in_client_job"`.
+  takes the job with its client: `detached: "in_client_job"`. On Windows
+  the detached supervisor hears no end of session, so a job running at
+  sign-out or shutdown is read as `lost`; and a supervisor that comes to a
+  job every reader already takes as lost leaves it so (`started_late`)
+  rather than run it.
 - **To an agent, a list that may be walked is a job** (`tools::Run::Job`):
   `snob_list` in mode `auto` or `refresh` (not `stored`, a dry run or a later
   page; the writes never) runs `__job start --wait=<wait_seconds>s --tool
