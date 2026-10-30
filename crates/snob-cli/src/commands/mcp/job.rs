@@ -129,12 +129,20 @@ pub fn with_id(mut told: Answer, doc: &Value) -> Answer {
     told
 }
 
+/// Whether the job's walk is still to come or going on: queued or running.
+pub fn going(doc: &Value) -> bool {
+    matches!(
+        doc.get("status").and_then(Value::as_str),
+        Some("queued" | "running")
+    )
+}
+
 /// A job that has not ended, or one whose walk never ran: how it stands,
 /// and a sentence on what to do next. `cancel` is for the answer to
 /// `snob_job_cancel`.
 pub fn standing(doc: &Value, cancel: bool) -> (Answer, String) {
     let status = doc.get("status").and_then(Value::as_str).unwrap_or("lost");
-    let going = matches!(status, "queued" | "running");
+    let going = going(doc);
     let id = doc
         .get("job_id")
         .and_then(Value::as_str)

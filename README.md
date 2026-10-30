@@ -143,7 +143,9 @@ can read:
   most an hour for the request budget unless the server was given
   `--max-wait`. One runs at a time per account, listed by `snob jobs` and in
   `snob status`, stopped like Ctrl+C by `snob jobs cancel <id>`, and stopped
-  by `snob logout` and `snob purge` before they remove anything.
+  by `snob logout` and `snob purge` before they remove anything. A client
+  that supports MCP Tasks gets the job as a task instead, which it polls
+  and can cancel on its own.
   `snob mcp config claude-code` (or `claude-desktop`, `codex`, `cursor`,
   `vscode`) prints what to add to that client's configuration. After
   upgrading snob, reconnect the server in the client: a server whose binary

@@ -85,7 +85,7 @@ pub(crate) const HEARTBEAT: Duration = Duration::from_secs(30);
 const KEEP_RESULT: Duration = Duration::from_secs(24 * 3600);
 
 /// How long a finished job's directory is kept, its record and its log.
-const KEEP_JOB: Duration = Duration::from_secs(7 * 24 * 3600);
+pub(crate) const KEEP_JOB: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// The most jobs kept for an account, however recent: the oldest finished
 /// ones go first.

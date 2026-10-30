@@ -542,8 +542,10 @@ pub enum Command {
                       answers with the result when the walk ends within its wait_seconds, \
                       and otherwise with the job, which the agent asks about, lists and \
                       stops with snob_job, snob_jobs and snob_job_cancel, and which goes on \
-                      after the call, the client and the server. A job's walk waits at most \
-                      an hour for the request budget, or --max-wait when it is given.\n\n\
+                      after the call, the client and the server. A client that supports MCP \
+                      Tasks gets the job as a task instead, which it polls and cancels on \
+                      its own. A job's walk waits at most an hour for the request budget, or \
+                      --max-wait when it is given.\n\n\
                       What runs on a yes is recorded in the account's database before its \
                       first request, and \"snob status --agents\" lists the last 24 hours. \
                       Agents may make --max-writes-per-day follows and unfollows on the \

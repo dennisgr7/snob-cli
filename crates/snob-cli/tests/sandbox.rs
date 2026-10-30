@@ -6065,3 +6065,297 @@ async fn snob_job_pages_a_finished_result_from_its_file() {
     assert_eq!(read, every, "every account once, in the order served");
     assert_eq!(posted(&instagram).await.len(), sent, "nothing was sent");
 }
+
+/// What a client that takes MCP Tasks declares, at `initialize` or in the
+/// `_meta` of a stateless request.
+#[cfg(feature = "mcp")]
+fn takes_tasks() -> serde_json::Value {
+    serde_json::json!({ "extensions": { "io.modelcontextprotocol/tasks": {} } })
+}
+
+#[cfg(feature = "mcp")]
+impl McpClient {
+    /// A client on 2025-11-25 that takes tasks, having checked that the
+    /// server says it hands them out.
+    async fn taking_tasks(root: &Path, instagram: &MockServer, args: &[&str]) -> Self {
+        let mut client = Self::spawn(root, instagram, args);
+        let hello = client
+            .ask(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": takes_tasks(),
+                    "clientInfo": { "name": "test", "version": "0" }
+                }),
+            )
+            .await;
+        assert!(
+            hello["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"]
+                .is_object(),
+            "the server declares tasks: {hello}"
+        );
+        client
+            .send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        client
+    }
+
+    /// `tasks/get` until the task is no longer working, within a minute and
+    /// a half: the task as it ended.
+    async fn task_over(&mut self, id: &str) -> serde_json::Value {
+        let since = std::time::Instant::now();
+        loop {
+            let got = self
+                .ask("tasks/get", serde_json::json!({ "taskId": id }))
+                .await;
+            let task = got["result"].clone();
+            assert!(task.is_object(), "a task: {got}");
+            assert_eq!(task["taskId"], id, "{task}");
+            if task["status"] != "working" {
+                return task;
+            }
+            assert!(
+                task["pollIntervalMs"]
+                    .as_u64()
+                    .is_some_and(|ms| ms >= 5_000),
+                "a working task says when to ask again: {task}"
+            );
+            assert!(
+                since.elapsed() < std::time::Duration::from_secs(90),
+                "still working after a minute and a half: {task}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+}
+
+/// A client that takes tasks is answered, for a walk that has not ended in a
+/// few seconds, with a task whose id is the job's, whatever wait it asked
+/// for, and `tasks/get` hands back the walk's result once it has ended, as
+/// the call would have answered it.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_tasks_client_gets_a_task_for_a_slow_walk_and_its_result_from_tasks_get() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(20), 1).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::taking_tasks(tmp.path(), &instagram, &[]).await;
+
+    let asked = std::time::Instant::now();
+    let started = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "wait_seconds": 50 }),
+        )
+        .await;
+    assert!(
+        asked.elapsed() < std::time::Duration::from_secs(19),
+        "answered before the walk could end, not after the wait it asked: {:?}",
+        asked.elapsed()
+    );
+    assert_eq!(started["resultType"], "task", "{started}");
+    assert_eq!(started["status"], "working", "{started}");
+    let id = started["taskId"].as_str().unwrap().to_string();
+    assert!(
+        snob_store::paths::JobId::parse(&id).is_some(),
+        "the task is the job: {id}"
+    );
+    assert_eq!(started["ttlMs"], 7 * 24 * 3600 * 1000, "{started}");
+    assert!(started["pollIntervalMs"].as_u64().is_some(), "{started}");
+    assert!(
+        started["statusMessage"]
+            .as_str()
+            .is_some_and(|said| said.contains("followers list")),
+        "{started}"
+    );
+    assert!(chrono::DateTime::parse_from_rfc3339(started["createdAt"].as_str().unwrap()).is_ok());
+
+    let ended = client.task_over(&id).await;
+    assert_eq!(ended["status"], "completed", "{ended}");
+    let result = &ended["result"];
+    assert_eq!(result["isError"], false, "{ended}");
+    let told = &result["structuredContent"];
+    assert_eq!(told["count"], 3, "{told}");
+    assert_eq!(usernames(told), ["user0", "user1", "user2"]);
+    assert_eq!(told["job_id"], id.as_str(), "{told}");
+    assert_eq!(followers_asked(&instagram).await, 1, "walked once");
+
+    // The task is the job: snob_job reads it too, and nothing more is walked.
+    let read = client
+        .call("snob_job", serde_json::json!({ "job_id": id }))
+        .await;
+    assert_eq!(read["structuredContent"]["count"], 3, "{read}");
+    assert_eq!(followers_asked(&instagram).await, 1);
+}
+
+/// `tasks/cancel` stops the walk as `snob_job_cancel` does: the task ends
+/// canceled, what was read is kept, and the list is let go of, so the next
+/// call walks it again. On the stateless revision, the client saying it
+/// takes tasks in every request.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn tasks_cancel_stops_the_walk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::stateless(tmp.path(), &instagram, takes_tasks());
+
+    let started = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(started["resultType"], "task", "{started}");
+    let id = started["taskId"].as_str().unwrap().to_string();
+    until_asked(&instagram, 1).await;
+
+    let canceled = client
+        .ask("tasks/cancel", serde_json::json!({ "taskId": id }))
+        .await;
+    assert!(canceled["error"].is_null(), "{canceled}");
+    assert!(canceled["result"].is_object(), "an empty ack: {canceled}");
+    let ended = client.task_over(&id).await;
+    let canceled = "cancelled"; // spelling-allow: the extension's word for it
+    assert_eq!(ended["status"], canceled, "{ended}");
+    assert!(ended.get("result").is_none(), "{ended}");
+
+    // The list was let go of: walked again, and this time it ends.
+    let again = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    let told = if again["resultType"] == "task" {
+        let next = again["taskId"].as_str().unwrap().to_string();
+        assert_ne!(next, id, "a walk of its own");
+        let ended = client.task_over(&next).await;
+        assert_eq!(ended["status"], "completed", "{ended}");
+        ended["result"]["structuredContent"].clone()
+    } else {
+        again["structuredContent"].clone()
+    };
+    assert_eq!(told["count"], 3, "{told}");
+}
+
+/// A client that did not say it takes tasks gets the job's id, as before,
+/// and is refused the task methods.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_client_without_tasks_gets_a_job_handle_instead() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(8), 1).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let started = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "wait_seconds": 0 }),
+        )
+        .await;
+    assert!(started.get("taskId").is_none(), "{started}");
+    assert_eq!(started["isError"], false, "{started}");
+    let told = &started["structuredContent"];
+    assert_eq!(told["poll_with"], "snob_job", "{told}");
+    let id = told["job_id"].as_str().unwrap().to_string();
+
+    let refused = client
+        .ask("tasks/get", serde_json::json!({ "taskId": id }))
+        .await;
+    assert!(refused["error"].is_object(), "{refused}");
+
+    let done = client
+        .call(
+            "snob_job",
+            serde_json::json!({ "job_id": id, "wait_seconds": 50 }),
+        )
+        .await;
+    assert_eq!(done["structuredContent"]["count"], 3, "{done}");
+}
+
+/// An id that names no job of the account, well formed or not, is an
+/// unknown task to every task method, and runs nothing.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn an_unknown_task_is_invalid_params() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::taking_tasks(tmp.path(), &instagram, &[]).await;
+
+    let none_such = format!("j{}", "0".repeat(26));
+    assert!(snob_store::paths::JobId::parse(&none_such).is_some());
+    for id in ["nope", "--all", none_such.as_str()] {
+        for (method, params) in [
+            ("tasks/get", serde_json::json!({ "taskId": id })),
+            ("tasks/cancel", serde_json::json!({ "taskId": id })),
+            (
+                "tasks/update",
+                serde_json::json!({ "taskId": id, "inputResponses": {} }),
+            ),
+        ] {
+            let answer = client.ask(method, params).await;
+            assert_eq!(answer["error"]["code"], -32602, "{method} {id}: {answer}");
+            assert!(
+                answer["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with("unknown task")),
+                "{answer}"
+            );
+        }
+    }
+    assert_eq!(followers_asked(&instagram).await, 0);
+    assert!(jobs.dirs().is_empty(), "no job was made");
+}
+
+/// A server acting as one account does not know another account's job as a
+/// task: it cannot read it or stop it by its id.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_task_of_another_account_is_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = two_accounts(tmp.path()).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(120)))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut args = vec!["--account", "other", "__job", "start", "--wait", "0s"];
+    args.extend_from_slice(&FOLLOWERS_JOB);
+    let out = snob(tmp.path(), Some(&instagram), &args);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let id = json(&out)["job_id"].as_str().unwrap().to_string();
+
+    let mut mine = McpClient::taking_tasks(tmp.path(), &instagram, &["--account", "me"]).await;
+    for method in ["tasks/get", "tasks/cancel"] {
+        let answer = mine.ask(method, serde_json::json!({ "taskId": id })).await;
+        assert_eq!(answer["error"]["code"], -32602, "{method}: {answer}");
+    }
+    assert!(
+        !jobs.dirs()[0].join("stop").exists(),
+        "the cancel as another account stopped nothing"
+    );
+
+    let mut theirs = McpClient::taking_tasks(tmp.path(), &instagram, &["--account", "other"]).await;
+    let got = theirs
+        .ask("tasks/get", serde_json::json!({ "taskId": id }))
+        .await;
+    assert_eq!(got["result"]["status"], "working", "{got}");
+}

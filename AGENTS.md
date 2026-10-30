@@ -505,6 +505,24 @@ writes it.
   result swept a day later is `result_gone`, a lost job `job_lost`. **All job
   I/O goes through those `__job` children**, so the server still opens no
   store and reads no job's file.
+- **A client that takes MCP Tasks gets a task for that job**
+  (`commands/mcp/tasks.rs`; SEP-2663 as rmcp 3.8.0 has it: `tasks/get`,
+  `tasks/update`, `tasks/cancel`, and no `tasks/result` or `tasks/list`, so
+  jobs are listed by `snob_jobs`). The server declares the extension. A
+  `snob_list` run as a job, for a client that declared it (at `initialize`,
+  or in a stateless request's `_meta`), waits at most `tasks::WAIT_SECONDS`
+  (5) whatever `wait_seconds` says, and answers with a task whose id is the
+  job's. `tasks/get` and `tasks/cancel` are the children `snob_job` (with no
+  wait) and `snob_job_cancel` run, under the same limits and the upgrade
+  check; an id that is not one of the account's jobs is `invalid_params`
+  "unknown task". Queued or running is `working`, with `pollIntervalMs` a
+  tenth of the least time left (5 to 60 s); a walk that ended is
+  `completed` with the result `snob_job` would give, an error result
+  included; a canceled job is the extension's canceled status, and a lost
+  one `failed` with `job_lost`. `ttlMs` is the week a job is kept. **Nothing
+  is asked inside a task**: the yes is settled before the job starts, so
+  `tasks/update` only checks the id. Not rmcp's `TaskManager`, which keeps
+  tasks in memory and aborts one after five minutes.
 - A heartbeat (`notifications/progress`) is sent from the call's own task
   and awaited, never spawned, so none can reach the client after the result.
 - **Upgrades.** `snob mcp config` prints a path that outlives one
