@@ -43,14 +43,9 @@ const TICK_WITHIN: Duration = Duration::from_secs(5);
 /// error line: enough for the sentences, not a log.
 const STDERR_KEPT: usize = 4 * 1024;
 
-/// Environment variables a child never inherits.
-///
-/// `SNOB_IGNORE_COOLDOWN` is the escape hatch that exists so a bug of ours
-/// cannot lock a person out; set in the environment the client was started
-/// from, it would hand every agent's call a way past the hard stop. The rest
-/// of the environment is the person's own machine (`SNOB_NO_BROWSER`, the
-/// proxy, the locale) and is passed on.
-const NEVER_INHERITED: &[&str] = &["SNOB_IGNORE_COOLDOWN"];
+/// Environment variables a child never inherits, from the one home they
+/// have (`jobs`), which says why.
+const NEVER_INHERITED: &[&str] = crate::jobs::NEVER_INHERITED;
 
 /// How a child run ended.
 #[derive(Debug)]
@@ -138,6 +133,26 @@ impl Launch {
         upgraded(self.started_from.as_ref(), Stamp::of(&self.exe).as_ref())
     }
 
+    /// The child `run` starts, built and not started.
+    fn command(&self, args: &[String]) -> Command {
+        let mut command = Command::new(&self.exe);
+        command
+            .args(&self.globals)
+            .arg("--stop-when-stdin-closes")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Not `kill_on_drop`: a child left behind by a server that went
+            // away stops on its own, in order, because its standard input
+            // closes with the server; killing it would hold its walk's claim
+            // until the lease ran out.
+            .stderr(Stdio::piped());
+        for name in NEVER_INHERITED {
+            command.env_remove(name);
+        }
+        command
+    }
+
     /// Runs `snob <globals> <args>` to its end, or until `stop` resolves.
     ///
     /// `tick` is called every `every` while it runs, with how long it has run,
@@ -156,22 +171,7 @@ impl Launch {
     where
         F: std::future::Future<Output = ()>,
     {
-        let mut command = Command::new(&self.exe);
-        command
-            .args(&self.globals)
-            .arg("--stop-when-stdin-closes")
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Not `kill_on_drop`: a child left behind by a server that went
-            // away stops on its own, in order, because its standard input
-            // closes with the server; killing it would hold its walk's claim
-            // until the lease ran out.
-            .stderr(Stdio::piped());
-        for name in NEVER_INHERITED {
-            command.env_remove(name);
-        }
-        let mut child = command.spawn()?;
+        let mut child = self.command(args).spawn()?;
         // Held, never written: dropping it is the request to stop.
         let mut stdin = child.stdin.take();
         let mut stdout = child.stdout.take().expect("piped");
@@ -332,6 +332,27 @@ mod tests {
         assert!(!launch.upgraded());
         std::fs::rename(&exe, tmp.path().join("snob.old")).unwrap();
         assert!(launch.upgraded());
+    }
+
+    /// The key of the server over the network, and a client's copy, are
+    /// taken out of what a child is started with, and so out of the browser
+    /// owner and the browsers it would start; so is the escape hatch.
+    #[test]
+    fn the_mcp_key_never_reaches_a_child() {
+        let launch = Launch::new(std::path::PathBuf::from("snob"), Vec::new());
+        let command = launch.command(&["status".to_string()]);
+        let removed: Vec<&std::ffi::OsStr> = command
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name)
+            .collect();
+        for name in ["SNOB_MCP_KEY", "SNOB_MCP_TOKEN", "SNOB_IGNORE_COOLDOWN"] {
+            assert!(
+                removed.contains(&std::ffi::OsStr::new(name)),
+                "{name} reaches the child: {removed:?}"
+            );
+        }
     }
 
     #[test]

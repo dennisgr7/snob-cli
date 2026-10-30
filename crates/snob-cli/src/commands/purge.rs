@@ -41,7 +41,8 @@ pub struct Plan {
     /// registry names and every one with a directory, in case the registry is
     /// gone or damaged. `only` names the one when one goes.
     pub accounts: Vec<Pk>,
-    /// The monitor's stored secrets, when there are any.
+    /// The secrets stored that are not a session, when there are any: the
+    /// monitor's and the MCP key.
     ///
     /// **For the listing only.** What `execute` removes is `Kind::ALL`, always,
     /// and it does not consult this: the deletion must not be gated on a survey
@@ -80,19 +81,29 @@ impl Plan {
         // Named separately from the session, because they are a different
         // thing to lose: a webhook token and a signing key belong to the
         // user's own server, not to Instagram, and somebody re-running `setup`
-        // afterwards has to know they will have to enter them again.
+        // afterwards has to know they will have to enter them again. The MCP
+        // key is named as what it is, not as one of the monitor's: every
+        // client given it stops working, and has to be given a new one.
         if !self.secrets.is_empty() {
-            let named: Vec<&str> = self
-                .secrets
-                .iter()
-                .map(|kind| match kind {
-                    Kind::WatchToken => "webhook token",
-                    Kind::WatchSigningKey => "signing key",
-                })
-                .collect();
+            let mut monitor = Vec::new();
+            let mut mcp = false;
+            for kind in &self.secrets {
+                match kind {
+                    Kind::WatchToken => monitor.push("webhook token"),
+                    Kind::WatchSigningKey => monitor.push("signing key"),
+                    Kind::McpKey => mcp = true,
+                }
+            }
+            let mut named = Vec::new();
+            if !monitor.is_empty() {
+                named.push(format!("the monitor's {}", monitor.join(" and ")));
+            }
+            if mcp {
+                named.push("the MCP key".to_string());
+            }
             lines.push(format!(
-                "the monitor's stored {}, from the system keyring",
-                named.join(" and ")
+                "stored secrets from the system keyring: {}",
+                named.join(", ")
             ));
         }
         lines.extend(self.directories.iter().map(|d| d.display().to_string()));
@@ -123,7 +134,7 @@ pub fn survey(store: &SecretStore, app_paths: &AppPaths) -> Plan {
         // corrupt to parse as well as a readable one.
         session: store.sessions_stored(&accounts),
         accounts,
-        secrets: store.monitor_secrets_stored(),
+        secrets: store.secrets_stored(),
         directories: app_paths
             .owned_dirs()
             .into_iter()
@@ -161,7 +172,8 @@ fn running_jobs(account: &AccountPaths) -> Vec<JobId> {
 
 /// What `purge --account` removes: one account's session, its directory and
 /// its browser profile, and its place in the registry. Nothing of any other
-/// account's, and none of the monitor's secrets.
+/// account's, and none of the secrets that are not a session: the monitor's
+/// and the MCP key are the machine's, not the account's.
 pub fn survey_account(store: &SecretStore, app_paths: &AppPaths, account: Viewer) -> Plan {
     let paths = app_paths.account(account.pk);
     Plan {
@@ -608,6 +620,34 @@ mod tests {
         assert!(
             !lines[0].contains("session"),
             "there is no session here to claim: {lines:?}"
+        );
+    }
+
+    /// The MCP key is named as itself, and never as one of the monitor's:
+    /// somebody reading the list has to know that the clients given it stop
+    /// working.
+    #[test]
+    fn the_listing_names_the_mcp_key_as_its_own() {
+        let plan = |secrets: Vec<Kind>| Plan {
+            secrets,
+            ..Plan::default()
+        };
+
+        let lines = plan(vec![Kind::McpKey]).lines();
+        assert_eq!(
+            lines,
+            vec!["stored secrets from the system keyring: the MCP key".to_string()]
+        );
+        assert!(!lines[0].contains("monitor"), "{lines:?}");
+
+        let lines = plan(vec![Kind::WatchToken, Kind::WatchSigningKey, Kind::McpKey]).lines();
+        assert_eq!(
+            lines,
+            vec![
+                "stored secrets from the system keyring: the monitor's webhook token and \
+                 signing key, the MCP key"
+                    .to_string()
+            ]
         );
     }
 

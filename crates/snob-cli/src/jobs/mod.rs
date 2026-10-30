@@ -71,6 +71,21 @@ pub const SCHEMA: u32 = 1;
 /// runs out.
 pub const GRACE: Duration = Duration::from_secs(30);
 
+/// Environment variables an agent's run never inherits: a call's child
+/// (`commands::mcp::child`) and a job's walk (`supervise`).
+///
+/// `SNOB_IGNORE_COOLDOWN` is the escape hatch that exists so a bug of ours
+/// cannot lock a person out; set in the environment the client was started
+/// from, it would hand every agent's call a way past the hard stop.
+/// `SNOB_MCP_KEY` and `SNOB_MCP_TOKEN` are the key of `snob mcp` served
+/// over the network, the server's and a client's copy (`commands::mcp::key`):
+/// no command a call runs reads either, and every process it starts would
+/// carry them on, the browser owner and its browsers among them, which keep
+/// the environment they were started with. The rest of the environment is
+/// the person's own machine (`SNOB_NO_BROWSER`, the proxy, the locale) and
+/// is passed on.
+pub const NEVER_INHERITED: &[&str] = &["SNOB_IGNORE_COOLDOWN", "SNOB_MCP_KEY", "SNOB_MCP_TOKEN"];
+
 /// How long a job may wait for its supervisor before it counts as lost: it
 /// is started at once, so a job still queued after this never will be.
 pub const LOST_AFTER: Duration = Duration::from_secs(30);

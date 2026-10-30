@@ -271,6 +271,21 @@ with a documented reason in the same place.
   Windows). One session per account. Credential fields are `Secret`: `Debug`
   prints `<hidden>`, zeroized on drop, read only through `expose()` (keep it
   greppable). Never log or print a token.
+- **The MCP key** (`snob mcp key`, `commands/mcp/key.rs`): one key for
+  `snob mcp` served over the network, `snob_mcp_` plus 43 base64url
+  characters of 256 random bits; any other text is refused, from the
+  keyring and from `SNOB_MCP_KEY` alike. **Keyring only** (`Kind::McpKey`,
+  like the monitor's secrets; `--no-keyring` does not change it): on a
+  machine without one, `SNOB_MCP_KEY` in the server's environment is the
+  way, and it wins over the keyring wherever it is set, which `show` and
+  `revoke` warn about. A client reads its copy from `SNOB_MCP_TOKEN`, never
+  the server's name. The key is printed only to a terminal unless `--print`
+  (an agent with a shell would keep it in its transcript), and is named
+  everywhere else by a 12-digit fingerprint. Neither variable reaches a
+  child of a tool call or a job (`jobs::NEVER_INHERITED`). `Kind` has no
+  feature gate, so every build purges the key; no test writes it to the
+  keyring outside `SecretStore::with_service`, and the sandbox tests reach
+  it through `SNOB_MCP_KEY` only.
 - **No cookie jar in `reqwest`**: the `cookies` feature is off workspace-wide
   so `.cookie_store(true)` does not compile; the session travels as an
   explicit header on the one client meant to carry it. `reqwest` is

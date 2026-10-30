@@ -65,6 +65,7 @@ pub mod answer;
 pub mod child;
 pub mod config;
 pub mod job;
+pub mod key;
 pub mod limits;
 pub mod pages;
 pub mod seal;

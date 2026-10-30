@@ -283,6 +283,17 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 mcp_globals(&cli, cli.max_wait)?,
                 cli.max_wait.unwrap_or(commands::mcp::MAX_WAIT),
             ),
+            // The key is the machine's, in the keyring whatever
+            // `--no-keyring` says (`commands::mcp::key`); a sandbox's under
+            // its own name, like everything else it keeps there.
+            Some(snob_cli::cli::McpCommand::Key(key)) => {
+                let store = SecretStore::new(paths.clone(), no_keyring);
+                let store = match &keyring_namespace {
+                    Some(service) => store.with_service(service),
+                    None => store,
+                };
+                commands::mcp::key::run(key, &store)
+            }
             None => {
                 // `--max-wait` is the server's to hand each child, which
                 // waits as long as what it runs allows (`mcp::Waits`).

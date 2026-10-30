@@ -104,10 +104,12 @@ pub async fn run(cli: &Cli, account: &AccountPaths, id: &str) -> Result<ExitCode
         .args(argv::walk(cli, account.pk(), &checked.args)?)
         .stdin(Stdio::piped())
         .stdout(private(&file(&dir, "out.json.partial"), false)?)
-        .stderr(private(&file(&dir, "err.log"), true)?)
-        // The escape hatch from the cooldown is for a bug of ours, typed by
-        // a person; a job is an agent's (`commands::mcp::child`).
-        .env_remove("SNOB_IGNORE_COOLDOWN");
+        .stderr(private(&file(&dir, "err.log"), true)?);
+    // The escape hatch from the cooldown is for a bug of ours, typed by a
+    // person, and the MCP key is the server's; a job is an agent's.
+    for name in super::NEVER_INHERITED {
+        command.env_remove(name);
+    }
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut command, NO_WINDOW);
     let mut child = match command.spawn() {

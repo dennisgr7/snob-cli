@@ -302,7 +302,8 @@ fn a_typed_yes_needs_nobody_to_confirm_at() {
     assert!(!mine(&paths).session_file().exists());
 }
 
-/// The monitor's secrets go even when there is no session left to find.
+/// The monitor's secrets, and the MCP key, go even when there is no session
+/// left to find.
 ///
 /// `snob watch setup` needs no session and `snob logout` removes the one there
 /// is by design, so after setup → logout the session entry is gone and the
@@ -325,6 +326,7 @@ fn purge_removes_the_monitors_secrets_with_no_session_stored() {
     let stored = [
         (Kind::WatchToken, "Bearer team"),
         (Kind::WatchSigningKey, "shared-secret"),
+        (Kind::McpKey, "snob_mcp_a-key-that-is-only-stored-here"),
     ]
     .into_iter()
     .all(|(kind, value)| store.save_secret(kind, &Secret::new(value)).is_ok());
@@ -341,6 +343,11 @@ fn purge_removes_the_monitors_secrets_with_no_session_stored() {
     assert!(
         plan.lines().iter().any(|l| l.contains("webhook token")),
         "an answer given to an incomplete list is not consent to the rest: {:?}",
+        plan.lines()
+    );
+    assert!(
+        plan.lines().iter().any(|l| l.contains("the MCP key")),
+        "{:?}",
         plan.lines()
     );
 
@@ -363,6 +370,10 @@ fn purge_removes_the_monitors_secrets_with_no_session_stored() {
             .unwrap()
             .found()
             .is_none()
+    );
+    assert!(
+        after.load_secret(Kind::McpKey).unwrap().found().is_none(),
+        "the MCP key survived a purge"
     );
 }
 

@@ -147,7 +147,12 @@ can read:
   that supports MCP Tasks gets the job as a task instead, which it polls
   and can cancel on its own.
   `snob mcp config claude-code` (or `claude-desktop`, `codex`, `cursor`,
-  `vscode`) prints what to add to that client's configuration. After
+  `vscode`) prints what to add to that client's configuration.
+  `snob mcp key new` makes the key a client presents to reach the server
+  over the network and keeps it in the system keyring, printing it once to
+  your terminal; `show` names it by a fingerprint, `revoke` removes it, and
+  on a machine with no keyring `SNOB_MCP_KEY` in the server's environment
+  takes its place. After
   upgrading snob, reconnect the server in the client: a server whose binary
   changed under it refuses every call.
 

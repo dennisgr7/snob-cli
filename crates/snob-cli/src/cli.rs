@@ -298,7 +298,9 @@ Environment:
                     one background process, e.g. from a systemd timer
   SNOB_CSRFTOKEN, SNOB_SIGNING_KEY
                     the two secrets a command line would otherwise carry;
-                    see \"snob login --help\" and \"snob watch --help\"";
+                    see \"snob login --help\" and \"snob watch --help\"
+  SNOB_MCP_KEY      the key of snob mcp served over the network, instead of
+                    the keyring's; see \"snob mcp key --help\"";
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
@@ -1880,6 +1882,62 @@ pub enum ConfirmInChat {
 pub enum McpCommand {
     /// Print what to add to a client's configuration to start this server
     Config(McpConfigArgs),
+
+    /// Keep the key a client presents to reach this server over the
+    /// network, in the system keyring
+    #[command(
+        subcommand,
+        after_help = "One key, kept in the system keyring under its own entry, whatever \
+                      --no-keyring says: there is no file form. On a machine with no keyring \
+                      (a server, a container), set SNOB_MCP_KEY in the server's environment \
+                      instead, to a key \"snob mcp key new\" printed; it wins over the \
+                      keyring wherever it is set, so set it only where the server runs. \
+                      Only a key in snob's own form is taken: snob_mcp_ and 43 characters, \
+                      256 random bits.\n\n\
+                      The key is printed only to a terminal, unless --print says otherwise, \
+                      so that a program running this does not keep it in what it reads. \
+                      \"snob mcp key new --force\" replaces it, and every client given the \
+                      old one stops working; \"snob mcp key revoke\" removes it. A server \
+                      already running keeps the key it started with until it is restarted. \
+                      \"snob purge\" removes it too."
+    )]
+    Key(McpKeyCommand),
+}
+
+/// `snob mcp key` (`commands::mcp::key`).
+#[cfg(feature = "mcp")]
+#[derive(Subcommand, Debug)]
+pub enum McpKeyCommand {
+    /// Make a key, keep it in the system keyring, and print it this once
+    New(McpKeyNewArgs),
+    /// Say where the key is read from, and its fingerprint
+    Show(McpKeyShowArgs),
+    /// Remove the key from the system keyring
+    Revoke,
+}
+
+#[cfg(feature = "mcp")]
+#[derive(Args, Debug)]
+pub struct McpKeyNewArgs {
+    /// Replace the key there is; every client given it stops working
+    #[arg(long)]
+    pub force: bool,
+
+    /// Print the key even when standard output is not a terminal
+    #[arg(long)]
+    pub print: bool,
+}
+
+#[cfg(feature = "mcp")]
+#[derive(Args, Debug)]
+pub struct McpKeyShowArgs {
+    /// Print the key itself, on a terminal
+    #[arg(long)]
+    pub reveal: bool,
+
+    /// With --reveal, print it even when standard output is not a terminal
+    #[arg(long, requires = "reveal")]
+    pub print: bool,
 }
 
 #[cfg(feature = "mcp")]
@@ -2359,6 +2417,7 @@ mod tests {
             "SNOB_NO_OWNER",
             "SNOB_CSRFTOKEN",
             "SNOB_SIGNING_KEY",
+            "SNOB_MCP_KEY",
         ] {
             assert!(EXAMPLES.contains(name), "{name} is read but not announced");
         }

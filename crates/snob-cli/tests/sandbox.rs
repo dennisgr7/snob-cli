@@ -82,6 +82,8 @@ fn command_of(program: &Path, root: &Path, instagram: Option<&MockServer>) -> Co
         "SNOB_ACCOUNT",
         "SNOB_CSRFTOKEN",
         "SNOB_SIGNING_KEY",
+        "SNOB_MCP_KEY",
+        "SNOB_MCP_TOKEN",
         "SNOB_IGNORE_COOLDOWN",
         "SNOB_LOG",
         "SSH_CONNECTION",
@@ -6358,4 +6360,124 @@ async fn a_task_of_another_account_is_unknown() {
         .ask("tasks/get", serde_json::json!({ "taskId": id }))
         .await;
     assert_eq!(got["result"]["status"], "working", "{got}");
+}
+
+/// A key in snob's form, as `snob mcp key new` makes one. A fixed one, since
+/// these tests hand it over through `SNOB_MCP_KEY` and never make one: that
+/// would write the system keyring.
+#[cfg(feature = "mcp")]
+const MCP_KEY: &str = "snob_mcp_N2u3l9q0aYyK0w7mQxk1vR4cT8bZp5sJdE6fGhIoUjA";
+
+/// `show` says where the key comes from and names it by a fingerprint, and
+/// with the key in `SNOB_MCP_KEY` warns that the variable overrides the
+/// keyring. The key itself is printed only on request, and then only to a
+/// terminal unless `--print` says otherwise; a key not in snob's form is
+/// refused without being repeated.
+///
+/// Through the variable only, and so it reads nothing from the keyring: the
+/// variable wins before the keyring is asked (`commands::mcp::key`).
+#[cfg(feature = "mcp")]
+#[test]
+fn mcp_key_show_names_the_environment_and_prints_a_fingerprint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let with_key = [("SNOB_MCP_KEY", MCP_KEY)];
+
+    let out = snob_with(tmp.path(), None, &with_key, &["mcp", "key", "show"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = stdout(&out);
+    assert!(said.contains("SNOB_MCP_KEY"), "{said}");
+    let fingerprint = said
+        .split("fingerprint ")
+        .nth(1)
+        .map(|rest| rest.trim_end().trim_end_matches('.'))
+        .unwrap_or_else(|| panic!("no fingerprint: {said}"));
+    assert_eq!(fingerprint.len(), 12, "{said}");
+    assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()), "{said}");
+    assert!(!said.contains(MCP_KEY), "the key was printed: {said}");
+    assert!(
+        stderr(&out).contains("warning: SNOB_MCP_KEY is set"),
+        "{}",
+        stderr(&out)
+    );
+
+    // The same key gives the same fingerprint, every run.
+    let again = snob_with(tmp.path(), None, &with_key, &["mcp", "key", "show"]);
+    assert_eq!(stdout(&again), said);
+
+    // Standard output here is a pipe, so the key is not shown without
+    // --print, and nothing is printed instead of it.
+    let refused = snob_with(
+        tmp.path(),
+        None,
+        &with_key,
+        &["mcp", "key", "show", "--reveal"],
+    );
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(stdout(&refused).is_empty(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("--print"), "{}", stderr(&refused));
+    assert!(!stderr(&refused).contains(MCP_KEY));
+
+    let revealed = snob_with(
+        tmp.path(),
+        None,
+        &with_key,
+        &["mcp", "key", "show", "--reveal", "--print"],
+    );
+    assert!(revealed.status.success(), "{}", stderr(&revealed));
+    assert_eq!(stdout(&revealed).trim_end(), MCP_KEY);
+    assert!(
+        stderr(&revealed).contains(fingerprint),
+        "{}",
+        stderr(&revealed)
+    );
+
+    let typo = format!("{MCP_KEY}x");
+    let malformed = snob_with(
+        tmp.path(),
+        None,
+        &[("SNOB_MCP_KEY", &typo)],
+        &["mcp", "key", "show"],
+    );
+    assert_eq!(malformed.status.code(), Some(1), "{}", stderr(&malformed));
+    assert!(stderr(&malformed).contains("SNOB_MCP_KEY"));
+    assert!(
+        !stderr(&malformed).contains(MCP_KEY) && !stdout(&malformed).contains(MCP_KEY),
+        "the value was repeated: {}",
+        stderr(&malformed)
+    );
+
+    let unparsed = snob(tmp.path(), None, &["mcp", "key", "show", "--print"]);
+    assert_eq!(unparsed.status.code(), Some(2), "--print needs --reveal");
+}
+
+/// `revoke` with the key in `SNOB_MCP_KEY` says that a server started with
+/// the variable still takes it: removing the keyring's changes nothing for
+/// that server. The sandbox's keyring holds no key, so it says there was
+/// none, and removes nothing anywhere else.
+#[cfg(feature = "mcp")]
+#[test]
+fn mcp_key_revoke_warns_when_the_environment_holds_the_key() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let out = snob_with(
+        tmp.path(),
+        None,
+        &[("SNOB_MCP_KEY", MCP_KEY)],
+        &["mcp", "key", "revoke"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = stdout(&out);
+    assert!(said.contains("no MCP key"), "{said}");
+    let warned = stderr(&out);
+    assert!(
+        warned.contains("warning: SNOB_MCP_KEY is set")
+            && warned.contains("a server started with it takes that key"),
+        "{warned}"
+    );
+    assert!(!said.contains(MCP_KEY) && !warned.contains(MCP_KEY));
+
+    // Without the variable there is nothing to warn about.
+    let out = snob(tmp.path(), None, &["mcp", "key", "revoke"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("warning"), "{}", stderr(&out));
 }
