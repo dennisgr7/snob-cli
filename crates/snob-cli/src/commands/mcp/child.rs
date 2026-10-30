@@ -153,6 +153,22 @@ impl Launch {
         for name in NEVER_INHERITED {
             command.env_remove(name);
         }
+        // **In a process group of its own, so closing its standard input is
+        // the only stop it gets.** Sharing the server's, the Ctrl+C a person
+        // presses to stop `snob mcp --listen` reached every child too, which
+        // took it as its first request to stop; the server then closed its
+        // input, a second request, and the child exited at once (`interrupt`:
+        // a second request does not wait), with no JSON failure and the
+        // terminal's reset sequences written into the pipe, and a write in
+        // flight was abandoned. Seen in 4 runs of 9 against a fake Instagram
+        // that never answered. On Windows a new group has Ctrl+C disabled and
+        // still hears the console closing, signing out and shutting down; on
+        // Unix a group other than the terminal's foreground one is not sent
+        // its SIGINT, and SIGTERM and SIGHUP still reach the child by pid.
+        #[cfg(windows)]
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+        #[cfg(unix)]
+        command.process_group(0);
         command
     }
 

@@ -371,8 +371,11 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   server's globals carry no `--max-wait` of their own, since clap refuses it
   twice. A canceled call closes the child's standard
   input and kills it only after a grace period, so a walk saves its page and
-  gives back its claim. `SNOB_IGNORE_COOLDOWN` is removed from a child's
-  environment.
+  gives back its claim. **A child runs in a process group of its own**
+  (`child::Launch`), so closing its input is the only stop it gets: the
+  Ctrl+C that stops the server would otherwise reach it too, and the input
+  closing after it would be a second stop, which exits at once.
+  `SNOB_IGNORE_COOLDOWN` is removed from a child's environment.
 - **Reads only, unless `--allow-writes`**: status, lists, profiles. One tool
   list for every client, from the server's flags alone. Walking another
   account's lists, and every follow or unfollow, needs a yes for that one
