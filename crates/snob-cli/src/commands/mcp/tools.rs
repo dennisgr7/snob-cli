@@ -158,7 +158,9 @@ pub fn specs(writes: bool) -> Vec<Spec> {
                           time for the account. A walk may also stop at a limit on the wait \
                           for the request budget, keeping what it read and continuing next \
                           time; max_pages caps what one call spends, and the rests are kept \
-                          across calls. \
+                          across calls. In a cooldown, or when that check fails, the stored \
+                          list is answered however old it is, with served saying so and \
+                          when it was read (taken_at), and nothing is walked. \
                           `mode: \"stored\"` answers only from what is stored and sends \
                           nothing; `dry_run` says what a walk would cost and sends nothing. \
                           Another account's lists are walked only after a yes from the person \
@@ -190,7 +192,9 @@ pub fn specs(writes: bool) -> Vec<Spec> {
                         "default": "auto",
                         "description": "auto: the stored list if it is under a day old and \
                                         its counter, checked with one request, has not moved; \
-                                        otherwise walk it. stored: only what is stored, no \
+                                        otherwise walk it; in a cooldown, or when the check \
+                                        fails, the stored list however old (served and \
+                                        taken_at say so). stored: only what is stored, no \
                                         request. refresh: walk it even if a fresh one is stored."
                     },
                     "limit": {
@@ -401,7 +405,9 @@ pub struct Plan {
     pub ask: Option<Question>,
     /// The exit codes that are an answer rather than a failure: `status`
     /// exits 5 while the account cools down and 3 with no session stored,
-    /// and each is what it was asked.
+    /// and a dry run 5 in a cooldown, and each is what it was asked. An exit
+    /// other than 0 is one only with a document on standard output
+    /// (`answer::from`): a refusal before anything was printed is a failure.
     pub answers: &'static [ExitCode],
     /// What the command may send to Instagram, which decides the permits the
     /// call takes (`limits.rs`) and whether its child holds the
@@ -529,6 +535,22 @@ impl Plan {
         ];
         line.extend(self.command(None));
         line
+    }
+
+    /// What asks, before the person is asked for a yes, what would refuse
+    /// this write now (`snob follow --check-ahead`, `follow::check_ahead`):
+    /// it sends nothing and writes nothing, and fails with the refusal the
+    /// write would meet (`busy`, the cooldown, `mcp_write_cap` against this
+    /// server's `writes_a_day`, `budget_wait`). The command as it is before a
+    /// yes. `None` for a plan that is no write.
+    pub fn ahead_line(&self, writes_a_day: u32) -> Option<Vec<String>> {
+        if self.spends != Spends::Writes {
+            return None;
+        }
+        let mut line = self.command(None);
+        line.push("--check-ahead".to_string());
+        line.push(format!("--mcp-write-cap={writes_a_day}"));
+        Some(line)
     }
 
     /// The command and, for a call run on a yes, how it was given (see
@@ -753,10 +775,14 @@ fn list(tool: &str, args: &Map<String, Value>) -> Result<Plan, String> {
             command.extend(["--max-pages".into(), pages.to_string()]);
         }
         // An estimate reads what is stored and the budget, and sends nothing.
+        // In a cooldown it still prints, with `sends_now: false` and when the
+        // cooldown lifts, and exits 5, as `snob status` does: the estimate
+        // is the answer asked for, not a failure (`answer::from` counts exit
+        // 5 as one only with a document).
         return Ok(Plan {
             args: command,
             ask: None,
-            answers: &[ExitCode::Ok],
+            answers: &[ExitCode::Ok, ExitCode::RateLimited],
             spends: Spends::Nothing,
             page: None,
             run: Run::Inline,
@@ -1043,6 +1069,32 @@ mod tests {
         let own = call("snob_list", json!({"list": "followers"})).unwrap();
         assert!(own.ask.is_none());
         assert!(!own.args.contains(&"-y".to_string()));
+    }
+
+    /// What is asked before a yes to a write is the write's own command line,
+    /// with nothing of a yes in it and this server's cap; a read has no such
+    /// line.
+    #[test]
+    fn a_write_is_checked_ahead_with_the_servers_cap_and_no_yes() {
+        let follow = call("snob_follow", json!({"account": "someone"})).unwrap();
+        let line = follow.ahead_line(3).unwrap();
+        assert_eq!(
+            line,
+            [
+                "follow",
+                "someone",
+                "-y",
+                "--json",
+                "--check-ahead",
+                "--mcp-write-cap=3"
+            ]
+        );
+        let parsed = <crate::cli::Cli as clap::Parser>::try_parse_from(
+            std::iter::once("snob".to_string()).chain(line.iter().cloned()),
+        );
+        assert!(parsed.is_ok(), "{parsed:?}");
+        let profile = call("snob_profile", json!({"account": "someone"})).unwrap();
+        assert!(profile.ahead_line(3).is_none());
     }
 
     #[test]

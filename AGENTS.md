@@ -424,9 +424,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   failure: exit 3 is what it was asked, as exit 5 is in a cooldown. **Every
   hint that is advice to the person at a terminal is replaced the same
   way**, by the failure's `reason` (`answer::agent_hint`: `too_many_jobs`,
-  `no_such_job`, `job_stopping`, `nothing_stored`, `budget_wait`), with the
-  tools that do it instead; a failure's message is its sentences, the
-  records of the log left out (`jobs::show::sentences`).
+  `no_such_job`, `job_stopping`, `nothing_stored`, `budget_wait`, `busy`,
+  `mcp_write_cap`), with the tools that do it instead; a failure's message
+  is its sentences, the records of the log left out
+  (`jobs::show::sentences`).
 - **`snob_profile` stays inline, not a job**: its walk of the mutual
   followers is at most `MUTUAL_PAGE_CAP` (10) pages, and it pays first any
   rest between sittings an earlier walk of the account left owed, up to 15
@@ -451,13 +452,24 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   60 calls a minute, which also keeps the tickets alive under `seal.rs`'s
   4096. Taken before anything is asked, so nobody says yes to a call that is
   then refused; past a limit the call answers `busy` at once and is never
-  queued; held until the child has exited. **The account's jobs are asked
-  before anything is asked too** (`Server::refused_ahead`), since a job's
-  walk holds no permit once its call answered: a walk run as a job through
-  `__job start --check`, which makes nothing and fails as the start would
-  (`too_many_jobs`, `job_stopping`, `walked_elsewhere`), and a write through
-  `__job list`, `busy` while a job is queued or walking. Only another
-  process holding `spend.lock` can still refuse after the yes. Across
+  queued; held until the child has exited. **Every refusal that costs
+  nothing to know is asked before anything is asked too**
+  (`Server::refused_ahead`), through a child that sends and writes nothing,
+  with the refusal the call's own child would give: a walk run as a job
+  through `__job start --check` (the account's jobs, since a job's walk
+  holds no permit once its call answered: `too_many_jobs`, `job_stopping`,
+  `walked_elsewhere`; and in a cooldown a refresh, or a list with nothing
+  stored to serve), and a write through `follow --check-ahead` (a job
+  walking or `spend.lock` held, `busy`; no CSRF token; the cooldown, with
+  `cooldown_until`; `mcp_write_cap`; a wait for the write bucket past
+  `--max-wait`, `budget_wait`). In a cooldown a stored list is still asked
+  about: the command carries `-y`, which a question skipped would hand a
+  walk with no yes once the cooldown lifts. What can still refuse after the
+  yes: what changes between the check and the yes (another process taking
+  `spend.lock`, a cooldown starting, the budget or the cap taken by another
+  call), what only a request tells (a write already so, a name that is
+  nobody's), and a crossing whose stored lists a cooldown serves were walked
+  too far apart. Across
   processes, every child that may reach Instagram is run with the hidden
   `--spend-alone` (`tools::Plan::command_line`, outside the binding) and takes
   `accounts/<pk>/spend.lock` in `App::open`, before any request; held
@@ -478,11 +490,12 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   `mcp_acts` table before its first request, in a transaction of its own
   (`commands::common::record_agent_act`); a follow or unfollow is refused
   with nothing sent and nothing recorded when the writes recorded in the
-  last 24 hours reach the cap: exit 1, `reason: "mcp_write_cap"`, a hint
-  with when the next frees. Attempts count (one Instagram refused, or that
-  found nothing to do, still did). Only follow and unfollow are writes, only
-  acts recorded this way are counted, on the account whichever server made
-  them; a command the person types records nothing. `--max-writes-per-day`
+  last 24 hours reach the cap: exit 1, `reason: "mcp_write_cap"`, and
+  `retry_at`, when the next frees. Attempts count (one Instagram refused, or
+  that found nothing to do, still did). Only follow and unfollow are
+  writes, only acts recorded this way are counted, on the account whichever
+  server made them; a command the person types records nothing, and nor
+  does a walk in a cooldown, which reads nothing. `--max-writes-per-day`
   (10 by default, `mcp_acts::WRITES_A_DAY`) is bounded by what the write
   bucket allows in a day anyway (99, `rate_budget::WRITES_IN_A_DAY`).
   `snob status` (section `--agents`, `agents` in `--json`) lists the last
@@ -655,7 +668,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   `--max-wait`, and a job's `too_many_jobs`, `job_stopping`, `no_such_job`,
   `refused_argv`).
   `cooldown_until` is when a cooldown that refused the run lifts
-  (`ExitError::with_cooldown_until`).
+  (`ExitError::with_cooldown_until`), and `retry_at` when a refusal that is
+  no cooldown stops applying (`ExitError::with_retry_at`: `mcp_write_cap`),
+  both in seconds since the epoch, since the sentence says them in the local
+  time of the machine that wrote it.
 - **Exit codes are stable** (`exit.rs`, `snob_core::watch::RunOutcome`, the
   `watch_runs.outcome` column and the `--json` `outcome` field share one
   vocabulary): 0 worked (a list cut short by `--limit`/`--max-pages` is still

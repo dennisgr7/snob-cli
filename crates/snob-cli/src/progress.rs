@@ -570,6 +570,33 @@ impl Progress {
     /// plain command cannot tell whether anybody is looking, and somebody who
     /// started an hour's walk has probably gone elsewhere. Its progress comes
     /// off the taskbar either way.
+    /// Under `--progress-json`, where a list came from once the engine has
+    /// answered for it: `{"progress": {"event": "served", "list", "from",
+    /// "taken_at", "cooldown_until"}}`. `from` is the provenance's word
+    /// (`engine::Provenance::as_str`), `taken_at` when the list was read, in
+    /// seconds, and `cooldown_until` when a cooldown that had it served from
+    /// storage lifts. A job's reader hands it on (`jobs::show::finished`),
+    /// so an agent is told a stored list is one, and how old, as a person is
+    /// told in the warning; nothing is drawn for it.
+    pub fn served(
+        &self,
+        list: snob_core::model::ListKind,
+        from: &str,
+        taken_at: snob_core::Epoch,
+        cooldown_until: Option<snob_core::Epoch>,
+    ) {
+        self.tell(
+            "served",
+            |_| {},
+            serde_json::json!({
+                "list": list.as_str(),
+                "from": from,
+                "taken_at": taken_at,
+                "cooldown_until": cooldown_until,
+            }),
+        );
+    }
+
     pub fn finish(&self) {
         if !self.quiet {
             crate::ui::notify::progress(crate::ui::notify::Progress::Clear);

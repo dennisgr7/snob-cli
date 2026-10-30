@@ -122,6 +122,12 @@ pub fn wait_at_most(limit: Option<std::time::Duration>) {
     let _ = MAX_WAIT.set(limit);
 }
 
+/// `--max-wait`, for a check that compares a wait with it without building a
+/// pacer (`follow --check-ahead`). `None` when it was not given.
+pub fn max_wait() -> Option<std::time::Duration> {
+    MAX_WAIT.get().copied().flatten()
+}
+
 /// `--stop-when-stdin-closes`, beside `--max-wait`: the other run-wide
 /// setting `main` hands every pacer, through the cancellation token.
 pub use crate::interrupt::stop_when_stdin_closes;
@@ -149,7 +155,7 @@ pub fn spend_alone() {
 
 /// The refusal of a run given `--spend-alone` while another holds the
 /// account: exit 1, with `busy` as the reason a program reads.
-fn held_elsewhere() -> anyhow::Error {
+pub(crate) fn held_elsewhere() -> anyhow::Error {
     crate::exit::ExitError::new(
         crate::exit::ExitCode::Error,
         "another snob started by an agent is using this account on Instagram, and only one \
@@ -192,7 +198,20 @@ pub fn held(pacer: &Pacer, paths: Option<&AppPaths>) -> Result<Option<Held>> {
     let Some(until_ms) = pacer.cooldown()? else {
         return Ok(None);
     };
-    let braked = match pacer.brake()? {
+    Ok(Some(held_by(until_ms, pacer.brake()?.as_ref(), paths)))
+}
+
+/// A cooldown until `until_ms`, named as [`held`] names it: by the accounts
+/// whose push-backs braked every account when `brake` is what lasts longest.
+/// For a reader that has the budget's state rather than a pacer
+/// (`rate_budget::state`, which `--dry-run` and the checks made before an
+/// agent's call is asked about read, writing nothing).
+pub fn held_by(
+    until_ms: EpochMs,
+    brake: Option<&snob_core::budget::Brake>,
+    paths: Option<&AppPaths>,
+) -> Held {
+    let braked = match brake {
         Some(brake) if brake.until >= until_ms => {
             let registry = paths
                 .and_then(|paths| Registry::load(paths).ok())
@@ -205,7 +224,7 @@ pub fn held(pacer: &Pacer, paths: Option<&AppPaths>) -> Result<Option<Held>> {
         }
         _ => Vec::new(),
     };
-    Ok(Some(Held { until_ms, braked }))
+    Held { until_ms, braked }
 }
 
 /// How a run could have been given consent before it started.

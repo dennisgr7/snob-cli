@@ -19,9 +19,7 @@ use serde_json::{Value, json};
 use snob_core::model::ListKind;
 use snob_store::paths::AccountPaths;
 use snob_store::secrets::SessionStore;
-use snob_store::store::Store;
 use snob_store::store::rate_budget;
-use snob_store::store::shared::Shared;
 
 use crate::app::Viewer;
 use crate::cli::{Format, OutputArgs, WalkArgs};
@@ -105,16 +103,8 @@ pub fn estimate_for(
 
     // An account that has never sent anything has no database, and its
     // budget is at rest: read over an empty one rather than making its file.
-    let store = match Store::read_existing(paths)? {
-        Some(store) => store,
-        None => Store::in_memory()?,
-    };
-    let shared = Shared::read_existing(paths).unwrap_or_else(|e| {
-        tracing::debug!(error = %e, "shared.db could not be read; no brake is counted");
-        None
-    });
     let now = snob_core::clock::now_ms();
-    let budget = rate_budget::state(store.conn(), shared.as_ref(), now)?;
+    let (store, budget) = common::standing(paths, now)?;
     let standing = Standing {
         viewer: &viewer,
         store: &store,

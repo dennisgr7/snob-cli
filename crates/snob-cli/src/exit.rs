@@ -151,6 +151,13 @@ pub struct ExitError {
     /// The JSON failure carries it as `cooldown_until`, so a program reads
     /// the moment rather than the sentence, which says it in local time.
     cooldown_until: Option<EpochMs>,
+    /// When the run would no longer be refused for this reason, for a
+    /// refusal that is no cooldown but ends at a known moment (the day's cap
+    /// on an agent's writes, `mcp_write_cap`). The JSON failure carries it as
+    /// `retry_at`, for the reason `cooldown_until` is a field: the sentence
+    /// says it in the local time of the machine that wrote it, with no zone,
+    /// and the reader may be a model in another one.
+    retry_at: Option<EpochMs>,
 }
 
 impl ExitError {
@@ -161,6 +168,7 @@ impl ExitError {
             hint: None,
             reason: None,
             cooldown_until: None,
+            retry_at: None,
         }
     }
 
@@ -197,6 +205,17 @@ impl ExitError {
 
     pub fn cooldown_until(&self) -> Option<EpochMs> {
         self.cooldown_until
+    }
+
+    /// Adds when a refusal that is no cooldown stops applying.
+    #[must_use]
+    pub fn with_retry_at(mut self, at: EpochMs) -> Self {
+        self.retry_at = Some(at);
+        self
+    }
+
+    pub fn retry_at(&self) -> Option<EpochMs> {
+        self.retry_at
     }
 }
 

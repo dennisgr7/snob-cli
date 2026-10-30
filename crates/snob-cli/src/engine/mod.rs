@@ -77,6 +77,20 @@ impl Provenance {
     pub fn describes_now(self) -> bool {
         matches!(self, Self::Walked | Self::CounterVerified)
     }
+
+    /// The word a program reads this by (`--progress-json`'s `served`
+    /// event, which `snob mcp` hands an agent as `served`). Part of that
+    /// contract.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Walked => "walked",
+            Self::CounterVerified => "stored_unchanged",
+            Self::Cooldown => "stored_in_cooldown",
+            Self::PollFailed => "stored_after_failed_poll",
+            Self::CacheFlag => "stored",
+            Self::WalkedRecently => "stored_walked_recently",
+        }
+    }
 }
 
 #[derive(Debug)]

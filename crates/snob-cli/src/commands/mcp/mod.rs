@@ -420,7 +420,8 @@ impl ServerHandler for Server {
                  yes in this conversation; never answer it yourself, and never make a token \
                  up. What runs on a yes is recorded where the person sees it, and follows \
                  and unfollows are capped at a few a day: one that came back mcp_write_cap \
-                 sent nothing, and is not to be tried again before the time its hint gives. \
+                 sent nothing, and is not to be tried again before its retry_at (seconds \
+                 since the epoch). \
                  A long list comes back a page at a time: count is the whole list's, and \
                  next_offset, when it is not null, is the offset to call again with for the \
                  next page, which sends nothing and asks nothing. \
@@ -684,22 +685,28 @@ impl ServerHandler for Server {
 impl Server {
     /// What would refuse a call that may reach Instagram once it was given
     /// its yes, asked before the person is, so nobody says yes to a call
-    /// that is then refused and no ticket is spent on one: **the account's
-    /// jobs**, which this server's permits do not see, since a job's walk
-    /// goes on in a process of its own once the call that started it has
-    /// answered. Read through a `snob __job` child, which spends nothing, as
-    /// all job I/O is (AGENTS.md, "The MCP server").
+    /// that is then refused and no ticket is spent on one: everything that
+    /// costs nothing to know and that this server's permits do not see.
+    /// Read through a `snob` child that sends nothing and writes nothing,
+    /// since the server opens no store (AGENTS.md, "The MCP server"), whose
+    /// refusal is the call's own.
     ///
     /// - A walk run as a job: `__job start --check` ([`tools::Plan::
-    ///   check_line`]), whose refusal (`too_many_jobs`, `job_stopping`,
-    ///   `walked_elsewhere`, no session) is the call's own.
-    /// - Any other call that may reach Instagram, a write: `__job list`, and
-    ///   `busy` while a job of the account is queued or walking, since its
-    ///   walk holds the account (`--spend-alone`).
+    ///   check_line`]): the account's jobs (`too_many_jobs`, `job_stopping`,
+    ///   `walked_elsewhere`), no session, and in a cooldown a refresh or a
+    ///   list with nothing stored to serve.
+    /// - A write: `follow --check-ahead` ([`tools::Plan::ahead_line`]): a job
+    ///   walking or another run holding the account (`busy`), no session or
+    ///   no CSRF token, the cooldown, the day's cap on an agent's writes
+    ///   (`mcp_write_cap`), and a wait for the budget past `--max-wait`
+    ///   (`budget_wait`).
     ///
-    /// Not seen ahead: another process that holds the account (another
-    /// server's call, or a job started between this and the yes), which the
-    /// call's child still refuses as `busy` after the yes.
+    /// **Still refused after the yes**: what changes between the check and
+    /// the yes (another process taking the account, which the child refuses
+    /// as `busy`; a cooldown starting; the budget or the cap taken by another
+    /// call), and what only a request tells (a write already so, a name that
+    /// is nobody's), or a crossing whose stored lists, served in a cooldown,
+    /// were walked too far apart.
     async fn refused_ahead(
         &self,
         plan: &tools::Plan,
@@ -708,9 +715,10 @@ impl Server {
     ) -> Result<Option<CallToolResult>, McpError> {
         let asked = match plan.run {
             Run::Job { .. } => plan.check_line(),
-            Run::Inline => [crate::jobs::start::COMMAND, "list", "--json"]
-                .map(String::from)
-                .to_vec(),
+            Run::Inline => match plan.ahead_line(self.writes_a_day) {
+                Some(line) => line,
+                None => return Ok(None),
+            },
             Run::Show { .. } | Run::Cancel => return Ok(None),
         };
         let _running = self.in_flight.enter();
@@ -725,28 +733,7 @@ impl Server {
         if finished.code != ExitCode::Ok {
             return Ok(Some(result(answer::from(plan, finished), tool)));
         }
-        if matches!(plan.run, Run::Job { .. }) {
-            return Ok(None);
-        }
-        let walking = finished
-            .json
-            .as_ref()
-            .and_then(|doc| doc.get("jobs"))
-            .and_then(Value::as_array)
-            .and_then(|jobs| jobs.iter().find(|doc| job::going(doc)))
-            .and_then(|doc| doc.get("job_id"))
-            .and_then(Value::as_str)
-            .map(snob_core::model::printable);
-        Ok(walking.map(|id| {
-            refusal(
-                "busy",
-                &format!(
-                    "job {id} of this account is walking a list, and one call that reaches \
-                     Instagram runs at a time; nothing was asked or sent. Call this again once \
-                     it has ended (snob_job tells when), or stop it with snob_job_cancel"
-                ),
-            )
-        }))
+        Ok(None)
     }
 
     /// What a call's child said, as the call's result, read as its plan
@@ -778,7 +765,7 @@ impl Server {
             Ok(doc) => doc,
             // The child's own failure: no session, no such job, a walk
             // refused before it started. Read as any command's.
-            Err(failed) => return result(answer::from(plan, failed), tool).into(),
+            Err(failed) => return result(answer::from(plan, *failed), tool).into(),
         };
         if plan.run == Run::Cancel {
             let (told, said) = job::standing(&doc, true);
@@ -863,7 +850,7 @@ impl Server {
         match job::document(finished) {
             Ok(doc) => Ok(doc),
             Err(failed) => {
-                let told = answer::from(&plan, failed);
+                let told = answer::from(&plan, *failed);
                 let error = |key: &str| {
                     told.body
                         .pointer(&format!("/error/{key}"))
@@ -906,8 +893,14 @@ fn handed_back(doc: &Value, walk: child::Finished, offset: usize, tool: &str) ->
 /// another after it, a sentence on how that one is had, by calling `tool`
 /// again.
 fn result(told: answer::Answer, tool: &str) -> CallToolResult {
-    let said = answer::next_page(&told.body, tool);
-    saying(told, said)
+    let said = [
+        answer::not_read_now(&told.body),
+        answer::next_page(&told.body, tool),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    saying(told, (!said.is_empty()).then(|| said.join(" ")))
 }
 
 /// A call's answer as its result, with a sentence beside the JSON when there

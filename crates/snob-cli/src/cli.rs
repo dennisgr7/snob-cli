@@ -1771,6 +1771,13 @@ pub struct PostArgs {
 }
 
 #[derive(Args, Debug)]
+// What `--mcp-write-cap` needs beside it: a run on an agent's yes, which the
+// cap counts toward, or the check made before that yes is asked for.
+#[command(group(
+    clap::ArgGroup::new("vouched")
+        .args(["confirmed_via", "check_ahead"])
+        .multiple(true)
+))]
 pub struct FollowArgs {
     /// The one account to follow or unfollow
     pub target: String,
@@ -1792,12 +1799,20 @@ pub struct FollowArgs {
     #[arg(
         long,
         hide = true,
-        requires = "confirmed_via",
+        requires = "vouched",
         value_name = "N",
         value_parser = clap::value_parser!(u32)
             .range(1..=i64::from(snob_store::store::mcp_acts::MOST_WRITES_A_DAY))
     )]
     pub mcp_write_cap: Option<u32>,
+
+    /// Send nothing and ask nothing: say what would refuse this write now if
+    /// an agent made it, or that nothing would
+    // Hidden: what `snob mcp` runs before it asks the person for a yes to a
+    // write, so nobody says yes to one that is then refused
+    // (`follow::check_ahead`). With `--mcp-write-cap`, the cap it counts.
+    #[arg(long, hide = true, conflicts_with = "confirmed_via")]
+    pub check_ahead: bool,
 }
 
 /// What a run of a command an agent was told yes to through `snob mcp`
@@ -2230,6 +2245,22 @@ mod tests {
             std::time::Duration::from_secs(21_600)
         );
         assert!(duration("six hours").is_err());
+    }
+
+    /// The cap on an agent's writes means something only on a run an agent
+    /// was told yes to, or on the check made before that yes is asked for,
+    /// and the check is never a run on a yes.
+    #[test]
+    fn the_write_cap_needs_an_agents_yes_or_the_check_ahead() {
+        let parses = |extra: &[&str]| {
+            let line = ["snob", "follow", "someone", "-y", "--json"];
+            Cli::try_parse_from(line.iter().chain(extra)).is_ok()
+        };
+        assert!(parses(&["--confirmed-via=chat", "--mcp-write-cap=3"]));
+        assert!(parses(&["--check-ahead", "--mcp-write-cap=3"]));
+        assert!(parses(&["--check-ahead"]));
+        assert!(!parses(&["--mcp-write-cap=3"]));
+        assert!(!parses(&["--check-ahead", "--confirmed-via=chat"]));
     }
 
     #[test]

@@ -29,9 +29,11 @@
 //!
 //! **`--check` makes nothing**: past the command's and the session's checks
 //! it answers `{"would": "start"}`, or `{"would": "reuse", "job_id": …}`, or
-//! the refusal a start would meet now, reading the jobs and writing nothing.
-//! It is what the MCP server asks before it asks the person for a yes, so
-//! nobody says yes to a walk a running job then refuses.
+//! the refusal a start would meet now, reading the jobs and writing nothing,
+//! and in a cooldown the refusal the walk itself would meet then (a refresh,
+//! or nothing stored to serve). It is what the MCP server asks before it asks
+//! the person for a yes, so nobody says yes to a walk a running job or a
+//! cooldown then refuses.
 //!
 //! **A job is left running only once its id has been handed over.** Asked to
 //! stop before it has answered (Ctrl+C, or, under `--stop-when-stdin-closes`,
@@ -111,8 +113,10 @@ pub async fn run(
     if args.check {
         let account = account.clone();
         let found = tokio::task::spawn_blocking(move || {
-            let now = snob_core::clock::now_ms().get();
-            vet(&super::all(&account, now)?, &checked, now)
+            let now = snob_core::clock::now_ms();
+            let found = vet(&super::all(&account, now.get())?, &checked, now.get())?;
+            refused_in_cooldown(&account, &checked, now)?;
+            Ok::<_, anyhow::Error>(found)
         })
         .await??;
         let out = match found {
@@ -279,6 +283,29 @@ fn vet(jobs: &[super::Seen], checked: &argv::Checked, now: i64) -> Result<Found>
         .into());
     }
     Ok(Found::Free)
+}
+
+/// For `--check`: the refusal the walk `checked` would meet now in a
+/// cooldown, **reading only**: a refresh, an account never resolved here, or
+/// a list with nothing stored, each refused as the walk's own run refuses it
+/// (`engine::cooldown::stored`). With something stored, the walk serves it
+/// and this answers nothing: the call is then asked about as any other, its
+/// command carrying `-y`, which a question skipped would hand a walk with no
+/// yes once the cooldown had lifted.
+fn refused_in_cooldown(
+    account: &AccountPaths,
+    checked: &argv::Checked,
+    now: snob_core::EpochMs,
+) -> Result<()> {
+    let (store, budget) = crate::commands::common::standing(account, now)?;
+    let Some(held) = crate::commands::common::held_in(&budget, account, now) else {
+        return Ok(());
+    };
+    let query = crate::commands::common::query(&checked.list.target, &checked.list.walk);
+    for &kind in checked.kinds {
+        crate::engine::cooldown::stored(&store, account.pk(), &query, kind, &held)?;
+    }
+    Ok(())
 }
 
 /// Whether two command lines walk the same list in the same way: the same

@@ -11,13 +11,14 @@
 //! beside it.
 //!
 //! **Taken before anything is asked**, so nobody says yes to a call that is
-//! then refused, and no ticket is spent on one; so is a look at the
-//! account's jobs, whose walks run in processes of their own and hold none
-//! of these permits once the call that started them has answered
-//! (`mod.rs`, `Server::refused_ahead`). **Never queued**: a call over
-//! a limit answers `busy` at once, and the agent calls again when the other
-//! has finished. A queue would hold a call for as long as another walks, past
-//! what the client waits for. Permits are held until the call returns, which
+//! then refused, and no ticket is spent on one; so is every other refusal
+//! that costs nothing to know, the account's jobs among them, whose walks
+//! run in processes of their own and hold none of these permits once the
+//! call that started them has answered (`mod.rs`, `Server::refused_ahead`,
+//! which lists what can still refuse after the yes). **Never queued**: a
+//! call over a limit answers `busy` at once, and the agent calls again when
+//! the other has finished. A queue would hold a call for as long as another
+//! walks, past what the client waits for. Permits are held until the call returns, which
 //! is after its child has exited, the grace a stopped child gets included.
 //!
 //! This holds within one server. The other half is the child's: every child

@@ -60,6 +60,9 @@ pub struct Finished {
     pub error: Option<Value>,
     /// The end of standard error, for a failure with no JSON error.
     pub said: String,
+    /// Where each list it answered with came from, as a walk run with
+    /// `--progress-json` says it (`Progress::served`): a job's walk.
+    pub served: Vec<Value>,
 }
 
 /// What every child is started with, ahead of its own arguments: the global
@@ -252,12 +255,19 @@ fn read(code: Option<i32>, out: &[u8], err: &str) -> Finished {
         }
         None => err.to_string(),
     };
+    let served = err
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .filter_map(|value| value.get("progress").cloned())
+        .filter(|progress| progress["event"] == "served")
+        .collect();
     Finished {
         code: code.map_or(ExitCode::Interrupted, from_number),
         json,
         text,
         error,
         said,
+        served,
     }
 }
 

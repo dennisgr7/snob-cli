@@ -112,8 +112,10 @@ pub enum Wording {
 /// backstop), and only that: a push-back met in this run starts one this
 /// does not look up; `reason` is a finer token than `code` when the failure
 /// has one (`ExitError::with_reason`: `busy`; `budget_wait` for a wait for
-/// the request budget past `--max-wait`), and null otherwise.
-/// Printed as one line, the last on standard error. Filtered line by line
+/// the request budget past `--max-wait`), and null otherwise; `retry_at` is
+/// when a refusal that is no cooldown stops applying
+/// (`ExitError::with_retry_at`: the day's cap on an agent's writes), and null
+/// otherwise. Printed as one line, the last on standard error. Filtered line by line
 /// like the prose, and for the same reason -- a name is filtered before
 /// anything draws it, and a JSON consumer may well print it. `viewer`, beside
 /// `error`, is the account the run acted as, or null before there was one.
@@ -137,6 +139,9 @@ fn error_json_for(error: &anyhow::Error, viewer: Option<&Viewer>) -> serde_json:
             })
         })
         .map(|until_ms| until_ms.to_epoch());
+    let retry_at = ours
+        .and_then(ExitError::retry_at)
+        .map(|at| at.to_epoch_not_before());
     // A wait past `--max-wait` exits as a stop does (130), and is told
     // apart from one by this: it is the one worth trying again later.
     let reason = ours.and_then(ExitError::reason).or_else(|| {
@@ -155,6 +160,7 @@ fn error_json_for(error: &anyhow::Error, viewer: Option<&Viewer>) -> serde_json:
             "hint": hint,
             "url": url,
             "cooldown_until": lifts,
+            "retry_at": retry_at,
             "reason": reason,
         }
     })
@@ -1153,6 +1159,22 @@ mod tests {
             );
             assert_eq!(json["error"]["code"], "rate_limited");
         }
+    }
+
+    /// The cap on an agent's writes says when the next is free as a moment,
+    /// which is no cooldown's end.
+    #[test]
+    fn a_refusal_by_the_write_cap_says_when_it_frees_in_its_json() {
+        let free_at = EpochMs::new(1_700_000_000_500);
+        let refused = crate::commands::common::write_cap_reached(10, free_at);
+        let json = error_json_for(&refused, None);
+        assert_eq!(
+            json["error"]["retry_at"],
+            serde_json::json!(free_at.to_epoch_not_before()),
+            "{json}"
+        );
+        assert_eq!(json["error"]["reason"], "mcp_write_cap");
+        assert!(json["error"]["cooldown_until"].is_null(), "{json}");
     }
 
     /// A wait for the budget past `--max-wait` exits as a stop does, and is

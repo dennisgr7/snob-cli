@@ -69,6 +69,9 @@ pub async fn run(
     // budget for a quarter of an hour (from the browser, before the profile
     // is loaded), which is a wait to be told about in a sentence rather than
     // animated.
+    if args.check_ahead {
+        return check_ahead(&args, verb, &secrets, paths);
+    }
     let mut app = common::app(&secrets, paths, false)?;
 
     // **Before anything is spent.** A session cannot write only when requests
@@ -77,21 +80,10 @@ pub async fn run(
     // request, a slot of write budget, and a message telling the user their
     // session had expired when it had not.
     if !app.client().can_write() {
-        return Err(ExitError::new(
-            ExitCode::NoSession,
-            format!(
-                "this session can read but not {}: it has no CSRF token",
-                verb.present()
-            ),
-        )
-        .with_hint(
-            "run \"snob login --browser\", which captures it, or \
-             \"snob login --paste --csrftoken <token>\"",
-        )
-        .into());
+        return Err(cannot_write(verb));
     }
 
-    common::refuse_during_cooldown(&app, "nothing can be sent")?;
+    common::refuse_during_cooldown(&app, NOTHING_SENT)?;
 
     // **Also before anything is spent.** Whether anybody can answer is a
     // property of this process's streams, not of the account, so it is known
@@ -186,6 +178,112 @@ pub async fn run(
         outcome(verb, &status),
         Some(&status),
     )
+}
+
+/// What a write refused in a cooldown says it did not do.
+const NOTHING_SENT: &str = "nothing can be sent";
+
+/// The refusal of a session that has no CSRF token to write with.
+fn cannot_write(verb: Verb) -> anyhow::Error {
+    ExitError::new(
+        ExitCode::NoSession,
+        format!(
+            "this session can read but not {}: it has no CSRF token",
+            verb.present()
+        ),
+    )
+    .with_hint(
+        "run \"snob login --browser\", which captures it, or \
+         \"snob login --paste --csrftoken <token>\"",
+    )
+    .into()
+}
+
+/// `--check-ahead`: what would refuse this write now if an agent made it,
+/// **sending nothing, asking nothing and writing nothing**, or `{"would":
+/// "send"}` on standard output when nothing would. `snob mcp` runs it before
+/// it asks the person for a yes to a follow or an unfollow, so nobody says
+/// yes to one that is then refused, and no ticket is spent on one
+/// (AGENTS.md, "The MCP server").
+///
+/// The refusals of [`run`] that cost nothing to know, in its order, each the
+/// same error a run would give: another run started by an agent holding the
+/// account (a job's walk, or anything under `--spend-alone`), no CSRF token,
+/// the cooldown, the day's cap on an agent's writes (`--mcp-write-cap`, or
+/// its default), and a wait for the budget past `--max-wait`. Read from the
+/// budget's state and the account's database as `--dry-run` reads them
+/// (`common::standing`). **Not known ahead**: what the profile says (already
+/// so, the viewer's own account, a name that resolves to nothing), and
+/// whatever changes between this and the yes.
+fn check_ahead(
+    args: &FollowArgs,
+    verb: Verb,
+    secrets: &SessionStore,
+    paths: &AccountPaths,
+) -> Result<ExitCode> {
+    let Some(session) = secrets.load()? else {
+        return Err(common::no_session());
+    };
+    if session.ds_user_id != paths.pk() {
+        anyhow::bail!(
+            "the session stored for account {} is account {}'s; log in again with \
+             \"snob login\"",
+            paths.pk(),
+            session.ds_user_id
+        );
+    }
+    let now = snob_core::clock::now_ms();
+    // A job's walk holds the account for as long as it walks, from before
+    // its walk takes `spend.lock` (queued) to its end.
+    if let Some(going) = crate::jobs::all(paths, now.get())?
+        .into_iter()
+        .find(|seen| !seen.status.is_over())
+    {
+        return Err(ExitError::new(
+            ExitCode::Error,
+            format!(
+                "{} of this account is walking a list, and only one run started by an agent \
+                 may use the account on Instagram at a time; nothing was sent",
+                going.id
+            ),
+        )
+        .with_reason("busy")
+        .with_hint(format!(
+            "ask again once it has ended, which \"snob jobs show {id}\" tells, or stop it \
+             with \"snob jobs cancel {id}\"",
+            id = going.id
+        ))
+        .into());
+    }
+    if snob_store::paths::lock_is_held(&paths.spend_lock())?.unwrap_or(false) {
+        return Err(crate::app::held_elsewhere());
+    }
+    if session.csrftoken.is_none() && !snob_ig::client::page::a_client_would_use_a_page() {
+        return Err(cannot_write(verb));
+    }
+    let (store, budget) = common::standing(paths, now)?;
+    if let Some(held) = common::held_in(&budget, paths, now) {
+        return Err(common::in_cooldown(&held, NOTHING_SENT));
+    }
+    let cap = args
+        .mcp_write_cap
+        .unwrap_or(snob_store::store::mcp_acts::WRITES_A_DAY);
+    if let Some(snob_store::store::mcp_acts::Recorded::Capped { writes, free_at }) =
+        snob_store::store::mcp_acts::over_the_cap(store.conn(), cap, now)?
+    {
+        return Err(common::write_cap_reached(writes, free_at));
+    }
+    // The write pays the pace and the day as the profile before it does, and
+    // the write bucket on top, so its wait is the longest of the run's.
+    let owed = budget.next_write_at.get().saturating_sub(now.get());
+    let wait = std::time::Duration::from_millis(u64::try_from(owed).unwrap_or(0));
+    if let Some(limit) = crate::app::max_wait()
+        && wait > limit
+    {
+        return Err(snob_ig::error::IgError::WaitTooLong { wait, limit }.into());
+    }
+    crate::ui::say!("{}", serde_json::json!({ "would": "send" }));
+    Ok(ExitCode::Ok)
 }
 
 /// How a run ended, as a word a program can match on and a sentence a person

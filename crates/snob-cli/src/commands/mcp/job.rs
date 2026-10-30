@@ -24,8 +24,9 @@ use crate::exit::ExitCode;
 
 /// The document a `snob __job` child printed: an object with a job's id,
 /// from a child that exited 0. Anything else is the child's own failure (no
-/// session, no such job, a refusal), handed back as it is.
-pub fn document(finished: Finished) -> Result<Value, Finished> {
+/// session, no such job, a refusal), handed back as it is, boxed, since a
+/// finished child is large beside a document.
+pub fn document(finished: Finished) -> Result<Value, Box<Finished>> {
     let is_one = finished.code == ExitCode::Ok
         && finished
             .json
@@ -34,7 +35,7 @@ pub fn document(finished: Finished) -> Result<Value, Finished> {
             .is_some_and(Value::is_string);
     match finished.json {
         Some(doc) if is_one => Ok(doc),
-        json => Err(Finished { json, ..finished }),
+        json => Err(Box::new(Finished { json, ..finished })),
     }
 }
 
@@ -81,6 +82,11 @@ pub fn finished_of(doc: &Value) -> Option<Finished> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        served: finished
+            .get("served")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
     })
 }
 
@@ -278,6 +284,7 @@ mod tests {
             text: String::new(),
             error: None,
             said: String::new(),
+            served: Vec::new(),
         }
     }
 

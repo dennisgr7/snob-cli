@@ -100,19 +100,10 @@ pub fn record(
     let tx = store
         .conn_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if let Some(cap) = cap.filter(|_| is_write(act.action)) {
-        let writes = writes_since(&tx, now.get() - DAY_MS)?;
-        let counted = u32::try_from(writes.len()).unwrap_or(u32::MAX);
-        if counted >= cap {
-            // The day frees a write when the oldest of those that would
-            // still be over the cap leaves it.
-            let index = writes.len() - cap as usize;
-            let free_at = EpochMs::new(writes[index].max(now.get() - DAY_MS) + DAY_MS);
-            return Ok(Recorded::Capped {
-                writes: counted,
-                free_at,
-            });
-        }
+    if let Some(cap) = cap.filter(|_| is_write(act.action))
+        && let Some(capped) = over_the_cap(&tx, cap, now)?
+    {
+        return Ok(capped);
     }
     tx.execute(
         "DELETE FROM mcp_acts WHERE at_ms <= ?1",
@@ -126,6 +117,33 @@ pub fn record(
     let id = tx.last_insert_rowid();
     tx.commit()?;
     Ok(Recorded::Done(id))
+}
+
+/// Whether one more write at `now` would be past `cap`, **writing nothing**:
+/// [`Recorded::Capped`] when it would. What [`record`] decides inside its
+/// transaction, and what `snob mcp` asks before it asks the person for a yes
+/// to a write (`follow --check-ahead`), so nobody says yes to one the cap
+/// then refuses. Between the two another write may still take the last one,
+/// which `record` then refuses.
+pub fn over_the_cap(
+    conn: &Connection,
+    cap: u32,
+    now: EpochMs,
+) -> Result<Option<Recorded>, StoreError> {
+    let writes = writes_since(conn, now.get() - DAY_MS)?;
+    let counted = u32::try_from(writes.len()).unwrap_or(u32::MAX);
+    if counted < cap {
+        return Ok(None);
+    }
+    // The day frees a write when the oldest of those that would still be
+    // over the cap leaves it. `get`, though `counted >= cap` keeps the index
+    // in range: a cap of 0 would otherwise index past the end.
+    let index = writes.len() - cap as usize;
+    let oldest = writes.get(index).copied().unwrap_or(now.get());
+    Ok(Some(Recorded::Capped {
+        writes: counted,
+        free_at: EpochMs::new(oldest.max(now.get() - DAY_MS) + DAY_MS),
+    }))
 }
 
 /// The moments of the writes recorded after `after_ms`, oldest first.
@@ -276,6 +294,30 @@ mod tests {
             shown.iter().filter(|act| act.is_write()).count(),
             4,
             "the first write is a day old"
+        );
+    }
+
+    /// Asked ahead of the question, the cap answers as `record` will, and
+    /// writes nothing.
+    #[test]
+    fn the_cap_can_be_asked_about_without_recording_anything() {
+        let mut store = Store::in_memory().unwrap();
+        let now = EpochMs::new(1_000 * DAY_MS);
+        assert_eq!(over_the_cap(store.conn(), 1, now).unwrap(), None);
+        record(&mut store, &act("follow"), Some(1), now).unwrap();
+        let later = EpochMs::new(now.get() + 60_000);
+        let asked = over_the_cap(store.conn(), 1, later).unwrap();
+        assert_eq!(
+            asked,
+            Some(Recorded::Capped {
+                writes: 1,
+                free_at: EpochMs::new(now.get() + DAY_MS)
+            })
+        );
+        assert_eq!(count(store.conn()).unwrap(), 1, "asking wrote nothing");
+        assert_eq!(
+            Some(record(&mut store, &act("unfollow"), Some(1), later).unwrap()),
+            asked
         );
     }
 

@@ -4225,7 +4225,9 @@ async fn a_yes_given_in_the_chat_sends_one_unfollow() {
 async fn confirm_in_chat_none_refuses_a_client_that_cannot_ask() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
-    log_in(tmp.path(), &instagram);
+    // A session that can write: one that cannot is refused before it is
+    // asked about (`follow --check-ahead`).
+    log_in_writing(tmp.path(), &instagram);
     let _jobs = Jobs {
         root: tmp.path(),
         instagram: &instagram,
@@ -4604,7 +4606,9 @@ async fn the_mcp_server_asks_an_older_client_while_the_call_waits() {
 async fn a_second_write_while_one_is_asked_is_refused_as_busy() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
-    log_in(tmp.path(), &instagram);
+    // A session that can write: one that cannot is refused before it is
+    // asked about (`follow --check-ahead`).
+    log_in_writing(tmp.path(), &instagram);
     let _jobs = Jobs {
         root: tmp.path(),
         instagram: &instagram,
@@ -4989,7 +4993,8 @@ fn acts_recorded(root: &Path) -> i64 {
 
 /// Ten follows and unfollows agents were told yes to in the last day are as
 /// many as a server allows when it was given no `--max-writes-per-day`: the
-/// eleventh is refused with nothing sent and nothing recorded. A write the
+/// eleventh is refused with nothing sent and nothing recorded, **before the
+/// person is asked**, and says when the next is free as a moment. A write the
 /// person types is not counted, and a server given a higher cap lets it
 /// through.
 #[cfg(feature = "mcp")]
@@ -5017,15 +5022,16 @@ async fn the_eleventh_agent_write_in_a_day_is_refused() {
     let unfollow = serde_json::json!({ "account": "someone" });
 
     let mut client = McpClient::start(tmp.path(), &instagram, &["--allow-writes"]).await;
-    let refused = confirmed_in_chat(&mut client, "snob_unfollow", unfollow.clone()).await;
+    let refused = client.call("snob_unfollow", unfollow.clone()).await;
     assert_eq!(refused["isError"], true, "{refused}");
     let error = &refused["structuredContent"]["error"];
     assert_eq!(error["code"], "mcp_write_cap", "{refused}");
+    let now = snob_core::clock::now_ms().to_epoch().get();
+    let retry_at = error["retry_at"].as_i64().expect("a moment");
+    // A day after the first of the ten, rounded up to the second.
+    assert!(retry_at > now && retry_at <= now + 86_401, "{refused}");
     assert!(
-        error["hint"]
-            .as_str()
-            .unwrap()
-            .contains("--max-writes-per-day"),
+        error["hint"].as_str().unwrap().contains("retry_at"),
         "{refused}"
     );
     assert_eq!(writes_sent(&instagram).await, 0, "nothing was sent");
@@ -5052,7 +5058,7 @@ async fn the_eleventh_agent_write_in_a_day_is_refused() {
     assert_eq!(done["isError"], false, "{done}");
     assert_eq!(writes_sent(&instagram).await, 2);
     assert_eq!(acts_recorded(tmp.path()), 11);
-    let twelfth = confirmed_in_chat(&mut eleven, "snob_unfollow", unfollow).await;
+    let twelfth = eleven.call("snob_unfollow", unfollow).await;
     assert_eq!(
         twelfth["structuredContent"]["error"]["code"], "mcp_write_cap",
         "{twelfth}"
@@ -5066,6 +5072,100 @@ async fn the_eleventh_agent_write_in_a_day_is_refused() {
         &["mcp", "--allow-writes", "--max-writes-per-day", "100"],
     );
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+/// In a cooldown a write, a refresh and a list with nothing stored to serve
+/// are refused **before the person is asked**, as their own runs would
+/// refuse them, with when the cooldown lifts; a list with something stored
+/// is still asked about and served, and none of it is recorded as an act,
+/// since nothing was read or sent.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_cooldown_refuses_a_call_before_anybody_is_asked() {
+    use snob_core::budget::RateBudget;
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    serve_an_unfollow(&instagram).await;
+    log_in_writing(tmp.path(), &instagram);
+    common::remember_doc_ids(tmp.path());
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let walked = snob(
+        tmp.path(),
+        Some(&instagram),
+        &[
+            "followers",
+            "someone",
+            "-y",
+            "--format",
+            "json",
+            "--no-interactive",
+        ],
+    );
+    assert!(walked.status.success(), "{}", stderr(&walked));
+    let paths = snob_store::paths::AppPaths::rooted_at(tmp.path()).account(PK);
+    snob_store::store::rate_budget::SqliteRateBudget::open(&paths)
+        .unwrap()
+        .start_cooldown("429", std::time::Duration::from_secs(3600))
+        .unwrap();
+    let before = posted(&instagram).await.len();
+
+    let mut client = McpClient::start(tmp.path(), &instagram, &["--allow-writes"]).await;
+    for (tool, arguments) in [
+        ("snob_unfollow", serde_json::json!({ "account": "someone" })),
+        (
+            "snob_list",
+            serde_json::json!({ "list": "following", "account": "someone" }),
+        ),
+        (
+            "snob_list",
+            serde_json::json!({ "list": "followers", "account": "someone", "mode": "refresh" }),
+        ),
+    ] {
+        let refused = client.call(tool, arguments).await;
+        assert_eq!(refused["isError"], true, "{refused}");
+        let told = &refused["structuredContent"];
+        assert_eq!(told["exit"], "rate_limited", "{refused}");
+        assert!(told.get("confirmation").is_none(), "asked: {refused}");
+        assert!(
+            told["error"]["cooldown_until"].as_i64().is_some(),
+            "{refused}"
+        );
+    }
+
+    let served = confirmed_in_chat(
+        &mut client,
+        "snob_list",
+        serde_json::json!({ "list": "followers", "account": "someone" }),
+    )
+    .await;
+    assert_eq!(served["isError"], false, "{served}");
+    let told = &served["structuredContent"];
+    assert_eq!(told["count"], 3, "{served}");
+    // Handed over as the stored list it is, with its date and the
+    // cooldown's end, in the JSON and in a sentence.
+    assert_eq!(told["served"][0]["from"], "stored_in_cooldown", "{served}");
+    assert!(told["served"][0]["taken_at"].as_i64().is_some(), "{served}");
+    assert!(told["cooldown_until"].as_i64().is_some(), "{served}");
+    let sentence = served["content"][1]["text"].as_str().unwrap_or_default();
+    assert!(sentence.contains("Not read now"), "{served}");
+
+    // An estimate in the cooldown is the answer asked for, not an error.
+    let estimate = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "dry_run": true }),
+        )
+        .await;
+    assert_eq!(estimate["isError"], false, "{estimate}");
+    assert_eq!(
+        estimate["structuredContent"]["sends_now"], false,
+        "{estimate}"
+    );
+    assert_eq!(acts_recorded(tmp.path()), 0, "nothing was read or sent");
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
 }
 
 /// `snob status` shows what agents were told yes to in the last day: what,

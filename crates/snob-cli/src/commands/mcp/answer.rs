@@ -76,6 +76,16 @@ fn agent_hint(reason: &str) -> Option<&'static str> {
             "nothing of this list is stored yet: call snob_list again without offset and with \
              mode \"auto\" to read it"
         }
+        "busy" => {
+            "another call that reaches Instagram is running for this account, and one runs \
+             at a time; nothing was sent: call this again once it has ended, not beside it \
+             (snob_jobs names a job that is walking, and snob_job_cancel stops it)"
+        }
+        "mcp_write_cap" => {
+            "agents have made as many follows and unfollows on this account as it allows \
+             them in a day: do not call this again before retry_at (seconds since the \
+             epoch); tell the person, who can make it in their own terminal"
+        }
         "budget_wait" => {
             "the request budget has no room within the wait this server allows: call it again \
              later; snob_status says when the budget has room"
@@ -89,7 +99,12 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
     let exit = finished.code;
     let offset = plan.page.as_ref().map_or(0, |page| page.offset);
     let mut whole = None;
-    let mut body = if plan.answers.contains(&exit) {
+    // Past 0, only with the document it is an answer for: `status` and a dry
+    // run print one whatever their exit, and the same exit with nothing on
+    // standard output is a refusal, which an empty answer would hide.
+    let answered = plan.answers.contains(&exit)
+        && (exit == ExitCode::Ok || matches!(finished.json, Some(Value::Object(_))));
+    let mut body = if answered {
         // A structured result is an object, so whatever else a command printed
         // goes under a key. **Never index into what came back before it is
         // known to be an object**: `serde_json` panics on `value["key"] = ...`
@@ -163,6 +178,33 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
             whole: None,
         };
     };
+    // Where the list came from, as its walk said it (`Progress::served`), and
+    // when a cooldown that had it served from storage lifts: a stored list
+    // is handed to the agent as one, with its date, as a person is told it
+    // in the warning, never as if it had just been read. `body` is an object
+    // for every list (a page), and nothing is indexed into one that is not.
+    if !finished.served.is_empty() && body.is_object() {
+        let served: Vec<Value> = finished
+            .served
+            .iter()
+            .map(|said| {
+                json!({
+                    "list": said.get("list"),
+                    "from": said.get("from"),
+                    "taken_at": said.get("taken_at"),
+                })
+            })
+            .collect();
+        let lifts = finished
+            .served
+            .iter()
+            .filter_map(|said| said.get("cooldown_until"))
+            .find(|until| until.is_i64());
+        if let Some(lifts) = lifts {
+            body["cooldown_until"] = lifts.clone();
+        }
+        body["served"] = Value::Array(served);
+    }
     if exit != ExitCode::Ok {
         body["exit"] = json!(exit.as_str());
     }
@@ -259,6 +301,51 @@ pub fn next_page(body: &Value, tool: &str) -> Option<String> {
     ))
 }
 
+/// What an agent is told beside a list that was not read now: served from
+/// storage in a cooldown, or because the check of its counter failed,
+/// **however old it is** (`engine::cooldown::serve`, `engine::freshness`).
+/// The moments in UTC: the agent and the person may be in another zone than
+/// this machine. `None` for any other answer.
+pub fn not_read_now(body: &Value) -> Option<String> {
+    let utc = |seconds: i64| {
+        chrono::DateTime::from_timestamp(seconds, 0).map_or_else(
+            || seconds.to_string(),
+            |at| at.format("%Y-%m-%d %H:%M UTC").to_string(),
+        )
+    };
+    let stale: Vec<String> = body
+        .get("served")?
+        .as_array()?
+        .iter()
+        .filter(|said| {
+            matches!(
+                said.get("from").and_then(Value::as_str),
+                Some("stored_in_cooldown" | "stored_after_failed_poll")
+            )
+        })
+        .filter_map(|said| {
+            let list = said.get("list")?.as_str()?;
+            let at = said.get("taken_at")?.as_i64()?;
+            Some(format!("the {list} list as it was stored at {}", utc(at)))
+        })
+        .collect();
+    if stale.is_empty() {
+        return None;
+    }
+    let why = match body.get("cooldown_until").and_then(Value::as_i64) {
+        Some(until) => format!(
+            "the account is in cooldown until {}, when nothing may be sent",
+            utc(until)
+        ),
+        None => "checking whether it had changed failed".to_string(),
+    };
+    Some(format!(
+        "Not read now: {why}, so this is {}, however old that is. Say so, with that date, \
+         when you present it.",
+        stale.join(" and ")
+    ))
+}
+
 /// The last few lines of what a command said, which is where its sentence
 /// about the failure is: the records of the log left out first
 /// (`jobs::show::sentences`), which carry what Instagram answered and would
@@ -340,6 +427,8 @@ mod tests {
             ("job_stopping", ExitCode::Error, "snob_job "),
             ("nothing_stored", ExitCode::Error, "mode \"auto\""),
             ("budget_wait", ExitCode::Interrupted, "snob_status"),
+            ("busy", ExitCode::Error, "snob_job_cancel"),
+            ("mcp_write_cap", ExitCode::Error, "retry_at"),
         ] {
             let told = from(
                 &plan(&[ExitCode::Ok]),
@@ -368,7 +457,7 @@ mod tests {
             finished(
                 ExitCode::Error,
                 None,
-                Some(json!({"error": {"code": "error", "reason": "busy", "hint": "wait"}})),
+                Some(json!({"error": {"code": "error", "reason": "refused_argv", "hint": "wait"}})),
             ),
         );
         assert_eq!(told.body["error"]["hint"], "wait");
@@ -537,7 +626,68 @@ mod tests {
             text: String::new(),
             error,
             said: "first\nsecond\n".into(),
+            served: Vec::new(),
         }
+    }
+
+    /// A dry run in a cooldown exits 5 with its estimate printed, which is the
+    /// answer asked for; exit 5 with nothing printed is still a refusal.
+    #[test]
+    fn an_estimate_in_a_cooldown_is_an_answer_and_a_bare_exit_five_is_not() {
+        let dry = plan(&[ExitCode::Ok, ExitCode::RateLimited]);
+        let estimate =
+            json!({"dry_run": true, "sends_now": false, "cooldown_until": 1_800_000_000});
+        let told = from(&dry, finished(ExitCode::RateLimited, Some(estimate), None));
+        assert!(!told.failed, "{}", told.body);
+        assert_eq!(told.body["sends_now"], false);
+        assert_eq!(told.body["exit"], "rate_limited");
+        assert_eq!(told.body["cooldown_until"], 1_800_000_000);
+
+        let bare = from(&dry, finished(ExitCode::RateLimited, None, None));
+        assert!(bare.failed, "{}", bare.body);
+        assert_eq!(bare.body["error"]["code"], "rate_limited");
+    }
+
+    /// A list served from storage in a cooldown says so, when it was read and
+    /// when the cooldown lifts, in the JSON and in a sentence; a list walked
+    /// now says it was, and has no sentence.
+    #[test]
+    fn a_list_served_in_a_cooldown_says_it_is_stored_and_how_old() {
+        let mut stored = finished(ExitCode::Ok, Some(accounts(2)), None);
+        stored.served = vec![json!({
+            "event": "served",
+            "list": "followers",
+            "from": "stored_in_cooldown",
+            "taken_at": 1_793_340_000,
+            "cooldown_until": 1_793_347_200,
+            "page": 0,
+        })];
+        let told = from(&list_at(0), stored);
+        assert!(!told.failed);
+        assert_eq!(told.body["count"], 2);
+        assert_eq!(
+            told.body["served"],
+            json!([{"list": "followers", "from": "stored_in_cooldown", "taken_at": 1_793_340_000}])
+        );
+        assert_eq!(told.body["cooldown_until"], 1_793_347_200);
+        let said = not_read_now(&told.body).expect("a sentence");
+        assert!(said.contains("stored at 2026-10-30 06:00 UTC"), "{said}");
+        assert!(
+            said.contains("cooldown until 2026-10-30 08:00 UTC"),
+            "{said}"
+        );
+
+        let mut walked = finished(ExitCode::Ok, Some(accounts(2)), None);
+        walked.served = vec![json!({
+            "list": "followers",
+            "from": "walked",
+            "taken_at": 1_793_340_000,
+            "cooldown_until": null,
+        })];
+        let told = from(&list_at(0), walked);
+        assert_eq!(told.body["served"][0]["from"], "walked");
+        assert!(told.body.get("cooldown_until").is_none());
+        assert!(not_read_now(&told.body).is_none());
     }
 
     #[test]
@@ -637,14 +787,21 @@ mod tests {
     #[test]
     fn a_document_that_is_not_an_object_is_put_under_a_key() {
         for document in [json!("a string"), json!(3), json!(true), json!(null)] {
+            let told = from(
+                &plan(&[ExitCode::Ok, ExitCode::RateLimited]),
+                finished(ExitCode::Ok, Some(document.clone()), None),
+            );
+            assert!(!told.failed, "{document}");
+            assert_eq!(told.body["value"], cleaned(document.clone()));
             // Under a code the plan counts as an answer but that is not 0,
-            // which is where `exit` was set by indexing.
+            // which is where `exit` was set by indexing: no answer without an
+            // object, and nothing indexed into the document either way.
             let told = from(
                 &plan(&[ExitCode::Ok, ExitCode::RateLimited]),
                 finished(ExitCode::RateLimited, Some(document.clone()), None),
             );
-            assert!(!told.failed, "{document}");
-            assert_eq!(told.body["value"], cleaned(document.clone()));
+            assert!(told.failed, "{document}");
+            assert_eq!(told.body["error"]["partial"], cleaned(document.clone()));
             assert_eq!(told.body["exit"], "rate_limited", "{document}");
         }
     }

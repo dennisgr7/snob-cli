@@ -129,13 +129,16 @@ pub(crate) fn sentences(lines: Vec<&str>) -> Vec<&str> {
 }
 
 /// The newest progress line a walk wrote (`--progress-json`), from the end of
-/// its log: the object under `progress`.
+/// its log: the object under `progress`. Not a `served` line, which says
+/// where a list came from once it is done with (`finished` reads those), and
+/// nothing of how far the walk is.
 pub fn newest_progress(dir: &Path) -> Option<Value> {
     let tail = tail_of(&file(dir, "err.log"), TAIL)?;
     tail.lines()
         .rev()
         .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
-        .find_map(|value| value.get("progress").cloned())
+        .filter_map(|value| value.get("progress").cloned())
+        .find(|progress| progress["event"] != "served")
 }
 
 /// The last `bytes` of a file, as text.
@@ -233,8 +236,10 @@ pub fn record(seen: &Seen, now: i64) -> Value {
 
 /// What the walk answered, once it has ended: its exit, what it printed and
 /// the JSON error line it ended with, as a call's child is read
-/// (`commands::mcp::child`). `output` is `null` once the result has been
-/// swept (`jobs::sweep`), a day after.
+/// (`commands::mcp::child`), and `served`, where each list it answered with
+/// came from (`Progress::served`: a walk, or what is stored, and when that
+/// was read). `output` is `null` once the result has been swept
+/// (`jobs::sweep`), a day after.
 pub fn finished(seen: &Seen) -> Option<Value> {
     if !seen.status.finished() {
         return None;
@@ -252,6 +257,13 @@ pub fn finished(seen: &Seen) -> Option<Value> {
                 .unwrap_or_else(|_| Value::String(text.into()))
         });
     let log = tail_of(&file(&seen.dir, "err.log"), 4 * TAIL).unwrap_or_default();
+    // Where each list came from, as the walk said it (`Progress::served`).
+    let served: Vec<Value> = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .filter_map(|value| value.get("progress").cloned())
+        .filter(|progress| progress["event"] == "served")
+        .collect();
     let lines = sentences(
         log.lines()
             .filter(|line| !line.trim().is_empty())
@@ -279,6 +291,7 @@ pub fn finished(seen: &Seen) -> Option<Value> {
         "output": output,
         "error": error,
         "said": said,
+        "served": served,
     }))
 }
 
@@ -485,6 +498,8 @@ mod tests {
         text.push_str(
             "{\"progress\":{\"event\":\"waiting\",\"kind\":\"sitting\",\"seconds\":300}}\n",
         );
+        // Where a list came from, which says nothing of how far a walk is.
+        text.push_str("{\"progress\":{\"event\":\"served\",\"from\":\"walked\"}}\n");
         text.push_str("{\"error\":{\"code\":\"rate_limited\"}}\n");
         std::fs::write(&log, text).unwrap();
         let newest = newest_progress(tmp.path()).expect("a line is there");

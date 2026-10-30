@@ -6,8 +6,10 @@
 //! however old it is: stale beats nothing, and the warning names the date.
 
 use anyhow::Result;
+use snob_core::Pk;
 use snob_core::model::{ListKind, User};
-use snob_store::store::snapshots;
+use snob_store::store::Store;
+use snob_store::store::snapshots::{self, Snapshot};
 
 use crate::app::{App, Held};
 use crate::engine::{ListOutcome, ListQuery, Provenance, target};
@@ -23,15 +25,34 @@ pub fn serve(
     kind: ListKind,
     held: &Held,
 ) -> Result<(Vec<User>, ListOutcome)> {
+    let snapshot = stored(app.db(), app.viewer().pk, args, kind, held)?;
+    let taken_at = snapshot.taken_at.unwrap_or_default();
+    app.warn(&report::serving_stored_in_cooldown(held, kind, taken_at));
+
+    super::serve_stored(app, &snapshot, Provenance::Cooldown)
+}
+
+/// The stored capture a cooldown serves the list of `kind` that `args` asks
+/// for from, as `viewer`, or the refusal when there is none to serve.
+/// **Reads only**: [`serve`]'s decision, and what `snob __job start --check`
+/// asks before `snob mcp` asks the person for a yes to a walk, so nobody says
+/// yes to one a cooldown then refuses.
+pub fn stored(
+    store: &Store,
+    viewer: Pk,
+    args: &ListQuery,
+    kind: ListKind,
+    held: &Held,
+) -> Result<Snapshot> {
     if args.refresh {
         return Err(report::refuse_in_cooldown(held, Blocked::RefreshWanted));
     }
 
     let pk = match args.target.as_deref() {
-        None => app.viewer().pk,
+        None => viewer,
         Some(typed) => {
             let username = target::clean(typed);
-            match snob_store::store::accounts::find_pk_by_username(app.db().conn(), username)? {
+            match snob_store::store::accounts::find_pk_by_username(store.conn(), username)? {
                 Some(pk) => pk,
                 None => {
                     return Err(report::refuse_in_cooldown(
@@ -43,17 +64,8 @@ pub fn serve(
         }
     };
 
-    let Some(snapshot) = snapshots::latest_complete(app.db().conn(), pk, kind)? else {
-        return Err(report::refuse_in_cooldown(
-            held,
-            Blocked::NothingStored(kind),
-        ));
-    };
-
-    let taken_at = snapshot.taken_at.unwrap_or_default();
-    app.warn(&report::serving_stored_in_cooldown(held, kind, taken_at));
-
-    super::serve_stored(app, &snapshot, Provenance::Cooldown)
+    snapshots::latest_complete(store.conn(), pk, kind)?
+        .ok_or_else(|| report::refuse_in_cooldown(held, Blocked::NothingStored(kind)))
 }
 
 /// Two lists may only be crossed if they describe roughly the same moment.
