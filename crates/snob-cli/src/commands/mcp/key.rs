@@ -36,13 +36,14 @@ use crate::exit::{ExitCode, ExitError};
 use crate::ui;
 
 /// The variable a server reads its key from instead of the keyring. A
-/// client reads its copy from a variable of another name, so that a person
-/// who exports one for a client does not hand the key to every server.
+/// client reads its copy from a variable of another name (`config::TOKEN`),
+/// so that a person who exports one for a client does not hand the key to
+/// every server.
 pub const ENV: &str = "SNOB_MCP_KEY";
 
 /// What every key starts with, so that one found in a file or a log says
 /// whose it is.
-pub const PREFIX: &str = "snob_mcp_";
+pub const PREFIX: &str = super::KEY_PREFIX;
 
 /// The random bytes in a key.
 const BYTES: usize = 32;

@@ -13,12 +13,23 @@
 //! directory named after its version, and a configuration pointing there
 //! stops working the day that directory is cleaned up. A server already
 //! running when that happens refuses its calls instead (`child::Launch`).
+//!
+//! **A remote server is pointed at, never started** (`--remote <URL>`): the
+//! snippet names the address a tunnel serves `snob mcp --listen` at, and how
+//! the client sends the key, with no command, and so none of the server's
+//! flags. **The key is never in it**, and never read to print it: the client
+//! takes it from [`TOKEN`] in its own environment, and a client with no
+//! variables is told to paste it where it keeps its connectors. `TOKEN` is
+//! not the server's variable (`key::ENV`), which wins over the keyring in
+//! every snob it reaches; a person who exported that one for a client would
+//! hand the key to any server started in the same shell.
 
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use url::{Host, Url};
 
 use crate::cli::{ConfirmInChat, McpClient, McpConfigArgs};
 use crate::exit::ExitCode;
@@ -32,6 +43,10 @@ pub fn run(
     globals: Vec<std::ffi::OsString>,
     max_wait: Duration,
 ) -> anyhow::Result<ExitCode> {
+    let within = super::longest_call(max_wait);
+    if let Some(url) = &args.remote {
+        return Ok(remote(args.client, url, &globals, within));
+    }
     let current = std::env::current_exe()?;
     let path_var = std::env::var_os("PATH");
     let exe = stable_exe(
@@ -65,7 +80,6 @@ pub fn run(
         server_args.push(writes.to_string());
     }
 
-    let within = super::longest_call(max_wait);
     let (snippet, whereto) = render(args.client, &exe, &server_args, within);
     ui::say!("{snippet}");
     ui::info(whereto);
@@ -79,6 +93,159 @@ pub fn run(
         );
     }
     Ok(ExitCode::Ok)
+}
+
+/// The variable a client reads the key from, for a remote server. Not the
+/// server's own (`key::ENV`): see the header. `jobs::NEVER_INHERITED` keeps
+/// it, with the server's, from every child.
+pub const TOKEN: &str = "SNOB_MCP_TOKEN";
+
+/// The global flags that describe the server a client starts, and so mean
+/// nothing to one that reaches a server already running.
+const SERVERS_GLOBALS: &[&str] = &["--account", "--no-keyring", "--strict-roots"];
+
+/// `--remote`'s value: where the client reaches the server. **`https`**, the
+/// tunnel's address, or `http` on this machine's loopback only (the near end
+/// of `ssh -L`), since anywhere else the key would cross a network in plain
+/// text. Nothing secret in it: no user or password, no query or fragment,
+/// and no key, which goes in a header and nowhere else. An address with no
+/// path is given the one the server serves ([`super::HTTP_PATH`]).
+pub fn remote_url(text: &str) -> Result<Url, String> {
+    // Before anything that would repeat the address: a key in it is said
+    // to be one, and not printed back.
+    if text.contains(super::KEY_PREFIX) {
+        return Err(format!(
+            "the address holds a key; the key goes in {TOKEN} in the client's environment, \
+             never in an address, which clients keep and show in plain text"
+        ));
+    }
+    // Nor is an address that does not parse, or that carries a password
+    // or a token, said back: it is checked for those first, and the
+    // sentences after them may repeat it.
+    let mut url = Url::parse(text).map_err(|e| format!("the address does not read as one: {e}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!(
+            "the address carries a user or password; the server takes nothing but the key, \
+             sent from {TOKEN} as a header"
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(
+            "the address has a query or a fragment; the server is reached at a plain address, \
+             with the key sent as a header"
+                .to_string(),
+        );
+    }
+    let loopback = match url.host() {
+        Some(Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        None => return Err(format!("\"{text}\" names no host")),
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        "http" => {
+            return Err(format!(
+                "\"{text}\" is http on another machine: the key travels in every request, so \
+                 the address is the tunnel's https one, or http on this machine's loopback for \
+                 a tunnel such as ssh -L"
+            ));
+        }
+        _ => return Err(format!("\"{text}\" is neither https nor http")),
+    }
+    if url.path() == "/" {
+        url.set_path(super::HTTP_PATH);
+    }
+    Ok(url)
+}
+
+/// [`remote_url`] for clap. Not a plain function as a value parser, whose
+/// refusal clap prints after the value it was given: an address that holds
+/// a key or a password is refused here without being repeated.
+#[derive(Clone, Copy, Debug)]
+pub struct RemoteUrl;
+
+impl clap::builder::TypedValueParser for RemoteUrl {
+    type Value = Url;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &OsStr,
+    ) -> Result<Url, clap::Error> {
+        let refused = |kind, why: &str| clap::Error::raw(kind, format!("--remote: {why}\n"));
+        let text = value.to_str().ok_or_else(|| {
+            refused(
+                clap::error::ErrorKind::InvalidUtf8,
+                "the address is not UTF-8",
+            )
+            .with_cmd(cmd)
+        })?;
+        remote_url(text)
+            .map_err(|why| refused(clap::error::ErrorKind::ValueValidation, &why).with_cmd(cmd))
+    }
+}
+
+/// `snob mcp config <client> --remote <URL>`: the snippet for a client that
+/// reaches a server already serving, and what to do with it. Exit 0 always:
+/// clap refused the server's flags (`cli::McpConfigArgs`), and the address
+/// was checked as it was parsed ([`remote_url`]).
+fn remote(
+    client: McpClient,
+    url: &Url,
+    globals: &[std::ffi::OsString],
+    within: Duration,
+) -> ExitCode {
+    let ignored: Vec<&str> = SERVERS_GLOBALS
+        .iter()
+        .copied()
+        .filter(|flag| globals.iter().any(|given| given == *flag))
+        .collect();
+    if !ignored.is_empty() {
+        ui::warn(&format!(
+            "{} {} the server, not this configuration: give {} to the \"snob mcp --listen\" \
+             the address leads to",
+            ignored.join(", "),
+            if ignored.len() == 1 {
+                "describes"
+            } else {
+                "describe"
+            },
+            if ignored.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    if !url.path().ends_with(super::HTTP_PATH) {
+        ui::warn(&format!(
+            "the server answers at {} only; this address is right only if the tunnel maps \
+             it there",
+            super::HTTP_PATH
+        ));
+    }
+    let (snippet, whereto) = render_remote(client, url.as_str(), within);
+    ui::say!("{snippet}");
+    ui::info(whereto);
+    ui::info(if client == McpClient::ClaudeDesktop {
+        "In the form, the header is Authorization and its value is \"Bearer \" followed by \
+         the key, which \"snob mcp key show --reveal\" prints on the machine the server runs \
+         on."
+    } else {
+        // `TOKEN` and `key::ENV`, spelled out so that the sentence is one
+        // constant.
+        "Set SNOB_MCP_TOKEN to the key (\"snob mcp key show --reveal\" prints it on the \
+         machine the server runs on) in the environment the client starts in, and only there: \
+         it is the client's name for the key, and SNOB_MCP_KEY, the server's, would replace \
+         the key of any snob started where it is set."
+    });
+    // The writes are the server's to offer (`--allow-writes` on its own
+    // command line), so the advice is given whether or not it does.
+    ui::info(
+        "If the server was started with --allow-writes, keep snob_follow and snob_unfollow on \
+         \"ask\" in the client's tool permissions: snob cannot tell whether the yes it is \
+         handed came from you or from the agent.",
+    );
+    ExitCode::Ok
 }
 
 /// The path to print for the running binary `current`: one that leads to the
@@ -264,6 +431,84 @@ fn render(
                 within.as_secs()
             ),
             "Add it to ~/.codex/config.toml.",
+        ),
+    }
+}
+
+/// The snippet for `client` to reach the server at `url`, and a sentence
+/// saying where it goes. No command, and **no key**: each client is told to
+/// read it from [`TOKEN`] in the way it reads a variable, and Claude Desktop,
+/// which reads no file for a remote server, is given the address alone.
+///
+/// The spellings of a variable are the clients' own, as their documentation
+/// was quoted to us and not checked against each client: Claude Code expands
+/// `${VAR}`, Cursor and VS Code `${env:VAR}`, and Codex takes the variable's
+/// name (`bearer_token_env_var`). The sentences say to check that where a
+/// client answers 401.
+fn render_remote(client: McpClient, url: &str, within: Duration) -> (String, &'static str) {
+    let header = |variable: String| json!({ "Authorization": format!("Bearer {variable}") });
+    let servers = |key: &str, server: Value| {
+        serde_json::to_string_pretty(&json!({ key: { "snob": server } })).expect("plain JSON")
+    };
+    match client {
+        McpClient::ClaudeCode => (
+            servers(
+                "mcpServers",
+                json!({ "type": "http", "url": url, "headers": header(format!("${{{TOKEN}}}")) }),
+            ),
+            "Add it to .mcp.json in a project, or under \"mcpServers\" in ~/.claude.json for \
+             every project: \"claude mcp add-json --scope user snob '<the inner object>'\" \
+             does the second, and \"--scope project\" the first. Claude Code fills in \
+             ${SNOB_MCP_TOKEN} from its environment when it connects.",
+        ),
+        // Claude Desktop and claude.ai reach a remote server as a custom
+        // connector, added in their settings, not in a file.
+        McpClient::ClaudeDesktop => (
+            url.to_string(),
+            "Claude Desktop reads no file for a remote server: add this address as a custom \
+             connector (Settings, Connectors), as on claude.ai. The server takes nothing but the \
+             key, as an Authorization header, so it is reached only where the connector's form \
+             takes a header; snob offers no sign-in of its own (OAuth).",
+        ),
+        McpClient::Cursor => (
+            servers(
+                "mcpServers",
+                json!({ "url": url, "headers": header(format!("${{env:{TOKEN}}}")) }),
+            ),
+            "Merge it into ~/.cursor/mcp.json, or .cursor/mcp.json in a project. Cursor fills \
+             in ${env:SNOB_MCP_TOKEN} from its environment; if the server answers 401, check \
+             how its documentation spells a variable in a header.",
+        ),
+        McpClient::Vscode => (
+            servers(
+                "servers",
+                json!({
+                    "type": "http",
+                    "url": url,
+                    "headers": header(format!("${{env:{TOKEN}}}")),
+                }),
+            ),
+            "Merge it into .vscode/mcp.json in a workspace, or the user mcp.json (\"MCP: Open \
+             User Configuration\"). VS Code's key is \"servers\", and it fills in \
+             ${env:SNOB_MCP_TOKEN} from its environment; if the server answers 401, check how \
+             its documentation spells a variable in a header.",
+        ),
+        // As for a server Codex starts (`render`): the longest call is the
+        // one this command line's `--max-wait` describes, which is the
+        // server's own only when the same one was given to both.
+        McpClient::Codex => (
+            format!(
+                "[mcp_servers.snob]\nurl = {}\nbearer_token_env_var = {}\n\
+                 # A call may wait for your answer, then for the request budget;\n\
+                 # a list that takes longer goes on as a job.\n\
+                 tool_timeout_sec = {}",
+                toml_string(url),
+                toml_string(TOKEN),
+                within.as_secs()
+            ),
+            "Add it to ~/.codex/config.toml. Codex sends the key from SNOB_MCP_TOKEN as \
+             Authorization: Bearer. tool_timeout_sec is counted from the --max-wait given \
+             here, so give the one the server was started with.",
         ),
     }
 }
@@ -474,5 +719,173 @@ mod tests {
                 .lines()
                 .all(|line| line.starts_with('[') || line.starts_with('#') || line.contains(" = "))
         );
+    }
+
+    const REMOTE: &str = "https://snob.example.com/mcp";
+
+    fn every_client() -> impl Iterator<Item = McpClient> {
+        use clap::ValueEnum as _;
+        McpClient::value_variants().iter().copied()
+    }
+
+    #[test]
+    fn a_remote_codex_config_reads_the_token_from_the_environment() {
+        let (snippet, whereto) = render_remote(McpClient::Codex, REMOTE, within());
+        assert!(snippet.starts_with("[mcp_servers.snob]\n"), "{snippet}");
+        assert!(
+            snippet.contains("\nurl = \"https://snob.example.com/mcp\"\n"),
+            "{snippet}"
+        );
+        assert!(
+            snippet.contains("\nbearer_token_env_var = \"SNOB_MCP_TOKEN\"\n"),
+            "{snippet}"
+        );
+        assert!(snippet.ends_with("\ntool_timeout_sec = 960"), "{snippet}");
+        assert!(!snippet.contains("command"), "{snippet}");
+        assert!(!snippet.contains("args"), "{snippet}");
+        assert!(
+            snippet
+                .lines()
+                .all(|line| line.starts_with('[') || line.starts_with('#') || line.contains(" = "))
+        );
+        assert!(whereto.contains("SNOB_MCP_TOKEN"), "{whereto}");
+    }
+
+    #[test]
+    fn a_remote_claude_code_config_sends_the_token_as_a_header() {
+        let (snippet, whereto) = render_remote(McpClient::ClaudeCode, REMOTE, within());
+        let parsed: Value = serde_json::from_str(&snippet).unwrap();
+        let server = &parsed["mcpServers"]["snob"];
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["url"], REMOTE);
+        assert_eq!(
+            server["headers"]["Authorization"],
+            "Bearer ${SNOB_MCP_TOKEN}"
+        );
+        assert_eq!(
+            server.as_object().map(|server| server.len()),
+            Some(3),
+            "nothing to start: {snippet}"
+        );
+        assert!(whereto.contains("--scope user"), "{whereto}");
+    }
+
+    #[test]
+    fn cursor_and_vs_code_read_the_token_as_they_spell_a_variable() {
+        let (snippet, _) = render_remote(McpClient::Cursor, REMOTE, within());
+        let parsed: Value = serde_json::from_str(&snippet).unwrap();
+        let server = &parsed["mcpServers"]["snob"];
+        assert_eq!(server["url"], REMOTE);
+        assert_eq!(
+            server["headers"]["Authorization"],
+            "Bearer ${env:SNOB_MCP_TOKEN}"
+        );
+        assert!(server.get("command").is_none(), "{snippet}");
+
+        let (snippet, _) = render_remote(McpClient::Vscode, REMOTE, within());
+        let parsed: Value = serde_json::from_str(&snippet).unwrap();
+        let server = &parsed["servers"]["snob"];
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["url"], REMOTE);
+        assert_eq!(
+            server["headers"]["Authorization"],
+            "Bearer ${env:SNOB_MCP_TOKEN}"
+        );
+        assert!(server.get("command").is_none(), "{snippet}");
+    }
+
+    #[test]
+    fn claude_desktop_is_given_the_address_for_a_connector() {
+        let (snippet, whereto) = render_remote(McpClient::ClaudeDesktop, REMOTE, within());
+        assert_eq!(snippet, REMOTE);
+        assert!(whereto.contains("custom connector"), "{whereto}");
+    }
+
+    /// Nothing printed for a remote server holds a key: it is never read,
+    /// and an address that holds one is refused without being repeated.
+    #[test]
+    fn a_remote_config_never_contains_a_key() {
+        for client in every_client() {
+            let (snippet, whereto) = render_remote(client, REMOTE, within());
+            for said in [&snippet[..], whereto] {
+                assert!(
+                    !said.contains(super::super::KEY_PREFIX),
+                    "{client:?}: {said}"
+                );
+            }
+        }
+        let key = "snob_mcp_N2u3l9q0aYyK0w7mQxk1vR4cT8bZp5sJdE6fGhIoUjA";
+        for address in [
+            format!("https://snob.example.com/{key}/mcp"),
+            format!("https://snob.example.com/mcp?key={key}"),
+            format!("https://{key}:x@snob.example.com/mcp"),
+        ] {
+            let refused = remote_url(&address).expect_err(&address);
+            assert!(!refused.contains(key), "the key was repeated: {refused}");
+        }
+    }
+
+    /// The server's variable wins over the keyring wherever it is set, so
+    /// no snippet has it set where a client runs.
+    #[test]
+    fn a_remote_config_never_names_the_servers_variable() {
+        for client in every_client() {
+            let (snippet, _) = render_remote(client, REMOTE, within());
+            assert!(!snippet.contains("SNOB_MCP_KEY"), "{client:?}: {snippet}");
+        }
+    }
+
+    #[test]
+    fn a_remote_server_is_reached_over_https_or_on_loopback() {
+        for taken in [
+            "https://snob.example.com/mcp",
+            "https://snob.example.com:8443/tunnel/mcp",
+            "http://127.0.0.1:8750/mcp",
+            "http://localhost:8750/mcp",
+            "http://[::1]:8750/mcp",
+        ] {
+            assert_eq!(remote_url(taken).map(String::from), Ok(taken.to_string()));
+        }
+        // An address with no path is given the server's.
+        assert_eq!(
+            remote_url("https://snob.example.com").map(String::from),
+            Ok("https://snob.example.com/mcp".to_string())
+        );
+        assert_eq!(
+            remote_url("http://127.0.0.1:8750/").map(String::from),
+            Ok("http://127.0.0.1:8750/mcp".to_string())
+        );
+        for refused in [
+            "http://snob.example.com/mcp",
+            "http://192.168.1.20:8750/mcp",
+            "ftp://snob.example.com/mcp",
+            "https://user:secret@snob.example.com/mcp",
+            "https://snob.example.com/mcp?token=1",
+            "https://snob.example.com/mcp#here",
+            "snob.example.com/mcp",
+        ] {
+            assert!(remote_url(refused).is_err(), "{refused}");
+        }
+        // What may be a secret is not said back, whatever else is wrong.
+        for (address, secret) in [
+            ("https://user:secret@snob.example.com/mcp", "secret"),
+            ("ftp://user:secret@snob.example.com/mcp", "secret"),
+            ("http://user:secret@192.168.1.20/mcp", "secret"),
+            ("https://snob.example.com/mcp?token=hush", "hush"),
+            ("http://192.168.1.20/mcp?token=hush", "hush"),
+            ("secret", "secret"),
+        ] {
+            let refused = remote_url(address).expect_err(address);
+            assert!(!refused.contains(secret), "{refused}");
+        }
+    }
+
+    /// Two homes would drift: the key's and the server's modules are behind
+    /// `mcp-http`, and what this refuses and points at is not.
+    #[cfg(feature = "mcp-http")]
+    #[test]
+    fn the_key_prefix_and_the_path_are_the_servers() {
+        assert_eq!(super::super::KEY_PREFIX, super::super::key::PREFIX);
+        assert_eq!(super::super::HTTP_PATH, super::super::http::PATH);
     }
 }

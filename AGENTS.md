@@ -353,7 +353,8 @@ Feature `mcp` (on by default; `rmcp` pinned exactly in the workspace
 `Cargo.toml`). A stdio server an agent's client starts, or with `--listen`
 (feature `mcp-http`, on by default) the same server over HTTP on loopback,
 behind the MCP key; `snob mcp config <client>` prints the snippet for that
-client's configuration and never writes it.
+client's configuration and never writes it (with `--remote <url>`, one that
+reaches a server already listening: no command, no key, see "Over HTTP").
 
 - **Every tool call is a child `snob`** with the arguments a person would
   type (`commands/mcp/tools.rs` builds them, `child.rs` runs them), never a
@@ -589,7 +590,20 @@ client's configuration and never writes it.
   sees the key and every answer, other people's names and lists included,
   in plain text, and a connector's vendor stores the key; put an access
   layer in front where the tunnel offers one (Cloudflare Access service
-  tokens, for example).
+  tokens, for example). **`snob mcp config <client> --remote <url>`**
+  (`config.rs`, `render_remote`) prints a client's snippet for such a
+  server: the address and how the client sends the key, never a command
+  and never the key, which it does not read. The client takes it from
+  `SNOB_MCP_TOKEN` in its own environment (`config::TOKEN`; each client's
+  spelling of a variable, Codex's `bearer_token_env_var`), never from
+  `SNOB_MCP_KEY`, which would replace the keyring's key in every snob
+  started where it is set; Claude Desktop gets the address alone, for a
+  connector. The address is `https`, or `http` on loopback only (`ssh -L`),
+  and holds no user, password, query, fragment or key; clap is handed a
+  parser of its own (`config::RemoteUrl`) so that a refused address is not
+  printed back. The server's flags (`--allow-writes`, `--confirm-in-chat`,
+  `--max-writes-per-day`) are refused with it, since they describe a
+  process this does not start.
 
 ## Output contract
 

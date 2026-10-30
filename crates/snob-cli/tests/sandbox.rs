@@ -7073,6 +7073,109 @@ async fn initialize_over_http_opens_a_session() {
     assert!(!server.said().contains(MCP_KEY), "the key is never said");
 }
 
+/// What `snob mcp config --remote` prints reaches a real `snob mcp --listen`
+/// as it is: the address, and the header with the token filled in as the
+/// client fills it in from `SNOB_MCP_TOKEN`. The key is never printed, even
+/// with the server's variable set where it runs, and the server's flags and
+/// an address that would carry the key in plain text or hold it are
+/// refused, without saying it back.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_remote_config_reaches_the_server_it_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let with_key = [("SNOB_MCP_KEY", MCP_KEY)];
+    let config = |client: &str, more: &[&str]| {
+        let mut args = vec!["mcp", "config", client];
+        args.extend_from_slice(more);
+        snob_with(tmp.path(), None, &with_key, &args)
+    };
+    let url = server.url();
+
+    let out = config("claude-code", &["--remote", &url]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    for said in [stdout(&out), stderr(&out)] {
+        assert!(!said.contains(MCP_KEY), "the key was printed: {said}");
+    }
+    assert!(stderr(&out).contains("SNOB_MCP_TOKEN"), "{}", stderr(&out));
+    let snippet: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let remote = &snippet["mcpServers"]["snob"];
+    assert_eq!(remote["url"], url.as_str());
+    assert!(remote.get("command").is_none(), "{snippet}");
+    let header = remote["headers"]["Authorization"].as_str().unwrap();
+    let hello = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "0" }
+        }
+    });
+    let send = |authorization: String| {
+        reqwest::Client::new()
+            .post(remote["url"].as_str().unwrap())
+            .header("Authorization", authorization)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(hello.to_string())
+            .send()
+    };
+    let opened = send(header.replace("${SNOB_MCP_TOKEN}", MCP_KEY))
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), 200);
+    assert!(opened.headers().contains_key("mcp-session-id"));
+    // Sent as it is printed, before the client fills it in: no key.
+    let unfilled = send(header.to_string()).await.unwrap();
+    assert_eq!(unfilled.status(), 401);
+
+    let out = config("codex", &["--remote", &url]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let toml = stdout(&out);
+    assert!(toml.contains(&format!("url = \"{url}\"")), "{toml}");
+    assert!(
+        toml.contains("bearer_token_env_var = \"SNOB_MCP_TOKEN\""),
+        "{toml}"
+    );
+    assert!(!toml.contains("command"), "{toml}");
+
+    // An address with no path gets the one the server serves.
+    let bare = format!("http://127.0.0.1:{}", server.port);
+    let out = config("cursor", &["--remote", &bare]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let snippet: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(snippet["mcpServers"]["snob"]["url"], url.as_str());
+
+    // The server's flags belong to the server.
+    for flags in [
+        &["--allow-writes"][..],
+        &["--confirm-in-chat", "all"],
+        &["--allow-writes", "--max-writes-per-day", "3"],
+    ] {
+        let mut args = vec!["--remote", url.as_str()];
+        args.extend_from_slice(flags);
+        let refused = config("codex", &args);
+        assert_eq!(refused.status.code(), Some(2), "{flags:?}");
+        assert!(stdout(&refused).is_empty());
+    }
+    // Plain http off this machine, and a key in the address.
+    let refused = config("codex", &["--remote", "http://snob.example.com/mcp"]);
+    assert_eq!(refused.status.code(), Some(2), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("https"), "{}", stderr(&refused));
+    let holding = format!("https://snob.example.com/{MCP_KEY}/mcp");
+    let refused = config("codex", &["--remote", &holding]);
+    assert_eq!(refused.status.code(), Some(2), "{}", stderr(&refused));
+    assert!(stdout(&refused).is_empty());
+    assert!(
+        !stderr(&refused).contains(MCP_KEY),
+        "the key was said back: {}",
+        stderr(&refused)
+    );
+
+    assert_eq!(server.stop().await.code(), Some(130));
+}
+
 /// On the stateless revision a call carries everything it needs, and no
 /// session is opened for it.
 #[cfg(feature = "mcp-http")]

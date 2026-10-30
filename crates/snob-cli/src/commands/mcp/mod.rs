@@ -124,6 +124,17 @@ pub const MAX_WAIT: Duration = Duration::from_secs(5 * 60);
 /// walk stops, keeping what it read, and the agent can say when to ask again.
 pub const JOB_MAX_WAIT: Duration = Duration::from_secs(60 * 60);
 
+/// The one path `snob mcp --listen` serves (`http::PATH`), and the one a
+/// configuration for a remote server points at (`config`). Here, outside the
+/// `mcp-http` feature, since a build without the server still prints the
+/// configuration of one.
+pub const HTTP_PATH: &str = "/mcp";
+
+/// What every MCP key starts with (`key::PREFIX`). Here, outside the
+/// `mcp-http` feature, so that a configuration for a remote server can
+/// refuse an address with a key in it in every build (`config`).
+pub const KEY_PREFIX: &str = "snob_mcp_";
+
 /// How long the children of a call may wait for the request budget
 /// (`--max-wait`): the server's own `--max-wait` for both when it was given
 /// one, and otherwise [`MAX_WAIT`] for a call's command and [`JOB_MAX_WAIT`]

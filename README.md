@@ -159,7 +159,13 @@ can read:
   and a yes given in the chat covers only reading lists unless
   `--confirm-in-chat all`. TLS ends at the tunnel, whose provider sees the
   key and every answer, other people's names and lists included; put an
-  access layer in front where the tunnel offers one. After
+  access layer in front where the tunnel offers one.
+  `snob mcp config codex --remote https://your-tunnel/mcp` (or any other
+  client) prints what a client needs to reach that server: no command and
+  no key. The client sends the key from `SNOB_MCP_TOKEN` in its own
+  environment; never set `SNOB_MCP_KEY` there, since it is the server's
+  and replaces the key of any snob started where it is set. Claude Desktop
+  and claude.ai take the address as a custom connector instead. After
   upgrading snob, reconnect the server in the client: a server whose binary
   changed under it refuses every call.
 

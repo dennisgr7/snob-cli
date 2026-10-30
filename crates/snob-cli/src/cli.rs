@@ -565,7 +565,9 @@ pub enum Command {
                       reading lists there and not the writes, unless --confirm-in-chat all. \
                       --public-url names the https address the tunnel serves it at. TLS ends \
                       at the tunnel, whose provider sees the key and every answer; put an \
-                      access layer in front where it offers one."
+                      access layer in front where it offers one. \"snob mcp config <client> \
+                      --remote <URL>\" prints what a client needs to reach it there; the \
+                      client reads the key from SNOB_MCP_TOKEN."
     )]
     Mcp(McpArgs),
 
@@ -1912,7 +1914,24 @@ pub enum ConfirmInChat {
 #[cfg(feature = "mcp")]
 #[derive(Subcommand, Debug)]
 pub enum McpCommand {
-    /// Print what to add to a client's configuration to start this server
+    /// Print what to add to a client's configuration to start this server,
+    /// or to reach one already serving over HTTP
+    #[command(
+        after_help = "Printed, never written: the snippet goes to standard output, and \
+                      where it goes to standard error.\n\n\
+                      --remote <URL> configures the client to reach a \"snob mcp --listen\" \
+                      already running, at the https address your tunnel serves it at (or \
+                      http on this machine's loopback, for ssh -L), instead of starting one. \
+                      The snippet holds no key and starts nothing: the client sends the key \
+                      from SNOB_MCP_TOKEN in its own environment, which you set to what \
+                      \"snob mcp key show --reveal\" prints on the server's machine. Never \
+                      set SNOB_MCP_KEY for a client: that is the server's, and it replaces \
+                      the key of any snob started where it is set. The server's flags \
+                      (--allow-writes, --confirm-in-chat, --max-writes-per-day) go on its own \
+                      command line, and are refused here with --remote. Claude Desktop and \
+                      claude.ai take a remote server as a custom connector in their \
+                      settings, so for them only the address is printed."
+    )]
     Config(McpConfigArgs),
 
     /// Keep the key a client presents to reach this server over the
@@ -1987,6 +2006,19 @@ pub struct McpConfigArgs {
     /// Start it with --confirm-in-chat
     #[arg(long, value_enum, value_name = "WHAT")]
     pub confirm_in_chat: Option<ConfirmInChat>,
+
+    /// Reach a server already serving over HTTP at this address rather
+    /// than start one; the client sends the key from SNOB_MCP_TOKEN
+    //
+    // The server's flags describe a process this does not start, so they
+    // are refused rather than printed somewhere they do nothing.
+    #[arg(
+        long,
+        value_name = "URL",
+        value_parser = crate::commands::mcp::config::RemoteUrl,
+        conflicts_with_all = ["allow_writes", "confirm_in_chat", "max_writes_per_day"]
+    )]
+    pub remote: Option<url::Url>,
 
     /// Start it with --max-writes-per-day
     #[arg(

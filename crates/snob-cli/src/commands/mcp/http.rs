@@ -63,7 +63,7 @@ use crate::exit::{ExitCode, ExitError};
 use crate::ui;
 
 /// The one path served.
-pub const PATH: &str = "/mcp";
+pub const PATH: &str = super::HTTP_PATH;
 
 /// Connections open at once. A client keeps one or two (a stream it
 /// listens on, and a request), a tunnel a few more; past this, whoever holds
