@@ -115,11 +115,14 @@ pub fn plan_of(doc: &Value, offset: usize) -> Plan {
         run: tools::Run::Inline,
     });
     // Not held under anything: the result is the job's file, read again for
-    // every page, so `of` names nothing the server keeps.
+    // every page, so `of` names nothing the server keeps. The limit is the
+    // one the job was started with.
+    let limit = plan.page.as_ref().and_then(|page| page.limit);
     plan.page = Some(tools::Page {
         offset,
         of: String::new(),
         held_only: false,
+        limit,
     });
     plan
 }

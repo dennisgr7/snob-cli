@@ -522,12 +522,19 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   day's acts: when, what, how the yes was given and through which client.
 - **A long list comes back a page at a time** (`answer::page`): at most 200
   accounts (`answer::PAGE`) and 30,000 bytes of compact JSON
-  (`answer::PAGE_BYTES`, as a page of accounts with a picture's address is
-  some 65), since the result goes into the model's context twice (structured
-  and as text) and clients cut long ones (Claude Code at 25,000 tokens, as
-  quoted). `{count, offset, items, next_offset}`, `count` the whole list's,
-  or at most `limit` when one is given (the command prints the cut list);
-  a failure's `partial` is one page with no `next_offset`, since what a walk
+  (`answer::PAGE_BYTES`), since the result goes into the model's context
+  twice (structured and as text) and clients cut long ones (Claude Code at
+  25,000 tokens, as quoted). **An account goes without its picture's
+  address** (`answer::LEFT_OUT`, `pfp_url`): a signed URL of 300 to 500
+  bytes that answers nothing an agent is asked, and with it a page held
+  some 65 accounts. `{total, count, offset, items, next_offset}`: `total`
+  the list's, `count` what the call hands back across its pages, at most
+  `limit`. **The server applies `limit`** (`tools::Page::limit`), never the
+  command's `--limit`, so a call given one still says the whole list's
+  `total`, and one it cut to a single page says so in a sentence
+  (`answer::limited`); the limit stays out of `Plan.args`, so a yes is to
+  the walk whatever it trims, and every limit pages from the same list held.
+  A failure's `partial` is one page with no `next_offset`, since what a walk
   stopped short read is not stored as a whole list. **A list is never
   handed back as more than it is**: where it came from is the walk's
   `served` progress line (`Progress::served`, read from a job's log, or

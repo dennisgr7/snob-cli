@@ -49,12 +49,12 @@ const ABOUT: [&str; 3] = ["served", "cooldown_until", "complete"];
 pub const PAGE: usize = 200;
 
 /// The most bytes of items on a page, as compact JSON, before the result
-/// is filtered. An account is 100 to 150 bytes without a picture's address
-/// and some 450 with one, whose signed query string tokenizes at about 3
-/// bytes a token; the result is sent twice, as the structured content and as
-/// its text (the specification asks for both), so 30,000 bytes keeps a page
-/// near 20,000 tokens in all, under the cut quoted above. Without addresses
-/// a page is [`PAGE`] accounts; with them, about 65.
+/// is filtered. An account is 100 to 150 bytes once its picture's address
+/// is left out ([`LEFT_OUT`]), so a page is [`PAGE`] accounts; the bound is
+/// for longer ones, names in scripts that take several bytes a character.
+/// The result is sent twice, as the structured content and as its text (the
+/// specification asks for both), so 30,000 bytes keeps a page near 20,000
+/// tokens in all, under the cut quoted above.
 pub const PAGE_BYTES: usize = 30_000;
 
 /// What an agent is told when there is no session to act with.
@@ -133,6 +133,7 @@ pub const PUSHED_BACK: &str = "Instagram pushed back and a cooldown has started 
 pub fn from(plan: &Plan, finished: Finished) -> Answer {
     let exit = finished.code;
     let offset = plan.page.as_ref().map_or(0, |page| page.offset);
+    let limit = plan.page.as_ref().and_then(|page| page.limit);
     let mut whole_items = None;
     // Past 0, only with the document it is an answer for: `status` and a dry
     // run print one whatever their exit, and the same exit with nothing on
@@ -150,7 +151,7 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
             Some(Value::Array(items)) => {
                 let items = compact(&items);
                 // A call that takes no offset has no next page to offer.
-                let body = page(&items, offset, plan.page.is_some());
+                let body = page(&items, offset, limit, plan.page.is_some());
                 if !body["next_offset"].is_null() {
                     whole_items = Some(items);
                 }
@@ -200,7 +201,7 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
         // continues the walk instead.
         if let Some(partial) = finished.json {
             failure["partial"] = match partial {
-                Value::Array(items) => page(&compact(&items), offset, false),
+                Value::Array(items) => page(&compact(&items), offset, limit, false),
                 other => other,
             };
         }
@@ -297,8 +298,8 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
 /// The page at `offset` of a list the server holds (`pages.rs`), as the
 /// answer of a call that ran nothing, saying what the first page said of
 /// the whole list.
-pub fn held(whole: &Whole, offset: usize) -> Answer {
-    let mut body = page(&whole.items, offset, true);
+pub fn held(whole: &Whole, offset: usize, limit: Option<usize>) -> Answer {
+    let mut body = page(&whole.items, offset, limit, true);
     if let Some(fields) = body.as_object_mut() {
         fields.extend(whole.about.clone());
     }
@@ -309,23 +310,43 @@ pub fn held(whole: &Whole, offset: usize) -> Answer {
     }
 }
 
+/// What an agent is not handed of an account: its picture's address, a
+/// signed URL of 300 to 500 bytes that answers nothing an agent is asked
+/// and would make most of a page.
+const LEFT_OUT: [&str; 1] = ["pfp_url"];
+
 /// Each item as its compact JSON, which is what a page is measured in and
-/// what the server holds.
+/// what the server holds, without the fields [`LEFT_OUT`].
 fn compact(items: &[Value]) -> Vec<String> {
-    items.iter().map(Value::to_string).collect()
+    items
+        .iter()
+        .map(|item| match item {
+            Value::Object(fields) => {
+                let mut fields = fields.clone();
+                for key in LEFT_OUT {
+                    fields.remove(key);
+                }
+                Value::Object(fields).to_string()
+            }
+            other => other.to_string(),
+        })
+        .collect()
 }
 
 /// The page of `items` that starts at `offset`: as many as fit in
 /// [`PAGE_BYTES`], at most [`PAGE`] and at least one, so a page always moves
-/// on. `{count, offset, items, next_offset}`, where `count` is how many the
-/// command printed: the whole list, or at most `limit` when the call gave
-/// one, or what a walk cut short read (which `complete: false` says), and
+/// on. `{total, count, offset, items, next_offset}`, where `total` is how
+/// many the command printed (the whole list, or what a walk cut short read,
+/// which `complete: false` says), `count` how many of them the call hands
+/// back across its pages (`total`, or `limit` when that is fewer), and
 /// `next_offset` is null on the last page, or always when the call cannot
 /// be made again for another (`pages` false). An offset past the
 /// end is an empty page. **Sliced with `get`, never by indexing**: the offset
 /// is the client's number, and a panic here is the whole server gone.
-pub fn page(items: &[String], offset: usize, pages: bool) -> Value {
-    let count = items.len();
+pub fn page(items: &[String], offset: usize, limit: Option<usize>, pages: bool) -> Value {
+    let total = items.len();
+    let count = limit.map_or(total, |limit| limit.min(total));
+    let items = items.get(..count).unwrap_or_default();
     let rest = items.get(offset.min(count)..).unwrap_or_default();
     let (mut taken, mut bytes) = (0, 0);
     for item in rest.iter().take(PAGE) {
@@ -346,6 +367,7 @@ pub fn page(items: &[String], offset: usize, pages: bool) -> Value {
     let end = offset.min(count) + taken;
     let next_offset = (pages && end < count).then_some(end);
     json!({
+        "total": total,
         "count": count,
         "offset": offset,
         "items": shown,
@@ -361,6 +383,10 @@ pub fn next_page(body: &Value, tool: &str) -> Option<String> {
     let next = body.get("next_offset")?.as_u64()?;
     let count = body.get("count")?.as_u64()?;
     let offset = body.get("offset")?.as_u64()?;
+    let of = match body.get("total").and_then(Value::as_u64) {
+        Some(total) if total > count => format!("{count} (the limit; the list has {total})"),
+        _ => count.to_string(),
+    };
     // A confirmation on a call that asks nothing is refused, and only a
     // list's call may carry one.
     let and = if tool == "snob_list" {
@@ -369,7 +395,7 @@ pub fn next_page(body: &Value, tool: &str) -> Option<String> {
         ""
     };
     Some(format!(
-        "Accounts {first} to {next} of {count}. For the next ones, call {tool} again with \
+        "Accounts {first} to {next} of {of}. For the next ones, call {tool} again with \
          the same arguments{and} and \"offset\": {next}; a later page is handed back from \
          what was already read, and sends nothing and asks nothing.",
         first = offset + 1,
@@ -439,6 +465,23 @@ pub fn not_read_now(body: &Value) -> Option<String> {
         "{}, however old that is. Say so, with that date, when you present it.",
         said.join("; ")
     ))
+}
+
+/// What an agent is told beside a list its `limit` cut, which then has no
+/// next page: that the list has more, so `count` is not read as its size.
+/// A page with another after it says so in [`next_page`] instead.
+pub fn limited(body: &Value) -> Option<String> {
+    if !body.get("next_offset")?.is_null() {
+        return None;
+    }
+    let count = body.get("count")?.as_u64()?;
+    let total = body.get("total")?.as_u64()?;
+    (total > count).then(|| {
+        format!(
+            "These are the first {count} accounts, as limit asked: the list has {total}. \
+             Call again without limit, or with a higher one, for the rest."
+        )
+    })
 }
 
 /// What an agent is told beside a list that is not all of it: a walk cut
@@ -552,11 +595,17 @@ mod tests {
 
     /// A list's plan, for the page at `offset`.
     fn list_at(offset: usize) -> Plan {
+        limited_at(offset, None)
+    }
+
+    /// A list's plan given `limit`, for the page at `offset`.
+    fn limited_at(offset: usize, limit: Option<usize>) -> Plan {
         Plan {
             page: Some(crate::commands::mcp::tools::Page {
                 offset,
                 of: "the call".into(),
                 held_only: false,
+                limit,
             }),
             ..plan(&[ExitCode::Ok])
         }
@@ -667,7 +716,7 @@ mod tests {
             read.extend(page);
             if let Some(whole) = told.whole {
                 // What the server holds pages the same as the command did.
-                assert_eq!(held(&whole, offset).body, told.body);
+                assert_eq!(held(&whole, offset, None).body, told.body);
                 kept = Some(whole);
             }
             match told.body["next_offset"].as_u64() {
@@ -706,6 +755,84 @@ mod tests {
     }
 
     #[test]
+    fn a_limit_keeps_the_first_accounts_and_still_says_the_whole_list() {
+        // Within one page: no next one, and a sentence saying there are more,
+        // so the limit is never read as the list's size.
+        let five = from(
+            &limited_at(0, Some(5)),
+            finished(ExitCode::Ok, Some(accounts(450)), None),
+        );
+        assert_eq!(five.body["total"], 450);
+        assert_eq!(five.body["count"], 5);
+        assert_eq!(
+            usernames(&five.body),
+            ["user0", "user1", "user2", "user3", "user4"]
+        );
+        assert!(five.body["next_offset"].is_null());
+        assert!(next_page(&five.body, "snob_list").is_none());
+        assert!(limited(&five.body).unwrap().contains("the list has 450"));
+
+        // Across pages: they stop at the limit, and each says both numbers.
+        let first = from(
+            &limited_at(0, Some(300)),
+            finished(ExitCode::Ok, Some(accounts(450)), None),
+        );
+        assert_eq!(first.body["total"], 450);
+        assert_eq!(first.body["count"], 300);
+        assert_eq!(first.body["next_offset"], PAGE);
+        assert!(limited(&first.body).is_none(), "next_page says it instead");
+        assert!(
+            next_page(&first.body, "snob_list")
+                .unwrap()
+                .contains("of 300 (the limit; the list has 450)")
+        );
+        let whole = first.whole.unwrap();
+        assert_eq!(whole.items.len(), 450, "the whole list is held");
+        let last = held(&whole, PAGE, Some(300));
+        assert_eq!(usernames(&last.body).len(), 300 - PAGE);
+        assert!(last.body["next_offset"].is_null());
+        assert_eq!(last.body["total"], 450);
+
+        // A limit past the list is no limit, and nothing more to say.
+        let all = from(
+            &limited_at(0, Some(10)),
+            finished(ExitCode::Ok, Some(accounts(3)), None),
+        );
+        assert_eq!(
+            (all.body["total"].clone(), all.body["count"].clone()),
+            (json!(3), json!(3))
+        );
+        assert!(limited(&all.body).is_none());
+    }
+
+    #[test]
+    fn an_account_is_handed_back_without_its_picture() {
+        let printed = json!([{
+            "pk": 1,
+            "username": "anna",
+            "full_name": "Anna",
+            "is_private": false,
+            "is_verified": false,
+            "pfp_url": "https://cdn.example/a.jpg?signed=0123456789",
+        }]);
+        let told = from(
+            &list_at(0),
+            finished(ExitCode::Ok, Some(printed.clone()), None),
+        );
+        let item = &told.body["items"][0];
+        assert!(item.get("pfp_url").is_none(), "{item}");
+        assert_eq!(item["username"], "anna");
+        assert_eq!(item["full_name"], "Anna");
+        // What a walk kept before it failed is handed back the same way.
+        let failed = from(&list_at(0), finished(ExitCode::Error, Some(printed), None));
+        assert!(
+            failed.body["error"]["partial"]["items"][0]
+                .get("pfp_url")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn an_offset_past_the_end_is_an_empty_page() {
         for offset in [450, 451, usize::MAX] {
             let told = from(
@@ -720,7 +847,11 @@ mod tests {
                 items: vec![],
                 about: serde_json::Map::new(),
             };
-            assert_eq!(held(&none, offset).body["items"], json!([]), "{offset}");
+            assert_eq!(
+                held(&none, offset, None).body["items"],
+                json!([]),
+                "{offset}"
+            );
         }
     }
 
@@ -729,7 +860,7 @@ mod tests {
         let long = |n: usize, length: usize| {
             Value::Array(
                 (0..n)
-                    .map(|n| json!({"pk": n, "pfp_url": "x".repeat(length)}))
+                    .map(|n| json!({"pk": n, "full_name": "x".repeat(length)}))
                     .collect(),
             )
         };
@@ -894,7 +1025,7 @@ mod tests {
 
         // The next page, handed back from what the server holds, says it too.
         let whole = told.whole.expect("a page after this one");
-        let later = held(&whole, 200);
+        let later = held(&whole, 200, None);
         assert_eq!(later.body["complete"], false);
         assert_eq!(later.body["served"], told.body["served"]);
         assert!(incomplete(&later.body).is_some());

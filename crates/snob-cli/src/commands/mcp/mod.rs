@@ -424,8 +424,9 @@ impl ServerHandler for Server {
                  and unfollows are capped at a few a day: one that came back mcp_write_cap \
                  sent nothing, and is not to be tried again before its retry_at (seconds \
                  since the epoch). \
-                 A long list comes back a page at a time: count is the whole list's (at most \
-                 limit when one was given), and next_offset, when it is not null, is the \
+                 A long list comes back a page at a time: total is how many accounts the list \
+                 has, count how many the call hands back (at most limit when one was \
+                 given), and next_offset, when it is not null, is the \
                  offset to call again with for the next page, which sends nothing and asks \
                  nothing. One that comes back with complete: false is not the whole list, \
                  and one served from storage says when it was stored: say so when you \
@@ -523,7 +524,9 @@ impl ServerHandler for Server {
         // store, unless the walk that read it may have stopped short.
         if let Some(page) = plan.page.as_ref().filter(|page| page.offset > 0) {
             if let Some(whole) = self.pages.get(&page.of) {
-                return Ok(result(answer::held(&whole, page.offset), &request.name).into());
+                return Ok(
+                    result(answer::held(&whole, page.offset, page.limit), &request.name).into(),
+                );
             }
             if page.held_only {
                 return Ok(refusal(
@@ -901,6 +904,7 @@ fn result(told: answer::Answer, tool: &str) -> CallToolResult {
     let said = [
         answer::not_read_now(&told.body),
         answer::incomplete(&told.body),
+        answer::limited(&told.body),
         answer::next_page(&told.body, tool),
     ]
     .into_iter()
