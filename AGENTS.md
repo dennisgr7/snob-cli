@@ -410,10 +410,12 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   ticket of the other kind, carried in the `confirmation` argument, which
   stays out of `Plan.args`; brought to a call that asks nothing it is
   `invalid_arguments`, and one for another call or past its time is no yes
-  (the call is asked again, with `previous` saying why). Where a transport
-  has sessions, the chat ticket is bound to the session too (over HTTP, the
-  request's `Mcp-Session-Id`, read from the parts rmcp hands the handler);
-  stdio has none.
+  (the call is asked again, with `previous` saying why). Where a request
+  carries a session, the chat ticket is bound to it too (over HTTP, the
+  `Mcp-Session-Id` of the 2025-11-25 revision, read from the parts rmcp
+  hands the handler). **A stateless call over HTTP carries none, as stdio
+  does**, so there the ticket is bound to the command alone, and any
+  conversation that holds the key may redeem it, once, before it expires.
   No ticket outlives the process.
 - **Signing in is the person's.** The server's instructions say so, and
   every answer that comes of having no session carries a hint that the
@@ -581,29 +583,37 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   checks and the same handler. **The `Host` and `Origin` checks guard
   browsers (DNS rebinding) only; against any other caller the key is the
   only control.** hyper serves HTTP/1.1 with a header (and idle) timeout of
-  10 s and a 16 KiB buffer, at most 32 connections; sessions idle for 30
-  min close. The limits, consent, jobs and tasks are the stdio server's,
-  shared by every session. Ctrl+C (or the system, or `--stop-when-stdin-
-  closes`) stops accepting, stops every call's child as a canceled call's
-  is stopped, waits for them (`child::GRACE` and 5 s), ends the streams and
-  exits 130. **What the tunnel sees**: TLS ends at its edge, so its provider
-  sees the key and every answer, other people's names and lists included,
-  in plain text, and a connector's vendor stores the key; put an access
-  layer in front where the tunnel offers one (Cloudflare Access service
-  tokens, for example). **`snob mcp config <client> --remote <url>`**
-  (`config.rs`, `render_remote`) prints a client's snippet for such a
-  server: the address and how the client sends the key, never a command
-  and never the key, which it does not read. The client takes it from
-  `SNOB_MCP_TOKEN` in its own environment (`config::TOKEN`; each client's
-  spelling of a variable, Codex's `bearer_token_env_var`), never from
-  `SNOB_MCP_KEY`, which would replace the keyring's key in every snob
-  started where it is set; Claude Desktop gets the address alone, for a
-  connector. The address is `https`, or `http` on loopback only (`ssh -L`),
-  and holds no user, password, query, fragment or key; clap is handed a
-  parser of its own (`config::RemoteUrl`) so that a refused address is not
-  printed back. The server's flags (`--allow-writes`, `--confirm-in-chat`,
-  `--max-writes-per-day`) are refused with it, since they describe a
-  process this does not start.
+  10 s and a 16 KiB buffer; a connection's first request must arrive within
+  2 s. At most 32 connections, **counted against those that have shown the
+  key**: past it, the oldest connection that has not is closed for the new
+  one, so idle sockets held by another local process lock no client with
+  the key out (`http::Open`). `Host` takes the bound address too, so any of
+  127/8 works. Sessions idle for 30 min close. The limits, consent, jobs and
+  tasks are the stdio server's, shared by every session; a chat token from
+  a stateless call is bound to its command only (see "A yes counts once").
+  Ctrl+C (or the system, or `--stop-when-stdin-closes`) stops accepting,
+  stops every call's child as a canceled call's is stopped, waits for them
+  (`child::GRACE` and 5 s), **then for their answers to be written** (rmcp
+  drops an answer it has not handed over once its token is canceled), and
+  only then ends the streams and exits 130. **What the tunnel sees**: TLS
+  ends at its edge, so its provider sees the key and every answer, other
+  people's names and lists included, in plain text, and a connector's vendor
+  stores the key; put an access layer in front where the tunnel offers one
+  (Cloudflare Access service tokens, for example). **`snob mcp config
+  <client> --remote <url>`** (`config.rs`, `render_remote`) prints a
+  client's snippet for such a server: the address and how the client sends
+  the key, never a command and never the key, which it does not read. The
+  client takes it from `SNOB_MCP_TOKEN` in its own environment
+  (`config::TOKEN`; each client's spelling of a variable, Codex's
+  `bearer_token_env_var`), never from `SNOB_MCP_KEY`, which would replace
+  the keyring's key in every snob started where it is set; Claude Desktop
+  gets the address alone, for a connector, which Anthropic's side reaches,
+  so a loopback address is warned about. The address is `https`, or `http`
+  on loopback only (`ssh -L`), and holds no user, password, query, fragment
+  or key; clap is handed a parser of its own (`config::RemoteUrl`) so that a
+  refused address is not printed back. The server's flags (`--allow-writes`,
+  `--confirm-in-chat`, `--max-writes-per-day`) are refused with it, since
+  they describe a process this does not start.
 
 ## Output contract
 

@@ -136,15 +136,12 @@ pub fn remote_url(text: &str) -> Result<Url, String> {
                 .to_string(),
         );
     }
-    let loopback = match url.host() {
-        Some(Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
-        Some(Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(Host::Ipv6(ip)) => ip.is_loopback(),
-        None => return Err(format!("\"{text}\" names no host")),
-    };
+    if url.host().is_none() {
+        return Err(format!("\"{text}\" names no host"));
+    }
     match url.scheme() {
         "https" => {}
-        "http" if loopback => {}
+        "http" if on_loopback(&url) => {}
         "http" => {
             return Err(format!(
                 "\"{text}\" is http on another machine: the key travels in every request, so \
@@ -158,6 +155,28 @@ pub fn remote_url(text: &str) -> Result<Url, String> {
         url.set_path(super::HTTP_PATH);
     }
     Ok(url)
+}
+
+/// Whether `url` is this machine's own: `localhost`, or a loopback address.
+fn on_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// The warning for an address `client` cannot reach, when it is one: a
+/// custom connector of Claude Desktop's is reached from Anthropic's side,
+/// never from the person's machine, so an address on this machine's
+/// loopback (where `ssh -L` puts a tunnel's near end) leads it nowhere.
+fn unreachable_by(client: McpClient, url: &Url) -> Option<&'static str> {
+    (client == McpClient::ClaudeDesktop && on_loopback(url)).then_some(
+        "a custom connector is reached from Anthropic's side, never from this machine, so \
+         this address leads it nowhere: give it the https address a tunnel serves the \
+         server at (\"snob mcp --listen --public-url\")",
+    )
 }
 
 /// [`remote_url`] for clap. Not a plain function as a value parser, whose
@@ -216,6 +235,9 @@ fn remote(
             if ignored.len() == 1 { "it" } else { "them" },
         ));
     }
+    if let Some(warning) = unreachable_by(client, url) {
+        ui::warn(warning);
+    }
     if !url.path().ends_with(super::HTTP_PATH) {
         ui::warn(&format!(
             "the server answers at {} only; this address is right only if the tunnel maps \
@@ -227,9 +249,9 @@ fn remote(
     ui::say!("{snippet}");
     ui::info(whereto);
     ui::info(if client == McpClient::ClaudeDesktop {
-        "In the form, the header is Authorization and its value is \"Bearer \" followed by \
-         the key, which \"snob mcp key show --reveal\" prints on the machine the server runs \
-         on."
+        "In the form, under Request headers, the header is Authorization and its value is \
+         \"Bearer \" followed by the key, which \"snob mcp key show --reveal\" prints on the \
+         machine the server runs on."
     } else {
         // `TOKEN` and `key::ENV`, spelled out so that the sentence is one
         // constant.
@@ -462,13 +484,21 @@ fn render_remote(client: McpClient, url: &str, within: Duration) -> (String, &'s
              ${SNOB_MCP_TOKEN} from its environment when it connects.",
         ),
         // Claude Desktop and claude.ai reach a remote server as a custom
-        // connector, added in their settings, not in a file.
+        // connector, added in their settings, not in a file, and reached
+        // from Anthropic's side (claude.com/docs/connectors/custom/
+        // add-unlisted, read 2026-10-30: the menu, the https address, and
+        // request headers in beta for some organizations, with
+        // Authentication set to "No sign-in").
         McpClient::ClaudeDesktop => (
             url.to_string(),
             "Claude Desktop reads no file for a remote server: add this address as a custom \
-             connector (Settings, Connectors), as on claude.ai. The server takes nothing but the \
-             key, as an Authorization header, so it is reached only where the connector's form \
-             takes a header; snob offers no sign-in of its own (OAuth).",
+             connector under Customize > Connectors, as on claude.ai (on a Team or Enterprise \
+             plan, an Owner adds it under Organization settings > Connectors). A connector is \
+             reached from Anthropic's side, so the address is the https one a tunnel serves. \
+             The server takes nothing but the key, as an Authorization header: choose \
+             Authentication \"No sign-in\" and give the key under Request headers, which are \
+             in beta and offered to some organizations only; snob offers no sign-in of its \
+             own (OAuth).",
         ),
         McpClient::Cursor => (
             servers(
@@ -799,6 +829,31 @@ mod tests {
         let (snippet, whereto) = render_remote(McpClient::ClaudeDesktop, REMOTE, within());
         assert_eq!(snippet, REMOTE);
         assert!(whereto.contains("custom connector"), "{whereto}");
+        assert!(whereto.contains("Customize > Connectors"), "{whereto}");
+        assert!(whereto.contains("\"No sign-in\""), "{whereto}");
+        assert!(whereto.contains("in beta"), "{whereto}");
+    }
+
+    /// A connector is reached from Anthropic's side: an address on this
+    /// machine is one it cannot reach, and is warned about; the other
+    /// clients run where the tunnel's near end is.
+    #[test]
+    fn a_loopback_address_for_claude_desktop_is_warned_about() {
+        for address in [
+            "http://127.0.0.1:8750/mcp",
+            "http://localhost:8750/mcp",
+            "http://[::1]:8750/mcp",
+            "https://localhost/mcp",
+        ] {
+            let url = remote_url(address).expect(address);
+            assert!(
+                unreachable_by(McpClient::ClaudeDesktop, &url).is_some(),
+                "{address}"
+            );
+            assert!(unreachable_by(McpClient::ClaudeCode, &url).is_none());
+        }
+        let public = remote_url(REMOTE).unwrap();
+        assert!(unreachable_by(McpClient::ClaudeDesktop, &public).is_none());
     }
 
     /// Nothing printed for a remote server holds a key: it is never read,

@@ -339,9 +339,11 @@ impl Server {
     }
 }
 
-/// The session a request was made in, when its transport has sessions: the
-/// `Mcp-Session-Id` the client sent over HTTP. Standard input and output is
-/// one connection to the person's own client, and has none.
+/// The session a request was made in, when it has one: the `Mcp-Session-Id`
+/// the client sent over HTTP on the 2025-11-25 revision. Standard input and
+/// output is one connection to the person's own client, and has none; **a
+/// stateless call over HTTP (2026-07-28) sends none either**, and its chat
+/// ticket is bound to the command alone ([`chat_binding`]).
 fn session_of(context: &RequestContext<RoleServer>) -> Option<String> {
     #[cfg(feature = "mcp-http")]
     {
@@ -1059,9 +1061,11 @@ fn cannot_confirm(about: About) -> String {
 }
 
 /// What a yes given in the chat is bound to: the command and, when the
-/// transport has sessions, the session, so that a token handed out in one
-/// is no yes in another. JSON, as the binding is, so neither can run into
-/// the other.
+/// request carries a session ([`session_of`]), the session, so that a token
+/// handed out in one is no yes in another. With none (stdio, or a stateless
+/// call over HTTP), the command alone: any conversation that holds the key
+/// may then redeem the token, once, before it expires. JSON, as the binding
+/// is, so neither can run into the other.
 fn chat_binding(binding: &str, session: Option<&str>) -> String {
     match session {
         None => binding.to_string(),

@@ -6569,60 +6569,74 @@ impl HttpMcp {
     /// Posts `message` with the key, in `session` when given, on the
     /// revision a session speaks (2025-11-25) or else the stateless one.
     async fn post(&self, session: Option<&str>, message: &serde_json::Value) -> Answered {
-        let mut request = self
-            .http
-            .post(self.url())
-            .header("Authorization", format!("Bearer {MCP_KEY}"))
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream")
-            .body(message.to_string());
-        match session {
-            Some(id) => {
-                request = request
-                    .header("Mcp-Session-Id", id)
-                    .header("MCP-Protocol-Version", "2025-11-25");
-            }
-            None if message["method"] != "initialize" => {
-                request = request
-                    .header("MCP-Protocol-Version", "2026-07-28")
-                    .header("Mcp-Method", message["method"].as_str().unwrap_or_default());
-                if let Some(name) = message["params"]["name"].as_str() {
-                    request = request.header("Mcp-Name", name);
-                }
-            }
-            None => {}
-        }
-        let response = tokio::time::timeout(std::time::Duration::from_secs(90), request.send())
-            .await
-            .expect("an answer within a minute and a half")
-            .expect("the server answers");
-        let status = response.status().as_u16();
-        let session = response
-            .headers()
-            .get("mcp-session-id")
-            .and_then(|id| id.to_str().ok())
-            .map(str::to_string);
-        let json = response
-            .headers()
-            .get("content-type")
-            .and_then(|kind| kind.to_str().ok())
-            .is_some_and(|kind| kind.starts_with("application/json"));
-        let body = response.text().await.unwrap_or_default();
-        let messages = if json {
-            serde_json::from_str(&body).into_iter().collect()
-        } else {
-            body.lines()
-                .filter_map(|line| line.strip_prefix("data:"))
-                .filter_map(|data| serde_json::from_str(data.trim()).ok())
-                .collect()
-        };
-        Answered {
-            status,
-            session,
-            messages,
-        }
+        post_to(&self.http, self.url(), session, message).await
     }
+}
 
+/// [`HttpMcp::post`], with what it needs of the server, for a request made
+/// from a task of its own.
+#[cfg(feature = "mcp-http")]
+async fn post_to(
+    http: &reqwest::Client,
+    url: String,
+    session: Option<&str>,
+    message: &serde_json::Value,
+) -> Answered {
+    let mut request = http
+        .post(url)
+        .header("Authorization", format!("Bearer {MCP_KEY}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(message.to_string());
+    match session {
+        Some(id) => {
+            request = request
+                .header("Mcp-Session-Id", id)
+                .header("MCP-Protocol-Version", "2025-11-25");
+        }
+        None if message["method"] != "initialize" => {
+            request = request
+                .header("MCP-Protocol-Version", "2026-07-28")
+                .header("Mcp-Method", message["method"].as_str().unwrap_or_default());
+            if let Some(name) = message["params"]["name"].as_str() {
+                request = request.header("Mcp-Name", name);
+            }
+        }
+        None => {}
+    }
+    let response = tokio::time::timeout(std::time::Duration::from_secs(90), request.send())
+        .await
+        .expect("an answer within a minute and a half")
+        .expect("the server answers");
+    let status = response.status().as_u16();
+    let session = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|id| id.to_str().ok())
+        .map(str::to_string);
+    let json = response
+        .headers()
+        .get("content-type")
+        .and_then(|kind| kind.to_str().ok())
+        .is_some_and(|kind| kind.starts_with("application/json"));
+    let body = response.text().await.unwrap_or_default();
+    let messages = if json {
+        serde_json::from_str(&body).into_iter().collect()
+    } else {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .filter_map(|data| serde_json::from_str(data.trim()).ok())
+            .collect()
+    };
+    Answered {
+        status,
+        session,
+        messages,
+    }
+}
+
+#[cfg(feature = "mcp-http")]
+impl HttpMcp {
     /// A request, and the message that answers it.
     async fn ask(
         &mut self,
@@ -6894,6 +6908,44 @@ async fn a_wrong_key_is_refused_and_the_connection_closed() {
     )
     .await;
     assert!(said.starts_with("HTTP/1.1 200"), "{said}");
+    assert_eq!(server.stop().await.code(), Some(130));
+}
+
+/// Connections that never show the key hold no place a client with it
+/// needs: past the cap, the oldest of them is closed for the new one, so a
+/// local process holding idle sockets locks nobody out.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn connections_without_the_key_do_not_lock_out_a_client_with_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    // More than the cap, sending nothing, all open at once.
+    let mut idle = Vec::new();
+    for _ in 0..40 {
+        idle.push(
+            tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+                .await
+                .unwrap(),
+        );
+    }
+    let since = std::time::Instant::now();
+    let session = server.open().await;
+    let tools = server
+        .ask(Some(&session), "tools/list", serde_json::json!({}))
+        .await;
+    assert!(tools["result"]["tools"].is_array(), "{tools}");
+    assert!(
+        since.elapsed() < std::time::Duration::from_secs(10),
+        "not by waiting for the idle ones to be cut: {:?}",
+        since.elapsed()
+    );
+
+    // And one that sends nothing is closed within seconds, not left to hold
+    // its place for the ten an idle connection between requests gets.
+    let (said, closed) = exchange(server.port, b"", std::time::Duration::from_secs(8)).await;
+    assert!(closed, "closed for sending nothing: {said}");
+    drop(idle);
     assert_eq!(server.stop().await.code(), Some(130));
 }
 
@@ -7372,13 +7424,27 @@ async fn a_chat_confirmation_of_a_list_works_over_two_http_requests() {
 
 /// Asked to stop while a call runs, the server stops that call's child in
 /// order, as a canceled call would (here, the start of a job, which stops
-/// the job it had not handed over yet), waits for it, and exits 130.
+/// the job it had not handed over yet), waits for it, **hands the call its
+/// answer**, and exits 130.
 ///
 /// Stopped through standard input closing (`--stop-when-stdin-closes`),
 /// which takes the same road as Ctrl+C and can be sent on every platform.
 #[cfg(feature = "mcp-http")]
 #[tokio::test]
 async fn ctrl_c_gives_running_calls_their_grace() {
+    stopped_during_a_call(true).await;
+}
+
+/// The same for a call on the stateless revision, whose answer the SDK
+/// drops if its own token is canceled first.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn ctrl_c_gives_a_stateless_call_its_answer() {
+    stopped_during_a_call(false).await;
+}
+
+#[cfg(feature = "mcp-http")]
+async fn stopped_during_a_call(in_a_session: bool) {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
     log_in(tmp.path(), &instagram);
@@ -7387,27 +7453,28 @@ async fn ctrl_c_gives_running_calls_their_grace() {
         instagram: &instagram,
     };
     let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
-    let session = server.open().await;
+    let session = if in_a_session {
+        Some(server.open().await)
+    } else {
+        None
+    };
+    let mut params = serde_json::json!({
+        "name": "snob_list", "arguments": { "list": "followers", "wait_seconds": 50 }
+    });
+    if !in_a_session {
+        params["_meta"] = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": { "name": "test", "version": "0" }
+        });
+    }
     let request = serde_json::json!({
-        "jsonrpc": "2.0", "id": 500, "method": "tools/call",
-        "params": { "name": "snob_list", "arguments": { "list": "followers", "wait_seconds": 50 } }
+        "jsonrpc": "2.0", "id": 500, "method": "tools/call", "params": params
     });
     let call = {
         let http = server.http.clone();
         let url = server.url();
-        tokio::spawn(async move {
-            http.post(url)
-                .header("Authorization", format!("Bearer {MCP_KEY}"))
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json, text/event-stream")
-                .header("Mcp-Session-Id", session)
-                .header("MCP-Protocol-Version", "2025-11-25")
-                .body(request.to_string())
-                .send()
-                .await
-                .ok()
-                .map(|response| response.status().as_u16())
-        })
+        tokio::spawn(async move { post_to(&http, url, session.as_deref(), &request).await })
     };
     until_asked(&instagram, 1).await;
 
@@ -7426,5 +7493,20 @@ async fn ctrl_c_gives_running_calls_their_grace() {
         matches!(job["status"].as_str(), Some("canceled" | "stopped")),
         "the walk was stopped in order: {job}"
     );
-    let _ = call.await;
+    let answered = call.await.unwrap();
+    assert_eq!(answered.status, 200, "{:?}", answered.messages);
+    let answer = answered
+        .messages
+        .iter()
+        .find(|message| message["id"] == 500)
+        .unwrap_or_else(|| panic!("the call was answered: {:?}", answered.messages));
+    assert!(
+        answer.get("result").is_some() || answer.get("error").is_some(),
+        "{answer}"
+    );
+    assert!(
+        !server.said().contains("empty response"),
+        "{}",
+        server.said()
+    );
 }

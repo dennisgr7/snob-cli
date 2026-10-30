@@ -157,17 +157,21 @@ can read:
   cloudflared, a VPN) to reach from elsewhere: it refuses any address that
   is not loopback and any request without the key (`Authorization: Bearer`),
   and a yes given in the chat covers only reading lists unless
-  `--confirm-in-chat all`. TLS ends at the tunnel, whose provider sees the
-  key and every answer, other people's names and lists included; put an
-  access layer in front where the tunnel offers one.
-  `snob mcp config codex --remote https://your-tunnel/mcp` (or any other
-  client) prints what a client needs to reach that server: no command and
-  no key. The client sends the key from `SNOB_MCP_TOKEN` in its own
-  environment; never set `SNOB_MCP_KEY` there, since it is the server's
-  and replaces the key of any snob started where it is set. Claude Desktop
-  and claude.ai take the address as a custom connector instead. After
-  upgrading snob, reconnect the server in the client: a server whose binary
-  changed under it refuses every call.
+  `--confirm-in-chat all`. A client on the stateless revision of MCP has no
+  session, so a chat yes it is handed is bound to the call alone, and any
+  client with the key may redeem it once. TLS ends at the tunnel, whose
+  provider sees the key and every answer, other people's names and lists
+  included; put an access layer in front where the tunnel offers one. `snob
+  mcp config codex --remote https://your-tunnel/mcp` (or any other client)
+  prints what a client needs to reach that server: no command and no key.
+  The client sends the key from `SNOB_MCP_TOKEN` in its own environment;
+  never set `SNOB_MCP_KEY` there, since it is the server's and replaces the
+  key of any snob started where it is set. Claude Desktop and claude.ai take
+  the address as a custom connector instead (Customize > Connectors), which
+  they reach from Anthropic's side, so it is the tunnel's https address,
+  with the key under the form's Request headers where your organization has
+  them. After upgrading snob, reconnect the server in the client: a server
+  whose binary changed under it refuses every call.
 
 ## Staying a light client
 

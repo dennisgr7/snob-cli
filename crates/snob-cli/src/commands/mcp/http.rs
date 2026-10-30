@@ -29,14 +29,27 @@
 //!    and then the same handler `snob mcp` serves on standard input and
 //!    output, with the same tickets, limits and children.
 //!
+//! **A connection that has not shown the key holds no place.** Anything on
+//! the machine can open connections and send nothing, so the cap on open
+//! connections ([`MOST_CONNECTIONS`]) is filled first by the key's holders:
+//! a connection whose first request has not arrived within
+//! [`FIRST_REQUEST_WITHIN`] is closed, and at the cap the oldest connection
+//! that has not shown the key is closed to make room ([`Open`]). Only when
+//! every connection open has shown it is a new one refused. A client's new
+//! connection shows the key in its first request, within milliseconds, so
+//! pushing it out would take more than the cap of new connections opened in
+//! that time.
+//!
 //! **Against a caller that is not a browser, the key is the only control.**
 //! The `Host` and `Origin` checks keep a web page in the person's own
 //! browser from reaching the port through DNS rebinding; anything else sets
 //! those headers as it likes.
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -54,10 +67,10 @@ use snob_core::watch::sign;
 use snob_ig::pace::CancelToken;
 use snob_store::secrets::SecretStore;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 use url::Url;
 
-use super::{Server, Settings, child, key};
+use super::{InFlight, Running, Server, Settings, child, key};
 use crate::cli::ConfirmInChat;
 use crate::exit::{ExitCode, ExitError};
 use crate::ui;
@@ -66,9 +79,19 @@ use crate::ui;
 pub const PATH: &str = super::HTTP_PATH;
 
 /// Connections open at once. A client keeps one or two (a stream it
-/// listens on, and a request), a tunnel a few more; past this, whoever holds
-/// them is not one person's clients, and a new one is closed at once.
+/// listens on, and a request), a tunnel a few more. **Counted against the
+/// connections that have shown the key**: a new one past this closes the
+/// oldest that has not ([`Open::admit`]), so a process without the key that
+/// holds idle connections only pushes out its own. Past this many that have
+/// shown it, whoever holds them is not one person's clients, and a new one is
+/// closed at once.
 const MOST_CONNECTIONS: usize = 32;
+
+/// How long a new connection has to send the head of its first request. A
+/// client connects to send one, and sends it at once; a connection that sends
+/// nothing is closed this soon, rather than after [`HEADERS_WITHIN`], so the
+/// places it holds turn over fast.
+const FIRST_REQUEST_WITHIN: Duration = Duration::from_secs(2);
 
 /// Sessions open at once (the revisions before 2026-07-28 open one per
 /// conversation). A session is a little memory and a task, and each client
@@ -100,8 +123,8 @@ const BUFFER: usize = 16 * 1024;
 /// among [`MOST_SESSIONS`] for the life of the server.
 const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
 
-/// How long the connections still open get, once the calls have settled, to
-/// finish what they are writing.
+/// Once the calls have settled on the way out: how long their answers get to
+/// be written, and then how long the connections still open get to end.
 const CLOSING_WITHIN: Duration = Duration::from_secs(2);
 
 /// Where to listen, and the address a tunnel reaches it at, if one does.
@@ -154,15 +177,21 @@ pub fn public_url(text: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-/// The `Host` values and browser origins taken: loopback's names, and the
-/// public URL's host and origin. **Never an empty list of hosts**, which the
-/// SDK reads as any host at all.
-fn allowed(public: Option<&Url>) -> (Vec<String>, Vec<String>) {
+/// The `Host` values and browser origins taken: loopback's names, the
+/// address the server is bound to (any of 127/8 may be, and a client told
+/// that address names it), and the public URL's host and origin. **Never an
+/// empty list of hosts**, which the SDK reads as any host at all.
+fn allowed(bound: IpAddr, public: Option<&Url>) -> (Vec<String>, Vec<String>) {
     let mut hosts = vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
         "::1".to_string(),
     ];
+    // Without brackets, as the SDK compares an IPv6 host.
+    let bound = bound.to_string();
+    if !hosts.contains(&bound) {
+        hosts.push(bound);
+    }
     let mut origins = Vec::new();
     if let Some(url) = public
         && let Some(host) = url.host_str()
@@ -207,7 +236,7 @@ pub async fn serve(
     let gate = Gate::new(&key)?;
     drop(key);
 
-    let (hosts, origins) = allowed(listen.public.as_ref());
+    let (hosts, origins) = allowed(bound.ip(), listen.public.as_ref());
     let config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(hosts)
         .with_allowed_origins(origins)
@@ -231,6 +260,7 @@ pub async fn serve(
         gate,
         service,
         manager,
+        answering: Arc::new(InFlight::default()),
     });
 
     started(
@@ -243,6 +273,7 @@ pub async fn serve(
     );
 
     let mut connections = JoinSet::new();
+    let mut open = Open::default();
     loop {
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
@@ -251,11 +282,20 @@ pub async fn serve(
         // Finished connections, before they are counted.
         while connections.try_join_next().is_some() {}
         match accepted {
-            Ok(_) if connections.len() >= MOST_CONNECTIONS => {
-                tracing::debug!("refused a connection to snob mcp: too many open");
+            Ok(_) if !open.admit() => {
+                tracing::debug!(
+                    "refused a connection to snob mcp: every one open has shown the key"
+                );
             }
             Ok((stream, _)) => {
-                connections.spawn(connection(stream, Arc::clone(&front), closing.clone()));
+                let seen = Arc::new(Seen::default());
+                let task = connections.spawn(connection(
+                    stream,
+                    Arc::clone(&front),
+                    closing.clone(),
+                    Arc::clone(&seen),
+                ));
+                open.push(seen, task);
             }
             Err(e) => {
                 tracing::debug!(error = %e, "refused a connection to snob mcp");
@@ -265,18 +305,67 @@ pub async fn serve(
         }
     }
 
-    // Stopping: nothing new is taken, each call's child has been asked to
+    // Stopping: nothing new is taken, and each call's child has been asked to
     // stop (the handlers race their child against the same token) and gets
-    // its grace, and then the streams still open are ended.
+    // its grace. **Then the answers are written, and only then are the
+    // streams ended**: the SDK's own token, canceled, drops an answer it has
+    // not yet handed to its response (a 500, or a stream with no result), so
+    // the server first waits for every response to a request to have been
+    // sent ([`Front::answering`]), which a connection told to close finishes
+    // writing. What is left is a stream that never ends by itself (a
+    // session's own), which the token ends.
     drop(listener);
     in_flight
         .settled(child::GRACE + Duration::from_secs(5))
         .await;
+    front.answering.settled(CLOSING_WITHIN).await;
     stopping.cancel();
     let ended = async { while connections.join_next().await.is_some() {} };
     let _ = tokio::time::timeout(CLOSING_WITHIN, ended).await;
     connections.abort_all();
     Ok(ExitCode::Interrupted)
+}
+
+/// What a connection has done so far, which the accept loop counts it by.
+#[derive(Default)]
+struct Seen {
+    /// The head of a request has arrived on it.
+    asked: AtomicBool,
+    /// A request on it has shown the key ([`Gate::lets_in`]).
+    keyed: AtomicBool,
+}
+
+/// The connections open, oldest first.
+#[derive(Default)]
+struct Open(VecDeque<(Arc<Seen>, AbortHandle)>);
+
+impl Open {
+    /// Whether a new connection may be taken: always while fewer than
+    /// [`MOST_CONNECTIONS`] are open, and otherwise once **the oldest that
+    /// has not shown the key** has been closed to make room. Refused only
+    /// when every connection open has shown it.
+    fn admit(&mut self) -> bool {
+        self.0.retain(|(_, task)| !task.is_finished());
+        if self.0.len() < MOST_CONNECTIONS {
+            return true;
+        }
+        let Some(oldest) = self
+            .0
+            .iter()
+            .position(|(seen, _)| !seen.keyed.load(Ordering::SeqCst))
+        else {
+            return false;
+        };
+        if let Some((_, task)) = self.0.remove(oldest) {
+            // Its task dropped, its connection is closed.
+            task.abort();
+        }
+        true
+    }
+
+    fn push(&mut self, seen: Arc<Seen>, task: AbortHandle) {
+        self.0.push_back((seen, task));
+    }
 }
 
 /// What the person running the server is told when it starts, on standard
@@ -317,14 +406,19 @@ fn started(
 }
 
 /// One connection, served until it ends or the server stops, when it is
-/// told to finish the response it is writing and take no other.
-async fn connection(stream: TcpStream, front: Arc<Front>, closing: CancelToken) {
+/// told to finish the response it is writing and take no other. One whose
+/// first request has not arrived within [`FIRST_REQUEST_WITHIN`] is closed.
+async fn connection(stream: TcpStream, front: Arc<Front>, closing: CancelToken, seen: Arc<Seen>) {
     // Small writes are the stream of a call: a heartbeat, an answer.
     let _ = stream.set_nodelay(true);
-    let service = hyper::service::service_fn(move |request| {
-        let front = Arc::clone(&front);
-        async move { Ok::<_, Infallible>(front.answer(request).await) }
-    });
+    let service = {
+        let seen = Arc::clone(&seen);
+        hyper::service::service_fn(move |request| {
+            let front = Arc::clone(&front);
+            let seen = Arc::clone(&seen);
+            async move { Ok::<_, Infallible>(front.answer(request, &seen).await) }
+        })
+    };
     let mut builder = http1::Builder::new();
     // **Without a timer, the header timeout panics** rather than timing out
     // (hyper's `common/time.rs`), and a buffer under hyper's 8 KiB floor
@@ -335,8 +429,16 @@ async fn connection(stream: TcpStream, front: Arc<Front>, closing: CancelToken) 
         .max_buf_size(BUFFER);
     let serving = builder.serve_connection(TokioIo::new(stream), service);
     let mut serving = std::pin::pin!(serving);
+    let unasked = async {
+        tokio::time::sleep(FIRST_REQUEST_WITHIN).await;
+        if seen.asked.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+    };
     tokio::select! {
         _ = serving.as_mut() => return,
+        // Dropped, which closes it.
+        () = unasked => return,
         () = closing.canceled() => {}
     }
     serving.as_mut().graceful_shutdown();
@@ -351,11 +453,17 @@ struct Front {
     gate: Gate,
     service: StreamableHttpService<Server, LocalSessionManager>,
     manager: Arc<LocalSessionManager>,
+    /// The responses to a `POST` not yet sent whole, from when the request
+    /// was let in until its body has been written or dropped: what the server
+    /// waits for on its way out before it ends the streams.
+    answering: Arc<InFlight>,
 }
 
 impl Front {
-    /// Answers one request, in the order the header gives.
-    async fn answer(&self, request: Request<Incoming>) -> Response {
+    /// Answers one request, in the order the header gives, noting on `seen`
+    /// that it came, and whether it showed the key.
+    async fn answer(&self, request: Request<Incoming>, seen: &Seen) -> Response {
+        seen.asked.store(true, Ordering::SeqCst);
         if request.uri().path() != PATH {
             return plain(StatusCode::NOT_FOUND, "Not Found", false);
         }
@@ -363,6 +471,10 @@ impl Front {
             tracing::debug!("refused a request to snob mcp: no key, or not the key");
             return unauthorized();
         }
+        seen.keyed.store(true, Ordering::SeqCst);
+        // A `GET` is a stream only the server's stopping ends, and is not
+        // waited for.
+        let answering = (request.method() == Method::POST).then(|| self.answering.enter());
         let (parts, body) = request.into_parts();
         let body = match read(&parts.headers, body).await {
             Ok(body) => body,
@@ -383,9 +495,48 @@ impl Front {
                 false,
             );
         }
-        self.service
+        let response = self
+            .service
             .handle(Request::from_parts(parts, Full::new(body)))
-            .await
+            .await;
+        match answering {
+            Some(running) => response.map(|body| {
+                Answering {
+                    body,
+                    _running: running,
+                }
+                .boxed()
+            }),
+            None => response,
+        }
+    }
+}
+
+/// A response's body that counts as being answered ([`Front::answering`])
+/// until it has been sent whole, or dropped with its connection.
+struct Answering {
+    body: BoxBody<Bytes, Infallible>,
+    /// Held for its drop, which ends the count.
+    _running: Running,
+}
+
+impl hyper::body::Body for Answering {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+        std::pin::Pin::new(&mut self.body).poll_frame(context)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
     }
 }
 
@@ -558,18 +709,58 @@ mod tests {
 
     #[test]
     fn loopback_and_the_public_host_are_the_hosts_taken() {
-        let (hosts, origins) = allowed(None);
+        let home = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let (hosts, origins) = allowed(home, None);
         assert_eq!(hosts, ["localhost", "127.0.0.1", "::1"]);
         assert!(origins.is_empty(), "no browser origin at all");
+        let (hosts, _) = allowed("::1".parse().unwrap(), None);
+        assert_eq!(hosts, ["localhost", "127.0.0.1", "::1"]);
+
+        // Bound elsewhere in 127/8, the address a client is told is taken.
+        let (hosts, _) = allowed("127.0.0.2".parse().unwrap(), None);
+        assert_eq!(hosts, ["localhost", "127.0.0.1", "::1", "127.0.0.2"]);
 
         let public = public_url("https://snob.example.com/mcp").unwrap();
-        let (hosts, origins) = allowed(Some(&public));
+        let (hosts, origins) = allowed(home, Some(&public));
         assert_eq!(hosts.last().unwrap(), "snob.example.com");
         assert_eq!(origins, ["https://snob.example.com:443"]);
 
         let public = public_url("https://snob.example.com:8443").unwrap();
-        let (_, origins) = allowed(Some(&public));
+        let (_, origins) = allowed(home, Some(&public));
         assert_eq!(origins, ["https://snob.example.com:8443"]);
+    }
+
+    /// At the cap, the oldest connection that has not shown the key makes
+    /// room; when every one has shown it, a new one is refused.
+    #[tokio::test]
+    async fn a_connection_without_the_key_makes_room_for_one_with_it() {
+        let mut tasks = JoinSet::new();
+        let mut open = Open::default();
+        let mut seen = Vec::new();
+        for _ in 0..MOST_CONNECTIONS {
+            assert!(open.admit());
+            let one = Arc::new(Seen::default());
+            let task = tasks.spawn(std::future::pending::<()>());
+            open.push(Arc::clone(&one), task);
+            seen.push(one);
+        }
+        // Every one but the third has shown the key.
+        for (n, one) in seen.iter().enumerate() {
+            one.keyed.store(n != 2, Ordering::SeqCst);
+        }
+        assert!(open.admit(), "the one without the key makes room");
+        assert_eq!(open.0.len(), MOST_CONNECTIONS - 1);
+        assert!(
+            open.0
+                .iter()
+                .all(|(one, _)| one.keyed.load(Ordering::SeqCst)),
+            "the one without the key is the one that went"
+        );
+        let keyed = Arc::new(Seen::default());
+        keyed.keyed.store(true, Ordering::SeqCst);
+        open.push(keyed, tasks.spawn(std::future::pending::<()>()));
+        assert!(!open.admit(), "every one open has shown the key");
+        tasks.abort_all();
     }
 
     #[test]
