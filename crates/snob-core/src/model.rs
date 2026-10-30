@@ -191,10 +191,14 @@ fn takes_a_presentation(c: char, keycap: bool) -> bool {
         | '\u{2122}'
         | '\u{2139}'
         | '\u{2194}'..='\u{21aa}'
-        | '\u{231a}'..='\u{23fa}'
+        // Around U+2329 and U+232A, angle brackets, and below the dingbat
+        // brackets U+2768 to U+2775: punctuation that is no emoji base.
+        | '\u{231a}'..='\u{2328}'
+        | '\u{232b}'..='\u{23fa}'
         | '\u{24c2}'
         | '\u{25aa}'..='\u{25fe}'
-        | '\u{2600}'..='\u{27bf}'
+        | '\u{2600}'..='\u{2767}'
+        | '\u{2776}'..='\u{27bf}'
         | '\u{2934}'..='\u{2935}'
         | '\u{2b05}'..='\u{2b55}'
         | '\u{3030}'
@@ -666,6 +670,22 @@ mod tests {
             printable("1\u{fe0f}\u{20e3}\u{fe0f}\u{20e3}\u{fe0e}\u{20e3}\u{fe0f}"),
             "1\u{fe0f}\u{20e3}\u{20e3}\u{20e3}"
         );
+    }
+
+    /// Brackets that sit among emoji bases are punctuation, not bases, and
+    /// keep no selector; the bases on either side of them still do.
+    #[test]
+    fn brackets_among_the_emoji_bases_keep_no_selector() {
+        for bracket in ['\u{2329}', '\u{232a}', '\u{2768}', '\u{2775}'] {
+            assert_eq!(
+                printable(&format!("{bracket}\u{fe0f}")),
+                bracket.to_string()
+            );
+        }
+        for base in ['\u{2328}', '\u{23cf}', '\u{2764}', '\u{2795}'] {
+            let kept = format!("{base}\u{fe0f}");
+            assert_eq!(printable(&kept), kept);
+        }
     }
 
     /// An ASCII digit, `#` or `*` keeps a selector only for a keycap drawn
