@@ -432,8 +432,9 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   failure: exit 3 is what it was asked, as exit 5 is in a cooldown. **Every
   hint that is advice to the person at a terminal is replaced the same
   way**, by the failure's `reason` (`answer::agent_hint`: `too_many_jobs`,
-  `no_such_job`, `job_stopping`, `nothing_stored`, `budget_wait`, `busy`,
-  `mcp_write_cap`, `walked_elsewhere`), with the tools that do it instead,
+  `no_such_job`, `job_stopping`, `nothing_stored`, `stored_moments`,
+  `budget_wait`, `busy`, `mcp_write_cap`, `walked_elsewhere`), with the
+  tools that do it instead,
   and a push-back the call met itself, whose cooldown the failure does not
   date, by `answer::PUSHED_BACK` (ask `snob_status` when it lifts); so
   every refusal a cooldown already held is behind carries
@@ -709,12 +710,14 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   the last line of standard error (`main::wording_for`); its `code` is the
   exit's token, and `reason` a finer one when there is one
   (`ExitError::with_reason`, e.g. `busy`, `mcp_write_cap`,
-  `walked_elsewhere`, `nothing_stored`, `budget_wait` for a wait past
-  `--max-wait`, and a job's `too_many_jobs`, `job_stopping`, `no_such_job`,
-  `refused_argv`).
+  `walked_elsewhere`, `nothing_stored`, `stored_moments` for a crossing of
+  two stored lists too far apart under `--offline`, `budget_wait` for a
+  wait past `--max-wait`, and a job's `too_many_jobs`, `job_stopping`,
+  `no_such_job`, `refused_argv`).
   `cooldown_until` is when a cooldown that refused the run lifts
   (`ExitError::with_cooldown_until`), and `retry_at` when a refusal that is
-  no cooldown stops applying (`ExitError::with_retry_at`: `mcp_write_cap`),
+  no cooldown stops applying (`ExitError::with_retry_at`: `mcp_write_cap`,
+  and `walked_elsewhere`, when the lost job's claim on the list frees),
   both in seconds since the epoch, since the sentence says them in the local
   time of the machine that wrote it.
 - **Exit codes are stable** (`exit.rs`, `snob_core::watch::RunOutcome`, the

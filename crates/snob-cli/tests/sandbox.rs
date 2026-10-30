@@ -4982,6 +4982,50 @@ async fn a_child_given_spend_alone_refuses_while_another_holds_the_account() {
     assert_eq!(walked["isError"], false, "{walked}");
 }
 
+/// A crossing whose two stored lists were read an hour apart is refused
+/// offline, and an agent, whose server passed the `--offline`, is told
+/// what to call instead, never to drop a flag it did not pass.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_stored_crossing_of_lists_far_apart_tells_an_agent_what_to_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    for list in ["followers", "following"] {
+        let out = snob(
+            tmp.path(),
+            Some(&instagram),
+            &[list, "--format", "json", "--no-interactive"],
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    snob_store::store::Store::open_at(&database(tmp.path()))
+        .unwrap()
+        .conn()
+        .execute(
+            "UPDATE snapshots SET started_at = started_at - 3600, taken_at = taken_at - 3600
+             WHERE kind = 'following'",
+            [],
+        )
+        .unwrap();
+    let sent = posted(&instagram).await.len();
+
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let told = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "fans", "mode": "stored" }),
+        )
+        .await;
+    assert_eq!(told["isError"], true, "{told}");
+    let error = &told["structuredContent"]["error"];
+    assert_eq!(error["code"], "stored_moments", "{told}");
+    let hint = error["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("mode \"auto\""), "{told}");
+    assert!(!hint.contains("--offline"), "{told}");
+    assert_eq!(posted(&instagram).await.len(), sent, "nothing was sent");
+}
+
 /// On 2026-07-28 the call answers with the question and a ticket; the
 /// answer counts only when it comes back with that ticket for that same
 /// command, and only once.

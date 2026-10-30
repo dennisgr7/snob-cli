@@ -114,8 +114,9 @@ pub enum Wording {
 /// has one (`ExitError::with_reason`: `busy`; `budget_wait` for a wait for
 /// the request budget past `--max-wait`), and null otherwise; `retry_at` is
 /// when a refusal that is no cooldown stops applying
-/// (`ExitError::with_retry_at`: the day's cap on an agent's writes), and null
-/// otherwise. Printed as one line, the last on standard error. Filtered line by line
+/// (`ExitError::with_retry_at`: the day's cap on an agent's writes, and a
+/// list a lost job may still hold), and null otherwise. Printed as one
+/// line, the last on standard error. Filtered line by line
 /// like the prose, and for the same reason -- a name is filtered before
 /// anything draws it, and a JSON consumer may well print it. `viewer`, beside
 /// `error`, is the account the run acted as, or null before there was one.
@@ -416,24 +417,30 @@ pub fn refuse_different_moments(
     // Each arm asks the same question of the same pair, so each one asks it the
     // same way.
     let either = |wanted: Provenance| a == wanted || b == wanted;
-    let (code, hint) = if either(Provenance::Cooldown) {
+    // `stored_moments` names the one an agent cannot act on as written: its
+    // server passed the `--offline` (a stored list, a later page no longer
+    // held), so it is told in its own tools' words (`mcp::answer`).
+    let (code, hint, reason) = if either(Provenance::Cooldown) {
         (
             ExitCode::RateLimited,
             "Run it again once the cooldown lifts.",
+            None,
         )
     } else if either(Provenance::CacheFlag) {
         (
             ExitCode::Error,
             "Run it again without --offline, so both lists are checked against the account.",
+            Some("stored_moments"),
         )
     } else {
         (
             ExitCode::Error,
             "Instagram could not be reached to check either list. Run it again in a while.",
+            None,
         )
     };
 
-    ExitError::new(
+    let refusal = ExitError::new(
         code,
         format!(
             "the two stored lists are from different moments ({} and {}), so crossing \
@@ -442,8 +449,11 @@ pub fn refuse_different_moments(
             stored_on(b_at)
         ),
     )
-    .with_hint(hint)
-    .into()
+    .with_hint(hint);
+    match reason {
+        Some(reason) => refusal.with_reason(reason).into(),
+        None => refusal.into(),
+    }
 }
 
 /// Why a cooldown could not be served around.
@@ -1559,6 +1569,16 @@ mod tests {
         assert!(hint.contains("--offline"), "{hint}");
         assert!(!hint.contains("cooldown"), "{hint}");
         assert_eq!(crate::exit::from_chain(&asked_for), Some(ExitCode::Error));
+        // A reason of its own, so an agent, whose server passed the flag, is
+        // told something it can do instead.
+        let reason = |error: &anyhow::Error| {
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<ExitError>())
+                .and_then(ExitError::reason)
+        };
+        assert_eq!(reason(&asked_for), Some("stored_moments"));
+        assert_eq!(reason(&throttled), None);
 
         // A failed poll is neither of the two. Nobody asked for storage — the
         // request to check went out and did not come back — so it is not told

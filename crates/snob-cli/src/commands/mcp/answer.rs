@@ -91,6 +91,11 @@ fn agent_hint(reason: &str) -> Option<&'static str> {
             "nothing of this list is stored yet: call snob_list again without offset and with \
              mode \"auto\" to read it"
         }
+        "stored_moments" => {
+            "the two stored lists were read too far apart to be crossed: call snob_list again \
+             without offset and with mode \"auto\" (not \"stored\"), so both lists are checked \
+             against the account"
+        }
         "busy" => {
             "another call that reaches Instagram is running for this account, and one runs \
              at a time; nothing was sent: call this again once it has ended, not beside it \
@@ -584,6 +589,7 @@ mod tests {
             ("no_such_job", ExitCode::Error, "snob_jobs"),
             ("job_stopping", ExitCode::Error, "snob_job "),
             ("nothing_stored", ExitCode::Error, "mode \"auto\""),
+            ("stored_moments", ExitCode::Error, "mode \"auto\""),
             ("budget_wait", ExitCode::Interrupted, "snob_status"),
             ("busy", ExitCode::Error, "snob_job_cancel"),
             ("mcp_write_cap", ExitCode::Error, "retry_at"),
