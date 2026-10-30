@@ -143,6 +143,28 @@ pub fn going(doc: &Value) -> bool {
     )
 }
 
+/// Whether a lost job's walk was ever started, so that it may still hold
+/// its lists: its document dates when that claim frees, and leaves it
+/// null for a job whose walk never started (`jobs::Seen::claim_frees_at`).
+fn walked(doc: &Value) -> bool {
+    doc.get("claim_frees_at").is_some_and(|at| !at.is_null())
+}
+
+/// What a lost job's failure says, the same for `snob_job` and a task
+/// (`tasks::detailed`): **a job whose walk never started read nothing and
+/// holds nothing**, and is not told as a walk that will continue.
+pub fn lost_message(doc: &Value) -> &'static str {
+    if walked(doc) {
+        "the job's walk stopped without ending (the machine slept or signed out, or the \
+         client that started it closed and took it along); what it read is stored, and the \
+         next walk of the list continues from it"
+    } else {
+        "the job's walk never started (its supervisor did not come in time: the machine slept \
+         or was busy, or the client that started it closed and took it along); nothing was \
+         read, and its lists can be walked again at once"
+    }
+}
+
 /// A job that has not ended, or one whose walk never ran: how it stands,
 /// and a sentence on what to do next. `cancel` is for the answer to
 /// `snob_job_cancel`.
@@ -174,24 +196,26 @@ pub fn standing(doc: &Value, cancel: bool) -> (Answer, String) {
         body["poll_with"] = json!("snob_job");
     }
 
-    // Lost: its supervisor went away with the walk unfinished. A failure,
-    // with the moment the list it held is free again.
+    // Lost: its supervisor went away with the walk unfinished, or before it
+    // started it. A failure, with the moment the list it held is free again.
     if status == "lost" {
         let body = json!({
             "exit": "error",
             "job_id": id,
             "error": {
                 "code": "job_lost",
-                "message": "the job's walk stopped without ending (the machine slept or signed \
-                            out, or the client that started it closed and took it along); what \
-                            it read is stored, and the next walk of the list continues from it",
+                "message": lost_message(doc),
                 "claim_frees_at": field("claim_frees_at"),
             },
         });
-        let said = "The job is lost. The list it walked can be read again once its claim frees \
-                    (claim_frees_at); a snob_list call before then is refused as \
-                    walked_elsewhere."
-            .to_string();
+        let said = if walked(doc) {
+            "The job is lost. The list it walked can be read again once its claim frees \
+             (claim_frees_at); a snob_list call before then is refused as walked_elsewhere."
+        } else {
+            "The job is lost before its walk started. Nothing was read and its lists are free: \
+             a snob_list call starts a new walk now."
+        }
+        .to_string();
         return (
             Answer {
                 failed: true,
@@ -394,10 +418,22 @@ mod tests {
         let (_, said) = standing(&held, false);
         assert!(said.contains("Closing this client ends the walk"), "{said}");
 
-        let (lost, said) = standing(&doc("lost", Value::Null), false);
+        let mut walked = doc("lost", Value::Null);
+        walked["claim_frees_at"] = json!(1_800_000_600);
+        let (lost, said) = standing(&walked, false);
         assert!(lost.failed);
         assert_eq!(lost.body["error"]["code"], "job_lost");
+        assert_eq!(lost.body["error"]["claim_frees_at"], 1_800_000_600);
         assert!(said.contains("walked_elsewhere"), "{said}");
+
+        // One whose walk never started holds nothing, and says so.
+        let (never, said) = standing(&doc("lost", Value::Null), false);
+        assert!(never.failed);
+        assert_eq!(never.body["error"]["code"], "job_lost");
+        let message = never.body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("never started"), "{message}");
+        assert!(!message.contains("continues"), "{message}");
+        assert!(!said.contains("walked_elsewhere"), "{said}");
     }
 
     #[test]

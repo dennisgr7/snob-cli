@@ -260,17 +260,17 @@ fn vet(jobs: &[super::Seen], checked: &argv::Checked, now: i64) -> Result<Found>
     }
     // A job that died without letting go of its list: another walk of the
     // list is refused until its claim runs out, and saying when is the one
-    // useful answer.
-    if let Some(lost) = jobs.iter().find(|seen| {
-        seen.status == Status::Lost
-            && seen.claim_frees_at() > now
-            && seen
-                .job
-                .as_ref()
-                .and_then(|other| argv::check(&other.argv).ok())
-                .is_some_and(|other| argv::overlap(&other, checked))
+    // useful answer. A lost job that never started a walk holds nothing
+    // (`Seen::claim_frees_at`).
+    if let Some((lost, frees_at)) = jobs.iter().find_map(|seen| {
+        let frees_at = seen.claim_frees_at().filter(|&at| at > now)?;
+        seen.job
+            .as_ref()
+            .and_then(|other| argv::check(&other.argv).ok())
+            .is_some_and(|other| argv::overlap(&other, checked))
+            .then_some((seen, frees_at))
     }) {
-        let frees = snob_core::EpochMs::new(lost.claim_frees_at()).to_epoch_not_before();
+        let frees = snob_core::EpochMs::new(frees_at).to_epoch_not_before();
         return Err(ExitError::new(
             ExitCode::Error,
             format!(
@@ -285,7 +285,7 @@ fn vet(jobs: &[super::Seen], checked: &argv::Checked, now: i64) -> Result<Found>
         .with_hint("ask again after that, and the walk continues where it stopped")
         // The same moment for a program, in no zone (`retry_at`): the one
         // above is this machine's, and an agent may be in another.
-        .with_retry_at(snob_core::EpochMs::new(lost.claim_frees_at()))
+        .with_retry_at(snob_core::EpochMs::new(frees_at))
         .into());
     }
     Ok(Found::Free)
@@ -524,6 +524,41 @@ mod tests {
         assert_eq!(
             reason(vet(&running, &checked(&FOLLOWERS), 2)),
             Some("too_many_jobs")
+        );
+    }
+
+    /// A lost job keeps its list from another walk only when it started a
+    /// walk of it: one whose supervisor never came, or came too late and
+    /// ran nothing, holds no claim, and the list is walked at once rather
+    /// than refused for the claim's 45 minutes over a walk that never was.
+    #[test]
+    fn a_lost_job_that_never_walked_holds_no_list() {
+        let state = |child_pid| super::super::State {
+            status: Status::Lost,
+            started_at: 1,
+            updated_at: 1,
+            finished_at: Some(2),
+            exit_number: None,
+            cancel: false,
+            failure: Some("started_late".into()),
+            supervisor_pid: Some(7),
+            child_pid,
+        };
+        let lost = |state| {
+            let mut seen = seen(Status::Lost, false, &FOLLOWERS);
+            seen.held = false;
+            seen.state = state;
+            [seen]
+        };
+        for never in [None, Some(state(None))] {
+            assert!(
+                matches!(vet(&lost(never), &checked(&FOLLOWERS), 2), Ok(Found::Free)),
+                "a job that never walked"
+            );
+        }
+        assert_eq!(
+            reason(vet(&lost(Some(state(Some(8)))), &checked(&FOLLOWERS), 2)),
+            Some("walked_elsewhere")
         );
     }
 }

@@ -551,7 +551,8 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   `--confirmed-*` aside, another is `too_many_jobs`, and one asked to stop
   that has not yet is `job_stopping`, never reused; a list a lost job may
   still hold is `walked_elsewhere`, with until when, `retry_at` for a
-  program), starts its supervisor
+  program, and one that never started its walk, with no walk's pid in its
+  state, holds none, `jobs::Seen::claim_frees_at`), starts its supervisor
   detached (`detach.rs`) and answers with **one** compact JSON document:
   the record, and the walk's answer under
   `finished` when it ended within `--wait`. Asked to stop before it answered

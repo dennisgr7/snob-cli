@@ -128,6 +128,10 @@ pub async fn run(cli: &Cli, account: &AccountPaths, id: &str) -> Result<ExitCode
         state.updated_at = alive;
         state.finished_at = Some(now);
         state.failure = Some("started_late".into());
+        // The walk an earlier supervisor started, if one did: what tells a
+        // lost job that may hold its lists from one that never walked
+        // (`Seen::walked`).
+        state.child_pid = before.as_ref().and_then(|s| s.child_pid);
         write(&dir, "state.json", &state)?;
         return Ok(ExitCode::Ok);
     }

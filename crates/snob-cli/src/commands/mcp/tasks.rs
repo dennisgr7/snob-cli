@@ -79,12 +79,11 @@ pub fn detailed(doc: &Value, finished: impl FnOnce(Finished) -> CallToolResult) 
             },
             None => failed("the walk's result could not be read", None),
         },
-        // Lost: its supervisor went away with the walk unfinished. The
-        // request failed, and the moment the list is free again comes along.
+        // Lost: its supervisor went away with the walk unfinished, or before
+        // it started it. The request failed, and the moment the list is
+        // free again comes along (null when it never held it).
         _ => failed(
-            "the job's walk stopped without ending (the machine slept or signed out, or the \
-             client that started it closed and took it along); what it read is stored, and \
-             the next walk of the list continues from it",
+            job::lost_message(doc),
             Some(json!({
                 "code": "job_lost",
                 "claim_frees_at": doc.get("claim_frees_at").cloned().unwrap_or(Value::Null),

@@ -6199,6 +6199,40 @@ async fn a_lost_job_with_a_live_claim_says_when_it_frees() {
     assert_eq!(told["status"], "succeeded", "{told}");
 }
 
+/// A lost job whose walk never started (its supervisor gone before it
+/// started it, or come too late to) holds no list: its record dates no
+/// claim, and the next walk of the list starts at once instead of being
+/// refused for the claim's 45 minutes as `walked_elsewhere`.
+#[tokio::test]
+async fn a_lost_job_that_never_walked_holds_no_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let told = jobs.started("60s", &FOLLOWERS_JOB);
+    let id = told["job_id"].as_str().unwrap().to_string();
+    let dir = jobs.dirs()[0].clone();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+    state["status"] = "running".into();
+    state["finished_at"] = serde_json::Value::Null;
+    state["child_pid"] = serde_json::Value::Null;
+    state["updated_at"] = snob_core::clock::now_ms().get().into();
+    std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
+    let shown = jobs.ask(&["show", &id, "--json"]);
+    assert_eq!(shown["status"], "lost", "{shown}");
+    assert!(shown["claim_frees_at"].is_null(), "{shown}");
+
+    let told = jobs.started(
+        "60s",
+        &["--", "unfollowers", "--format", "json", "--no-interactive"],
+    );
+    assert_eq!(told["status"], "succeeded", "{told}");
+}
+
 // ---------------------------------------------------------------------------
 // The jobs through `snob mcp`: a list call starts its walk as a job, and the
 // job tools read it back. The same cleanup rule as above: a `Jobs` guard,

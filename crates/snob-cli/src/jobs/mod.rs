@@ -176,6 +176,9 @@ pub struct State {
     pub failure: Option<String>,
     /// For showing only: nothing signals a pid read from a file.
     pub supervisor_pid: Option<u32>,
+    /// The walk's, once it was started: shown, and what tells a lost job
+    /// that walked from one that never did (`Seen::walked`). Never
+    /// signaled either.
     pub child_pid: Option<u32>,
 }
 
@@ -313,10 +316,26 @@ impl Seen {
     /// latest, which is how long another walk of that list is refused
     /// (`report::walked_elsewhere`). A walk refreshes its claim with every
     /// page, and the supervisor said it was there until [`HEARTBEAT`] before
-    /// it was not, so the claim was last refreshed before then.
-    pub fn claim_frees_at(&self) -> i64 {
-        let ttl = snob_store::store::snapshots::CLAIM_TTL_SECS * 1000;
-        self.last_alive() + HEARTBEAT.as_millis() as i64 + ttl
+    /// it was not, so the claim was last refreshed before then. **`None`
+    /// for a job that is not lost, and for a lost one that never started a
+    /// walk** ([`Seen::walked`]), which holds nothing: refusing its lists
+    /// for the claim's 45 minutes would refuse them over a walk that never
+    /// was.
+    pub fn claim_frees_at(&self) -> Option<i64> {
+        (self.status == Status::Lost && self.walked()).then(|| {
+            let ttl = snob_store::store::snapshots::CLAIM_TTL_SECS * 1000;
+            self.last_alive() + HEARTBEAT.as_millis() as i64 + ttl
+        })
+    }
+
+    /// Whether a walk was ever started for it. A supervisor writes the
+    /// walk's pid (`child_pid`) once it has started it, and a late one that
+    /// runs nothing keeps the pid an earlier one wrote
+    /// (`supervise::run`), so no pid is no walk: a job whose supervisor
+    /// never came (no `state.json`), came too late, or went before it
+    /// started the walk.
+    pub fn walked(&self) -> bool {
+        self.state.as_ref().is_some_and(|s| s.child_pid.is_some())
     }
 
     /// When it ended, or was last seen, for the retention.
@@ -496,8 +515,8 @@ pub(crate) fn sweep(account: &AccountPaths, now: i64) {
     }
 }
 
-/// `account`'s jobs being stopped, and the jobs lock held so no other starts
-/// until this is dropped (`purge`, `logout`).
+/// `account`'s jobs being stopped, and the jobs lock held, when it can be,
+/// so no other starts until this is dropped (`purge`, `logout`).
 pub struct Stopping {
     pub ids: Vec<JobId>,
     account: AccountPaths,
@@ -516,73 +535,39 @@ impl Stopping {
     /// before they delete anything, and bookkeeping for jobs that may not
     /// exist must not keep a credential from going. So it does not fail. A
     /// jobs directory or `.lock` that cannot be made or taken (a stray file
-    /// in its place, a full disk, an ACL that refuses) is warned about and
-    /// taken as no jobs to stop: where the lock cannot be taken, no job can
-    /// start either (`start::make` takes the same one). **Each job is read
-    /// on its own**: one that cannot be read (its `lock` cannot be opened,
-    /// say) is warned about, still sent a `stop` in case it is running, and
-    /// not waited for, and every other is asked to stop as usual. A job that
-    /// cannot be told to stop is warned about and not waited for either.
+    /// in its place, a full disk, an ACL that refuses) is warned about, and
+    /// **the jobs are asked to stop all the same**, without the lock: no new
+    /// job can start while it cannot be taken (`start::make` takes the same
+    /// one), but a running one does not hold it (each holds its own `lock`)
+    /// and would otherwise go on with the session it holds in memory after
+    /// the session is deleted. Asking needs no lock: it is a `stop` file in
+    /// the job's directory. **Each job is read on its own**: one that cannot
+    /// be read (its `lock` cannot be opened, say) is warned about, still
+    /// sent a `stop` in case it is running, and not waited for, and every
+    /// other is asked to stop as usual. A job that cannot be told to stop is
+    /// warned about and not waited for either.
     pub fn every_job_of(account: &AccountPaths) -> Self {
-        let none = || Self {
-            ids: Vec::new(),
-            account: account.clone(),
-            _lock: None,
-        };
         let lock = match lock_jobs(account) {
-            Ok(Some(lock)) => lock,
-            Ok(None) => return none(),
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                return Self {
+                    ids: Vec::new(),
+                    account: account.clone(),
+                    _lock: None,
+                };
+            }
             Err(e) => {
                 crate::ui::warn(&format!(
-                    "could not hold the jobs of {}: {e}; going on without stopping them",
+                    "could not hold the jobs of {}: {e}; asking them to stop without it",
                     account.dir().display()
                 ));
-                return none();
+                None
             }
         };
-        let now = snob_core::clock::now_ms().get();
-        let every = ids(account).unwrap_or_else(|e| {
-            crate::ui::warn(&format!(
-                "could not read the jobs of {}: {e}; going on without stopping them",
-                account.dir().display()
-            ));
-            Vec::new()
-        });
-        let mut ids = Vec::new();
-        for id in every {
-            let seen = match look(account, &id, now) {
-                Ok(Some(seen)) => seen,
-                Ok(None) => continue,
-                Err(e) => {
-                    // What it is doing is unknown, so it is asked all the
-                    // same; a `stop` in a job that is over changes nothing.
-                    let asked = private_marker(&file(&account.job_dir(&id), "stop"));
-                    crate::ui::warn(&format!(
-                        "could not read job {}: {e}; {}, and going on",
-                        id.as_str(),
-                        match asked {
-                            Ok(()) => "asked it to stop",
-                            Err(_) => "could not ask it to stop either",
-                        }
-                    ));
-                    continue;
-                }
-            };
-            if seen.status.is_over() {
-                continue;
-            }
-            match ask_to_stop(&seen) {
-                Ok(()) => ids.push(seen.id),
-                Err(e) => crate::ui::warn(&format!(
-                    "could not ask job {} to stop: {e}; going on",
-                    seen.id.as_str()
-                )),
-            }
-        }
         Self {
-            ids,
+            ids: ask_every_job_to_stop(account),
             account: account.clone(),
-            _lock: Some(lock),
+            _lock: lock,
         }
     }
 
@@ -609,6 +594,53 @@ impl Stopping {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// Asks every job of `account`'s that is not over to stop, each read on its
+/// own ([`Stopping::every_job_of`]), and answers the ones asked, to be
+/// waited for. Takes no lock: a `stop` in a job that is over changes
+/// nothing.
+fn ask_every_job_to_stop(account: &AccountPaths) -> Vec<JobId> {
+    let now = snob_core::clock::now_ms().get();
+    let every = ids(account).unwrap_or_else(|e| {
+        crate::ui::warn(&format!(
+            "could not read the jobs of {}: {e}; going on without stopping them",
+            account.dir().display()
+        ));
+        Vec::new()
+    });
+    let mut asked = Vec::new();
+    for id in every {
+        let seen = match look(account, &id, now) {
+            Ok(Some(seen)) => seen,
+            Ok(None) => continue,
+            Err(e) => {
+                // What it is doing is unknown, so it is asked all the
+                // same; a `stop` in a job that is over changes nothing.
+                let sent = private_marker(&file(&account.job_dir(&id), "stop"));
+                crate::ui::warn(&format!(
+                    "could not read job {}: {e}; {}, and going on",
+                    id.as_str(),
+                    match sent {
+                        Ok(()) => "asked it to stop",
+                        Err(_) => "could not ask it to stop either",
+                    }
+                ));
+                continue;
+            }
+        };
+        if seen.status.is_over() {
+            continue;
+        }
+        match ask_to_stop(&seen) {
+            Ok(()) => asked.push(seen.id),
+            Err(e) => crate::ui::warn(&format!(
+                "could not ask job {} to stop: {e}; going on",
+                seen.id.as_str()
+            )),
+        }
+    }
+    asked
 }
 
 /// How long [`Stopping::wait`] waits: the grace a walk gets, and a little for
@@ -920,6 +952,28 @@ mod tests {
         assert_eq!(stopping.len(), 1);
         assert!(stopping[0].ids.is_empty());
         assert!(stopping[0]._lock.is_none());
+    }
+
+    /// A jobs lock that cannot be taken (`.lock` a directory, which cannot
+    /// be opened) still has every job that is not over asked to stop, and
+    /// waited for: a running job does not hold that lock, and before this a
+    /// `logout` that met one deleted the session under its walk without a
+    /// word to it.
+    #[test]
+    fn a_jobs_lock_that_cannot_be_taken_still_stops_every_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = account(&tmp);
+        account.ensure_dirs().unwrap();
+        let now = snob_core::clock::now_ms().get();
+        let queued = made(&account, now, None);
+        let done = made(&account, now, Some((Status::Succeeded, now)));
+        std::fs::create_dir(account.jobs_dir().join(".lock")).unwrap();
+        assert!(lock_jobs(&account).is_err(), "the lock cannot be taken");
+        let stopping = Stopping::every_job_of(&account);
+        assert!(stopping._lock.is_none());
+        assert_eq!(stopping.ids, std::slice::from_ref(&queued));
+        assert!(account.job_dir(&queued).join("stop").exists());
+        assert!(!account.job_dir(&done).join("stop").exists());
     }
 
     /// A read sweeps what is past its keeping when nobody holds the jobs

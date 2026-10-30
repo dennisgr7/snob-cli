@@ -373,8 +373,9 @@ pub fn record(seen: &Seen, now: i64) -> Value {
         "detached": job.and_then(|job| job.detached).map(super::Detached::as_str),
         "started_by": job.and_then(|job| job.started_by.as_deref()).map(printable),
         // Until when a lost job may still be holding the list it walked, so
-        // another walk of it is refused (`start`).
-        "claim_frees_at": (seen.status == Status::Lost).then(|| seconds(seen.claim_frees_at())),
+        // another walk of it is refused (`start`); null for a lost job that
+        // never started its walk, whose lists are free.
+        "claim_frees_at": seen.claim_frees_at().map(seconds),
     })
 }
 
@@ -582,11 +583,13 @@ pub fn line(seen: &Seen, now: i64) -> String {
     if let Some((least, most)) = eta(seen, newest_progress(&seen.dir).as_ref(), &served, now) {
         line.push_str(&format!("; {} left", report::time_left(least, most)));
     }
-    if seen.status == Status::Lost {
+    if let Some(frees_at) = seen.claim_frees_at() {
         line.push_str(&format!(
             "; its walk lets go of the list by {}",
-            report::stored_on(seconds(seen.claim_frees_at()))
+            report::stored_on(seconds(frees_at))
         ));
+    } else if seen.status == Status::Lost {
+        line.push_str("; its walk never started, and its lists are free");
     }
     line
 }
