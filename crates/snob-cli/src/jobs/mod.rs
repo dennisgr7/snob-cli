@@ -903,18 +903,26 @@ mod tests {
         assert!(!stopping.wait(Duration::from_millis(200)));
     }
 
-    /// A job that cannot be read (its `lock` a directory, which cannot be
-    /// opened) keeps no other from being asked to stop: before it, a
-    /// `logout` that met one asked none of the account's jobs to stop and
-    /// deleted the session under their walks. It is sent a `stop` itself,
-    /// in case it runs, and not waited for.
+    /// A job that cannot be read (its `lock` cannot be opened) keeps no
+    /// other from being asked to stop: before it, a `logout` that met one
+    /// asked none of the account's jobs to stop and deleted the session
+    /// under their walks. It is sent a `stop` itself, in case it runs, and
+    /// not waited for.
     #[test]
     fn a_job_that_cannot_be_read_keeps_no_other_from_being_stopped() {
         let tmp = tempfile::tempdir().unwrap();
         let account = account(&tmp);
         let now = snob_core::clock::now_ms().get();
         let unreadable = made(&account, now - 1, None);
-        std::fs::create_dir(file(&account.job_dir(&unreadable), "lock")).unwrap();
+        let lock = file(&account.job_dir(&unreadable), "lock");
+        // On Windows a directory cannot be opened as a file. On Unix it can,
+        // and be locked too, so there the lock is a link to itself, which
+        // fails to open with ELOOP even as root (`tools/ci`'s container
+        // runs as root, past a file without permissions).
+        #[cfg(windows)]
+        std::fs::create_dir(&lock).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("lock", &lock).unwrap();
         assert!(look(&account, &unreadable, now).is_err());
         let queued = made(&account, now, None);
         let stopping = Stopping::every_job_of(&account);
