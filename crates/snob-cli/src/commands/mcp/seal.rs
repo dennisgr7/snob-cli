@@ -172,7 +172,7 @@ impl Sealer {
         // Checked before anything in the ticket is believed, and checking it
         // spends nothing: a ticket for another call stays good for its own.
         let expected = self.mac(kind, nonce, until, binding);
-        if !same(expected.as_bytes(), mac.as_bytes()) {
+        if !snob_core::watch::sign::same(expected.as_bytes(), mac.as_bytes()) {
             return Err(Spoiled::NotThisCall);
         }
         let (Ok(until), Some(nonce)) = (until.parse::<u64>(), nonce_of(nonce)) else {
@@ -208,12 +208,6 @@ fn nonce_of(text: &str) -> Option<[u8; 16]> {
         .ok()?
         .try_into()
         .ok()
-}
-
-/// Whether two signatures are equal, in a time that does not depend on where
-/// they first differ.
-fn same(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
 #[cfg(test)]

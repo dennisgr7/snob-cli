@@ -58,10 +58,10 @@ Rust 2024 edition, resolver 3. Dependency direction is one-way:
 
 | Crate | What lives there | What must not |
 |---|---|---|
-| `crates/snob-core` | Domain: `Pk`, models (the JSON contract), set arithmetic, `watch` diff, schedule (cron and `--on/--at/--every`), webhook signing (HMAC-SHA256), `Secret`, `Session`, the `RateBudget` trait and cooldown policy, `clock` | **No I/O.** No file, database, network or directory; `clock` is the single exception |
+| `crates/snob-core` | Domain: `Pk`, models (the JSON contract), set arithmetic, `watch` diff, schedule (cron and `--on/--at/--every`), webhook signing (HMAC-SHA256) and the one constant-time comparison (`watch::sign::same`), `Secret`, `Session`, the `RateBudget` trait and cooldown policy, `clock` | **No I/O.** No file, database, network or directory; `clock` is the single exception |
 | `crates/snob-ig` | Instagram web client: `client/` (`read.rs`, `write.rs`, `transport.rs`, `headers.rs`, `cdn.rs`, `media.rs`, `page.rs`, `ask.rs`, `posts.rs`), `web.rs` (calls built as the web app builds them), `allowlist.rs`, `pager.rs` (list walks), `pace.rs`, `graphql.rs`, `error.rs` (classifying answers), `http.rs` (the only place `reqwest` is configured; re-exported) | No SQLite, no keyring, no browser driving (it defines the page request shape only) |
 | `crates/snob-store` | SQLite (`store/`, migrations in `store/sql/`), platform paths, keyring/file secret store, account registry (`accounts.toml`), the monitor's `watch.toml`, layout migration | Domain logic that belongs in `snob-core` |
-| `crates/snob-cli` | `cli.rs` (clap), `main.rs`, `app.rs` (wires everything), `commands/`, `engine/` (rules: cache, consent, cooldown, walks, estimates, monitor), `output/`, `report.rs` (shared sentences), `ui/` (ratatui views), `headless/` + `cdp/` + `pipe.rs` (the browser), `owner/` (one background process that owns the browsers), `detach.rs` (starting a process that outlives its command, with nothing of the command's), `jobs/` (a list walk run as a job that outlives the call that started it: the hidden `__job start|run|show|list|cancel`, and `snob jobs`), `relay/` (`login --remote`), `power/`, `watch/webhook.rs`, `commands/mcp/` (the MCP server, feature `mcp`) | |
+| `crates/snob-cli` | `cli.rs` (clap), `main.rs`, `app.rs` (wires everything), `commands/`, `engine/` (rules: cache, consent, cooldown, walks, estimates, monitor), `output/`, `report.rs` (shared sentences), `ui/` (ratatui views), `headless/` + `cdp/` + `pipe.rs` (the browser), `owner/` (one background process that owns the browsers), `detach.rs` (starting a process that outlives its command, with nothing of the command's), `jobs/` (a list walk run as a job that outlives the call that started it: the hidden `__job start|run|show|list|cancel`, and `snob jobs`), `relay/` (`login --remote`), `power/`, `watch/webhook.rs`, `commands/mcp/` (the MCP server, feature `mcp`; over HTTP, `mcp-http`) | |
 
 Layering rules inside `snob-cli`:
 
@@ -282,8 +282,12 @@ with a documented reason in the same place.
   the server's name. The key is printed only to a terminal unless `--print`
   (an agent with a shell would keep it in its transcript), and is named
   everywhere else by a 12-digit fingerprint. Neither variable reaches a
-  child of a tool call or a job (`jobs::NEVER_INHERITED`). `Kind` has no
-  feature gate, so every build purges the key; no test writes it to the
+  child of a tool call or a job (`jobs::NEVER_INHERITED`). **`snob mcp
+  --listen` does not start without it**: a TCP port on loopback is open to
+  every local user, unlike the owner's pipe, and the key is what tells the
+  person's client from anything else that connects. `snob mcp key` is
+  behind the `mcp-http` feature; `Kind` has no feature gate, so every build
+  purges the key; no test writes it to the
   keyring outside `SecretStore::with_service`, and the sandbox tests reach
   it through `SNOB_MCP_KEY` only.
 - **No cookie jar in `reqwest`**: the `cookies` feature is off workspace-wide
@@ -346,9 +350,10 @@ with a documented reason in the same place.
 ## The MCP server (`snob mcp`)
 
 Feature `mcp` (on by default; `rmcp` pinned exactly in the workspace
-`Cargo.toml`). A stdio server an agent's client starts; `snob mcp config
-<client>` prints the snippet for that client's configuration and never
-writes it.
+`Cargo.toml`). A stdio server an agent's client starts, or with `--listen`
+(feature `mcp-http`, on by default) the same server over HTTP on loopback,
+behind the MCP key; `snob mcp config <client>` prints the snippet for that
+client's configuration and never writes it.
 
 - **Every tool call is a child `snob`** with the arguments a person would
   type (`commands/mcp/tools.rs` builds them, `child.rs` runs them), never a
@@ -356,8 +361,9 @@ writes it.
   which here carries the protocol, the cancellation token is per process, and
   a stray line on standard output would corrupt a frame. So every rule above
   (the budget, the cooldown, consent, the write regime) holds for an agent
-  through the same code path it holds for a person. Never let the server
-  process itself build a client or open the store.
+  through the same code path it holds for a person. **The server process
+  itself never builds an Instagram client or opens a database**; the one
+  thing it reads is the MCP key, to serve over HTTP.
 - Children get the server's global flags, `--max-wait` (`mcp::Waits`: the
   server's own when given, else 5 min, and an hour, `mcp::JOB_MAX_WAIT`, for
   a job's walk, which nobody waits on) and `--stop-when-stdin-closes`; the
@@ -376,8 +382,8 @@ writes it.
   question and a `confirmation` token, which the agent puts to the person
   word for word and hands back on the same call only on a yes. A decline, a
   dismissal or a timeout in a form is a no, never a reason to ask in the
-  chat. `--confirm-in-chat none|lists|all` (`all` when not given on stdio)
-  says what the chat may cover; past it the call is `cannot_confirm`. Not
+  chat. `--confirm-in-chat none|lists|all` (`all` when not given on stdio,
+  `lists` with `--listen`) says what the chat may cover; past it the call is `cannot_confirm`. Not
   offered, ever: `login`, `logout`, `purge`, the monitor, `--same-day`,
   downloads (outside the request budget), any flag that writes a file.
 - **The yes comes from the client, not provably from the person.** The
@@ -404,7 +410,9 @@ writes it.
   stays out of `Plan.args`; brought to a call that asks nothing it is
   `invalid_arguments`, and one for another call or past its time is no yes
   (the call is asked again, with `previous` saying why). Where a transport
-  has sessions, the chat ticket is bound to the session too; stdio has none.
+  has sessions, the chat ticket is bound to the session too (over HTTP, the
+  request's `Mcp-Session-Id`, read from the parts rmcp hands the handler);
+  stdio has none.
   No ticket outlives the process.
 - **Signing in is the person's.** The server's instructions say so, and
   every answer that comes of having no session carries a hint that the
@@ -553,6 +561,35 @@ writes it.
   (`MOST_WAIT_SECONDS` plus `jobs::start::SUPERVISOR_WITHIN`), the child's
   grace and a margin. A list's walk is bounded by it however long it is: the
   call hands back the job and the walk goes on.
+- **Over HTTP, for a tunnel of your own** (`snob mcp --listen <addr>`,
+  `commands/mcp/http.rs`). **Loopback only**: any other address is refused
+  with exit 2, and TLS is the tunnel's job (`--public-url`, `https` only,
+  adds the tunnel's host and origin to those taken). **The key is
+  mandatory** (no key, exit 1 and a hint), because loopback TCP is
+  reachable by every local user, unlike the owner's pipe; startup says its
+  source and fingerprint, never the key, and with `--allow-writes` warns
+  that whoever holds it can call the writes (and confirm them in the chat
+  under `--confirm-in-chat all`). Each request, in order: the path (`/mcp`
+  only, `/.well-known/*` included is 404); the key (`Authorization:
+  Bearer`, the scheme in any case), checked **before any of the body is
+  read** by comparing HMACs of both sides under a key drawn at start, and
+  refused with 401, `WWW-Authenticate: Bearer realm="snob"` and
+  `Connection: close`; the body, read by snob, at most 256 KiB (413) within
+  30 s (408); a new session only while fewer than 8 are open (503 for an
+  `initialize`; a stateless call opens none and passes); then rmcp's own
+  checks and the same handler. **The `Host` and `Origin` checks guard
+  browsers (DNS rebinding) only; against any other caller the key is the
+  only control.** hyper serves HTTP/1.1 with a header (and idle) timeout of
+  10 s and a 16 KiB buffer, at most 32 connections; sessions idle for 30
+  min close. The limits, consent, jobs and tasks are the stdio server's,
+  shared by every session. Ctrl+C (or the system, or `--stop-when-stdin-
+  closes`) stops accepting, stops every call's child as a canceled call's
+  is stopped, waits for them (`child::GRACE` and 5 s), ends the streams and
+  exits 130. **What the tunnel sees**: TLS ends at its edge, so its provider
+  sees the key and every answer, other people's names and lists included,
+  in plain text, and a connector's vendor stores the key; put an access
+  layer in front where the tunnel offers one (Cloudflare Access service
+  tokens, for example).
 
 ## Output contract
 
@@ -701,6 +738,11 @@ sent and binary size, not speed. Measured, and recorded beside the setting:
   `--no-default-features` (also drops reading a zipped export).
 - Dropping the Windows keyring's `search` feature removed `regex` and
   `aho-corasick`: 863,744 bytes, 11.4% of the Windows binaries.
+- The `mcp-http` feature (`snob mcp --listen`: hyper's server half and
+  rmcp's Streamable HTTP; tokio-stream and sse-stream are the only new
+  crates, the rest was in the tree through reqwest): 486,912 bytes, 4.8%
+  of the Windows x86-64 release binary (10,180,608 against 9,693,696
+  with `--no-default-features --features xlsx,mcp`); on by default.
 
 ## Open questions
 

@@ -29,6 +29,17 @@ pub fn sign(body: &str, key: &Secret) -> String {
     sign_bytes(body.as_bytes(), key.expose().as_bytes())
 }
 
+/// Whether two secrets or signatures are equal, in a time that does not
+/// depend on where they first differ.
+///
+/// **The one home for this comparison**: the relay's tokens, the MCP
+/// server's tickets and the key a client presents over HTTP are all checked
+/// with it. The length is not hidden, and need not be: every caller
+/// compares values whose length is fixed by their format, or two HMACs.
+pub fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
 /// The same over raw bytes.
 ///
 /// Split out so the tests can drive the published vectors, which are specified
@@ -129,5 +140,13 @@ mod tests {
             hex.chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
         );
+    }
+
+    #[test]
+    fn secrets_are_compared_whole() {
+        assert!(same(b"abc", b"abc"));
+        assert!(!same(b"abc", b"abd"));
+        assert!(!same(b"abc", b"ab"));
+        assert!(!same(b"", b"a"));
     }
 }

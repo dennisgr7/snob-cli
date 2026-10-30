@@ -152,7 +152,14 @@ can read:
   over the network and keeps it in the system keyring, printing it once to
   your terminal; `show` names it by a fingerprint, `revoke` removes it, and
   on a machine with no keyring `SNOB_MCP_KEY` in the server's environment
-  takes its place. After
+  takes its place. `snob mcp --listen 127.0.0.1:8750` serves the same over
+  HTTP on this machine's loopback, for a tunnel of your own (`ssh -L`,
+  cloudflared, a VPN) to reach from elsewhere: it refuses any address that
+  is not loopback and any request without the key (`Authorization: Bearer`),
+  and a yes given in the chat covers only reading lists unless
+  `--confirm-in-chat all`. TLS ends at the tunnel, whose provider sees the
+  key and every answer, other people's names and lists included; put an
+  access layer in front where the tunnel offers one. After
   upgrading snob, reconnect the server in the client: a server whose binary
   changed under it refuses every call.
 

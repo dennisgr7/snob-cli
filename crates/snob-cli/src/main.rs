@@ -286,6 +286,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             // The key is the machine's, in the keyring whatever
             // `--no-keyring` says (`commands::mcp::key`); a sandbox's under
             // its own name, like everything else it keeps there.
+            #[cfg(feature = "mcp-http")]
             Some(snob_cli::cli::McpCommand::Key(key)) => {
                 let store = SecretStore::new(paths.clone(), no_keyring);
                 let store = match &keyring_namespace {
@@ -301,14 +302,28 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     std::env::current_exe()?,
                     mcp_globals(&cli, None)?,
                 );
-                commands::mcp::serve(
-                    launch,
-                    args.allow_writes,
-                    args.confirm_in_chat,
-                    args.max_writes_per_day,
-                    cli.max_wait,
-                )
-                .await
+                let settings = commands::mcp::Settings {
+                    writes: args.allow_writes,
+                    in_chat: args.confirm_in_chat,
+                    writes_a_day: args.max_writes_per_day,
+                    max_wait: cli.max_wait,
+                };
+                // Over HTTP the one thing the server reads is the key its
+                // clients present, from where `snob mcp key` keeps it.
+                #[cfg(feature = "mcp-http")]
+                if let Some(address) = args.listen {
+                    let store = SecretStore::new(paths.clone(), no_keyring);
+                    let store = match &keyring_namespace {
+                        Some(service) => store.with_service(service),
+                        None => store,
+                    };
+                    let listen = commands::mcp::http::Listen {
+                        address,
+                        public: args.public_url.clone(),
+                    };
+                    return commands::mcp::http::serve(launch, settings, listen, &store).await;
+                }
+                commands::mcp::serve(launch, settings).await
             }
         };
     }

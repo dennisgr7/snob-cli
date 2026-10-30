@@ -65,6 +65,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use snob_core::watch::sign;
 use snob_ig::login::BrowserCookies;
 use snob_ig::pace::CancelToken;
 use snob_store::paths::AppPaths;
@@ -581,7 +582,7 @@ async fn route<S: AsyncWrite + Unpin>(
 
 /// Whether `given` is the key the token was traded for.
 fn has_the_key(given: Option<&str>, shared: &Shared) -> bool {
-    given.is_some_and(|key| same(key.as_bytes(), shared.key.as_bytes()))
+    given.is_some_and(|key| sign::same(key.as_bytes(), shared.key.as_bytes()))
 }
 
 /// The link's token traded for the key, once.
@@ -596,7 +597,7 @@ async fn redeem<S: AsyncWrite + Unpin>(
 ) -> std::io::Result<Answered> {
     let keep = request.keeps_alive();
     let offered = request.path.trim_start_matches('/');
-    let first = same(shared.token.as_bytes(), offered.as_bytes())
+    let first = sign::same(shared.token.as_bytes(), offered.as_bytes())
         && !shared.spent.swap(true, Ordering::SeqCst);
     if first {
         shared.opened.send_replace(true);
@@ -717,12 +718,6 @@ async fn text<S: AsyncWrite + Unpin>(
         keep,
     )
     .await
-}
-
-/// Whether two secrets are equal, in a time that does not depend on where
-/// they first differ.
-fn same(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
 /// 256 random bits from the operating system, as text that fits in a path,
@@ -1180,14 +1175,6 @@ mod tests {
         }
         let deep = format!("/{}/relay-1.sock", "d".repeat(MOST_SOCKET_PATH));
         assert!(!can_be_forwarded(Path::new(&deep)));
-    }
-
-    #[test]
-    fn secrets_are_compared_whole() {
-        assert!(same(b"abc", b"abc"));
-        assert!(!same(b"abc", b"abd"));
-        assert!(!same(b"abc", b"ab"));
-        assert!(!same(b"", b"a"));
     }
 
     #[test]

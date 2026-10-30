@@ -521,6 +521,7 @@ pub enum Command {
     Import(crate::commands::import::ImportCommand),
 
     /// Offer snob to an AI agent as an MCP server, on standard input and output
+    /// or over HTTP on loopback
     #[cfg(feature = "mcp")]
     #[command(
         after_help = "Started by the agent's client, not typed: \"snob mcp config <client>\" \
@@ -555,7 +556,16 @@ pub enum Command {
                       counted; past that the call is refused and nothing is sent. What you \
                       type in a terminal is neither recorded nor counted.\n\n\
                       After upgrading snob, restart the server (reconnect it in the client): \
-                      one whose binary changed under it refuses every call and runs nothing."
+                      one whose binary changed under it refuses every call and runs nothing.\n\n\
+                      --listen 127.0.0.1:8750 serves the same over HTTP at /mcp on this \
+                      machine's loopback, for a tunnel of your own (ssh -L, cloudflared, a VPN) \
+                      to reach from elsewhere; any other address is refused. Every request \
+                      carries the key \"snob mcp key new\" makes, as Authorization: Bearer, \
+                      and the server does not start without one. A yes in the chat covers \
+                      reading lists there and not the writes, unless --confirm-in-chat all. \
+                      --public-url names the https address the tunnel serves it at. TLS ends \
+                      at the tunnel, whose provider sees the key and every answer; put an \
+                      access layer in front where it offers one."
     )]
     Mcp(McpArgs),
 
@@ -1843,14 +1853,36 @@ pub struct McpArgs {
 
     /// What a yes the agent relays from the chat may confirm, for a client
     /// that cannot show a form: none, reading other accounts' lists, or that
-    /// and the writes too [default: all]
+    /// and the writes too [default: all; lists with --listen]
     //
     // An `Option` rather than a default value, so that whoever reads it can
-    // tell "not given" from "all": a transport other than standard input
-    // and output would want a narrower default, and one value for both
-    // would hide that the choice was never made.
+    // tell "not given" from "all": over HTTP the default is narrower
+    // (`commands::mcp::http`), and one value for both would hide that the
+    // choice was never made.
     #[arg(long, value_enum, value_name = "WHAT")]
     pub confirm_in_chat: Option<ConfirmInChat>,
+
+    /// Serve over HTTP on this address of this machine's loopback, such as
+    /// 127.0.0.1:8750, for a tunnel of your own; clients present the key
+    /// "snob mcp key new" makes
+    #[cfg(feature = "mcp-http")]
+    #[arg(
+        long,
+        value_name = "ADDRESS",
+        value_parser = crate::commands::mcp::http::loopback
+    )]
+    pub listen: Option<std::net::SocketAddr>,
+
+    /// With --listen, the https address the tunnel serves this at, so that
+    /// requests addressed to it are taken
+    #[cfg(feature = "mcp-http")]
+    #[arg(
+        long,
+        requires = "listen",
+        value_name = "URL",
+        value_parser = crate::commands::mcp::http::public_url
+    )]
+    pub public_url: Option<url::Url>,
 
     /// The follows and unfollows agents may make in any 24 hours on the
     /// account, with --allow-writes [default: 10; at most 99, what the write
@@ -1901,11 +1933,12 @@ pub enum McpCommand {
                       already running keeps the key it started with until it is restarted. \
                       \"snob purge\" removes it too."
     )]
+    #[cfg(feature = "mcp-http")]
     Key(McpKeyCommand),
 }
 
 /// `snob mcp key` (`commands::mcp::key`).
-#[cfg(feature = "mcp")]
+#[cfg(feature = "mcp-http")]
 #[derive(Subcommand, Debug)]
 pub enum McpKeyCommand {
     /// Make a key, keep it in the system keyring, and print it this once
@@ -1916,7 +1949,7 @@ pub enum McpKeyCommand {
     Revoke,
 }
 
-#[cfg(feature = "mcp")]
+#[cfg(feature = "mcp-http")]
 #[derive(Args, Debug)]
 pub struct McpKeyNewArgs {
     /// Replace the key there is; every client given it stops working
@@ -1928,7 +1961,7 @@ pub struct McpKeyNewArgs {
     pub print: bool,
 }
 
-#[cfg(feature = "mcp")]
+#[cfg(feature = "mcp-http")]
 #[derive(Args, Debug)]
 pub struct McpKeyShowArgs {
     /// Print the key itself, on a terminal

@@ -1,8 +1,10 @@
 //! `snob mcp`: snob as a Model Context Protocol server, on standard input and
-//! output, for an agent's client to start.
+//! output, for an agent's client to start, or with `--listen` over HTTP on
+//! loopback, behind a key, for a tunnel of the person's own (`http.rs`).
 //!
 //! The server is a dispatcher and nothing else. It builds no client, opens no
-//! store and spends nothing: each tool call becomes one `snob` command
+//! database and spends nothing; the one thing it reads is the MCP key, and
+//! only to serve over HTTP. Each tool call becomes one `snob` command
 //! (`tools.rs`), run as a child process (`child.rs`), whose answer is filtered
 //! and handed back (`answer.rs`). AGENTS.md, "The MCP server", has the rules
 //! this keeps.
@@ -64,7 +66,10 @@
 pub mod answer;
 pub mod child;
 pub mod config;
+#[cfg(feature = "mcp-http")]
+pub mod http;
 pub mod job;
+#[cfg(feature = "mcp-http")]
 pub mod key;
 pub mod limits;
 pub mod pages;
@@ -87,6 +92,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceError, ServiceExt};
 use serde_json::{Value, json};
+use snob_ig::pace::CancelToken;
 
 use crate::cli::{ConfirmInChat, ConfirmedVia};
 use crate::exit::ExitCode;
@@ -167,6 +173,22 @@ pub fn longest_call(max_wait: Duration) -> Duration {
 /// The key the question is answered under, in `inputResponses`.
 const CONFIRM: &str = "confirm";
 
+/// What `snob mcp` was told on its command line, for either transport.
+#[derive(Debug, Clone, Copy)]
+pub struct Settings {
+    /// `--allow-writes`.
+    pub writes: bool,
+    /// `--confirm-in-chat`, which each transport resolves for itself when
+    /// it was not given.
+    pub in_chat: Option<ConfirmInChat>,
+    /// `--max-writes-per-day`, [`mcp_acts::WRITES_A_DAY`] when not given.
+    ///
+    /// [`mcp_acts::WRITES_A_DAY`]: snob_store::store::mcp_acts::WRITES_A_DAY
+    pub writes_a_day: Option<u32>,
+    /// The server's own `--max-wait` ([`Waits`]).
+    pub max_wait: Option<Duration>,
+}
+
 /// Serves until the client closes standard input.
 ///
 /// **Then waits for the calls still running**, which the SDK does not: it
@@ -175,33 +197,16 @@ const CONFIRM: &str = "confirm";
 /// handler, canceled, closes its child's standard input and gives it
 /// [`child::GRACE`]; this waits that long and a little more.
 ///
-/// `in_chat` is `--confirm-in-chat`; **not given, it is `all`**: over
-/// standard input and output the client is a program the person started
-/// themselves, and refusing the chat would leave most clients, which show no
-/// form, unable to make any call that asks. `writes_a_day` is
-/// `--max-writes-per-day`, [`mcp_acts::WRITES_A_DAY`] when not given, and
-/// `max_wait` the server's own `--max-wait` ([`Waits`]).
-///
-/// [`mcp_acts::WRITES_A_DAY`]: snob_store::store::mcp_acts::WRITES_A_DAY
-pub async fn serve(
-    launch: Launch,
-    writes: bool,
-    in_chat: Option<ConfirmInChat>,
-    writes_a_day: Option<u32>,
-    max_wait: Option<Duration>,
-) -> anyhow::Result<ExitCode> {
-    let in_flight = Arc::new(InFlight::default());
-    let server = Server {
-        launch: Arc::new(launch),
-        writes,
-        in_chat: in_chat.unwrap_or(ConfirmInChat::All),
-        writes_a_day: writes_a_day.unwrap_or(snob_store::store::mcp_acts::WRITES_A_DAY),
-        waits: Waits::given(max_wait),
-        sealer: Arc::new(seal::Sealer::new()?),
-        in_flight: Arc::clone(&in_flight),
-        limits: Arc::new(limits::Limits::default()),
-        pages: Arc::new(pages::Held::default()),
-    };
+/// `--confirm-in-chat`, **not given, is `all` here**: over standard input
+/// and output the client is a program the person started themselves, and
+/// refusing the chat would leave most clients, which show no form, unable
+/// to make any call that asks. Over HTTP it is narrower (`http.rs`).
+pub async fn serve(launch: Launch, settings: Settings) -> anyhow::Result<ExitCode> {
+    let in_chat = settings.in_chat.unwrap_or(ConfirmInChat::All);
+    // Nothing stops this server but its client: the token is never
+    // canceled, and each call is stopped by its own.
+    let server = Server::new(launch, &settings, in_chat, CancelToken::default())?;
+    let in_flight = Arc::clone(&server.in_flight);
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     in_flight
@@ -278,6 +283,69 @@ struct Server {
     limits: Arc<limits::Limits>,
     /// The long lists handed back in part, for the pages after the first.
     pages: Arc<pages::Held>,
+    /// Canceled when the whole server is stopping, which stops every call's
+    /// child as its own call being canceled would.
+    closing: CancelToken,
+}
+
+impl Server {
+    fn new(
+        launch: Launch,
+        settings: &Settings,
+        in_chat: ConfirmInChat,
+        closing: CancelToken,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            launch: Arc::new(launch),
+            writes: settings.writes,
+            in_chat,
+            writes_a_day: settings
+                .writes_a_day
+                .unwrap_or(snob_store::store::mcp_acts::WRITES_A_DAY),
+            waits: Waits::given(settings.max_wait),
+            sealer: Arc::new(seal::Sealer::new()?),
+            in_flight: Arc::new(InFlight::default()),
+            limits: Arc::new(limits::Limits::default()),
+            pages: Arc::new(pages::Held::default()),
+            closing,
+        })
+    }
+
+    /// Resolves when the call `context` is canceled, or the server stops:
+    /// what a call's child is raced against.
+    fn stopped(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = ()> + use<> {
+        let call = context.ct.clone();
+        let closing = self.closing.clone();
+        async move {
+            tokio::select! {
+                () = call.cancelled() => {} // spelling-allow: the SDK's name
+                () = closing.canceled() => {}
+            }
+        }
+    }
+}
+
+/// The session a request was made in, when its transport has sessions: the
+/// `Mcp-Session-Id` the client sent over HTTP. Standard input and output is
+/// one connection to the person's own client, and has none.
+fn session_of(context: &RequestContext<RoleServer>) -> Option<String> {
+    #[cfg(feature = "mcp-http")]
+    {
+        context
+            .extensions
+            .get::<::http::request::Parts>()
+            .and_then(|parts| parts.headers.get("mcp-session-id"))
+            .and_then(|id| id.to_str().ok())
+            .map(str::to_string)
+    }
+    #[cfg(not(feature = "mcp-http"))]
+    {
+        let _ = context;
+        None
+    }
 }
 
 /// Whether the person said yes, and if not, what they are told back.
@@ -459,16 +527,15 @@ impl ServerHandler for Server {
         };
         let mut via = None;
         if let Some(question) = &plan.ask {
+            // So that a token printed in one conversation is no yes in
+            // another, over a transport that has them.
+            let session = session_of(&context);
             let asked = Asked {
                 tool: &request.name,
                 question,
                 binding: plan.binding(&request.name),
                 offered: offered.as_deref(),
-                // Standard input and output is one connection, to the
-                // person's own client, and has no session. A transport with
-                // sessions hands its session id here, so that a token
-                // printed in one conversation is no yes in another.
-                session: None,
+                session: session.as_deref(),
             };
             match self.consent(&asked, &request, &context).await? {
                 Consent::Given(how) => via = Some(how),
@@ -478,9 +545,10 @@ impl ServerHandler for Server {
             }
         }
 
-        // A call canceled while the person was being asked starts nothing.
+        // A call canceled while the person was being asked starts nothing,
+        // and neither does one on a server that is stopping.
         let canceled = context.ct.is_cancelled(); // spelling-allow: the SDK's name
-        if canceled {
+        if canceled || self.closing.is_canceled() {
             return Ok(refusal("canceled", "the call was canceled before it started").into());
         }
         let _running = self.in_flight.enter();
@@ -538,7 +606,7 @@ impl ServerHandler for Server {
         // Ahead of the command, as every global flag goes.
         let mut line = vec![self.waits.flag(plan.run)];
         line.extend(command);
-        let stop = context.ct.cancelled(); // spelling-allow: the SDK's name
+        let stop = self.stopped(&context);
         let finished = self
             .launch
             .run(&line, stop, HEARTBEAT, tick)
@@ -674,7 +742,8 @@ impl Server {
         let plan = tools::plan(tool, &arguments, self.writes).map_err(|_| unknown())?;
         if self.launch.upgraded() {
             return Err(McpError::internal_error(
-                "snob was upgraded while this server ran, so nothing was run; restart the MCP                  server (reconnect it in the client)",
+                "snob was upgraded while this server ran, so nothing was run; restart the MCP \
+                 server (reconnect it in the client)",
                 None,
             ));
         }
@@ -687,7 +756,7 @@ impl Server {
         let _running = self.in_flight.enter();
         let mut line = vec![self.waits.flag(plan.run)];
         line.extend(plan.command_line(None));
-        let stop = context.ct.cancelled(); // spelling-allow: the SDK's name
+        let stop = self.stopped(context);
         let finished = self
             .launch
             .run(&line, stop, HEARTBEAT, |_| std::future::ready(()))
@@ -726,7 +795,8 @@ fn handed_back(doc: &Value, walk: child::Finished, offset: usize, tool: &str) ->
     if job::result_gone(&walk) {
         return refusal(
             "result_gone",
-            "a job's result is kept for a day after its walk ended, and this one's is gone;              call snob_list again for the list",
+            "a job's result is kept for a day after its walk ended, and this one's is gone; \
+             call snob_list again for the list",
         );
     }
     let told = job::with_id(answer::from(&job::plan_of(doc, offset), walk), doc);

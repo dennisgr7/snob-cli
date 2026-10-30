@@ -6365,7 +6365,7 @@ async fn a_task_of_another_account_is_unknown() {
 /// A key in snob's form, as `snob mcp key new` makes one. A fixed one, since
 /// these tests hand it over through `SNOB_MCP_KEY` and never make one: that
 /// would write the system keyring.
-#[cfg(feature = "mcp")]
+#[cfg(feature = "mcp-http")]
 const MCP_KEY: &str = "snob_mcp_N2u3l9q0aYyK0w7mQxk1vR4cT8bZp5sJdE6fGhIoUjA";
 
 /// `show` says where the key comes from and names it by a fingerprint, and
@@ -6376,7 +6376,7 @@ const MCP_KEY: &str = "snob_mcp_N2u3l9q0aYyK0w7mQxk1vR4cT8bZp5sJdE6fGhIoUjA";
 ///
 /// Through the variable only, and so it reads nothing from the keyring: the
 /// variable wins before the keyring is asked (`commands::mcp::key`).
-#[cfg(feature = "mcp")]
+#[cfg(feature = "mcp-http")]
 #[test]
 fn mcp_key_show_names_the_environment_and_prints_a_fingerprint() {
     let tmp = tempfile::tempdir().unwrap();
@@ -6454,7 +6454,7 @@ fn mcp_key_show_names_the_environment_and_prints_a_fingerprint() {
 /// the variable still takes it: removing the keyring's changes nothing for
 /// that server. The sandbox's keyring holds no key, so it says there was
 /// none, and removes nothing anywhere else.
-#[cfg(feature = "mcp")]
+#[cfg(feature = "mcp-http")]
 #[test]
 fn mcp_key_revoke_warns_when_the_environment_holds_the_key() {
     let tmp = tempfile::tempdir().unwrap();
@@ -6480,4 +6480,848 @@ fn mcp_key_revoke_warns_when_the_environment_holds_the_key() {
     let out = snob(tmp.path(), None, &["mcp", "key", "revoke"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(!stderr(&out).contains("warning"), "{}", stderr(&out));
+}
+
+/// One `snob mcp --listen` on a loopback port of its own, with
+/// [`MCP_KEY`] in its environment, spoken to over HTTP as a client does.
+///
+/// Started with `--stop-when-stdin-closes`, so closing its standard input
+/// asks it to stop as Ctrl+C would, on every platform.
+#[cfg(feature = "mcp-http")]
+struct HttpMcp {
+    child: tokio::process::Child,
+    stdin: Option<tokio::process::ChildStdin>,
+    port: u16,
+    http: reqwest::Client,
+    next: u64,
+    /// What the server said on standard error, as it said it.
+    said: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+/// What an HTTP request to the server came back with.
+#[cfg(feature = "mcp-http")]
+struct Answered {
+    status: u16,
+    session: Option<String>,
+    /// The JSON-RPC messages in the body, from its events or as it is.
+    messages: Vec<serde_json::Value>,
+}
+
+#[cfg(feature = "mcp-http")]
+impl HttpMcp {
+    async fn start(root: &Path, instagram: &MockServer, args: &[&str]) -> Self {
+        use tokio::io::AsyncBufReadExt;
+        let mut command = tokio::process::Command::from(command(root, Some(instagram)));
+        command
+            .args(["--stop-when-stdin-closes", "mcp", "--listen", "127.0.0.1:0"])
+            .args(args)
+            .env("SNOB_MCP_KEY", MCP_KEY)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("the binary runs");
+        let stdin = child.stdin.take();
+        let mut lines = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+        let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let line = lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("the server went away before it listened");
+                said.lock().unwrap().push_str(&format!("{line}\n"));
+                if line.contains("serving on http://") {
+                    return line;
+                }
+            }
+        })
+        .await
+        .expect("listening within a minute");
+        let port = first
+            .split("http://127.0.0.1:")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|port| port.parse().ok())
+            .unwrap_or_else(|| panic!("a port in {first}"));
+        // Read on, so that nothing the server says can fill the pipe.
+        let more = std::sync::Arc::clone(&said);
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                more.lock().unwrap().push_str(&format!("{line}\n"));
+            }
+        });
+        Self {
+            child,
+            stdin,
+            port,
+            http: reqwest::Client::new(),
+            next: 0,
+            said,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/mcp", self.port)
+    }
+
+    /// Posts `message` with the key, in `session` when given, on the
+    /// revision a session speaks (2025-11-25) or else the stateless one.
+    async fn post(&self, session: Option<&str>, message: &serde_json::Value) -> Answered {
+        let mut request = self
+            .http
+            .post(self.url())
+            .header("Authorization", format!("Bearer {MCP_KEY}"))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(message.to_string());
+        match session {
+            Some(id) => {
+                request = request
+                    .header("Mcp-Session-Id", id)
+                    .header("MCP-Protocol-Version", "2025-11-25");
+            }
+            None if message["method"] != "initialize" => {
+                request = request
+                    .header("MCP-Protocol-Version", "2026-07-28")
+                    .header("Mcp-Method", message["method"].as_str().unwrap_or_default());
+                if let Some(name) = message["params"]["name"].as_str() {
+                    request = request.header("Mcp-Name", name);
+                }
+            }
+            None => {}
+        }
+        let response = tokio::time::timeout(std::time::Duration::from_secs(90), request.send())
+            .await
+            .expect("an answer within a minute and a half")
+            .expect("the server answers");
+        let status = response.status().as_u16();
+        let session = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|id| id.to_str().ok())
+            .map(str::to_string);
+        let json = response
+            .headers()
+            .get("content-type")
+            .and_then(|kind| kind.to_str().ok())
+            .is_some_and(|kind| kind.starts_with("application/json"));
+        let body = response.text().await.unwrap_or_default();
+        let messages = if json {
+            serde_json::from_str(&body).into_iter().collect()
+        } else {
+            body.lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .filter_map(|data| serde_json::from_str(data.trim()).ok())
+                .collect()
+        };
+        Answered {
+            status,
+            session,
+            messages,
+        }
+    }
+
+    /// A request, and the message that answers it.
+    async fn ask(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        self.next += 1;
+        let id = self.next;
+        let mut params = params;
+        if session.is_none() {
+            params["_meta"] = serde_json::json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": { "name": "test", "version": "0" }
+            });
+        }
+        let message =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let answered = self.post(session, &message).await;
+        assert_eq!(answered.status, 200, "{method}");
+        answered
+            .messages
+            .into_iter()
+            .find(|message| message["id"] == id)
+            .unwrap_or_else(|| panic!("no answer to {method}"))
+    }
+
+    /// The handshake of a client on 2025-11-25, which opens a session: its
+    /// id.
+    async fn open(&mut self) -> String {
+        self.next += 1;
+        let hello = serde_json::json!({
+            "jsonrpc": "2.0", "id": self.next, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "0" }
+            }
+        });
+        let answered = self.post(None, &hello).await;
+        assert_eq!(answered.status, 200);
+        assert_eq!(
+            answered.messages[0]["result"]["serverInfo"]["name"], "snob",
+            "{:?}",
+            answered.messages
+        );
+        let session = answered.session.expect("a session id");
+        let done = self
+            .post(
+                Some(&session),
+                &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            )
+            .await;
+        assert_eq!(done.status, 202);
+        session
+    }
+
+    async fn call(
+        &mut self,
+        session: Option<&str>,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let answer = self
+            .ask(
+                session,
+                "tools/call",
+                serde_json::json!({ "name": tool, "arguments": arguments }),
+            )
+            .await;
+        answer["result"].clone()
+    }
+
+    /// Closes the server's standard input, the stop `--stop-when-stdin-
+    /// closes` hears, and waits for it to exit.
+    async fn stop(&mut self) -> std::process::ExitStatus {
+        self.stdin = None;
+        tokio::time::timeout(std::time::Duration::from_secs(90), self.child.wait())
+            .await
+            .expect("the server stopped within a minute and a half")
+            .unwrap()
+    }
+
+    fn said(&self) -> String {
+        self.said.lock().unwrap().clone()
+    }
+
+    /// Whether the server has said `what` on standard error, waiting a few
+    /// seconds for the lines after the first.
+    async fn has_said(&self, what: &str) -> bool {
+        let since = std::time::Instant::now();
+        while since.elapsed() < std::time::Duration::from_secs(10) {
+            if self.said().contains(what) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+}
+
+/// Sends `request` as it is on a connection of its own, and reads what comes
+/// back until the server closes the connection or `within` passes: what it
+/// read, and whether the server closed it.
+#[cfg(feature = "mcp-http")]
+async fn exchange(port: u16, request: &[u8], within: std::time::Duration) -> (String, bool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    // A refusal may close the connection before all of it is written.
+    let _ = stream.write_all(request).await;
+    let mut read = Vec::new();
+    let mut buffer = [0u8; 4096];
+    let closed = tokio::time::timeout(within, async {
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => read.extend_from_slice(&buffer[..n]),
+            }
+        }
+    })
+    .await
+    .is_ok();
+    (String::from_utf8_lossy(&read).into_owned(), closed)
+}
+
+/// A request's head, by hand: `extra` lines go in as they are.
+#[cfg(feature = "mcp-http")]
+fn head(port: u16, extra: &[&str], length: usize) -> String {
+    let mut head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nContent-Length: {length}\r\n"
+    );
+    for line in extra {
+        head.push_str(line);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    head
+}
+
+/// An `initialize` as a client on 2025-11-25 sends it.
+#[cfg(feature = "mcp-http")]
+const HELLO: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"raw","version":"0"}}}"#;
+
+/// No key, no server: it does not start listening, and says how to make
+/// one.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn the_http_server_refuses_to_start_without_a_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut command = tokio::process::Command::from(command(tmp.path(), None));
+    command.args(["mcp", "--listen", "127.0.0.1:0"]);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(60), command.output())
+        .await
+        .expect("it did not stay to serve")
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("snob mcp key new"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stderr(&out).contains("serving on"), "{}", stderr(&out));
+}
+
+/// Loopback only, and a public address only over https and with --listen.
+#[cfg(feature = "mcp-http")]
+#[test]
+fn the_http_server_refuses_a_non_loopback_address() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = [("SNOB_MCP_KEY", MCP_KEY)];
+    for refused in [
+        &["mcp", "--listen", "0.0.0.0:8750"][..],
+        &["mcp", "--listen", "[::]:8750"][..],
+        &["mcp", "--listen", "192.168.1.10:8750"][..],
+        &["mcp", "--listen", "example.com:8750"][..],
+        &[
+            "mcp",
+            "--listen",
+            "127.0.0.1:0",
+            "--public-url",
+            "http://snob.example.com",
+        ][..],
+        &["mcp", "--public-url", "https://snob.example.com"][..],
+    ] {
+        let out = snob_with(tmp.path(), None, &key, refused);
+        assert_eq!(out.status.code(), Some(2), "{refused:?}: {}", stderr(&out));
+        assert!(!stderr(&out).contains("serving on"), "{}", stderr(&out));
+    }
+    let out = snob_with(tmp.path(), None, &key, &["mcp", "--listen", "0.0.0.0:8750"]);
+    assert!(stderr(&out).contains("tunnel"), "{}", stderr(&out));
+}
+
+/// A request with no key is refused as soon as its head has arrived: the
+/// body it announced is never waited for, and the connection is closed.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_request_without_the_key_is_refused_before_its_body_is_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+
+    // A body far past the limit, announced and never sent: a server that
+    // read it first would wait, or answer 413.
+    let since = std::time::Instant::now();
+    let (said, closed) = exchange(
+        server.port,
+        head(server.port, &[], 10_000_000).as_bytes(),
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    assert!(said.starts_with("HTTP/1.1 401"), "{said}");
+    assert!(
+        said.contains("www-authenticate: Bearer realm=\"snob\""),
+        "{said}"
+    );
+    assert!(closed, "the connection was closed: {said}");
+    assert!(since.elapsed() < std::time::Duration::from_secs(10));
+
+    // Another path is not found, key or no key.
+    let (said, _) = exchange(
+        server.port,
+        b"GET /.well-known/oauth-protected-resource HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    assert!(said.starts_with("HTTP/1.1 404"), "{said}");
+    assert!(posted(&instagram).await.is_empty());
+}
+
+/// Not the key, or the key under another scheme: 401, and the connection
+/// closed, so a guess costs a connection.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_wrong_key_is_refused_and_the_connection_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let wrong = format!("{}E", &MCP_KEY[..MCP_KEY.len() - 1]);
+    for authorization in [
+        format!("Authorization: Bearer {wrong}"),
+        format!("Authorization: Basic {MCP_KEY}"),
+        format!("Authorization: {MCP_KEY}"),
+        "Authorization: Bearer ".to_string(),
+    ] {
+        let mut request = head(server.port, &[&authorization], HELLO.len());
+        request.push_str(HELLO);
+        let (said, closed) = exchange(
+            server.port,
+            request.as_bytes(),
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+        assert!(said.starts_with("HTTP/1.1 401"), "{authorization}: {said}");
+        assert!(said.contains("connection: close"), "{said}");
+        assert!(closed, "{authorization}: the connection was closed");
+    }
+    // The key, in any case of its scheme, is let in.
+    let key = format!("Authorization: bEaReR {MCP_KEY}");
+    let mut request = head(server.port, &[&key, "Connection: close"], HELLO.len());
+    request.push_str(HELLO);
+    let (said, _) = exchange(
+        server.port,
+        request.as_bytes(),
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    assert!(said.starts_with("HTTP/1.1 200"), "{said}");
+    assert_eq!(server.stop().await.code(), Some(130));
+}
+
+/// A `Host` that is neither loopback nor the public URL's is refused, as a
+/// page that reached the port through DNS rebinding would send.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_foreign_host_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let server = HttpMcp::start(
+        tmp.path(),
+        &instagram,
+        &["--public-url", "https://snob.example.com/mcp"],
+    )
+    .await;
+    let key = format!("Authorization: Bearer {MCP_KEY}");
+    for (host, status) in [
+        ("evil.example", "403"),
+        ("snob.example.com", "200"),
+        ("localhost", "200"),
+    ] {
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\n{key}\r\nContent-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\nConnection: close\r\n\
+             Content-Length: {}\r\n\r\n{HELLO}",
+            HELLO.len()
+        );
+        let (said, _) = exchange(
+            server.port,
+            request.as_bytes(),
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+        assert!(
+            said.starts_with(&format!("HTTP/1.1 {status}")),
+            "{host}: {said}"
+        );
+    }
+}
+
+/// An `Origin` other than the public URL's is refused; a request with none,
+/// which is what a client that is not a browser sends, is not.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_foreign_origin_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let server = HttpMcp::start(
+        tmp.path(),
+        &instagram,
+        &["--public-url", "https://snob.example.com"],
+    )
+    .await;
+    let key = format!("Authorization: Bearer {MCP_KEY}");
+    for (origin, status) in [
+        (Some("https://evil.example"), "403"),
+        (Some("http://localhost:8080"), "403"),
+        (Some("https://snob.example.com"), "200"),
+        (None, "200"),
+    ] {
+        let origin_line = origin.map(|origin| format!("Origin: {origin}"));
+        let mut extra = vec![key.as_str(), "Connection: close"];
+        if let Some(line) = &origin_line {
+            extra.push(line);
+        }
+        let mut request = head(server.port, &extra, HELLO.len());
+        request.push_str(HELLO);
+        let (said, _) = exchange(
+            server.port,
+            request.as_bytes(),
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+        assert!(
+            said.starts_with(&format!("HTTP/1.1 {status}")),
+            "{origin:?}: {said}"
+        );
+    }
+}
+
+/// A body past the quarter of a megabyte is refused, announced or not.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_body_past_the_limit_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let key = format!("Authorization: Bearer {MCP_KEY}");
+
+    // Announced: refused before any of it is read.
+    let (said, closed) = exchange(
+        server.port,
+        head(server.port, &[&key], 300_000).as_bytes(),
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    assert!(said.starts_with("HTTP/1.1 413"), "{said}");
+    assert!(closed);
+
+    // In chunks, which announce nothing: refused once past it.
+    let mut request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{key}\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+        server.port
+    );
+    let chunk = "x".repeat(64 * 1024);
+    for _ in 0..5 {
+        request.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+    }
+    request.push_str("0\r\n\r\n");
+    let (said, _) = exchange(
+        server.port,
+        request.as_bytes(),
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    assert!(said.starts_with("HTTP/1.1 413"), "{said}");
+}
+
+/// A body that does not arrive is given half a minute, and then the request
+/// is answered 408 and its connection closed.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_body_that_never_arrives_is_cut() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let key = format!("Authorization: Bearer {MCP_KEY}");
+    let mut request = head(server.port, &[&key], HELLO.len());
+    request.push_str(&HELLO[..10]);
+    let since = std::time::Instant::now();
+    let (said, closed) = exchange(
+        server.port,
+        request.as_bytes(),
+        std::time::Duration::from_secs(60),
+    )
+    .await;
+    assert!(said.starts_with("HTTP/1.1 408"), "{said}");
+    assert!(closed);
+    assert!(since.elapsed() >= std::time::Duration::from_secs(25));
+}
+
+/// `initialize` opens a session, which later requests name; a session the
+/// server never opened is not found. The key is named at start by its
+/// fingerprint, never itself.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn initialize_over_http_opens_a_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let session = server.open().await;
+    let tools = server
+        .ask(Some(&session), "tools/list", serde_json::json!({}))
+        .await;
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"snob_list"), "{names:?}");
+    assert!(
+        !names.contains(&"snob_follow"),
+        "no writes without --allow-writes"
+    );
+
+    let unknown = server
+        .post(
+            Some("not-a-session"),
+            &serde_json::json!({"jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {}}),
+        )
+        .await;
+    assert_eq!(unknown.status, 404);
+    assert!(server.said().contains("fingerprint"), "{}", server.said());
+    assert!(!server.said().contains(MCP_KEY), "the key is never said");
+}
+
+/// On the stateless revision a call carries everything it needs, and no
+/// session is opened for it.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_stateless_call_over_http_needs_no_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let status = server
+        .call(None, "snob_status", serde_json::json!({}))
+        .await;
+    assert_eq!(status["isError"], false, "{status}");
+    assert_eq!(
+        status["structuredContent"]["error"]["code"], "no_session",
+        "{status}"
+    );
+}
+
+/// Eight sessions at once, and a ninth `initialize` waits for one to close;
+/// a stateless call, which opens none, is still answered.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_ninth_session_is_refused_while_eight_are_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    for _ in 0..8 {
+        server.open().await;
+    }
+    let ninth = server
+        .post(None, &serde_json::from_str(HELLO).unwrap())
+        .await;
+    assert_eq!(ninth.status, 503);
+    let status = server
+        .call(None, "snob_status", serde_json::json!({}))
+        .await;
+    assert_eq!(status["isError"], false, "{status}");
+}
+
+/// Over HTTP, whoever holds the key may be the one saying yes in the chat,
+/// so by default a yes in the chat covers reading lists and not the writes.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_remote_server_takes_no_chat_yes_for_a_write_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    serve_an_unfollow(&instagram).await;
+    log_in_writing(tmp.path(), &instagram);
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &["--allow-writes"]).await;
+    assert!(
+        server
+            .has_said("whoever holds the key can call follow and unfollow")
+            .await,
+        "{}",
+        server.said()
+    );
+    let session = server.open().await;
+    let before = posted(&instagram).await.len();
+    for tool in ["snob_follow", "snob_unfollow"] {
+        let refused = server
+            .call(
+                Some(&session),
+                tool,
+                serde_json::json!({ "account": "someone" }),
+            )
+            .await;
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert_eq!(
+            refused["structuredContent"]["error"]["code"], "cannot_confirm",
+            "{refused}"
+        );
+    }
+    let walk = server
+        .call(
+            Some(&session),
+            "snob_list",
+            serde_json::json!({ "list": "followers", "account": "someone" }),
+        )
+        .await;
+    assert_eq!(
+        walk["structuredContent"]["status"], "confirmation_required",
+        "{walk}"
+    );
+    assert_eq!(writes_sent(&instagram).await, 0);
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // Given --confirm-in-chat all, the writes are asked in the chat too.
+    let mut all = HttpMcp::start(
+        tmp.path(),
+        &instagram,
+        &["--allow-writes", "--confirm-in-chat", "all"],
+    )
+    .await;
+    assert!(
+        all.has_said("confirm them in the chat").await,
+        "{}",
+        all.said()
+    );
+    let session = all.open().await;
+    let asked = all
+        .call(
+            Some(&session),
+            "snob_unfollow",
+            serde_json::json!({ "account": "someone" }),
+        )
+        .await;
+    assert_eq!(
+        asked["structuredContent"]["status"], "confirmation_required",
+        "{asked}"
+    );
+    assert_eq!(writes_sent(&instagram).await, 0);
+}
+
+/// A token handed out in one session is no yes in another: that call is
+/// asked again, and nothing is walked until the session it was given in
+/// brings it back.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_chat_ticket_from_one_session_is_refused_in_another() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let here = server.open().await;
+    let there = server.open().await;
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+    let asking = server.call(Some(&here), "snob_list", theirs.clone()).await;
+    let token = asking["structuredContent"]["confirmation"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a token: {asking}"))
+        .to_string();
+    let mut with_token = theirs.clone();
+    with_token["confirmation"] = serde_json::json!(token);
+
+    let elsewhere = server
+        .call(Some(&there), "snob_list", with_token.clone())
+        .await;
+    assert_eq!(
+        elsewhere["structuredContent"]["status"], "confirmation_required",
+        "{elsewhere}"
+    );
+    assert_eq!(
+        elsewhere["structuredContent"]["previous"], "not_for_this_call",
+        "{elsewhere}"
+    );
+    assert_eq!(followers_asked(&instagram).await, 0, "nothing was walked");
+
+    let done = server.call(Some(&here), "snob_list", with_token).await;
+    assert_eq!(done["isError"], false, "{done}");
+    assert_eq!(done["structuredContent"]["count"], 3, "{done}");
+}
+
+/// The question in one request and the yes in the next, as a stateless
+/// client makes them: the walk runs on the second, once.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_chat_confirmation_of_a_list_works_over_two_http_requests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+    let asking = server.call(None, "snob_list", theirs.clone()).await;
+    assert_eq!(asking["isError"], false, "{asking}");
+    let token = asking["structuredContent"]["confirmation"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a token: {asking}"))
+        .to_string();
+    assert_eq!(followers_asked(&instagram).await, 0);
+
+    let mut with_token = theirs;
+    with_token["confirmation"] = serde_json::json!(token);
+    let done = server.call(None, "snob_list", with_token.clone()).await;
+    assert_eq!(done["isError"], false, "{done}");
+    assert_eq!(done["structuredContent"]["count"], 3, "{done}");
+    let walked = followers_asked(&instagram).await;
+    assert!(walked > 0);
+
+    let again = server.call(None, "snob_list", with_token).await;
+    assert_eq!(
+        again["structuredContent"]["error"]["code"], "confirmation_used",
+        "{again}"
+    );
+    assert_eq!(followers_asked(&instagram).await, walked);
+}
+
+/// Asked to stop while a call runs, the server stops that call's child in
+/// order, as a canceled call would (here, the start of a job, which stops
+/// the job it had not handed over yet), waits for it, and exits 130.
+///
+/// Stopped through standard input closing (`--stop-when-stdin-closes`),
+/// which takes the same road as Ctrl+C and can be sent on every platform.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn ctrl_c_gives_running_calls_their_grace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let session = server.open().await;
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 500, "method": "tools/call",
+        "params": { "name": "snob_list", "arguments": { "list": "followers", "wait_seconds": 50 } }
+    });
+    let call = {
+        let http = server.http.clone();
+        let url = server.url();
+        tokio::spawn(async move {
+            http.post(url)
+                .header("Authorization", format!("Bearer {MCP_KEY}"))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .header("Mcp-Session-Id", session)
+                .header("MCP-Protocol-Version", "2025-11-25")
+                .body(request.to_string())
+                .send()
+                .await
+                .ok()
+                .map(|response| response.status().as_u16())
+        })
+    };
+    until_asked(&instagram, 1).await;
+
+    let since = std::time::Instant::now();
+    let exited = server.stop().await;
+    assert_eq!(exited.code(), Some(130), "{}", server.said());
+    // Within the grace a stopped child gets, and the wait for it.
+    assert!(
+        since.elapsed() < std::time::Duration::from_secs(60),
+        "{:?}",
+        since.elapsed()
+    );
+    let listed = jobs.ask(&["list", "--all", "--json"]);
+    let job = &listed["jobs"][0];
+    assert!(
+        matches!(job["status"].as_str(), Some("canceled" | "stopped")),
+        "the walk was stopped in order: {job}"
+    );
+    let _ = call.await;
 }
