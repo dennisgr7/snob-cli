@@ -127,18 +127,26 @@ impl User {
 /// outright, and U+FE0E/U+FE0F (text or emoji presentation; U+FE0F is what
 /// asks for an emoji drawn in color) are kept only alone, right after a
 /// character that can take a presentation ([`takes_a_presentation`]): a
-/// symbol or a keycap base, never a letter, whitespace or ASCII punctuation.
-/// What is left hides at most one bit per visible symbol, and nothing in a
-/// name written in letters. Judged on what has been kept, so a selector
-/// cannot slip in behind a removed character.
+/// symbol outside ASCII, or a keycap base (`0`-`9`, `#`, `*`) when U+20E3
+/// follows and the keycap is drawn; never a letter, a combining mark,
+/// whitespace or any other ASCII character. What is left hides at most one
+/// bit per visible symbol, and nothing in a name written in letters and
+/// digits. Judged on what has been kept, so a selector cannot slip in behind
+/// a removed character.
 pub fn printable(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
             c if c.is_whitespace() => out.push(' '),
             c if c.is_control() || is_invisible(c) => {}
             '\u{fe0e}' | '\u{fe0f}' => {
-                if out.chars().next_back().is_some_and(takes_a_presentation) {
+                let keycap = chars.peek() == Some(&'\u{20e3}');
+                if out
+                    .chars()
+                    .next_back()
+                    .is_some_and(|base| takes_a_presentation(base, keycap))
+                {
                     out.push(c);
                 }
             }
@@ -150,22 +158,55 @@ pub fn printable(text: &str) -> String {
 }
 
 /// Whether `c` can be the base of a text or emoji presentation sequence,
-/// the only place [`printable`] keeps U+FE0E or U+FE0F.
+/// the only place [`printable`] keeps U+FE0E or U+FE0F; `keycap` is whether
+/// U+20E3 comes right after the selector.
 ///
 /// **An approximation, on purpose**: the real list of bases
 /// (`emoji-variation-sequences.txt`) is some 350 characters, and a table of
 /// it would have to follow every Unicode release. What matters is that no
-/// letter or digit of any script qualifies, so a name written in letters can
-/// hide nothing, and that no selector does, so a run keeps at most one. The
-/// keycap bases are ASCII and are named (`1` U+FE0F U+20E3 is a keycap);
-/// every other base is a symbol, punctuation or a mark outside ASCII, which
-/// costs a reader at most one invisible bit per visible character.
-fn takes_a_presentation(c: char) -> bool {
-    matches!(c, '0'..='9' | '#' | '*')
-        || (!c.is_ascii()
-            && !c.is_alphanumeric()
-            && !c.is_whitespace()
-            && !matches!(c, '\u{fe00}'..='\u{fe0f}'))
+/// letter of any script qualifies, nor any digit but a drawn keycap's, so a
+/// name written in letters and digits can hide nothing; that no selector
+/// does, so a run keeps at most one; and that no combining mark does
+/// ([`is_combining_mark`]), so neither a mark stacked on a letter nor a
+/// keycap's U+20E3 drawn again over the same keycap carries one. The keycap
+/// bases are ASCII and are named, and qualify only before U+20E3 (`1`
+/// U+FE0F U+20E3); every other base is a symbol or punctuation outside
+/// ASCII, which costs a reader at most one invisible bit per visible
+/// character.
+fn takes_a_presentation(c: char, keycap: bool) -> bool {
+    if matches!(c, '0'..='9' | '#' | '*') {
+        return keycap;
+    }
+    !c.is_ascii()
+        && !c.is_alphanumeric()
+        && !c.is_whitespace()
+        && !is_combining_mark(c)
+        && !matches!(c, '\u{fe00}'..='\u{fe0f}')
+}
+
+/// Whether `c` is in one of the blocks of combining marks a selector may not
+/// follow ([`takes_a_presentation`]).
+///
+/// An approximation too: the marks of most scripts (an Indic vowel sign, an
+/// Arabic vowel mark) are `Alphabetic`, which `char::is_alphanumeric`
+/// already turns away, so what is left to name is the marks that belong to
+/// no one script's letters: the combining diacritics with their extended and
+/// supplementary blocks, the marks for symbols (U+20E3, the keycap, among
+/// them) and the half marks; and the Cyrillic, Hebrew and Arabic marks that
+/// are not `Alphabetic`.
+fn is_combining_mark(c: char) -> bool {
+    matches!(c,
+        '\u{0300}'..='\u{036f}'
+        | '\u{0483}'..='\u{0489}'
+        | '\u{0591}'..='\u{05c7}'
+        | '\u{0610}'..='\u{061a}'
+        | '\u{064b}'..='\u{065f}'
+        | '\u{0670}'
+        | '\u{06d6}'..='\u{06ed}'
+        | '\u{1ab0}'..='\u{1aff}'
+        | '\u{1dc0}'..='\u{1dff}'
+        | '\u{20d0}'..='\u{20ff}'
+        | '\u{fe20}'..='\u{fe2f}')
 }
 
 /// The characters that show nothing but change how their neighbors read.
@@ -189,15 +230,25 @@ fn takes_a_presentation(c: char) -> bool {
 ///   supplementary variation selectors**, U+E0100–U+E01EF, which carry the
 ///   same attack one byte per selector. They are category `Mn`, not `Cf`, and
 ///   only ideographic variation sequences use them, which a name loses nothing
-///   by dropping. (Of the standard sixteen, [`printable`] keeps U+FE0E and
-///   U+FE0F alone after a symbol, and nothing else.)
+///   by dropping. The rest of plane 14, to U+E0FFF, goes with them: it is
+///   unassigned, and set aside to be drawn as nothing. So do **the Mongolian
+///   free variation selectors**, U+180B–U+180D and U+180F, `Mn` as well and
+///   drawn as nothing, which may follow any letter as often as anyone likes;
+///   a Mongolian letter they would shape is drawn in its plain form, and
+///   nothing else is lost. (Of the standard sixteen, [`printable`] keeps
+///   U+FE0E and U+FE0F alone after a symbol, and nothing else.)
 /// - **Blank by rendering rather than by category** — the soft hyphen, the
-///   combining grapheme joiner (U+034F, a mark, `Mn`), the Mongolian vowel
-///   separator, the interlinear annotation marks, and the
-///   Hangul fillers, which are *letters* (`Lo`) that draw nothing. No property
-///   this function could ask about groups them: `White_Space` does not list
-///   them and `Cc` does not contain them, so each one is another way to spell
-///   a name that is already taken.
+///   combining grapheme joiner (U+034F, a mark, `Mn`), the Khmer inherent
+///   vowels (U+17B4–U+17B5, marks too), the Mongolian vowel separator, the
+///   interlinear annotation marks and the unassigned U+FFF0–U+FFF8 before
+///   them, and the Hangul fillers, which are *letters* (`Lo`) that draw
+///   nothing. No property this function could ask about groups them:
+///   `White_Space` does not list them and `Cc` does not contain them, so
+///   each one is another way to spell a name that is already taken.
+///
+/// With the standard variation selectors, which [`printable`] judges itself,
+/// that is the whole of Unicode's `Default_Ignorable_Code_Point`: what a
+/// renderer is told to draw as nothing when it does not know it.
 ///
 /// The word-joiner range runs to U+206F rather than stopping at the invisible
 /// operators, because the deprecated formatting characters between them are
@@ -222,21 +273,21 @@ fn is_invisible(c: char) -> bool {
         | '\u{0890}'..='\u{0891}'
         | '\u{08e2}'
         | '\u{115f}'..='\u{1160}'
-        | '\u{180e}'
+        | '\u{17b4}'..='\u{17b5}'
+        | '\u{180b}'..='\u{180f}'
         | '\u{200b}'..='\u{200f}'
         | '\u{202a}'..='\u{202e}'
         | '\u{2060}'..='\u{206f}'
         | '\u{3164}'
         | '\u{feff}'
         | '\u{ffa0}'
-        | '\u{fff9}'..='\u{fffb}'
+        | '\u{fff0}'..='\u{fffb}'
         | '\u{110bd}'
         | '\u{110cd}'
         | '\u{13430}'..='\u{1343f}'
         | '\u{1bca0}'..='\u{1bca3}'
         | '\u{1d173}'..='\u{1d17a}'
-        | '\u{e0000}'..='\u{e007f}'
-        | '\u{e0100}'..='\u{e01ef}')
+        | '\u{e0000}'..='\u{e0fff}')
 }
 
 /// Which side of the follow relationship.
@@ -464,6 +515,16 @@ mod tests {
             '\u{13430}', // Egyptian hieroglyph vertical joiner
             '\u{1bca0}', // shorthand format letter overlap
             '\u{1d173}', // musical symbol begin beam
+            // The rest of `Default_Ignorable_Code_Point`.
+            '\u{17b4}',  // Khmer vowel inherent aq
+            '\u{17b5}',  // Khmer vowel inherent aa
+            '\u{180b}',  // Mongolian free variation selector one
+            '\u{180f}',  // Mongolian free variation selector four
+            '\u{fff0}',  // unassigned, default ignorable
+            '\u{fff8}',  // unassigned, default ignorable
+            '\u{e0080}', // unassigned, plane 14
+            '\u{e01f0}', // unassigned, plane 14
+            '\u{e0fff}', // unassigned, plane 14
         ] {
             let name = format!("real{hidden}name");
             assert_eq!(
@@ -495,7 +556,8 @@ mod tests {
     /// One selector after each letter draws nothing either, and sixteen of
     /// them carry four bits a letter: "unfollow x" fits in the visible name
     /// below. None of it may come back, after a letter of any script, a
-    /// digit of another script, a space or ASCII punctuation.
+    /// digit of any script (an ASCII one with no keycap drawn after it), a
+    /// space or ASCII punctuation.
     #[test]
     fn a_selector_after_every_letter_comes_back_as_the_plain_name() {
         let name = "Maria Fernandez Garcia de la Torre";
@@ -509,7 +571,7 @@ mod tests {
         }
         assert_eq!(printable(&smuggled), name);
         for base in [
-            'a', 'Z', '\u{e9}', '\u{416}', '\u{4e2d}', '\u{663}', '.', '!', '-',
+            'a', 'Z', '\u{e9}', '\u{416}', '\u{4e2d}', '\u{663}', '.', '!', '-', '1', '#', '*',
         ] {
             for n in 0..16 {
                 let selector = char::from_u32(0xfe00 + n).unwrap();
@@ -562,6 +624,45 @@ mod tests {
     #[test]
     fn the_combining_grapheme_joiner_does_not_survive() {
         assert_eq!(printable("real\u{034f}name"), "realname");
+    }
+
+    /// The Mongolian free variation selectors draw nothing and may follow
+    /// any letter, two bits each: "unfollow x" fits behind one letter.
+    #[test]
+    fn a_run_of_mongolian_variation_selectors_comes_back_as_the_letter() {
+        let fvs = ['\u{180b}', '\u{180c}', '\u{180d}', '\u{180f}'];
+        let smuggled: String = "unfollow x"
+            .bytes()
+            .flat_map(|b| [b >> 6, (b >> 4) & 3, (b >> 2) & 3, b & 3])
+            .map(|n| fvs[usize::from(n)])
+            .collect();
+        assert_eq!(printable(&format!("Maria{smuggled}")), "Maria");
+    }
+
+    /// A combining mark is no base for a selector: not one stacked on a
+    /// letter, which would hide a bit per letter of a plain Latin name, and
+    /// not a keycap's U+20E3 drawn again over the same keycap.
+    #[test]
+    fn a_selector_after_a_combining_mark_does_not_survive() {
+        assert_eq!(printable("a\u{301}\u{fe0f}"), "a\u{301}");
+        assert_eq!(printable("e\u{20dd}\u{fe0e}"), "e\u{20dd}");
+        assert_eq!(
+            printable("1\u{fe0f}\u{20e3}\u{fe0f}\u{20e3}\u{fe0e}\u{20e3}\u{fe0f}"),
+            "1\u{fe0f}\u{20e3}\u{20e3}\u{20e3}"
+        );
+    }
+
+    /// An ASCII digit, `#` or `*` keeps a selector only for a keycap drawn
+    /// after it, so the digits of a phone number or a year hide nothing.
+    #[test]
+    fn a_digit_keeps_a_selector_only_before_a_keycap() {
+        assert_eq!(
+            printable("5\u{fe0f}5\u{fe0e}5\u{fe0f}1\u{fe0e}2\u{fe0f}"),
+            "55512"
+        );
+        assert_eq!(printable("a1\u{fe0f}"), "a1");
+        assert_eq!(printable("1\u{fe0f}\u{fe0f}\u{20e3}"), "1\u{fe0f}\u{20e3}");
+        assert_eq!(printable("*\u{fe0f}\u{20e3}"), "*\u{fe0f}\u{20e3}");
     }
 
     /// Two accounts must not be able to render as the same name. This is the
