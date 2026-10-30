@@ -422,9 +422,12 @@ impl ServerHandler for Server {
                  and unfollows are capped at a few a day: one that came back mcp_write_cap \
                  sent nothing, and is not to be tried again before its retry_at (seconds \
                  since the epoch). \
-                 A long list comes back a page at a time: count is the whole list's, and \
-                 next_offset, when it is not null, is the offset to call again with for the \
-                 next page, which sends nothing and asks nothing. \
+                 A long list comes back a page at a time: count is the whole list's (at most \
+                 limit when one was given), and next_offset, when it is not null, is the \
+                 offset to call again with for the next page, which sends nothing and asks \
+                 nothing. One that comes back with complete: false is not the whole list, \
+                 and one served from storage says when it was stored: say so when you \
+                 present it. \
                  A list that has to be walked takes minutes to an hour at a human pace, so \
                  it runs as a job: when it has not ended within wait_seconds, the call \
                  answers with status running and a job_id. Ask snob_job how it is going, \
