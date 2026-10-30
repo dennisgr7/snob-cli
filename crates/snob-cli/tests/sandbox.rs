@@ -3938,6 +3938,10 @@ async fn the_mcp_server_runs_the_commands_and_nothing_it_was_not_told_yes_to() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
     log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
     let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
 
     let listed = client.ask("tools/list", serde_json::json!({})).await;
@@ -4054,6 +4058,10 @@ async fn the_mcp_server_asks_in_the_chat_when_the_client_cannot_ask() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
     log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
     let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
     let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
     let with = |token: &str, account: &str| serde_json::json!({ "list": "followers", "account": account, "confirmation": token });
@@ -4192,6 +4200,10 @@ async fn confirm_in_chat_none_refuses_a_client_that_cannot_ask() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
     log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
     let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
     let follow = serde_json::json!({ "account": "someone" });
     let before = posted(&instagram).await.len();
@@ -4257,6 +4269,10 @@ async fn an_older_client_that_cannot_answer_the_form_is_asked_in_the_chat() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
     log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
     let mut client = McpClient::start_with(
         tmp.path(),
         &instagram,
@@ -4343,6 +4359,10 @@ async fn the_mcp_server_hands_a_long_list_back_a_page_at_a_time() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(450, 2).await;
     log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
     let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
 
     let first = client
@@ -4515,6 +4535,10 @@ async fn the_mcp_server_asks_an_older_client_while_the_call_waits() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
     log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
     let mut client = McpClient::start_with(
         tmp.path(),
         &instagram,
@@ -4547,6 +4571,10 @@ async fn a_second_write_while_one_is_asked_is_refused_as_busy() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
     log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
     let mut client = McpClient::start_with(
         tmp.path(),
         &instagram,
@@ -4624,6 +4652,10 @@ async fn a_child_given_spend_alone_refuses_while_another_holds_the_account() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
     log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
     let followers = ["followers", "--format", "json", "--no-interactive"];
     let first = snob(tmp.path(), Some(&instagram), &followers);
     assert!(first.status.success(), "{}", stderr(&first));
@@ -4686,6 +4718,10 @@ async fn the_mcp_server_asks_a_stateless_client_in_the_call() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
     log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
     let mut client = McpClient::stateless(
         tmp.path(),
         &instagram,
@@ -4755,6 +4791,10 @@ async fn a_stateless_retry_without_an_answer_is_asked_again() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
     log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
     let mut client = McpClient::stateless(
         tmp.path(),
         &instagram,
@@ -4937,6 +4977,10 @@ async fn status_shows_what_an_agent_was_told_yes_to() {
     serve_an_unfollow(&instagram).await;
     log_in_writing(tmp.path(), &instagram);
     common::remember_doc_ids(tmp.path());
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
 
     let mut chat = McpClient::start(tmp.path(), &instagram, &["--allow-writes"]).await;
     let done = confirmed_in_chat(
@@ -5628,4 +5672,396 @@ async fn a_lost_job_with_a_live_claim_says_when_it_frees() {
         &["--", "following", "--format", "json", "--no-interactive"],
     );
     assert_eq!(told["status"], "succeeded", "{told}");
+}
+
+// ---------------------------------------------------------------------------
+// The jobs through `snob mcp`: a list call starts its walk as a job, and the
+// job tools read it back. The same cleanup rule as above: a `Jobs` guard,
+// declared after the `TempDir`, stops them before it goes.
+// ---------------------------------------------------------------------------
+
+/// The text blocks of a tool result, in one string.
+#[cfg(feature = "mcp")]
+fn said(result: &serde_json::Value) -> String {
+    result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A list walk that ends within the call's wait is answered as it always
+/// was, with the job it ran as beside it: the walk is a job all the same,
+/// kept, and seen by the person.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_answers_a_quick_walk_inline_with_its_job_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let followers = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(followers["isError"], false, "{followers}");
+    let told = &followers["structuredContent"];
+    assert_eq!(told["count"], 3, "{told}");
+    assert_eq!(usernames(told), ["user0", "user1", "user2"]);
+    let id = told["job_id"]
+        .as_str()
+        .expect("the job it ran as")
+        .to_string();
+    assert!(snob_store::paths::JobId::parse(&id).is_some(), "{id}");
+
+    // Kept as a job of the account's, with the call it was started for.
+    let listed = jobs.ask(&["list", "--all", "--json"]);
+    let job = &listed["jobs"][0];
+    assert_eq!(job["job_id"], id.as_str(), "{listed}");
+    assert_eq!(job["status"], "succeeded", "{job}");
+    assert_eq!(job["tool"], "snob_list", "{job}");
+    assert_eq!(
+        job["arguments"],
+        serde_json::json!({ "list": "followers" }),
+        "{job}"
+    );
+    assert_eq!(job["started_by"], "test 0", "{job}");
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(jobs.dirs()[0].join("job.json")).unwrap()).unwrap();
+    // A job waits for the budget an hour when the server was given no wait.
+    assert_eq!(record["max_wait_seconds"], 3600, "{record}");
+    assert_eq!(followers_asked(&instagram).await, 1);
+}
+
+/// A walk that outlasts the call's wait is handed back as a job that is
+/// still running, and `snob_job` gives its result once it has ended, as the
+/// list call would have; `snob_jobs` lists it while it runs.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_hands_back_a_job_for_a_slow_walk_and_snob_job_gives_its_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(8), 1).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let started = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "wait_seconds": 0 }),
+        )
+        .await;
+    assert_eq!(started["isError"], false, "{started}");
+    let told = &started["structuredContent"];
+    assert!(
+        matches!(told["status"].as_str(), Some("running" | "queued")),
+        "{told}"
+    );
+    assert_eq!(told["done"], false, "{told}");
+    assert_eq!(told["poll_with"], "snob_job", "{told}");
+    assert_eq!(told["command"], "followers", "{told}");
+    let id = told["job_id"].as_str().unwrap().to_string();
+    let text = said(&started);
+    assert!(
+        text.contains(&format!("snob_job with \"job_id\": \"{id}\"")),
+        "{text}"
+    );
+
+    let running = client.call("snob_jobs", serde_json::json!({})).await;
+    assert_eq!(running["isError"], false, "{running}");
+    assert_eq!(
+        running["structuredContent"]["jobs"][0]["job_id"],
+        id.as_str(),
+        "{running}"
+    );
+
+    // The same call again is the same job, not a second walk.
+    let again = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "wait_seconds": 0 }),
+        )
+        .await;
+    assert_eq!(again["structuredContent"]["job_id"], id.as_str(), "{again}");
+    assert_eq!(again["structuredContent"]["reused"], true, "{again}");
+
+    let done = client
+        .call(
+            "snob_job",
+            serde_json::json!({ "job_id": id, "wait_seconds": 50 }),
+        )
+        .await;
+    assert_eq!(done["isError"], false, "{done}");
+    let told = &done["structuredContent"];
+    assert_eq!(told["count"], 3, "{told}");
+    assert_eq!(usernames(told), ["user0", "user1", "user2"]);
+    assert_eq!(told["job_id"], id.as_str(), "{told}");
+    assert_eq!(followers_asked(&instagram).await, 1, "walked once");
+
+    // Ended, it is listed only with all.
+    let listed = client.call("snob_jobs", serde_json::json!({})).await;
+    assert_eq!(
+        listed["structuredContent"]["jobs"],
+        serde_json::json!([]),
+        "{listed}"
+    );
+    let every = client
+        .call("snob_jobs", serde_json::json!({ "all": true }))
+        .await;
+    assert_eq!(
+        every["structuredContent"]["jobs"][0]["status"], "succeeded",
+        "{every}"
+    );
+}
+
+/// `snob_job_cancel` stops the walk as Ctrl+C does, keeping what it read and
+/// letting go of the list, so the next call walks it again.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn snob_job_cancel_stops_the_walk_and_it_resumes_on_the_next_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let started = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "wait_seconds": 0 }),
+        )
+        .await;
+    let id = started["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a job: {started}"))
+        .to_string();
+    until_asked(&instagram, 1).await;
+
+    let canceled = client
+        .call("snob_job_cancel", serde_json::json!({ "job_id": id }))
+        .await;
+    assert_eq!(canceled["isError"], false, "{canceled}");
+    assert_eq!(
+        canceled["structuredContent"]["stop_asked"], true,
+        "{canceled}"
+    );
+    // Stopped as Ctrl+C stops a walk: interrupted, not a failure of its own.
+    let stopped = client
+        .call(
+            "snob_job",
+            serde_json::json!({ "job_id": id, "wait_seconds": 50 }),
+        )
+        .await;
+    assert_eq!(stopped["isError"], true, "{stopped}");
+    assert_eq!(
+        stopped["structuredContent"]["exit"], "interrupted",
+        "{stopped}"
+    );
+    assert_eq!(stopped["structuredContent"]["job_id"], id.as_str());
+    // Canceled again, it says it had stopped and changes nothing.
+    let again = client
+        .call("snob_job_cancel", serde_json::json!({ "job_id": id }))
+        .await;
+    assert_eq!(again["structuredContent"]["status"], "canceled", "{again}");
+    assert_eq!(again["structuredContent"]["done"], true, "{again}");
+
+    // The list was let go of: walked again, and this time it answers.
+    let walked = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(walked["isError"], false, "{walked}");
+    assert_eq!(walked["structuredContent"]["count"], 3, "{walked}");
+    assert_ne!(walked["structuredContent"]["job_id"], id.as_str());
+}
+
+/// A job outlives the server that started it, and another server, of the
+/// same account, reads it back by its id.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_job_started_by_one_server_is_read_by_another() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(5), 1).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut first = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let started = first
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "wait_seconds": 0 }),
+        )
+        .await;
+    let id = started["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a job: {started}"))
+        .to_string();
+    // The server, and the client with it, gone.
+    drop(first);
+
+    let mut second = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let done = second
+        .call(
+            "snob_job",
+            serde_json::json!({ "job_id": id, "wait_seconds": 50 }),
+        )
+        .await;
+    assert_eq!(done["isError"], false, "{done}");
+    assert_eq!(done["structuredContent"]["count"], 3, "{done}");
+}
+
+/// A list call canceled while it waits for its walk stops the job it
+/// started: its id was never handed over, so nobody could ask for it.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_canceled_call_cancels_the_job_it_had_not_handed_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let call = client
+        .send_raw(
+            "tools/call",
+            serde_json::json!({
+                "name": "snob_list",
+                "arguments": { "list": "followers", "wait_seconds": 50 }
+            }),
+        )
+        .await;
+    until_asked(&instagram, 1).await;
+    client
+        .send(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled", // spelling-allow: the protocol's name
+            "params": { "requestId": call, "reason": "the person moved on" }
+        }))
+        .await;
+
+    let since = std::time::Instant::now();
+    let over = loop {
+        let listed = jobs.ask(&["list", "--all", "--json"]);
+        let job = listed["jobs"][0].clone();
+        if !matches!(job["status"].as_str(), Some("running" | "queued")) {
+            break job;
+        }
+        assert!(
+            since.elapsed() < std::time::Duration::from_secs(60),
+            "the job was not stopped: {job}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+    assert_eq!(over["status"], "canceled", "{over}");
+    // And the server goes on.
+    let status = client.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(status["isError"], false, "{status}");
+}
+
+/// `snob_job` takes a job's id and nothing else, and a well-formed id this
+/// account has no job of is "no such job", from the child that looked.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn snob_job_refuses_an_id_that_is_not_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let before = posted(&instagram).await.len();
+
+    for id in ["--all", "../x", "j1"] {
+        for tool in ["snob_job", "snob_job_cancel"] {
+            let refused = client.call(tool, serde_json::json!({ "job_id": id })).await;
+            assert_eq!(refused["isError"], true, "{tool} {id}: {refused}");
+            assert_eq!(
+                refused["structuredContent"]["error"]["code"], "invalid_arguments",
+                "{tool} {id}: {refused}"
+            );
+        }
+    }
+    let nobody = format!("j{}", "0".repeat(26));
+    for tool in ["snob_job", "snob_job_cancel"] {
+        let unknown = client
+            .call(tool, serde_json::json!({ "job_id": nobody }))
+            .await;
+        assert_eq!(unknown["isError"], true, "{tool}: {unknown}");
+        assert_eq!(
+            unknown["structuredContent"]["error"]["code"], "no_such_job",
+            "{tool}: {unknown}"
+        );
+    }
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+}
+
+/// A finished job's result is handed back a page at a time from the job's
+/// own file, by a server that never held it, and sends nothing.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn snob_job_pages_a_finished_result_from_its_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(450, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut first = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let walked = first
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(walked["isError"], false, "{walked}");
+    let id = walked["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(first);
+
+    let sent = posted(&instagram).await.len();
+    let mut other = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let mut read = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = other
+            .call(
+                "snob_job",
+                serde_json::json!({ "job_id": id, "offset": offset }),
+            )
+            .await;
+        assert_eq!(page["isError"], false, "{page}");
+        let told = &page["structuredContent"];
+        assert_eq!(told["count"], 450, "{told}");
+        assert_eq!(told["offset"], offset, "{told}");
+        read.extend(usernames(told));
+        match told["next_offset"].as_u64() {
+            Some(next) => {
+                let text = said(&page);
+                assert!(
+                    text.contains("call snob_job again")
+                        && text.contains(&format!("\"offset\": {next}")),
+                    "{text}"
+                );
+                offset = next;
+            }
+            None => break,
+        }
+    }
+    let every: Vec<String> = (0..450).map(|n| format!("user{n}")).collect();
+    assert_eq!(read, every, "every account once, in the order served");
+    assert_eq!(posted(&instagram).await.len(), sent, "nothing was sent");
 }

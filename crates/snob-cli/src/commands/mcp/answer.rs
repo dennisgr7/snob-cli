@@ -203,16 +203,24 @@ pub fn page(items: &[String], offset: usize, pages: bool) -> Value {
 }
 
 /// What an agent is told of a page with another after it, beside the JSON:
-/// which accounts these are, and how the next ones are had. `None` for any
-/// other answer.
-pub fn next_page(body: &Value) -> Option<String> {
+/// which accounts these are, and how the next ones are had, by calling
+/// `tool` again (`snob_list`, or `snob_job` for a job's result). `None` for
+/// any other answer.
+pub fn next_page(body: &Value, tool: &str) -> Option<String> {
     let next = body.get("next_offset")?.as_u64()?;
     let count = body.get("count")?.as_u64()?;
     let offset = body.get("offset")?.as_u64()?;
+    // A confirmation on a call that asks nothing is refused, and only a
+    // list's call may carry one.
+    let and = if tool == "snob_list" {
+        ", no confirmation,"
+    } else {
+        ""
+    };
     Some(format!(
-        "Accounts {first} to {next} of {count}. For the next ones, call snob_list again with \
-         the same arguments, no confirmation, and \"offset\": {next}; a later page is handed \
-         back from what was already read, and sends nothing and asks nothing.",
+        "Accounts {first} to {next} of {count}. For the next ones, call {tool} again with \
+         the same arguments{and} and \"offset\": {next}; a later page is handed back from \
+         what was already read, and sends nothing and asks nothing.",
         first = offset + 1,
     ))
 }
@@ -251,6 +259,7 @@ mod tests {
             answers,
             spends: crate::commands::mcp::tools::Spends::Nothing,
             page: None,
+            run: crate::commands::mcp::tools::Run::Inline,
         }
     }
 
@@ -308,7 +317,7 @@ mod tests {
             match told.body["next_offset"].as_u64() {
                 Some(next) => {
                     assert!(
-                        next_page(&told.body)
+                        next_page(&told.body, "snob_list")
                             .unwrap()
                             .contains(&format!("\"offset\": {next}"))
                     );
@@ -330,7 +339,7 @@ mod tests {
         );
         assert_eq!(usernames(&told.body).len(), 50);
         assert!(told.body["next_offset"].is_null());
-        assert!(next_page(&told.body).is_none());
+        assert!(next_page(&told.body, "snob_list").is_none());
         assert!(told.whole.is_none(), "nothing after it to hold for");
 
         // A list that fits on one page is the same shape, and held for nothing.
@@ -404,7 +413,7 @@ mod tests {
         assert_eq!(usernames(partial).len(), PAGE);
         assert!(partial["next_offset"].is_null());
         assert!(told.whole.is_none());
-        assert!(next_page(&told.body).is_none());
+        assert!(next_page(&told.body, "snob_list").is_none());
     }
 
     #[test]

@@ -538,6 +538,12 @@ pub enum Command {
                       another is refused as busy, never queued. A long list is handed back \
                       a page at a time, up to 200 accounts; the later pages come from what \
                       was already read and send nothing.\n\n\
+                      A list that has to be walked runs as a job (\"snob jobs\"): the call \
+                      answers with the result when the walk ends within its wait_seconds, \
+                      and otherwise with the job, which the agent asks about, lists and \
+                      stops with snob_job, snob_jobs and snob_job_cancel, and which goes on \
+                      after the call, the client and the server. A job's walk waits at most \
+                      an hour for the request budget, or --max-wait when it is given.\n\n\
                       What runs on a yes is recorded in the account's database before its \
                       first request, and \"snob status --agents\" lists the last 24 hours. \
                       Agents may make --max-writes-per-day follows and unfollows on the \

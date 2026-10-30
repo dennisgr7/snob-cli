@@ -247,11 +247,14 @@ fn render(
         }
         // Codex gives up on a tool call after 60 seconds unless told
         // otherwise (`tool_timeout_sec`), which is less than the person may
-        // take to answer a question alone.
+        // take to answer a question alone. A list's call is bounded by its
+        // wait for the job it starts, and the walk goes on past it, so the
+        // longest call is one that waits for the budget (`mcp::longest_call`).
         McpClient::Codex => (
             format!(
                 "[mcp_servers.snob]\ncommand = {}\nargs = [{}]\n\
-                 # A call may wait for your answer, then for the request budget.\n\
+                 # A call may wait for your answer, then for the request budget;\n\
+                 # a list that takes longer goes on as a job.\n\
                  tool_timeout_sec = {}",
                 toml_string(exe),
                 args.iter()

@@ -136,10 +136,14 @@ can read:
   hours, and agents may make at most ten follows and unfollows a day on the
   account (`--max-writes-per-day` to change it, up to 99); what you type in a
   terminal is not counted.
-  A walk can run as a job that goes on after the agent's call has answered:
-  one at a time per account, listed by `snob jobs` and in `snob status`,
-  stopped like Ctrl+C by `snob jobs cancel <id>`, and stopped by `snob
-  logout` and `snob purge` before they remove anything.
+  A list the agent asks for that has to be walked runs as a job: answered in
+  the call when it ends within `wait_seconds` (20 by default, at most 50),
+  and otherwise handed back as a job the agent asks about with `snob_job`,
+  lists with `snob_jobs` and stops with `snob_job_cancel`. A job waits at
+  most an hour for the request budget unless the server was given
+  `--max-wait`. One runs at a time per account, listed by `snob jobs` and in
+  `snob status`, stopped like Ctrl+C by `snob jobs cancel <id>`, and stopped
+  by `snob logout` and `snob purge` before they remove anything.
   `snob mcp config claude-code` (or `claude-desktop`, `codex`, `cursor`,
   `vscode`) prints what to add to that client's configuration. After
   upgrading snob, reconnect the server in the client: a server whose binary

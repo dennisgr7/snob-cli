@@ -47,8 +47,9 @@ use crate::report;
 /// The hidden command a supervisor is started as.
 pub const COMMAND: &str = "__job";
 
-/// How long the start waits for the supervisor to take the job.
-const SUPERVISOR_WITHIN: Duration = Duration::from_secs(10);
+/// How long the start waits for the supervisor to take the job, before it
+/// waits `--wait` for the walk (`commands::mcp::longest_call` counts both).
+pub const SUPERVISOR_WITHIN: Duration = Duration::from_secs(10);
 
 /// How long the start waits for the job it asks to stop to have stopped,
 /// before it exits anyway; the job stops on its own either way.

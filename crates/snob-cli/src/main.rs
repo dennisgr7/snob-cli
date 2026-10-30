@@ -280,19 +280,22 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         return match &args.command {
             Some(snob_cli::cli::McpCommand::Config(config)) => commands::mcp::config::run(
                 config,
-                mcp_globals(&cli, None)?,
+                mcp_globals(&cli, cli.max_wait)?,
                 cli.max_wait.unwrap_or(commands::mcp::MAX_WAIT),
             ),
             None => {
+                // `--max-wait` is the server's to hand each child, which
+                // waits as long as what it runs allows (`mcp::Waits`).
                 let launch = commands::mcp::child::Launch::new(
                     std::env::current_exe()?,
-                    mcp_globals(&cli, Some(commands::mcp::MAX_WAIT))?,
+                    mcp_globals(&cli, None)?,
                 );
                 commands::mcp::serve(
                     launch,
                     args.allow_writes,
                     args.confirm_in_chat,
                     args.max_writes_per_day,
+                    cli.max_wait,
                 )
                 .await
             }
@@ -531,17 +534,18 @@ fn owner_args(cli: &Cli) -> anyhow::Result<Vec<std::ffi::OsString>> {
 
 /// What every command `snob mcp` runs for a tool call is started with, ahead
 /// of its own arguments: the global flags the server was given, so the child
-/// lands on the same files, account and trust, and the limit on a wait.
+/// lands on the same files, account and trust, and `--max-wait` when
+/// `max_wait` is given.
 ///
 /// `snob mcp config` prints the same flags in front of `mcp`, so the server
-/// a client starts is the one this command line describes; `--max-wait` only
-/// when it was given, since the server supplies its own default.
-///
-/// `default_max_wait` is what a child gets when the server was given none.
+/// a client starts is the one this command line describes, `--max-wait`
+/// among them when it was given. The server itself passes none here: it
+/// hands each child the wait that child's kind of run allows
+/// (`commands::mcp::Waits`), and clap refuses the flag twice.
 #[cfg(feature = "mcp")]
 fn mcp_globals(
     cli: &Cli,
-    default_max_wait: Option<std::time::Duration>,
+    max_wait: Option<std::time::Duration>,
 ) -> anyhow::Result<Vec<std::ffi::OsString>> {
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     if let Some(account) = &cli.account {
@@ -561,7 +565,7 @@ fn mcp_globals(
     // Whole seconds, which is all `--max-wait` can be written in. **Zero
     // stays zero**: it means "never wait for the budget", and a floor of one
     // second here would hand every child a wait the person did not allow.
-    if let Some(max_wait) = cli.max_wait.or(default_max_wait) {
+    if let Some(max_wait) = max_wait {
         args.push("--max-wait".into());
         args.push(format!("{}s", max_wait.as_secs()).into());
     }
@@ -716,17 +720,28 @@ mod mcp_tests {
     #[test]
     fn a_max_wait_of_zero_reaches_the_children_as_zero() {
         let cli = Cli::try_parse_from(["snob", "--max-wait", "0", "mcp"]).expect("it parses");
-        let globals = mcp_globals(&cli, Some(commands::mcp::MAX_WAIT)).expect("no path to resolve");
+        // Printed by `snob mcp config` in front of `mcp`, as it was given.
+        let globals = mcp_globals(&cli, cli.max_wait).expect("no path to resolve");
         let at = globals
             .iter()
             .position(|arg| arg == "--max-wait")
             .expect("the limit is passed on");
         assert_eq!(globals[at + 1], "0s");
+        // And handed by the server to every child, a job's walk included.
+        let waits = commands::mcp::Waits::given(cli.max_wait);
+        assert_eq!(waits.call, std::time::Duration::ZERO);
+        assert_eq!(waits.job, std::time::Duration::ZERO);
 
-        // And the server's own default when none was given.
+        // None given: none in the server's globals, and its own defaults.
         let cli = Cli::try_parse_from(["snob", "mcp"]).expect("it parses");
-        let globals = mcp_globals(&cli, Some(commands::mcp::MAX_WAIT)).expect("no path to resolve");
-        assert!(globals.iter().any(|arg| arg == "300s"), "{globals:?}");
+        let globals = mcp_globals(&cli, None).expect("no path to resolve");
+        assert!(
+            !globals.iter().any(|arg| arg == "--max-wait"),
+            "{globals:?}"
+        );
+        let waits = commands::mcp::Waits::given(cli.max_wait);
+        assert_eq!(waits.call, commands::mcp::MAX_WAIT);
+        assert_eq!(waits.job, commands::mcp::JOB_MAX_WAIT);
     }
 }
 

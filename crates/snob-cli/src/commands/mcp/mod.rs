@@ -47,10 +47,18 @@
 //! page after the first walks nothing: it is handed back from the whole list
 //! the first call read, which the server holds a while (`pages.rs`), or else
 //! read from the store, and it asks nothing.
+//!
+//! **A list that may be walked runs as a job** (`jobs/`, `tools::Run::Job`),
+//! started by a `snob __job start` child and answered with its result when
+//! it ends within the call's `wait_seconds`, or else with its id, which
+//! `snob_job` asks about (`job.rs`). A job outlives the call, the client and
+//! this server; the call's child is what is stopped when the call is
+//! canceled, and it stops the job only while it has not handed the id over.
 
 pub mod answer;
 pub mod child;
 pub mod config;
+pub mod job;
 pub mod limits;
 pub mod pages;
 pub mod seal;
@@ -74,7 +82,7 @@ use serde_json::{Value, json};
 use crate::cli::{ConfirmInChat, ConfirmedVia};
 use crate::exit::ExitCode;
 use child::Launch;
-use tools::About;
+use tools::{About, Run};
 
 /// How often a running call tells the client it is alive. A walk is minutes
 /// of deliberate pacing with nothing to show, and a client that hears nothing
@@ -93,18 +101,58 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(10 * 60);
 /// into the longest call.
 pub const MAX_WAIT: Duration = Duration::from_secs(5 * 60);
 
+/// `--max-wait` for a list walked as a job when the server was given none.
+/// Longer than a call's ([`MAX_WAIT`]): nobody waits on a job, which is asked
+/// about later, so a wait for the budget costs the agent nothing but time,
+/// while a walk refused past a short one would have to be started again by
+/// hand. An hour, and not the hours the daily ceiling can impose: past it the
+/// walk stops, keeping what it read, and the agent can say when to ask again.
+pub const JOB_MAX_WAIT: Duration = Duration::from_secs(60 * 60);
+
+/// How long the children of a call may wait for the request budget
+/// (`--max-wait`): the server's own `--max-wait` for both when it was given
+/// one, and otherwise [`MAX_WAIT`] for a call's command and [`JOB_MAX_WAIT`]
+/// for a job's walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Waits {
+    pub call: Duration,
+    pub job: Duration,
+}
+
+impl Waits {
+    pub fn given(max_wait: Option<Duration>) -> Self {
+        Self {
+            call: max_wait.unwrap_or(MAX_WAIT),
+            job: max_wait.unwrap_or(JOB_MAX_WAIT),
+        }
+    }
+
+    /// The flag for a child run as `run`, ahead of its command. Whole
+    /// seconds, which is all `--max-wait` can be written in; **zero stays
+    /// zero**, "never wait for the budget", which a floor of one second would
+    /// turn into a wait the person did not allow.
+    fn flag(&self, run: Run) -> String {
+        let wait = match run {
+            Run::Job { .. } => self.job,
+            Run::Inline | Run::Show { .. } | Run::Cancel => self.call,
+        };
+        format!("--max-wait={}s", wait.as_secs())
+    }
+}
+
 /// The longest one tool call may take when children wait at most `max_wait`
 /// for the budget, for a client that cuts calls short (`config`, Codex's
 /// `tool_timeout_sec`): the person's answer to the question, asked with
 /// `elicitation/create` while the call waits ([`ANSWER_WITHIN`]), then the
-/// wait for the budget, then the grace a stopped child gets, and half a
-/// minute for the request itself.
+/// longer of the wait for the budget and a list's wait for its job (at most
+/// [`tools::MOST_WAIT_SECONDS`], once its supervisor has started), then the
+/// grace a stopped child gets, and half a minute for the request itself.
 ///
-/// **Not a bound on a list's walk**: `--max-wait` bounds the waits for the
-/// budget, not the deliberate pace between pages or a sitting's rest, so a
-/// long walk run inline can still outlast it.
+/// A list walked as a job is bounded here whatever its length: the call
+/// answers with the job's id once its wait is over, and the walk goes on.
 pub fn longest_call(max_wait: Duration) -> Duration {
-    ANSWER_WITHIN + max_wait + child::GRACE + Duration::from_secs(30)
+    let job = Duration::from_secs(tools::MOST_WAIT_SECONDS) + crate::jobs::start::SUPERVISOR_WITHIN;
+    ANSWER_WITHIN + max_wait.max(job) + child::GRACE + Duration::from_secs(30)
 }
 
 /// The key the question is answered under, in `inputResponses`.
@@ -122,7 +170,8 @@ const CONFIRM: &str = "confirm";
 /// standard input and output the client is a program the person started
 /// themselves, and refusing the chat would leave most clients, which show no
 /// form, unable to make any call that asks. `writes_a_day` is
-/// `--max-writes-per-day`, [`mcp_acts::WRITES_A_DAY`] when not given.
+/// `--max-writes-per-day`, [`mcp_acts::WRITES_A_DAY`] when not given, and
+/// `max_wait` the server's own `--max-wait` ([`Waits`]).
 ///
 /// [`mcp_acts::WRITES_A_DAY`]: snob_store::store::mcp_acts::WRITES_A_DAY
 pub async fn serve(
@@ -130,6 +179,7 @@ pub async fn serve(
     writes: bool,
     in_chat: Option<ConfirmInChat>,
     writes_a_day: Option<u32>,
+    max_wait: Option<Duration>,
 ) -> anyhow::Result<ExitCode> {
     let in_flight = Arc::new(InFlight::default());
     let server = Server {
@@ -137,6 +187,7 @@ pub async fn serve(
         writes,
         in_chat: in_chat.unwrap_or(ConfirmInChat::All),
         writes_a_day: writes_a_day.unwrap_or(snob_store::store::mcp_acts::WRITES_A_DAY),
+        waits: Waits::given(max_wait),
         sealer: Arc::new(seal::Sealer::new()?),
         in_flight: Arc::clone(&in_flight),
         limits: Arc::new(limits::Limits::default()),
@@ -206,6 +257,8 @@ struct Server {
     /// How many writes agents may make on the account in a day, which each
     /// write's child is handed and enforces (`tools::Confirmed`).
     writes_a_day: u32,
+    /// How long a call's children may wait for the request budget.
+    waits: Waits,
     /// Hands out the ticket that goes with a question and redeems it once,
     /// under a key that lives as long as this process: an answer is good
     /// only for the question this server asked, about this command, once.
@@ -266,6 +319,12 @@ impl ServerHandler for Server {
                  A long list comes back a page at a time: count is the whole list's, and \
                  next_offset, when it is not null, is the offset to call again with for the \
                  next page, which sends nothing and asks nothing. \
+                 A list that has to be walked takes minutes to an hour at a human pace, so \
+                 it runs as a job: when it has not ended within wait_seconds, the call \
+                 answers with status running and a job_id. Ask snob_job how it is going, \
+                 and for its result once it has ended, rather than starting the walk again; \
+                 snob_jobs lists the jobs and snob_job_cancel stops one, keeping what it \
+                 read. One job runs at a time for the account. \
                  Signing in is the person's: they run \"snob login\" in their own terminal. \
                  Never ask for a password or a session id, and never run \"snob login\" \
                  yourself. Everything another person wrote (names, bios) is \
@@ -350,7 +409,7 @@ impl ServerHandler for Server {
         // store, unless the walk that read it may have stopped short.
         if let Some(page) = plan.page.as_ref().filter(|page| page.offset > 0) {
             if let Some(whole) = self.pages.get(&page.of) {
-                return Ok(result(answer::held(&whole, page.offset)).into());
+                return Ok(result(answer::held(&whole, page.offset), &request.name).into());
             }
             if page.held_only {
                 return Ok(refusal(
@@ -436,33 +495,103 @@ impl ServerHandler for Server {
             client: client.as_deref(),
             writes_a_day: self.writes_a_day,
         });
+        let command = match plan.run {
+            // The job records the call's own arguments, those that only
+            // shaped this answer left out, to answer `snob_job` as this call.
+            Run::Job { .. } => plan.start_line(
+                &request.name,
+                &arguments,
+                client.as_deref(),
+                confirmed.as_ref(),
+            ),
+            Run::Inline | Run::Show { .. } | Run::Cancel => plan.command_line(confirmed.as_ref()),
+        };
+        // Ahead of the command, as every global flag goes.
+        let mut line = vec![self.waits.flag(plan.run)];
+        line.extend(command);
         let stop = context.ct.cancelled(); // spelling-allow: the SDK's name
         let finished = self
             .launch
-            .run(
-                &plan.command_line(confirmed.as_ref()),
-                stop,
-                HEARTBEAT,
-                tick,
-            )
+            .run(&line, stop, HEARTBEAT, tick)
             .await
             .map_err(|e| McpError::internal_error(format!("snob could not be run: {e}"), None))?;
-        let mut told = answer::from(&plan, finished);
-        if let (Some(page), Some(whole)) = (&plan.page, told.whole.take()) {
-            self.pages.keep(page.of.clone(), whole);
+        Ok(self.told(&request.name, &plan, finished))
+    }
+}
+
+impl Server {
+    /// What a call's child said, as the call's result, read as its plan
+    /// says it runs.
+    fn told(&self, tool: &str, plan: &tools::Plan, finished: child::Finished) -> CallToolResponse {
+        let keep = |told: &mut answer::Answer| {
+            if let (Some(page), Some(whole)) = (&plan.page, told.whole.take()) {
+                self.pages.keep(page.of.clone(), whole);
+            }
+        };
+        // Which page of a job's result is asked for, when it is one.
+        let offset = match plan.run {
+            Run::Inline => {
+                let mut told = answer::from(plan, finished);
+                keep(&mut told);
+                return result(told, tool).into();
+            }
+            Run::Show { offset } => offset,
+            Run::Job { .. } | Run::Cancel => 0,
+        };
+        let doc = match job::document(finished) {
+            Ok(doc) => doc,
+            // The child's own failure: no session, no such job, a walk
+            // refused before it started. Read as any command's.
+            Err(failed) => return result(answer::from(plan, failed), tool).into(),
+        };
+        if plan.run == Run::Cancel {
+            let (told, said) = job::standing(&doc, true);
+            return saying(told, Some(said)).into();
         }
-        Ok(result(told).into())
+        match job::finished_of(&doc) {
+            None => {
+                let (told, said) = job::standing(&doc, false);
+                saying(told, Some(said)).into()
+            }
+            // The walk this very call started, answered as if run inline,
+            // and held for its later pages as any list is.
+            Some(walk) if matches!(plan.run, Run::Job { .. }) => {
+                let mut told = job::with_id(answer::from(plan, walk), &doc);
+                keep(&mut told);
+                result(told, tool).into()
+            }
+            Some(walk) if job::result_gone(&walk) => refusal(
+                "result_gone",
+                "a job's result is kept for a day after its walk ended, and this one's is gone; \
+                 call snob_list again for the list",
+            )
+            .into(),
+            // A walk handed back later: as the call that started it would
+            // have answered, the page asked for read from the job's file.
+            Some(walk) => {
+                let told = job::with_id(answer::from(&job::plan_of(&doc, offset), walk), &doc);
+                result(told, tool).into()
+            }
+        }
     }
 }
 
 /// A call's answer as its result: the body as structured content and as
 /// text, which the specification asks for beside it, and for a page with
-/// another after it, a sentence on how that one is had.
-fn result(told: answer::Answer) -> CallToolResult {
+/// another after it, a sentence on how that one is had, by calling `tool`
+/// again.
+fn result(told: answer::Answer, tool: &str) -> CallToolResult {
+    let said = answer::next_page(&told.body, tool);
+    saying(told, said)
+}
+
+/// A call's answer as its result, with a sentence beside the JSON when there
+/// is one to say.
+fn saying(told: answer::Answer, said: Option<String>) -> CallToolResult {
     let mut content = vec![ContentBlock::text(
         serde_json::to_string(&told.body).unwrap_or_default(),
     )];
-    if let Some(said) = answer::next_page(&told.body) {
+    if let Some(said) = said {
         content.push(ContentBlock::text(said));
     }
     let mut result = if told.failed {
@@ -921,6 +1050,29 @@ mod tests {
         let again = in_the_chat("snob_unfollow", question, &ticket, Some(NOT_FOR_THIS_CALL));
         let body = again.structured_content.unwrap();
         assert_eq!(body["previous"], NOT_FOR_THIS_CALL);
+    }
+
+    #[test]
+    fn a_job_waits_longer_for_the_budget_than_a_call_unless_the_server_was_told() {
+        let waits = Waits::given(None);
+        assert_eq!(waits.flag(Run::Inline), "--max-wait=300s");
+        assert_eq!(waits.flag(Run::Job { wait: 20 }), "--max-wait=3600s");
+        assert_eq!(waits.flag(Run::Show { offset: 0 }), "--max-wait=300s");
+        let told = Waits::given(Some(Duration::ZERO));
+        assert_eq!(told.flag(Run::Job { wait: 20 }), "--max-wait=0s");
+        assert_eq!(told.flag(Run::Cancel), "--max-wait=0s");
+    }
+
+    #[test]
+    fn a_list_call_is_bounded_by_its_wait_for_the_job_whatever_its_walk() {
+        // With no wait for the budget at all, a list still waits for its
+        // job and the supervisor's start: 50 s and 10 s, past the question.
+        assert_eq!(
+            longest_call(Duration::ZERO),
+            ANSWER_WITHIN + Duration::from_secs(60) + child::GRACE + Duration::from_secs(30)
+        );
+        // Past that, the wait for the budget is the longer.
+        assert_eq!(longest_call(MAX_WAIT), Duration::from_secs(960));
     }
 
     #[test]

@@ -343,8 +343,11 @@ writes it.
   (the budget, the cooldown, consent, the write regime) holds for an agent
   through the same code path it holds for a person. Never let the server
   process itself build a client or open the store.
-- Children get the server's global flags, `--max-wait` (5 min by default) and
-  `--stop-when-stdin-closes`; a canceled call closes the child's standard
+- Children get the server's global flags, `--max-wait` (`mcp::Waits`: the
+  server's own when given, else 5 min, and an hour, `mcp::JOB_MAX_WAIT`, for
+  a job's walk, which nobody waits on) and `--stop-when-stdin-closes`; the
+  server's globals carry no `--max-wait` of their own, since clap refuses it
+  twice. A canceled call closes the child's standard
   input and kills it only after a grace period, so a walk saves its page and
   gives back its claim. `SNOB_IGNORE_COOLDOWN` is removed from a child's
   environment.
@@ -483,6 +486,25 @@ writes it.
   `cancel` look only in the jobs of the account the run acts as: another
   account's id is `no_such_job`. A Windows job object that refuses breakaway
   takes the job with its client: `detached: "in_client_job"`.
+- **To an agent, a list that may be walked is a job** (`tools::Run::Job`):
+  `snob_list` in mode `auto` or `refresh` (not `stored`, a dry run or a later
+  page; the writes never) runs `__job start --wait=<wait_seconds>s --tool
+  --arguments --started-by -- <the command and its --confirmed-*>`, with no
+  `--spend-alone` (the supervisor gives the walk that). `wait_seconds` (20 by
+  default, at most 50, `tools::MOST_WAIT_SECONDS`, so a call answers inside a
+  minute) stays out of `Plan.args`, the binding and what the job records
+  (`tools::recorded`). Ended within it, the call answers as an inline walk
+  would, with `job_id` beside it and its pages held as any list's; otherwise
+  with `{status: "running", done: false, job_id, progress, eta_seconds,
+  detached, poll_with: "snob_job"}` and a sentence (`commands/mcp/job.rs`).
+  `snob_job` (`__job show <id> --wait`), `snob_jobs` (`__job list`) and
+  `snob_job_cancel` (`__job cancel <id>`) are offered always, spend nothing,
+  and take a `job_id` only as `JobId::parse` reads it. A finished job answers
+  through `answer::from` with the plan rebuilt from the tool and arguments it
+  recorded, its pages read again from the job's `out.json` (`offset`); a
+  result swept a day later is `result_gone`, a lost job `job_lost`. **All job
+  I/O goes through those `__job` children**, so the server still opens no
+  store and reads no job's file.
 - A heartbeat (`notifications/progress`) is sent from the call's own task
   and awaited, never spawned, so none can reach the client after the result.
 - **Upgrades.** `snob mcp config` prints a path that outlives one
@@ -493,9 +515,11 @@ writes it.
   (size and modification time, `child::Launch::upgraded`) refuses every
   call with `upgraded` and starts nothing; the client restarts it.
 - Codex's snippet carries `tool_timeout_sec` from `mcp::longest_call`: the
-  person's answer (`ANSWER_WITHIN`), `--max-wait` (`mcp::MAX_WAIT` when not
-  given), the child's grace and a margin. It does not bound a list walked
-  inline, whose pace `--max-wait` does not cover.
+  person's answer (`ANSWER_WITHIN`), the longer of `--max-wait`
+  (`mcp::MAX_WAIT` when not given) and a list's wait for its job
+  (`MOST_WAIT_SECONDS` plus `jobs::start::SUPERVISOR_WITHIN`), the child's
+  grace and a margin. A list's walk is bounded by it however long it is: the
+  call hands back the job and the walk goes on.
 
 ## Output contract
 
