@@ -212,8 +212,16 @@ pub struct Failure {
 ///
 /// The session goes first, on purpose: it is the only item here that is a live
 /// credential, and it must not be held hostage by a directory that turns out to
-/// be locked.
-pub fn execute(plan: &Plan, store: &SecretStore, app_paths: &AppPaths) -> Vec<Failure> {
+/// be locked. `between` runs once it has gone and before any directory does:
+/// where the jobs locks a purge holds are let go of (`jobs::Stopping`), so a
+/// job start that waited on one wakes to find no session and makes nothing
+/// (`jobs::start::make`), and no file is held open in what is removed.
+pub fn execute(
+    plan: &Plan,
+    store: &SecretStore,
+    app_paths: &AppPaths,
+    between: impl FnOnce(),
+) -> Vec<Failure> {
     let mut failures = Vec::new();
 
     // `delete_all`, not `delete`: this is the command whose whole promise is
@@ -240,6 +248,7 @@ pub fn execute(plan: &Plan, store: &SecretStore, app_paths: &AppPaths) -> Vec<Fa
             credential: true,
         });
     }
+    between();
 
     for dir in &plan.directories {
         // `remove_tree`, not `remove_dir_all`: the scratch root sits at a
@@ -363,11 +372,11 @@ pub async fn run_for_account(
     // it. The owner and the other accounts' browsers stay.
     let stopping = crate::jobs::stop_before_leaving(vec![app_paths.account(pk)]).await?;
     crate::owner::release(app_paths, Some(pk)).await;
-    // Let go of before the removal, which Windows refuses while a file in it
-    // is open. The session goes first in `finish`, and a job is started only
-    // with one, so none starts in between.
-    drop(stopping);
-    finish(&plan, &store, app_paths)
+    // **The session goes while the jobs lock is held**, and the lock is let
+    // go of before the removal, which Windows refuses while a file in it is
+    // open: a start waiting on the lock then finds no session and makes
+    // nothing (`jobs::start::make`).
+    finish(&plan, &store, app_paths, || drop(stopping))
 }
 
 /// `purge` of everything, from the command line: what [`run`] does, with
@@ -392,8 +401,8 @@ pub async fn run_everything(
     // asked to leave, not only to close its browsers; after the jobs, which
     // would start it again.
     crate::owner::quit(app_paths).await;
-    drop(stopping);
-    finish(&plan, &store, app_paths)
+    // The sessions go while the jobs locks are held (see `run_for_account`).
+    finish(&plan, &store, app_paths, || drop(stopping))
 }
 
 /// Says which of the monitor's entries name `account` as their viewer.
@@ -426,7 +435,7 @@ fn carry_out(
 ) -> Result<ExitCode> {
     match ask(&args, plan, someone_is_there)? {
         Some(code) => Ok(code),
-        None => finish(plan, store, app_paths),
+        None => finish(plan, store, app_paths, || {}),
     }
 }
 
@@ -489,8 +498,13 @@ fn ask(args: &PurgeArgs, plan: &Plan, someone_is_there: bool) -> Result<Option<E
 }
 
 /// Removes what the plan says, and says how it went.
-fn finish(plan: &Plan, store: &SecretStore, app_paths: &AppPaths) -> Result<ExitCode> {
-    let failures = execute(plan, store, app_paths);
+fn finish(
+    plan: &Plan,
+    store: &SecretStore,
+    app_paths: &AppPaths,
+    between: impl FnOnce(),
+) -> Result<ExitCode> {
+    let failures = execute(plan, store, app_paths, between);
 
     if failures.is_empty() {
         crate::ui::say!("Done.");
@@ -665,7 +679,7 @@ mod tests {
         let store = SecretStore::new(paths.clone(), true)
             .with_service(&format!("snob-ig-test-purge-empty-{}", std::process::id()));
 
-        let failures = execute(&Plan::default(), &store, &paths);
+        let failures = execute(&Plan::default(), &store, &paths, || {});
         assert!(failures.is_empty());
     }
 }

@@ -238,8 +238,8 @@ pub fn record(seen: &Seen, now: i64) -> Value {
 /// the JSON error line it ended with, as a call's child is read
 /// (`commands::mcp::child`), and `served`, where each list it answered with
 /// came from (`Progress::served`: a walk, or what is stored, and when that
-/// was read). `output` is `null` once the result has been swept
-/// (`jobs::sweep`), a day after.
+/// was read). `output` is `null` a day after the walk ended, swept or not
+/// (`jobs::sweep`).
 pub fn finished(seen: &Seen) -> Option<Value> {
     if !seen.status.finished() {
         return None;
@@ -249,8 +249,15 @@ pub fn finished(seen: &Seen) -> Option<Value> {
         Some(number) => crate::exit::outcome_of(number).unwrap_or(ExitCode::Error),
         None => ExitCode::Error,
     };
+    // Past its keeping it is gone, whether or not a sweep has come by yet
+    // (`snob status` sweeps nothing): the day is what is promised.
+    let past = snob_core::clock::now_ms()
+        .get()
+        .saturating_sub(seen.ended_at())
+        > super::KEEP_RESULT.as_millis() as i64;
     let output = std::fs::read(file(&seen.dir, "out.json"))
         .ok()
+        .filter(|_| !past)
         .map(|bytes| {
             let text = String::from_utf8_lossy(&bytes);
             serde_json::from_str::<Value>(text.trim())

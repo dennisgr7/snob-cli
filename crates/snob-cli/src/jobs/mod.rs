@@ -15,8 +15,10 @@
 //! walk as a child of its own with the flags every agent's run gets
 //! (`--spend-alone`, `--stop-when-stdin-closes`) and `--progress-json`, and
 //! writes what it came to. Everything else (`show`, `list`, `cancel`,
-//! `snob status`, the sweep) reads the files and asks the lock, and writes
-//! nothing but a `stop` file.
+//! `snob status`) reads the files and asks the lock, and writes nothing but a
+//! `stop` file, and the sweep of what is past its keeping ([`sweep`]), which a
+//! start makes under the jobs lock and `show`, `list` and `cancel` make when
+//! the lock is free ([`sweep_if_free`]); `snob status` writes nothing.
 //!
 //! **One job running per account, and nothing in one runs that was not
 //! checked where it runs** (`argv.rs`): the supervisor runs itself, never a
@@ -99,7 +101,7 @@ pub(crate) const HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// How long a finished job's result is kept: a day, which is longer than
 /// anybody waits to ask for it, and short enough that lists do not pile up.
-const KEEP_RESULT: Duration = Duration::from_secs(24 * 3600);
+pub(crate) const KEEP_RESULT: Duration = Duration::from_secs(24 * 3600);
 
 /// How long a finished job's directory is kept, its record and its log.
 pub(crate) const KEEP_JOB: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -225,6 +227,35 @@ impl Status {
     }
 }
 
+/// The status a job is read as, from its state read before its lock was
+/// asked about, whether the lock was held, its state read again after, when
+/// it was made and the time now.
+///
+/// **Read twice, around the lock**, because a supervisor writes its ending
+/// and then lets go of the lock, microseconds apart: a reader that read the
+/// state once, before, could find it still running and the lock already
+/// free, and call a job that had just succeeded `lost`, a status every waiter
+/// stops on for good. An ending read after is the answer. Asking the lock
+/// first and reading once after would not do either: a job just starting has
+/// its lock free while queued, and then its supervisor takes the lock and
+/// writes `running` between the two, which would read as lost the same way.
+/// So `before` decides whether a supervisor had written anything while its
+/// lock was seen free.
+pub fn derive_around(
+    before: Option<&State>,
+    held: bool,
+    after: Option<&State>,
+    created_at: i64,
+    now: i64,
+) -> Status {
+    if let Some(after) = after
+        && after.status.is_over()
+    {
+        return after.status;
+    }
+    derive(before, held, created_at, now)
+}
+
 /// The status a job is read as, from its state, whether its lock is held,
 /// when it was made and the time now.
 ///
@@ -289,7 +320,7 @@ impl Seen {
     }
 
     /// When it ended, or was last seen, for the retention.
-    fn ended_at(&self) -> i64 {
+    pub(crate) fn ended_at(&self) -> i64 {
         self.state
             .as_ref()
             .and_then(|s| s.finished_at)
@@ -331,14 +362,16 @@ pub fn look(account: &AccountPaths, id: &JobId, now: i64) -> io::Result<Option<S
         return Ok(None);
     }
     let job: Option<Job> = read(&dir, "job.json");
-    let state: Option<State> = read(&dir, "state.json");
+    // Around the lock, not once before it (`derive_around`).
+    let before: Option<State> = read(&dir, "state.json");
     let held = paths::lock_is_held(&file(&dir, "lock"))?.unwrap_or(false);
+    let state: Option<State> = read(&dir, "state.json");
     let stop_asked = file(&dir, "stop").exists();
     let created_at = job
         .as_ref()
         .map(|job| job.created_at)
         .unwrap_or_else(|| modified_ms(&dir).unwrap_or(0));
-    let status = derive(state.as_ref(), held, created_at, now);
+    let status = derive_around(before.as_ref(), held, state.as_ref(), created_at, now);
     Ok(Some(Seen {
         id: id.clone(),
         dir,
@@ -373,12 +406,34 @@ pub fn all(account: &AccountPaths, now: i64) -> io::Result<Vec<Seen>> {
 }
 
 /// Takes the lock every start and every sweep of `account`'s jobs holds
-/// (`jobs/.lock`), creating the directory, private, when it is not there.
-/// Held until the file is dropped.
-pub(crate) fn lock_jobs(account: &AccountPaths) -> io::Result<std::fs::File> {
-    account.ensure_dirs().map_err(io::Error::other)?;
+/// (`jobs/.lock`), creating the jobs directory, private, when it is not
+/// there. Held until the file is dropped.
+///
+/// `None` when the account's own directory is gone: **never made again
+/// here**, since a start that waited on the lock of an account a purge was
+/// removing would otherwise put it back (an account with a session stored
+/// has its directory, which `login` makes).
+pub(crate) fn lock_jobs(account: &AccountPaths) -> io::Result<Option<std::fs::File>> {
+    if !account.dir().is_dir() {
+        return Ok(None);
+    }
     paths::create_private_dir(&account.jobs_dir()).map_err(io::Error::other)?;
-    paths::lock_file(&account.jobs_dir().join(".lock"))
+    paths::lock_file(&account.jobs_dir().join(".lock")).map(Some)
+}
+
+/// [`sweep`], when nobody holds the jobs lock, and nothing when somebody
+/// does (a start, which sweeps itself, or a purge or a logout): for the
+/// commands that read the jobs (`show`, `list`, `cancel`), so that what is
+/// past its keeping goes when it is due and not only when the account's next
+/// job starts. A finished job's result is other people's lists, and it is
+/// kept a day, as AGENTS.md promises. Makes no directory.
+pub(crate) fn sweep_if_free(account: &AccountPaths, now: i64) {
+    if !account.jobs_dir().is_dir() {
+        return;
+    }
+    if let Ok(Some(_lock)) = paths::try_lock_file(&account.jobs_dir().join(".lock")) {
+        sweep(account, now);
+    }
 }
 
 /// Asks a job to stop. Nothing else is touched: its supervisor reads the
@@ -444,17 +499,19 @@ pub struct Stopping {
 
 impl Stopping {
     /// Asks every job of `account`'s that is not over to stop, holding the
-    /// jobs lock. An account with no jobs directory has none, and nothing is
-    /// made for it.
+    /// jobs lock, **taken whether or not the account has run a job yet**
+    /// (its jobs directory is made for it), so no job starts until this is
+    /// dropped: a start waiting on the lock then finds the session gone and
+    /// makes nothing (`start::make`). An account with no directory of its
+    /// own has no jobs and gets none.
     pub fn every_job_of(account: &AccountPaths) -> io::Result<Self> {
-        if !account.jobs_dir().is_dir() {
+        let Some(lock) = lock_jobs(account)? else {
             return Ok(Self {
                 ids: Vec::new(),
                 account: account.clone(),
                 _lock: None,
             });
-        }
-        let lock = lock_jobs(account)?;
+        };
         let now = snob_core::clock::now_ms().get();
         let mut ids = Vec::new();
         for seen in all(account, now)? {
@@ -550,6 +607,15 @@ pub async fn dispatch(
         .ok_or_else(crate::commands::common::no_session)?;
     crate::report::act_as(viewer.clone());
     let account = app.account(viewer.pk);
+    // What reads the jobs sweeps what is past its keeping first, when the
+    // lock is free: a start sweeps under it, and a supervisor touches only
+    // its own job.
+    if !matches!(
+        cli.command,
+        Command::Job(JobCommand::Start(_) | JobCommand::Run(_))
+    ) {
+        sweep_if_free(&account, snob_core::clock::now_ms().get());
+    }
 
     match &cli.command {
         Command::Job(JobCommand::Start(args)) => start::run(cli, args, store, &account).await,
@@ -613,6 +679,35 @@ mod tests {
             assert_eq!(derive(Some(&state(over)), true, 0, 1), over);
             assert_eq!(derive(Some(&state(over)), false, 0, late), over);
         }
+    }
+
+    /// A supervisor writes its ending and lets go of its lock in a few
+    /// microseconds; a reader between the two reads is never told `lost`.
+    #[test]
+    fn a_job_read_as_it_ends_or_starts_is_never_lost() {
+        let running = state(Status::Running);
+        let ended = state(Status::Succeeded);
+        // Running when first read, its lock free by the time it was asked,
+        // and its ending there when read again: the ending.
+        assert_eq!(
+            derive_around(Some(&running), false, Some(&ended), 0, 1),
+            Status::Succeeded
+        );
+        // Not there when first read, its lock free, and running when read
+        // again: its supervisor took it in between, so it is starting.
+        assert_eq!(
+            derive_around(None, false, Some(&running), 1_000, 1_000),
+            Status::Queued
+        );
+        // Running before and after, with its lock free: gone.
+        assert_eq!(
+            derive_around(Some(&running), false, Some(&running), 0, 1),
+            Status::Lost
+        );
+        assert_eq!(
+            derive_around(Some(&running), true, Some(&running), 0, 1),
+            Status::Running
+        );
     }
 
     #[test]
@@ -716,6 +811,42 @@ mod tests {
         assert!(!account.job_dir(&done).join("stop").exists());
         // A queued job nobody runs is not over until it is lost.
         assert!(!stopping.wait(Duration::from_millis(200)));
+    }
+
+    /// An account that has never run a job is still held while it is left,
+    /// so none starts in between; its jobs directory is made to hold it.
+    #[test]
+    fn an_account_with_no_jobs_yet_is_held_while_it_is_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = account(&tmp);
+        account.ensure_dirs().unwrap();
+        let stopping = Stopping::every_job_of(&account).unwrap();
+        assert!(stopping.ids.is_empty());
+        let lock = account.jobs_dir().join(".lock");
+        assert!(paths::try_lock_file(&lock).unwrap().is_none(), "held");
+        drop(stopping);
+        assert!(paths::try_lock_file(&lock).unwrap().is_some(), "let go of");
+    }
+
+    /// A read sweeps what is past its keeping when nobody holds the jobs
+    /// lock, and leaves it while somebody does.
+    #[test]
+    fn a_read_sweeps_when_the_lock_is_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = account(&tmp);
+        let day = 24 * 3600 * 1000;
+        let now = 100 * day;
+        let old = made(
+            &account,
+            now - 2 * day,
+            Some((Status::Succeeded, now - 2 * day)),
+        );
+        let held = lock_jobs(&account).unwrap().unwrap();
+        sweep_if_free(&account, now);
+        assert!(account.job_dir(&old).join("out.json").exists(), "busy");
+        drop(held);
+        sweep_if_free(&account, now);
+        assert!(!account.job_dir(&old).join("out.json").exists());
     }
 
     #[test]

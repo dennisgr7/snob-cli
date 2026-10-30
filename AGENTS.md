@@ -333,9 +333,14 @@ with a documented reason in the same place.
   rows, the last day shown by `snob status`); its jobs under
   `accounts/<pk>/jobs/<id>/` (`job.json`, `state.json`, the walk's output and
   log, `0600` on Unix; a finished job's result kept a day, the job a week, at
-  most 50), which `snob logout` stops and `snob purge` stops and removes,
-  both before the owner of the browsers is released, so no walk starts it
-  again into what is going; `accounts.toml` changed only
+  most 50, swept by a start and by `snob jobs` and the `__job` reads when
+  the jobs lock is free, and a result past its day is not handed back,
+  swept or not), which `snob logout` stops and `snob purge` stops and
+  removes, both before the owner of the browsers is released, so no walk
+  starts it again into what is going, and **both holding the account's jobs
+  lock until its session is gone** (an account that never ran a job
+  included), since a start checks the session again under that lock and
+  makes nothing without one; `accounts.toml` changed only
   through `Registry::update` (file lock). `watch.toml` and `accounts.toml`
   are read with serde and written from a hand-written template, tested to
   round-trip. `snob status` and `--dry-run` write nothing. `snob purge`

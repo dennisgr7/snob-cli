@@ -5612,9 +5612,11 @@ async fn closing_starts_stdin_before_it_answered_stops_the_job() {
 }
 
 /// `purge` stops the jobs before anything goes: they are listed in what it
-/// will do, stopped, and only then is everything removed.
+/// will do, stopped, and only then is everything removed. (That the owner of
+/// the browsers is released after them is the order of `purge.rs`; no
+/// browser runs here to tell.)
 #[tokio::test]
-async fn purge_stops_running_jobs_before_releasing_the_owner() {
+async fn purge_lists_then_stops_running_jobs_before_removing_everything() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
     log_in(tmp.path(), &instagram);
@@ -5644,6 +5646,46 @@ async fn purge_stops_running_jobs_before_releasing_the_owner() {
         !tmp.path().join("data").exists(),
         "the data directory, the job's with it, is gone"
     );
+}
+
+/// A job start that waited on the jobs lock while the session was deleted,
+/// as a purge and a logout delete it holding that lock, makes no job and
+/// says there is no session, rather than starting a walk in what is going.
+#[tokio::test]
+async fn a_start_that_waited_while_the_session_went_makes_no_job() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let account = snob_store::paths::AppPaths::rooted_at(tmp.path()).account(PK);
+    snob_store::paths::create_private_dir(&account.jobs_dir()).unwrap();
+    let lock = snob_store::paths::try_lock_file(&account.jobs_dir().join(".lock"))
+        .unwrap()
+        .expect("nothing holds it yet");
+
+    let mut start = command(tmp.path(), Some(&instagram));
+    start
+        .args(["__job", "start", "--wait=0s"])
+        .args(FOLLOWERS_JOB)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = start.spawn().unwrap();
+    // Long enough for it to pass its first look at the session and wait on
+    // the lock; a start that has not got there yet finds no session either.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let session = account.session_file();
+    assert!(session.exists(), "the sandbox keeps the session in a file");
+    std::fs::remove_file(&session).unwrap();
+    drop(lock);
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    let made: Vec<_> = std::fs::read_dir(account.jobs_dir())
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+    assert!(made.is_empty(), "no job was made: {made:?}");
 }
 
 /// `logout` stops the account's jobs too: a walk would otherwise go on with

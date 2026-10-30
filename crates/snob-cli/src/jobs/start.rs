@@ -13,8 +13,10 @@
 //! - estimates the walk out of what is stored (`commands::dry_run`), which
 //!   sends nothing either;
 //! - under the account's jobs lock, so two starts at once make one job:
-//!   sweeps (`jobs::sweep`); answers with the job already running when it
-//!   runs the same command (`reused`), and refuses when it runs another
+//!   checks the session again (a purge or a logout deletes it holding that
+//!   lock, so a start that waited makes nothing); sweeps (`jobs::sweep`);
+//!   answers with the job already running when it runs the same command
+//!   (`reused`), and refuses when it runs another
 //!   (`too_many_jobs`: one at a time per account), or when it was asked to
 //!   stop and has not yet (`job_stopping`: **a job on its way out is never
 //!   handed to a new start**, which would be given a walk about to end
@@ -166,7 +168,8 @@ pub async fn run(
     let supervisor = argv::supervisor(cli, account.pk())?;
     let made = {
         let account = account.clone();
-        tokio::task::spawn_blocking(move || make(&account, job, &checked, supervisor)).await??
+        tokio::task::spawn_blocking(move || make(&account, &secrets, job, &checked, supervisor))
+            .await??
     };
     let (id, ours) = match made {
         Made::New(id) => (id, true),
@@ -333,13 +336,29 @@ fn same_walk(one: &[String], other: &[String]) -> bool {
 
 /// Under the account's jobs lock: sweeps, finds a job to reuse or a reason to
 /// refuse ([`vet`]), or makes the job and starts its supervisor.
+///
+/// **The session is asked about again under the lock**, which a purge or a
+/// logout holds while it deletes the session (`jobs::Stopping`): a start that
+/// passed the first check and then waited on the lock finds the session gone
+/// and makes nothing (exit 3), rather than a job in what is being removed. An
+/// account whose directory has gone is refused the same way, and its
+/// directory is not made again (`jobs::lock_jobs`).
 fn make(
     account: &AccountPaths,
+    secrets: &snob_store::secrets::SessionStore,
     mut job: Job,
     checked: &argv::Checked,
     supervisor_globals: Vec<OsString>,
 ) -> Result<Made> {
-    let _lock = super::lock_jobs(account)?;
+    let Some(_lock) = super::lock_jobs(account)? else {
+        return Err(crate::commands::common::no_session());
+    };
+    if !secrets
+        .load()?
+        .is_some_and(|session| session.ds_user_id == account.pk())
+    {
+        return Err(crate::commands::common::no_session());
+    }
     let now = snob_core::clock::now_ms().get();
     super::sweep(account, now);
     if let Found::Reuse(id) = vet(&super::all(account, now)?, checked, now)? {
