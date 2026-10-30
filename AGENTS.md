@@ -285,8 +285,10 @@ with a documented reason in the same place.
   child of a tool call or a job (`jobs::NEVER_INHERITED`). **`snob mcp
   --listen` does not start without it**: a TCP port on loopback is open to
   every local user, unlike the owner's pipe, and the key is what tells the
-  person's client from anything else that connects. `snob mcp key` is
-  behind the `mcp-http` feature; `Kind` has no feature gate, so every build
+  person's client from anything else that connects (on Unix, `--listen
+  socket` serves where nobody else can connect, and the key is required
+  there too, since a tunnel lets in whoever reaches its far end). `snob
+  mcp key` is behind the `mcp-http` feature; `Kind` has no feature gate, so every build
   purges the key; no test writes it to the
   keyring outside `SecretStore::with_service`, and the sandbox tests reach
   it through `SNOB_MCP_KEY` only.
@@ -637,7 +639,15 @@ reaches a server already listening: no command, no key, see "Over HTTP").
 - **Over HTTP, for a tunnel of your own** (`snob mcp --listen <addr>`,
   `commands/mcp/http.rs`). **Loopback only**: any other address is refused
   with exit 2, and TLS is the tunnel's job (`--public-url`, `https` only,
-  adds the tunnel's host and origin to those taken). **The key is
+  adds the tunnel's host and origin to those taken). **On Unix, `--listen
+  socket`**
+  (`http/socket.rs`) serves on `mcp.sock` in the private data directory,
+  `0600`, each connection checked for this user or root (`peer_cred`): the
+  one way to close the gap below, since nobody else can connect to it or
+  take its name while snob is not running. One server holds the name at a
+  time (`mcp.sock.lock`, held for its life); holding it, a socket left at
+  the name by a killed server is replaced, and anything else there is left
+  alone and refused. Refused on Windows with exit 2. **The key is
   mandatory** (no key, exit 1 and a hint), because loopback TCP is
   reachable by every local user, unlike the owner's pipe; startup says its
   source and fingerprint, never the key, and with `--allow-writes` warns

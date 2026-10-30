@@ -311,15 +311,16 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 // Over HTTP the one thing the server reads is the key its
                 // clients present, from where `snob mcp key` keeps it.
                 #[cfg(feature = "mcp-http")]
-                if let Some(address) = args.listen {
+                if let Some(at) = args.listen {
                     let store = SecretStore::new(paths.clone(), no_keyring);
                     let store = match &keyring_namespace {
                         Some(service) => store.with_service(service),
                         None => store,
                     };
                     let listen = commands::mcp::http::Listen {
-                        address,
+                        at,
                         public: args.public_url.clone(),
+                        data_dir: paths.data_dir().to_path_buf(),
                     };
                     return commands::mcp::http::serve(launch, settings, listen, &store).await;
                 }

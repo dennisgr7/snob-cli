@@ -7439,6 +7439,131 @@ fn the_http_server_refuses_a_non_loopback_address() {
     assert!(stderr(&out).contains("tunnel"), "{}", stderr(&out));
 }
 
+/// A socket is for Linux and macOS: on Windows `--listen socket` is a
+/// command line refused, which says what to give instead.
+#[cfg(all(windows, feature = "mcp-http"))]
+#[test]
+fn a_socket_is_refused_on_windows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = snob_with(
+        tmp.path(),
+        None,
+        &[("SNOB_MCP_KEY", MCP_KEY)],
+        &["mcp", "--listen", "socket"],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("127.0.0.1:8750"), "{}", stderr(&out));
+}
+
+/// On Unix, `snob mcp --listen socket` serves the same server on a socket
+/// in the data directory, made `0600`, behind the same key, and leaves
+/// nothing at its name once it has stopped.
+#[cfg(all(unix, feature = "mcp-http"))]
+#[tokio::test]
+async fn the_http_server_listens_on_a_socket_only_its_user_can_reach() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// One request on a connection of its own, and the status and body
+    /// that came back.
+    async fn ask(socket: &Path, key: Option<&str>, body: &str) -> (String, String) {
+        let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+        let key = key
+            .map(|key| format!("Authorization: Bearer {key}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8750\r\n{key}Content-Type: \
+             application/json\r\nAccept: application/json, text/event-stream\r\n\
+             MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/list\r\n\
+             Connection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut said = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            stream.read_to_string(&mut said),
+        )
+        .await
+        .expect("an answer within a minute")
+        .unwrap();
+        let status = said.lines().next().unwrap_or_default().to_owned();
+        (status, said)
+    }
+
+    // Under /tmp, so that the socket's path is short on macOS too.
+    let tmp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut command = tokio::process::Command::from(command(tmp.path(), Some(&instagram)));
+    command
+        .args(["--stop-when-stdin-closes", "mcp", "--listen", "socket"])
+        .env("SNOB_MCP_KEY", MCP_KEY)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("the binary runs");
+    let stdin = child.stdin.take();
+    let mut lines = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+    let mut said = String::new();
+    let socket = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            let line = lines.next_line().await.unwrap().unwrap_or_else(|| {
+                panic!("the server went away before it listened, saying:\n{said}")
+            });
+            said.push_str(&line);
+            said.push('\n');
+            if let Some(rest) = line.split("serving on the socket ").nth(1) {
+                return std::path::PathBuf::from(rest.split(", at ").next().unwrap());
+            }
+        }
+    })
+    .await
+    .expect("listening within a minute");
+    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+
+    assert!(socket.starts_with(tmp.path()), "{}", socket.display());
+    let mode = std::fs::symlink_metadata(&socket)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+
+    let list = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+        "params": {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "0"}
+        }}
+    })
+    .to_string();
+    let (status, said) = ask(&socket, None, &list).await;
+    assert!(status.starts_with("HTTP/1.1 401"), "{said}");
+    let (status, said) = ask(&socket, Some(MCP_KEY), &list).await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{said}");
+    assert!(said.contains("snob_status"), "{said}");
+    assert!(
+        instagram
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "listing the tools sends nothing to Instagram"
+    );
+
+    drop(stdin);
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait())
+        .await
+        .expect("it stops when asked")
+        .unwrap();
+    assert_eq!(ended.code(), Some(130));
+    assert!(
+        std::fs::symlink_metadata(&socket).is_err(),
+        "the socket stayed"
+    );
+}
+
 /// A request with no key is refused as soon as its head has arrived: the
 /// body it announced is never waited for, and the connection is closed.
 #[cfg(feature = "mcp-http")]

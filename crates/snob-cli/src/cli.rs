@@ -369,7 +369,12 @@ macro_rules! mcp_listen_help {
     () => {
         "--listen 127.0.0.1:8750 serves the same over HTTP at /mcp on this \
                       machine's loopback, for a tunnel of your own (ssh -L, cloudflared, a VPN) \
-                      to reach from elsewhere; any other address is refused. Every request \
+                      to reach from elsewhere; any other address is refused. On Linux and \
+                      macOS, --listen socket serves on a socket in snob's data directory that \
+                      only you can reach, which no other user can take while snob is not \
+                      running (ssh -L 8750:<its path>, or cloudflared's unix:<its path>); on a \
+                      port, whoever listens there while snob does not is handed the key. Every \
+                      request \
                       carries the key \"snob mcp key new\" makes, as Authorization: Bearer, \
                       and the server does not start without one. A yes in the chat covers \
                       reading lists there and not the writes, unless --confirm-in-chat all. \
@@ -1939,15 +1944,16 @@ pub struct McpArgs {
     pub confirm_in_chat: Option<ConfirmInChat>,
 
     /// Serve over HTTP on this address of this machine's loopback, such as
-    /// 127.0.0.1:8750, for a tunnel of your own; clients present the key
-    /// "snob mcp key new" makes
+    /// 127.0.0.1:8750, or on Linux and macOS on "socket", a socket in snob's
+    /// data directory only you can reach, for a tunnel of your own; clients
+    /// present the key "snob mcp key new" makes
     #[cfg(feature = "mcp-http")]
     #[arg(
         long,
         value_name = "ADDRESS",
-        value_parser = crate::commands::mcp::http::loopback
+        value_parser = crate::commands::mcp::http::listen_at
     )]
-    pub listen: Option<std::net::SocketAddr>,
+    pub listen: Option<crate::commands::mcp::http::ListenAt>,
 
     /// With --listen, the https address the tunnel serves this at, so that
     /// requests addressed to it are taken

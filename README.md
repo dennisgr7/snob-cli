@@ -167,7 +167,12 @@ can read:
   there while snob is not running is handed it. Serve it only on a machine
   where nobody else can run code, and if the port could have been taken,
   revoke the key and make a new one (for a key in `SNOB_MCP_KEY`, put a
-  new one there instead: revoking touches only the keyring). `snob
+  new one there instead: revoking touches only the keyring). On Linux and
+  macOS, `snob mcp --listen socket` closes that gap: it serves on a socket
+  in snob's private data directory (`mcp.sock`, `0600`) that only you and
+  root can connect to and nobody else can take, and the tunnel reaches it
+  there (`ssh -L 8750:<path>` from the far end, or cloudflared's
+  `unix:<path>` service); startup prints the path. `snob
   mcp config codex --remote https://your-tunnel/mcp` (or any other client)
   prints what a client needs to reach that server: no command and no key.
   The client sends the key from `SNOB_MCP_TOKEN` in its own environment;

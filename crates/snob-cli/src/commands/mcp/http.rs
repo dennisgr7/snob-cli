@@ -51,9 +51,12 @@
 //! answers on the port, and nothing holds the port while `snob mcp --listen`
 //! is not running (stopped, restarted after `upgraded`, never started).
 //! Any other user of the machine who binds it first is handed the key by
-//! the next request, and the key lasts until it is revoked. So `--listen` is
-//! for a machine where nobody else can run code, and a key that may have
-//! been read so is replaced (`snob mcp key revoke` and `new` for the
+//! the next request, and the key lasts until it is revoked. **On Unix,
+//! `--listen socket` closes this** (`http/socket.rs`): a socket in the
+//! private data directory, which nobody else can connect to or take, for the
+//! tunnel to reach there. On a port, `--listen` is for a machine where
+//! nobody else can run code, and a key that may have been read so is
+//! replaced (`snob mcp key revoke` and `new` for the
 //! keyring's, a new `SNOB_MCP_KEY` for the environment's); startup says so
 //! ([`started`], `key::Source::replace_it`). **The other loopback family is
 //! held too** ([`twin`]): a client told `localhost` may try `[::1]` before
@@ -85,6 +88,7 @@ use snob_core::secret::Secret;
 use snob_core::watch::sign;
 use snob_ig::pace::CancelToken;
 use snob_store::secrets::SecretStore;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{AbortHandle, JoinSet};
 use url::Url;
@@ -93,6 +97,9 @@ use super::{InFlight, Running, Server, Settings, child, key};
 use crate::cli::ConfirmInChat;
 use crate::exit::{ExitCode, ExitError};
 use crate::ui;
+
+#[cfg(unix)]
+mod socket;
 
 /// The one path served.
 pub const PATH: &str = super::HTTP_PATH;
@@ -156,8 +163,43 @@ const CLOSING_WITHIN: Duration = Duration::from_secs(2);
 /// Where to listen, and the address a tunnel reaches it at, if one does.
 #[derive(Debug, Clone)]
 pub struct Listen {
-    pub address: SocketAddr,
+    pub at: ListenAt,
     pub public: Option<Url>,
+    /// snob's data directory, where the socket of [`ListenAt::Socket`] is.
+    pub data_dir: std::path::PathBuf,
+}
+
+/// `--listen`'s value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenAt {
+    /// A port on this machine's loopback ([`loopback`]).
+    Address(SocketAddr),
+    /// `socket`, on Unix: a socket in the data directory that only this
+    /// user can reach, and nobody else can take (`http/socket.rs`).
+    Socket,
+}
+
+/// `--listen`'s value: `socket` where there are Unix sockets, and
+/// otherwise a loopback address ([`loopback`]).
+pub fn listen_at(text: &str) -> Result<ListenAt, String> {
+    if text == "socket" {
+        return if cfg!(unix) {
+            Ok(ListenAt::Socket)
+        } else {
+            Err(
+                "a socket is for Linux and macOS; on Windows, give a loopback address with a \
+                 port, such as 127.0.0.1:8750"
+                    .to_owned(),
+            )
+        };
+    }
+    loopback(text).map(ListenAt::Address).map_err(|refused| {
+        if cfg!(unix) {
+            format!("{refused}; or \"socket\", for a socket only you can reach")
+        } else {
+            refused
+        }
+    })
 }
 
 /// `--listen`'s value: an address on this machine's loopback, `localhost`
@@ -255,15 +297,11 @@ pub async fn serve(
     let server = Server::new(launch, &settings, in_chat, closing.clone())?;
     let in_flight = Arc::clone(&server.in_flight);
 
-    let listener = TcpListener::bind(listen.address)
-        .await
-        .with_context(|| format!("could not listen on {}", listen.address))?;
-    let bound = listener.local_addr()?;
-    let twin = twin(bound, listen.address.port() != 0, source).await?;
+    let bound = Bound::new(&listen, source).await?;
     let gate = Gate::new(&key)?;
     drop(key);
 
-    let (hosts, origins) = allowed(bound.ip(), listen.public.as_ref());
+    let (hosts, origins) = allowed(bound.host(), listen.public.as_ref());
     let config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(hosts)
         .with_allowed_origins(origins)
@@ -292,8 +330,7 @@ pub async fn serve(
     });
 
     started(
-        bound,
-        twin.as_ref().and_then(|t| t.local_addr().ok()),
+        &bound,
         source,
         &front.gate.fingerprint,
         &listen,
@@ -305,8 +342,7 @@ pub async fn serve(
     let mut open = Open::default();
     loop {
         let accepted = tokio::select! {
-            accepted = listener.accept() => accepted,
-            accepted = accept(twin.as_ref()) => accepted,
+            accepted = bound.accept() => accepted,
             () = closing.canceled() => break,
         };
         // Finished connections, before they are counted.
@@ -317,7 +353,7 @@ pub async fn serve(
                     "refused a connection to snob mcp: every one open has shown the key"
                 );
             }
-            Ok((stream, _)) => {
+            Ok(stream) => {
                 let seen = Arc::new(Seen::default());
                 let task = connections.spawn(connection(
                     stream,
@@ -344,8 +380,7 @@ pub async fn serve(
     // sent ([`Front::answering`]), which a connection told to close finishes
     // writing. What is left is a stream that never ends by itself (a
     // session's own), which the token ends.
-    drop(listener);
-    drop(twin);
+    drop(bound);
     in_flight
         .settled(child::GRACE + Duration::from_secs(5))
         .await;
@@ -355,6 +390,77 @@ pub async fn serve(
     let _ = tokio::time::timeout(CLOSING_WITHIN, ended).await;
     connections.abort_all();
     Ok(ExitCode::Interrupted)
+}
+
+/// A connection, whichever listener it came from.
+trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
+
+/// What the server listens on.
+enum Bound {
+    /// A loopback port, and the same port of the other family ([`twin`]).
+    Port {
+        listener: TcpListener,
+        twin: Option<TcpListener>,
+    },
+    /// The socket in the data directory.
+    #[cfg(unix)]
+    Socket(socket::Held),
+}
+
+impl Bound {
+    async fn new(listen: &Listen, source: key::Source) -> Result<Self> {
+        match listen.at {
+            ListenAt::Address(address) => {
+                let listener = TcpListener::bind(address)
+                    .await
+                    .with_context(|| format!("could not listen on {address}"))?;
+                let bound = listener.local_addr()?;
+                let twin = twin(bound, address.port() != 0, source).await?;
+                Ok(Self::Port { listener, twin })
+            }
+            #[cfg(unix)]
+            ListenAt::Socket => {
+                // Made here when nothing has made it yet (the server opens
+                // no store), and private either way: the directory being
+                // `0700` is what keeps everybody else from the socket.
+                snob_store::paths::create_private_dir(&listen.data_dir)?;
+                let path = socket::path(&listen.data_dir)?;
+                Ok(Self::Socket(socket::hold(&path)?))
+            }
+            // `listen_at` takes `socket` only where there are sockets.
+            #[cfg(not(unix))]
+            ListenAt::Socket => anyhow::bail!("a socket is for Linux and macOS"),
+        }
+    }
+
+    /// The address a client names in `Host`: the one bound, or for the
+    /// socket the loopback a client on the far end of `ssh -L` names.
+    fn host(&self) -> IpAddr {
+        match self {
+            Self::Port { listener, .. } => listener
+                .local_addr()
+                .map_or(IpAddr::V4(Ipv4Addr::LOCALHOST), |a| a.ip()),
+            #[cfg(unix)]
+            Self::Socket(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        }
+    }
+
+    async fn accept(&self) -> std::io::Result<Box<dyn Stream>> {
+        match self {
+            Self::Port { listener, twin } => {
+                let (stream, _) = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    accepted = accept(twin.as_ref()) => accepted,
+                }?;
+                // Small writes are the stream of a call: a heartbeat, an answer.
+                let _ = stream.set_nodelay(true);
+                Ok(Box::new(stream))
+            }
+            #[cfg(unix)]
+            Self::Socket(held) => Ok(Box::new(held.accept().await?)),
+        }
+    }
 }
 
 /// The listener on the same port of the other loopback family, when the
@@ -479,30 +585,57 @@ impl Open {
 /// whoever holds that key may do, and that the server does not prove itself
 /// to its clients.
 fn started(
-    bound: SocketAddr,
-    twin: Option<SocketAddr>,
+    bound: &Bound,
     source: key::Source,
     fingerprint: &str,
     listen: &Listen,
     settings: &Settings,
     in_chat: ConfirmInChat,
 ) {
-    ui::info(&format!(
-        "snob mcp is serving on http://{bound}{PATH}, for clients that present the MCP key \
-         from {} (fingerprint {fingerprint}).",
-        source.describe()
-    ));
-    if let Some(twin) = twin {
-        ui::info(&format!(
-            "It also holds {twin}, where a client told localhost may connect first."
-        ));
+    match bound {
+        Bound::Port { listener, twin } => {
+            let at = listener
+                .local_addr()
+                .map_or_else(|_| "loopback".to_owned(), |a| a.to_string());
+            ui::info(&format!(
+                "snob mcp is serving on http://{at}{PATH}, for clients that present the MCP key \
+                 from {} (fingerprint {fingerprint}).",
+                source.describe()
+            ));
+            if let Some(twin) = twin.as_ref().and_then(|t| t.local_addr().ok()) {
+                ui::info(&format!(
+                    "It also holds {twin}, where a client told localhost may connect first."
+                ));
+            }
+            ui::info(&format!(
+                "Clients send the key to whatever answers on this port, and another user of this \
+                 machine who listens on it while snob is not running is handed it: serve this \
+                 only on a machine where nobody else can run code, and if the port could have \
+                 been taken, {}.",
+                source.replace_it()
+            ));
+            #[cfg(unix)]
+            ui::info(
+                "On this system --listen socket serves on a socket only you can reach, which \
+                 nobody else can take while snob is not running.",
+            );
+        }
+        #[cfg(unix)]
+        Bound::Socket(held) => {
+            let path = held.path().display();
+            ui::info(&format!(
+                "snob mcp is serving on the socket {path}, at {PATH}, for clients that present \
+                 the MCP key from {} (fingerprint {fingerprint}).",
+                source.describe()
+            ));
+            ui::info(&format!(
+                "Only you, and root, can connect to it. A tunnel of your own brings it \
+                 elsewhere: ssh -L 8750:\"{path}\" to this machine, and then \
+                 http://127.0.0.1:8750{PATH} there, or cloudflared with the service \
+                 unix:{path}."
+            ));
+        }
     }
-    ui::info(&format!(
-        "Clients send the key to whatever answers on this port, and another user of this \
-         machine who listens on it while snob is not running is handed it: serve this only on a \
-         machine where nobody else can run code, and if the port could have been taken, {}.",
-        source.replace_it()
-    ));
     if let Some(public) = &listen.public {
         ui::info(&format!(
             "It takes requests addressed to {}; TLS ends at the tunnel, which sees the key and \
@@ -527,9 +660,12 @@ fn started(
 /// One connection, served until it ends or the server stops, when it is
 /// told to finish the response it is writing and take no other. One whose
 /// first request has not arrived within [`FIRST_REQUEST_WITHIN`] is closed.
-async fn connection(stream: TcpStream, front: Arc<Front>, closing: CancelToken, seen: Arc<Seen>) {
-    // Small writes are the stream of a call: a heartbeat, an answer.
-    let _ = stream.set_nodelay(true);
+async fn connection(
+    stream: Box<dyn Stream>,
+    front: Arc<Front>,
+    closing: CancelToken,
+    seen: Arc<Seen>,
+) {
     let service = {
         let seen = Arc::clone(&seen);
         hyper::service::service_fn(move |request| {
@@ -1086,6 +1222,25 @@ mod tests {
             let why = loopback(refused).unwrap_err();
             assert!(why.contains("tunnel"), "{refused}: {why}");
         }
+    }
+
+    #[test]
+    fn a_socket_is_listened_on_only_where_there_are_sockets() {
+        assert_eq!(
+            listen_at("127.0.0.1:8750").unwrap(),
+            ListenAt::Address("127.0.0.1:8750".parse().unwrap())
+        );
+        let refused = listen_at("0.0.0.0:8750").unwrap_err();
+        assert!(refused.contains("tunnel"), "{refused}");
+        if cfg!(unix) {
+            assert_eq!(listen_at("socket").unwrap(), ListenAt::Socket);
+            assert!(refused.contains("\"socket\""), "{refused}");
+        } else {
+            let refused = listen_at("socket").unwrap_err();
+            assert!(refused.contains("127.0.0.1:8750"), "{refused}");
+        }
+        // The word itself, not a path to a socket.
+        assert!(listen_at("/tmp/mcp.sock").is_err());
     }
 
     #[test]
