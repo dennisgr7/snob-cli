@@ -246,6 +246,24 @@ pub(crate) fn signing_secret(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+/// The line of [`EXAMPLES`] that announces `SNOB_MCP_KEY`, in a build that
+/// reads it (`commands::mcp::key`, feature `mcp-http`) and in no other: a
+/// build without the HTTP half has no key to read.
+#[cfg(feature = "mcp-http")]
+macro_rules! mcp_key_variable {
+    () => {
+        "
+  SNOB_MCP_KEY      the key of snob mcp served over the network, instead of
+                    the keyring's; see \"snob mcp key --help\""
+    };
+}
+#[cfg(not(feature = "mcp-http"))]
+macro_rules! mcp_key_variable {
+    () => {
+        ""
+    };
+}
+
 /// Shown under the option list.
 ///
 /// The note about quoting is not decoration. On PowerShell `@` is the splatting
@@ -253,7 +271,8 @@ pub(crate) fn signing_secret(value: &str) -> Result<String, String> {
 /// this program, which then answers about the user's own account instead. It
 /// cannot be detected from here, so the only place to say it is the help, and
 /// none of the examples above it are written that way.
-const EXAMPLES: &str = "\
+const EXAMPLES: &str = concat!(
+    "\
 Examples:
   snob login                          store your session, once
   snob status --budget                what you can still send today, for no request
@@ -298,9 +317,69 @@ Environment:
                     one background process, e.g. from a systemd timer
   SNOB_CSRFTOKEN, SNOB_SIGNING_KEY
                     the two secrets a command line would otherwise carry;
-                    see \"snob login --help\" and \"snob watch --help\"
-  SNOB_MCP_KEY      the key of snob mcp served over the network, instead of
-                    the keyring's; see \"snob mcp key --help\"";
+                    see \"snob login --help\" and \"snob watch --help\"",
+    mcp_key_variable!()
+);
+
+/// What `snob mcp --help` says under its options, in every build that has
+/// the server; `mcp_listen_help` follows it where the HTTP half is built.
+#[cfg(feature = "mcp")]
+macro_rules! mcp_after_help {
+    () => {
+        "Started by the agent's client, not typed: \"snob mcp config <client>\" \
+                      prints what to add to its configuration. Each tool call runs one snob \
+                      command, so the budget, the cooldown and consent hold exactly as they do \
+                      in a terminal. It offers the status, the lists and profiles; with \
+                      --allow-writes, follow and unfollow too. Each of those, and walking \
+                      another account's lists, runs only after a yes for that one call, \
+                      asked in the client when it can show a form, or else put to you by the \
+                      agent in the chat (--confirm-in-chat narrows what that may cover). \
+                      snob cannot tell who gave the yes, so keep the writes on \"ask\" in the \
+                      client's permissions. Never login, purge, the monitor or a \
+                      download.\n\n\
+                      A call waits at most --max-wait for the request budget (five minutes \
+                      when it is not given) and is refused past it; a list stopped that way \
+                      continues next time. Calls that may reach Instagram run one at a time; \
+                      another is refused as busy, never queued. A long list is handed back \
+                      a page at a time, up to 200 accounts; the later pages come from what \
+                      was already read and send nothing.\n\n\
+                      A list that has to be walked runs as a job (\"snob jobs\"): the call \
+                      answers with the result when the walk ends within its wait_seconds, \
+                      and otherwise with the job, which the agent asks about, lists and \
+                      stops with snob_job, snob_jobs and snob_job_cancel, and which goes on \
+                      after the call, the client and the server. A client that supports MCP \
+                      Tasks gets the job as a task instead, which it polls and cancels on \
+                      its own. A job's walk waits at most an hour for the request budget, or \
+                      --max-wait when it is given.\n\n\
+                      What runs on a yes is recorded in the account's database before its \
+                      first request, and \"snob status --agents\" lists the last 24 hours. \
+                      Agents may make --max-writes-per-day follows and unfollows on the \
+                      account in any 24 hours (ten when not given, at most 99), attempts \
+                      counted; past that the call is refused and nothing is sent. What you \
+                      type in a terminal is neither recorded nor counted.\n\n\
+                      After upgrading snob, restart the server (reconnect it in the client): \
+                      one whose binary changed under it refuses every call and runs nothing."
+    };
+}
+
+/// The paragraph of `snob mcp --help` about `--listen`, which exists only
+/// with the `mcp-http` feature.
+#[cfg(feature = "mcp-http")]
+macro_rules! mcp_listen_help {
+    () => {
+        "--listen 127.0.0.1:8750 serves the same over HTTP at /mcp on this \
+                      machine's loopback, for a tunnel of your own (ssh -L, cloudflared, a VPN) \
+                      to reach from elsewhere; any other address is refused. Every request \
+                      carries the key \"snob mcp key new\" makes, as Authorization: Bearer, \
+                      and the server does not start without one. A yes in the chat covers \
+                      reading lists there and not the writes, unless --confirm-in-chat all. \
+                      --public-url names the https address the tunnel serves it at. TLS ends \
+                      at the tunnel, whose provider sees the key and every answer; put an \
+                      access layer in front where it offers one. \"snob mcp config <client> \
+                      --remote <URL>\" prints what a client needs to reach it there; the \
+                      client reads the key from SNOB_MCP_TOKEN."
+    };
+}
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
@@ -366,15 +445,18 @@ pub enum Command {
 
     /// An account as its page shows it: counts, bio, who you both know, highlights
     #[command(
-        after_help = "What you would see opening the profile, for three or four requests: the \
-                      counters, the bio, whether you follow each other, the accounts you follow \
-                      that follow them, the highlights and whether anything is up right now. It \
-                      walks no list and stores nothing.\n\n\
+        after_help = "What you would see opening the profile: the counters, the bio, whether \
+                      you follow each other, the accounts you follow that follow them, the \
+                      highlights and whether anything is up right now. A few requests for the \
+                      page, and up to ten pages of the accounts you follow that follow them, \
+                      which count toward the account's sitting as a list's pages do: a rest \
+                      between sittings that an earlier walk left owed, up to 15 minutes, is \
+                      waited out first. It walks neither of its lists and stores nothing.\n\n\
                       From the browser, finding another account's id costs one more until snob \
                       has walked its lists or a list that names it; your own is the session's. A \
                       name that cannot be an Instagram username is not found, for no request. \
-                      With SNOB_NO_BROWSER the name is asked about as typed, within the three or \
-                      four.\n\n\
+                      With SNOB_NO_BROWSER the name is asked about as typed, for no extra \
+                      request.\n\n\
                       \"snob scan\" is the crossing, and costs both lists."
     )]
     Profile(ProfileArgs),
@@ -523,51 +605,18 @@ pub enum Command {
     /// Offer snob to an AI agent as an MCP server, on standard input and output
     /// or over HTTP on loopback
     #[cfg(feature = "mcp")]
-    #[command(
-        after_help = "Started by the agent's client, not typed: \"snob mcp config <client>\" \
-                      prints what to add to its configuration. Each tool call runs one snob \
-                      command, so the budget, the cooldown and consent hold exactly as they do \
-                      in a terminal. It offers the status, the lists and profiles; with \
-                      --allow-writes, follow and unfollow too. Each of those, and walking \
-                      another account's lists, runs only after a yes for that one call, \
-                      asked in the client when it can show a form, or else put to you by the \
-                      agent in the chat (--confirm-in-chat narrows what that may cover). \
-                      snob cannot tell who gave the yes, so keep the writes on \"ask\" in the \
-                      client's permissions. Never login, purge, the monitor or a \
-                      download.\n\n\
-                      A call waits at most --max-wait for the request budget (five minutes \
-                      when it is not given) and is refused past it; a list stopped that way \
-                      continues next time. Calls that may reach Instagram run one at a time; \
-                      another is refused as busy, never queued. A long list is handed back \
-                      a page at a time, up to 200 accounts; the later pages come from what \
-                      was already read and send nothing.\n\n\
-                      A list that has to be walked runs as a job (\"snob jobs\"): the call \
-                      answers with the result when the walk ends within its wait_seconds, \
-                      and otherwise with the job, which the agent asks about, lists and \
-                      stops with snob_job, snob_jobs and snob_job_cancel, and which goes on \
-                      after the call, the client and the server. A client that supports MCP \
-                      Tasks gets the job as a task instead, which it polls and cancels on \
-                      its own. A job's walk waits at most an hour for the request budget, or \
-                      --max-wait when it is given.\n\n\
-                      What runs on a yes is recorded in the account's database before its \
-                      first request, and \"snob status --agents\" lists the last 24 hours. \
-                      Agents may make --max-writes-per-day follows and unfollows on the \
-                      account in any 24 hours (ten when not given, at most 99), attempts \
-                      counted; past that the call is refused and nothing is sent. What you \
-                      type in a terminal is neither recorded nor counted.\n\n\
-                      After upgrading snob, restart the server (reconnect it in the client): \
-                      one whose binary changed under it refuses every call and runs nothing.\n\n\
-                      --listen 127.0.0.1:8750 serves the same over HTTP at /mcp on this \
-                      machine's loopback, for a tunnel of your own (ssh -L, cloudflared, a VPN) \
-                      to reach from elsewhere; any other address is refused. Every request \
-                      carries the key \"snob mcp key new\" makes, as Authorization: Bearer, \
-                      and the server does not start without one. A yes in the chat covers \
-                      reading lists there and not the writes, unless --confirm-in-chat all. \
-                      --public-url names the https address the tunnel serves it at. TLS ends \
-                      at the tunnel, whose provider sees the key and every answer; put an \
-                      access layer in front where it offers one. \"snob mcp config <client> \
-                      --remote <URL>\" prints what a client needs to reach it there; the \
-                      client reads the key from SNOB_MCP_TOKEN."
+    #[cfg_attr(
+        feature = "mcp-http",
+        command(after_help = concat!(mcp_after_help!(), "\n\n", mcp_listen_help!()))
+    )]
+    // A build without the HTTP half (`mcp-http`) has no --listen, no key and
+    // no remote server of its own to tell of.
+    #[cfg_attr(
+        not(feature = "mcp-http"),
+        command(
+            about = "Offer snob to an AI agent as an MCP server, on standard input and output",
+            after_help = mcp_after_help!()
+        )
     )]
     Mcp(McpArgs),
 
@@ -1875,7 +1924,11 @@ pub struct McpArgs {
 
     /// What a yes the agent relays from the chat may confirm, for a client
     /// that cannot show a form: none, reading other accounts' lists, or that
-    /// and the writes too [default: all; lists with --listen]
+    #[cfg_attr(
+        feature = "mcp-http",
+        doc = " and the writes too [default: all; lists with --listen]"
+    )]
+    #[cfg_attr(not(feature = "mcp-http"), doc = " and the writes too [default: all]")]
     //
     // An `Option` rather than a default value, so that whoever reads it can
     // tell "not given" from "all": over HTTP the default is narrower
@@ -2506,6 +2559,34 @@ mod tests {
     /// the list. `SNOB_IGNORE_COOLDOWN` is deliberately absent -- its own
     /// doc-comment in `rate_budget` says why it is not advertised -- and the
     /// assertion holds that down too.
+    /// `snob mcp --help` tells of `--listen` and the key only in a build that
+    /// has them, and `snob profile --help` of the rest it may wait first.
+    #[test]
+    fn the_help_tells_only_of_what_the_build_has() {
+        let mut cli = Cli::command();
+        cli.build();
+        #[cfg(feature = "mcp")]
+        {
+            let mcp = cli.find_subcommand_mut("mcp").unwrap();
+            let help = mcp.render_long_help().to_string();
+            assert_eq!(
+                help.contains("--listen"),
+                cfg!(feature = "mcp-http"),
+                "{help}"
+            );
+            assert_eq!(
+                help.contains("snob mcp key new"),
+                cfg!(feature = "mcp-http"),
+                "{help}"
+            );
+            assert!(help.contains("Started by the agent's client"), "{help}");
+        }
+        let profile = cli.find_subcommand_mut("profile").unwrap();
+        let help = profile.render_long_help().to_string();
+        assert!(help.contains("up to 15 minutes"), "{help}");
+        assert!(!help.contains("three or four"), "{help}");
+    }
+
     #[test]
     fn the_environment_variables_are_announced_together() {
         for name in [
@@ -2518,10 +2599,18 @@ mod tests {
             "SNOB_NO_OWNER",
             "SNOB_CSRFTOKEN",
             "SNOB_SIGNING_KEY",
+            #[cfg(feature = "mcp-http")]
             "SNOB_MCP_KEY",
         ] {
             assert!(EXAMPLES.contains(name), "{name} is read but not announced");
         }
+        // And the other way: a build that does not read the MCP key does not
+        // announce it.
+        assert_eq!(
+            EXAMPLES.contains("SNOB_MCP_KEY"),
+            cfg!(feature = "mcp-http"),
+            "SNOB_MCP_KEY is announced only where it is read"
+        );
         assert!(
             !EXAMPLES.contains("SNOB_IGNORE_COOLDOWN"),
             "the escape hatch is deliberately not advertised"
