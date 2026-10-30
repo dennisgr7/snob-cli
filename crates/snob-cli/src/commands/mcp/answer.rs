@@ -439,13 +439,20 @@ pub fn not_read_now(body: &Value) -> Option<String> {
 /// What an agent is told beside a list that is not all of it: a walk cut
 /// short by `max_pages`, or stopped for another reason that still printed
 /// what it read. `None` for a whole list.
+///
+/// **A crossing is told otherwise**: its `count` is what it found among the
+/// accounts read of a list cut short, against the whole of the other (a cut
+/// list to cross against is refused, `SetOp::require_against_complete`), so
+/// some results are missing and the ones given are right, as a person is
+/// told it (`commands::sets`). Its body is the one that says where two
+/// lists came from.
 pub fn incomplete(body: &Value) -> Option<String> {
     if body.get("complete").and_then(Value::as_bool) != Some(false) {
         return None;
     }
-    let short: Vec<String> = body
-        .get("served")?
-        .as_array()?
+    let served = body.get("served")?.as_array()?;
+    let crossing = served.len() > 1;
+    let short: Vec<String> = served
         .iter()
         .filter_map(|said| {
             let list = said.get("list")?.as_str()?;
@@ -467,9 +474,15 @@ pub fn incomplete(body: &Value) -> Option<String> {
     if short.is_empty() {
         return None;
     }
+    let count = if crossing {
+        "some results are missing and the ones given are right: count is how many were \
+         found among the accounts read, not how many there are"
+    } else {
+        "count is what was read, not how many the account has"
+    };
     Some(format!(
-        "Not the whole list: {}. count is what was read, not how many the account has; say \
-         so when you present it. Calling snob_list again without max_pages reads the rest.",
+        "Not the whole list: {}, so {count}; say so when you present it. Calling snob_list \
+         again without max_pages reads the rest.",
         short.join(" and ")
     ))
 }
@@ -890,6 +903,31 @@ mod tests {
         assert!(told.body.get("complete").is_none());
         assert!(told.body["served"][0].get("stopped").is_none());
         assert!(incomplete(&told.body).is_none());
+    }
+
+    /// A crossing whose base list was cut short found its count among what
+    /// was read, against the whole other list: some results are missing and
+    /// the ones given are right, and its count is not what was read.
+    #[test]
+    fn a_crossing_cut_short_says_results_are_missing() {
+        let mut short = finished(ExitCode::Ok, Some(accounts(2)), None);
+        short.served = vec![
+            json!({
+                "list": "following", "from": "walked", "taken_at": 1_793_340_000,
+                "reason": "completed", "accounts": 30, "of": 30,
+            }),
+            json!({
+                "list": "followers", "from": "walked", "taken_at": 1_793_340_000,
+                "reason": "page_limit", "accounts": 12, "of": 25,
+            }),
+        ];
+        let told = from(&list_at(0), short);
+        assert_eq!(told.body["complete"], false);
+        assert_eq!(told.body["count"], 2);
+        let said = incomplete(&told.body).expect("a sentence");
+        assert!(said.contains("12 of about 25 accounts read"), "{said}");
+        assert!(said.contains("some results are missing"), "{said}");
+        assert!(!said.contains("count is what was read"), "{said}");
     }
 
     /// What is read from storage because the call asked for it is dated as

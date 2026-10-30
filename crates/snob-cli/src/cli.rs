@@ -2550,15 +2550,6 @@ mod tests {
         assert!(args.walk.offline && args.walk.consent.yes);
     }
 
-    /// The environment variables the program answers to are announced in one
-    /// place, under the examples, where exit codes already live.
-    ///
-    /// Four of them have no flag whose help would mention them: three belong to
-    /// the crates behind the styling (`console`, `supports-hyperlinks`) and one
-    /// to `main::init_tracing`. This pins
-    /// the list. `SNOB_IGNORE_COOLDOWN` is deliberately absent -- its own
-    /// doc-comment in `rate_budget` says why it is not advertised -- and the
-    /// assertion holds that down too.
     /// `snob mcp --help` tells of `--listen` and the key only in a build that
     /// has them, and `snob profile --help` of the rest it may wait first.
     #[test]
@@ -2587,6 +2578,15 @@ mod tests {
         assert!(!help.contains("three or four"), "{help}");
     }
 
+    /// The environment variables the program answers to are announced in one
+    /// place, under the examples, where exit codes already live.
+    ///
+    /// Four of them have no flag whose help would mention them: three belong to
+    /// the crates behind the styling (`console`, `supports-hyperlinks`) and one
+    /// to `main::init_tracing`. This pins
+    /// the list. `SNOB_IGNORE_COOLDOWN` is deliberately absent -- its own
+    /// doc-comment in `rate_budget` says why it is not advertised -- and the
+    /// assertion holds that down too.
     #[test]
     fn the_environment_variables_are_announced_together() {
         for name in [

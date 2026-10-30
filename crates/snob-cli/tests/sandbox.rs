@@ -4518,6 +4518,23 @@ async fn the_mcp_server_hands_a_long_list_back_a_page_at_a_time() {
     let sentence = stored["content"][1]["text"].as_str().unwrap_or_default();
     assert!(sentence.contains("Read from what is stored"), "{stored}");
 
+    // A refresh's later page is held where the page looks for it. Asked
+    // before any other list given max_pages, so the refresh's own is the
+    // only one held that could answer it: with max_pages, the store is not
+    // asked (`page_unavailable`).
+    let refreshed = serde_json::json!({ "list": "followers", "mode": "refresh", "max_pages": 40 });
+    let first = client.call("snob_list", refreshed.clone()).await;
+    assert_eq!(first["isError"], false, "{first}");
+    let mut later = refreshed;
+    later["offset"] = serde_json::json!(200);
+    let held = client.call("snob_list", later).await;
+    assert_eq!(held["isError"], false, "{held}");
+    assert_eq!(usernames(&held["structuredContent"])[0], "user200");
+    assert_eq!(
+        held["structuredContent"]["served"], first["structuredContent"]["served"],
+        "{held}"
+    );
+
     // A walk given max_pages may stop short, and what it read is then not
     // stored as a whole list: its later pages come from the server that
     // read it, and another server says it cannot hand them back.
@@ -4534,16 +4551,6 @@ async fn the_mcp_server_hands_a_long_list_back_a_page_at_a_time() {
         gone["structuredContent"]["error"]["code"], "page_unavailable",
         "{gone}"
     );
-
-    // A refresh's later page is held where the page looks for it.
-    let refreshed = serde_json::json!({ "list": "followers", "mode": "refresh", "max_pages": 40 });
-    let first = client.call("snob_list", refreshed.clone()).await;
-    assert_eq!(first["isError"], false, "{first}");
-    let mut later = refreshed;
-    later["offset"] = serde_json::json!(200);
-    let held = client.call("snob_list", later).await;
-    assert_eq!(held["isError"], false, "{held}");
-    assert_eq!(usernames(&held["structuredContent"])[0], "user200");
 }
 
 /// A walk cut short by `max_pages` exits 0 with what it read, as a list cut

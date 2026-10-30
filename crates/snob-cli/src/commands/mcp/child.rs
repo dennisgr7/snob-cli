@@ -61,7 +61,8 @@ pub struct Finished {
     /// The end of standard error, for a failure with no JSON error.
     pub said: String,
     /// Where each list it answered with came from, as a walk run with
-    /// `--progress-json` says it (`Progress::served`): a job's walk.
+    /// `--progress-json` says it (`Progress::served`): a job's walk, a list
+    /// read from what is stored, and a later page read from it.
     pub served: Vec<Value>,
 }
 

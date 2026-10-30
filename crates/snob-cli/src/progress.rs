@@ -575,6 +575,14 @@ impl Progress {
         }
     }
 
+    /// Under `--progress-json`, the list the walk about to start reads, said
+    /// on every line from then on (`list`); nothing is drawn for it.
+    pub fn walking(&self, list: snob_core::model::ListKind) {
+        if let Some(told) = &self.told {
+            told.lock().unwrap_or_else(|e| e.into_inner()).list = Some(list.as_str());
+        }
+    }
+
     /// Under `--progress-json`, where a list came from once the engine has
     /// answered for it: `{"progress": {"event": "served", "list", "from",
     /// "taken_at", "cooldown_until", "reason"}}`. `from` is the provenance's
@@ -589,14 +597,6 @@ impl Progress {
     /// with this flag, so an agent is told a stored list is one, and how old,
     /// and a short one is short, as a person is told in the warning and the
     /// summary; nothing is drawn for it.
-    /// Under `--progress-json`, the list the walk about to start reads, said
-    /// on every line from then on (`list`); nothing is drawn for it.
-    pub fn walking(&self, list: snob_core::model::ListKind) {
-        if let Some(told) = &self.told {
-            told.lock().unwrap_or_else(|e| e.into_inner()).list = Some(list.as_str());
-        }
-    }
-
     pub fn served(
         &self,
         list: snob_core::model::ListKind,

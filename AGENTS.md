@@ -528,7 +528,8 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   later page get `--progress-json` for), with its date, a sentence beside
   it when it was not read now (`answer::not_read_now`), and `complete:
   false` with what was read of how many and a sentence
-  (`answer::incomplete`) when a walk cut short by `max_pages` exited 0. The
+  (`answer::incomplete`; for a crossing, that results are missing and the
+  ones given are right) when a walk cut short by `max_pages` exited 0. The
   client's `offset` is sliced with `get`, never indexed. **A page past the
   first never walks**: `offset` stays out of `Plan.args` (and the binding),
   and the call is planned as the same list read with `--offline`, which
