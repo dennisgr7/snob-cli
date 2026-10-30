@@ -45,10 +45,23 @@
 //! The `Host` and `Origin` checks keep a web page in the person's own
 //! browser from reaching the port through DNS rebinding; anything else sets
 //! those headers as it likes.
+//!
+//! **The server does not prove itself to its clients.** A client, or a
+//! tunnel (cloudflared, a VPN, `ssh -L` or `-R`), sends the key to whatever
+//! answers on the port, and nothing holds the port while `snob mcp --listen`
+//! is not running (stopped, restarted after `upgraded`, never started).
+//! Any other user of the machine who binds it first is handed the key by
+//! the next request, and the key lasts until it is revoked. So `--listen` is
+//! for a machine where nobody else can run code, and a key that may have
+//! been read so is revoked and made again (`snob mcp key revoke`, `new`);
+//! startup says so ([`started`]). **The other loopback family is held
+//! too** ([`twin`]): a client told `localhost` may try `[::1]` before
+//! `127.0.0.1`, so bound to one of the two, the server listens on the same
+//! port of the other, and refuses to start when somebody else already does.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -242,6 +255,7 @@ pub async fn serve(
         .await
         .with_context(|| format!("could not listen on {}", listen.address))?;
     let bound = listener.local_addr()?;
+    let twin = twin(bound, listen.address.port() != 0).await?;
     let gate = Gate::new(&key)?;
     drop(key);
 
@@ -275,6 +289,7 @@ pub async fn serve(
 
     started(
         bound,
+        twin.as_ref().and_then(|t| t.local_addr().ok()),
         source,
         &front.gate.fingerprint,
         &listen,
@@ -287,6 +302,7 @@ pub async fn serve(
     loop {
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
+            accepted = accept(twin.as_ref()) => accepted,
             () = closing.canceled() => break,
         };
         // Finished connections, before they are counted.
@@ -325,6 +341,7 @@ pub async fn serve(
     // writing. What is left is a stream that never ends by itself (a
     // session's own), which the token ends.
     drop(listener);
+    drop(twin);
     in_flight
         .settled(child::GRACE + Duration::from_secs(5))
         .await;
@@ -334,6 +351,55 @@ pub async fn serve(
     let _ = tokio::time::timeout(CLOSING_WITHIN, ended).await;
     connections.abort_all();
     Ok(ExitCode::Interrupted)
+}
+
+/// The listener on the same port of the other loopback family, when the
+/// server is bound to `127.0.0.1` or `[::1]`: those are what `localhost`
+/// resolves to, in an order the client's resolver picks, and a port left
+/// free on one of them is one another user of the machine can listen on to
+/// be handed the key by a client told `localhost`.
+///
+/// **Taken already, on a port the person named, the server does not
+/// start**: whatever holds it is not this server, and may be listening for
+/// exactly that. Where the family is not there at all (IPv6 turned off),
+/// nobody can listen on it either, and the server goes on with one. On a
+/// port the system picked (`:0`, which only a test or a tunnel set up
+/// afterwards would use) a taken twin is not a reason to refuse.
+async fn twin(bound: SocketAddr, named: bool) -> Result<Option<TcpListener>> {
+    let other = match bound.ip() {
+        IpAddr::V4(ip) if ip == Ipv4Addr::LOCALHOST => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip == Ipv6Addr::LOCALHOST => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        _ => return Ok(None),
+    };
+    let address = SocketAddr::new(other, bound.port());
+    match TcpListener::bind(address).await {
+        Ok(listener) => Ok(Some(listener)),
+        Err(e) if named && e.kind() == std::io::ErrorKind::AddrInUse => Err(ExitError::new(
+            ExitCode::Error,
+            format!(
+                "{address} is taken by another process, and a client told localhost may reach \
+                 it rather than {bound} and hand it the key"
+            ),
+        )
+        .with_hint(
+            "find what listens there and stop it, or listen on another port; if a client \
+             may have sent the key to it already, revoke the key (\"snob mcp key revoke\") \
+             and make a new one",
+        )
+        .into()),
+        Err(e) => {
+            tracing::debug!(error = %e, %address, "not listening on the other loopback family");
+            Ok(None)
+        }
+    }
+}
+
+/// The next connection on the twin listener, or never when there is none.
+async fn accept(twin: Option<&TcpListener>) -> std::io::Result<(TcpStream, SocketAddr)> {
+    match twin {
+        Some(listener) => listener.accept().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// What a connection has done so far, which the accept loop counts it by.
@@ -379,10 +445,12 @@ impl Open {
 }
 
 /// What the person running the server is told when it starts, on standard
-/// error: where it listens, which key it takes (by fingerprint), and what
-/// whoever holds that key may do.
+/// error: where it listens, which key it takes (by fingerprint), what
+/// whoever holds that key may do, and that the server does not prove itself
+/// to its clients.
 fn started(
     bound: SocketAddr,
+    twin: Option<SocketAddr>,
     source: key::Source,
     fingerprint: &str,
     listen: &Listen,
@@ -394,6 +462,17 @@ fn started(
          from {} (fingerprint {fingerprint}).",
         source.describe()
     ));
+    if let Some(twin) = twin {
+        ui::info(&format!(
+            "It also holds {twin}, where a client told localhost may connect first."
+        ));
+    }
+    ui::info(
+        "Clients send the key to whatever answers on this port, and another user of this \
+         machine who listens on it while snob is not running is handed it: serve this only on a \
+         machine where nobody else can run code, and if the port could have been taken, revoke \
+         the key (\"snob mcp key revoke\") and make a new one.",
+    );
     if let Some(public) = &listen.public {
         ui::info(&format!(
             "It takes requests addressed to {}; TLS ends at the tunnel, which sees the key and \
@@ -801,6 +880,31 @@ impl Gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bound to one loopback family, the server holds the same port of the
+    /// other, and does not start on a named port somebody else holds there;
+    /// bound anywhere else in 127/8 it holds nothing more.
+    #[tokio::test]
+    async fn the_other_loopback_family_is_held_or_the_server_does_not_start() {
+        let Ok(stranger) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await else {
+            // No IPv6 here: nobody can listen on it either.
+            return;
+        };
+        let port = stranger.local_addr().unwrap().port();
+        let ours = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let refused = twin(ours, true).await.unwrap_err();
+        assert!(refused.to_string().contains("taken by another process"));
+        assert!(twin(ours, false).await.unwrap().is_none());
+        drop(stranger);
+
+        let held = twin(ours, true).await.unwrap().expect("[::1] is free now");
+        assert_eq!(
+            held.local_addr().unwrap(),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)
+        );
+        let elsewhere = SocketAddr::new("127.0.0.2".parse().unwrap(), port);
+        assert!(twin(elsewhere, true).await.unwrap().is_none());
+    }
 
     /// A new session closes the one asked anything longest ago that has no
     /// call running, one never seen first; with a call running in every one,

@@ -161,7 +161,12 @@ can read:
   session, so a chat yes it is handed is bound to the call alone, and any
   client with the key may redeem it once. TLS ends at the tunnel, whose
   provider sees the key and every answer, other people's names and lists
-  included; put an access layer in front where the tunnel offers one. `snob
+  included; put an access layer in front where the tunnel offers one. The
+  server does not prove itself to its clients: they send the key to
+  whatever answers on the port, so another user of the machine who listens
+  there while snob is not running is handed it. Serve it only on a machine
+  where nobody else can run code, and if the port could have been taken,
+  revoke the key and make a new one. `snob
   mcp config codex --remote https://your-tunnel/mcp` (or any other client)
   prints what a client needs to reach that server: no command and no key.
   The client sends the key from `SNOB_MCP_TOKEN` in its own environment;
