@@ -23,8 +23,9 @@
 //! 3. **The body**, read here, at most [`MOST_BODY`] bytes within
 //!    [`BODY_WITHIN`]: hyper's header timeout does not cover the body, and
 //!    a body that never arrives would hold its connection for ever.
-//! 4. **Sessions**: a new one only while fewer than [`MOST_SESSIONS`] are
-//!    open.
+//! 4. **Sessions**: at most [`MOST_SESSIONS`] open; a new one past them
+//!    closes the session left idle longest with no call running
+//!    ([`idlest`]), and is refused only when every one has a call running.
 //! 5. The SDK's own checks (`Host` and `Origin`, the protocol's headers),
 //!    and then the same handler `snob mcp` serves on standard input and
 //!    output, with the same tickets, limits and children.
@@ -45,12 +46,12 @@
 //! browser from reaching the port through DNS rebinding; anything else sets
 //! those headers as it likes.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
@@ -60,6 +61,7 @@ use http_body_util::{BodyExt as _, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use rmcp::transport::streamable_http_server::session::SessionManager as _;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use snob_core::secret::Secret;
@@ -95,7 +97,14 @@ const FIRST_REQUEST_WITHIN: Duration = Duration::from_secs(2);
 
 /// Sessions open at once (the revisions before 2026-07-28 open one per
 /// conversation). A session is a little memory and a task, and each client
-/// a person uses holds one; eight is a few clients and their reconnections.
+/// a person uses holds one. **A new one past these closes the one left idle
+/// longest with no call running** ([`idlest`]), as a new connection closes
+/// one that never showed the key: a client that crashed, slept or closed
+/// without a `DELETE` keeps its session until [`SESSION_IDLE`], and eight
+/// reconnections of that kind in half an hour locked every new conversation
+/// out, with nothing anybody could close (seen against a test server: `200
+/// x8, 503 503`). A client whose session was closed is answered 404 on its
+/// next request, which the protocol has it meet with a new session.
 const MOST_SESSIONS: usize = 8;
 
 /// The largest request body taken. The largest call a client makes is a
@@ -261,6 +270,7 @@ pub async fn serve(
         service,
         manager,
         answering: Arc::new(InFlight::default()),
+        activity: Activity::default(),
     });
 
     started(
@@ -457,6 +467,9 @@ struct Front {
     /// was let in until its body has been written or dropped: what the server
     /// waits for on its way out before it ends the streams.
     answering: Arc<InFlight>,
+    /// When each session was last asked anything, and how many of its calls
+    /// are being answered: what decides which session a new one closes.
+    activity: Activity,
 }
 
 impl Front {
@@ -475,6 +488,17 @@ impl Front {
         // A `GET` is a stream only the server's stopping ends, and is not
         // waited for.
         let answering = (request.method() == Method::POST).then(|| self.answering.enter());
+        // A request in a session is that session alive; a `POST` is one of
+        // its calls until its answer has been sent, and its session is never
+        // closed under it.
+        let session = request
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|id| id.to_str().ok())
+            .map(Arc::<str>::from);
+        let call = session
+            .as_ref()
+            .and_then(|id| self.activity.touch(id, request.method() == Method::POST));
         let (parts, body) = request.into_parts();
         let body = match read(&parts.headers, body).await {
             Ok(body) => body,
@@ -486,12 +510,12 @@ impl Front {
             }
             Err(Unread::Broken) => return plain(StatusCode::BAD_REQUEST, "Bad Request", true),
         };
-        if opens_a_session(&parts.method, &parts.headers, &body)
-            && self.manager.sessions.read().await.len() >= MOST_SESSIONS
-        {
+        let opens = opens_a_session(&parts.method, &parts.headers, &body);
+        if opens && !self.room_for_a_session().await {
             return plain(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Service Unavailable: too many sessions are open; close one, or try again later",
+                "Service Unavailable: every session open has a call running; try again once \
+                 one has ended",
                 false,
             );
         }
@@ -499,15 +523,123 @@ impl Front {
             .service
             .handle(Request::from_parts(parts, Full::new(body)))
             .await;
+        // The session it opened, alive from now.
+        if opens
+            && let Some(id) = response
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|id| id.to_str().ok())
+        {
+            self.activity.touch(&Arc::from(id), false);
+        }
         match answering {
             Some(running) => response.map(|body| {
                 Answering {
                     body,
                     _running: running,
+                    _call: call,
                 }
                 .boxed()
             }),
             None => response,
+        }
+    }
+
+    /// Whether a session may be opened now: while fewer than
+    /// [`MOST_SESSIONS`] are, and otherwise once the one left idle longest
+    /// with no call running has been closed for it. `false` only when every
+    /// session open has a call running.
+    async fn room_for_a_session(&self) -> bool {
+        let open: Vec<Arc<str>> = self.manager.sessions.read().await.keys().cloned().collect();
+        self.activity.keep_only(&open);
+        if open.len() < MOST_SESSIONS {
+            return true;
+        }
+        let Some(idlest) = self.activity.idlest(&open) else {
+            return false;
+        };
+        tracing::debug!("closed the session of snob mcp left idle longest, for a new one");
+        // Gone already is as good: the place is free either way.
+        let _ = self.manager.close_session(&idlest).await;
+        self.activity.forget(&idlest);
+        true
+    }
+}
+
+/// What each session has done lately, by its id: when it was last asked
+/// anything, and how many of its calls are being answered.
+#[derive(Default)]
+struct Activity(Arc<Mutex<HashMap<Arc<str>, Lately>>>);
+
+#[derive(Debug, Clone, Copy)]
+struct Lately {
+    last: Instant,
+    calls: usize,
+}
+
+impl Activity {
+    fn seen(&self) -> std::sync::MutexGuard<'_, HashMap<Arc<str>, Lately>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Notes that session `id` was asked something now; for a call, the
+    /// call too, until the guard handed back is dropped.
+    fn touch(&self, id: &Arc<str>, call: bool) -> Option<Call> {
+        let mut seen = self.seen();
+        let lately = seen.entry(Arc::clone(id)).or_insert(Lately {
+            last: Instant::now(),
+            calls: 0,
+        });
+        lately.last = Instant::now();
+        if !call {
+            return None;
+        }
+        lately.calls += 1;
+        Some(Call {
+            of: Arc::clone(&self.0),
+            id: Arc::clone(id),
+        })
+    }
+
+    /// Forgets the sessions that are not in `open`, so what is kept is
+    /// never more than the sessions there are.
+    fn keep_only(&self, open: &[Arc<str>]) {
+        self.seen().retain(|id, _| open.contains(id));
+    }
+
+    fn forget(&self, id: &Arc<str>) {
+        self.seen().remove(id);
+    }
+
+    /// The session of `open` to close for a new one ([`idlest`]).
+    fn idlest(&self, open: &[Arc<str>]) -> Option<Arc<str>> {
+        idlest(open, &self.seen())
+    }
+}
+
+/// Of the sessions `open`, the one with no call running that was asked
+/// anything longest ago, a session never seen counting as the oldest. `None`
+/// when every one has a call running.
+fn idlest(open: &[Arc<str>], seen: &HashMap<Arc<str>, Lately>) -> Option<Arc<str>> {
+    open.iter()
+        .filter(|id| seen.get(*id).is_none_or(|lately| lately.calls == 0))
+        .min_by_key(|id| seen.get(*id).map(|lately| lately.last))
+        .cloned()
+}
+
+/// A call of a session being answered, until its answer has been sent or
+/// dropped, which is the session's last moment of activity too.
+struct Call {
+    of: Arc<Mutex<HashMap<Arc<str>, Lately>>>,
+    id: Arc<str>,
+}
+
+impl Drop for Call {
+    fn drop(&mut self) {
+        let mut seen = self.of.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lately) = seen.get_mut(&self.id) {
+            lately.calls = lately.calls.saturating_sub(1);
+            lately.last = Instant::now();
         }
     }
 }
@@ -518,6 +650,8 @@ struct Answering {
     body: BoxBody<Bytes, Infallible>,
     /// Held for its drop, which ends the count.
     _running: Running,
+    /// The session's call it answers, held for the same reason.
+    _call: Option<Call>,
 }
 
 impl hyper::body::Body for Answering {
@@ -667,6 +801,30 @@ impl Gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A new session closes the one asked anything longest ago that has no
+    /// call running, one never seen first; with a call running in every one,
+    /// none.
+    #[test]
+    fn the_session_closed_for_a_new_one_is_the_idlest_with_no_call_running() {
+        let activity = Activity::default();
+        let [a, b, c]: [Arc<str>; 3] = ["a", "b", "c"].map(Arc::from);
+        let open = [a.clone(), b.clone(), c.clone()];
+        let _a = activity.touch(&a, false);
+        let _b = activity.touch(&b, false);
+        assert_eq!(activity.idlest(&open), Some(c.clone()), "never seen");
+        let _c = activity.touch(&c, false);
+        assert_eq!(activity.idlest(&open), Some(a.clone()));
+        let call = activity.touch(&a, true);
+        assert_eq!(activity.idlest(&open), Some(b.clone()), "a has a call");
+        let calls = [activity.touch(&b, true), activity.touch(&c, true)];
+        assert_eq!(activity.idlest(&open), None, "every one has a call");
+        drop(call);
+        drop(calls);
+        assert_eq!(activity.idlest(&open), Some(a.clone()), "a ended first");
+        activity.keep_only(std::slice::from_ref(&b));
+        assert_eq!(activity.seen().len(), 1);
+    }
 
     #[test]
     fn only_a_loopback_address_with_a_port_is_listened_on() {

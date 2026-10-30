@@ -7505,21 +7505,37 @@ async fn a_stateless_call_over_http_needs_no_session() {
     );
 }
 
-/// Eight sessions at once, and a ninth `initialize` waits for one to close;
-/// a stateless call, which opens none, is still answered.
+/// Eight sessions at once, left by clients that went away without a
+/// `DELETE`: a ninth `initialize` closes the one left idle longest rather
+/// than being refused, and that client is told its session is gone; the
+/// others go on, and a stateless call, which opens none, is answered too.
 #[cfg(feature = "mcp-http")]
 #[tokio::test]
-async fn a_ninth_session_is_refused_while_eight_are_open() {
+async fn a_ninth_session_closes_the_one_left_idle_longest() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
     let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let mut sessions = Vec::new();
     for _ in 0..8 {
-        server.open().await;
+        sessions.push(server.open().await);
     }
+    // The first is asked something again, so the second is the idlest.
+    let status = server
+        .call(Some(&sessions[0]), "snob_status", serde_json::json!({}))
+        .await;
+    assert_eq!(status["isError"], false, "{status}");
+
     let ninth = server
         .post(None, &serde_json::from_str(HELLO).unwrap())
         .await;
-    assert_eq!(ninth.status, 503);
+    assert_eq!(ninth.status, 200);
+    assert!(ninth.session.is_some());
+    let ping = serde_json::json!({"jsonrpc": "2.0", "id": 900, "method": "ping"});
+    let closed = server.post(Some(&sessions[1]), &ping).await;
+    assert_eq!(closed.status, 404, "the idlest session is gone");
+    let kept = server.post(Some(&sessions[0]), &ping).await;
+    assert_eq!(kept.status, 200, "the one asked lately is kept");
+
     let status = server
         .call(None, "snob_status", serde_json::json!({}))
         .await;

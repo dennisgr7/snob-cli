@@ -616,8 +616,11 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   read** by comparing HMACs of both sides under a key drawn at start, and
   refused with 401, `WWW-Authenticate: Bearer realm="snob"` and
   `Connection: close`; the body, read by snob, at most 256 KiB (413) within
-  30 s (408); a new session only while fewer than 8 are open (503 for an
-  `initialize`; a stateless call opens none and passes); then rmcp's own
+  30 s (408); at most 8 sessions, a new one past them closing the one left
+  idle longest with no call running, since a client gone without a `DELETE`
+  keeps its session for the idle time (503 for an `initialize` only when
+  every one has a call running; a stateless call opens none and passes);
+  then rmcp's own
   checks and the same handler. **The `Host` and `Origin` checks guard
   browsers (DNS rebinding) only; against any other caller the key is the
   only control.** hyper serves HTTP/1.1 with a header (and idle) timeout of
