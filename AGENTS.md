@@ -672,7 +672,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
 - **Every string from another person goes through `snob_core::model::printable`**
   before it reaches a terminal or a JSON list (`output::readable`; a JSON
   reader may be a model, and `serde_json` writes `Cf` as it is): all of `Cc`
-  and all of `Cf` removed, plus the invisible letters such as Hangul fillers;
+  and all of `Cf` removed, plus the invisible letters such as Hangul fillers
+  and the marks that draw nothing (the combining grapheme joiner, the
+  supplementary variation selectors, and every standard selector but one
+  right after its base, since a run of them hides a byte each);
   whitespace controls become a space.
 - **No `@` in a command handed over to be typed back** (PowerShell's splatting
   eats an unquoted `@name`, and the command then answers about the user's own
