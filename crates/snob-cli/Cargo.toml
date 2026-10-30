@@ -160,6 +160,13 @@ tempfile.workspace = true
 # including the one where narrowing is refused.
 webpki-root-certs.workspace = true
 
+# Only for the test of `commands::mcp::http::twin` against a wildcard held
+# with exclusive use (`SO_EXCLUSIVEADDRUSE`), which neither `std` nor tokio
+# can set before a bind. A dev-dependency's features reach test builds only,
+# so the release binary keeps the feature list of the workspace entry.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
+
 # Enough for `apt install ./snob-*.deb` to work and `apt remove snob` to undo
 # it. A signed apt repository would be the other half, and it needs a GPG key
 # that only the maintainer can hold, so the loose package is what can be built

@@ -57,7 +57,8 @@
 //! startup says so ([`started`]). **The other loopback family is held
 //! too** ([`twin`]): a client told `localhost` may try `[::1]` before
 //! `127.0.0.1`, so bound to one of the two, the server listens on the same
-//! port of the other, and refuses to start when somebody else already does.
+//! port of the other, and refuses to start when somebody else already does,
+//! on that address or on its family's wildcard.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -359,11 +360,16 @@ pub async fn serve(
 /// free on one of them is one another user of the machine can listen on to
 /// be handed the key by a client told `localhost`.
 ///
-/// **Taken already, on a port the person named, the server does not
+/// **Not to be had, on a port the person named, the server does not
 /// start**: whatever holds it is not this server, and may be listening for
-/// exactly that. Where the family is not there at all (IPv6 turned off),
-/// nobody can listen on it either, and the server goes on with one. On a
-/// port the system picked (`:0`, which only a test or a tunnel set up
+/// exactly that. Taken is not only the same address held: a process holding
+/// the family's wildcard (`[::]` or `0.0.0.0`) with exclusive use, as any
+/// user may on Windows, makes the bind fail with access denied rather than
+/// in use, and is handed every connection to the address all the same. So
+/// only a failure that says the family is not there at all
+/// ([`family_absent`]: IPv6 turned off), where nobody can listen either,
+/// lets the server go on with one; any other refuses. On a port the system
+/// picked (`:0`, which only a test or a tunnel set up
 /// afterwards would use) a taken twin is not a reason to refuse.
 async fn twin(bound: SocketAddr, named: bool) -> Result<Option<TcpListener>> {
     let other = match bound.ip() {
@@ -374,24 +380,44 @@ async fn twin(bound: SocketAddr, named: bool) -> Result<Option<TcpListener>> {
     let address = SocketAddr::new(other, bound.port());
     match TcpListener::bind(address).await {
         Ok(listener) => Ok(Some(listener)),
-        Err(e) if named && e.kind() == std::io::ErrorKind::AddrInUse => Err(ExitError::new(
-            ExitCode::Error,
-            format!(
-                "{address} is taken by another process, and a client told localhost may reach \
-                 it rather than {bound} and hand it the key"
-            ),
-        )
-        .with_hint(
-            "find what listens there and stop it, or listen on another port; if a client \
-             may have sent the key to it already, revoke the key (\"snob mcp key revoke\") \
-             and make a new one",
-        )
-        .into()),
-        Err(e) => {
+        Err(e) if !named || family_absent(&e) => {
             tracing::debug!(error = %e, %address, "not listening on the other loopback family");
             Ok(None)
         }
+        Err(e) => {
+            let why = match e.kind() {
+                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied => {
+                    "is taken by another process".to_owned()
+                }
+                _ => format!("cannot be held ({e}), so another process may hold it"),
+            };
+            Err(ExitError::new(
+                ExitCode::Error,
+                format!(
+                    "{address} {why}, and a client told localhost may reach it rather than \
+                     {bound} and hand it the key"
+                ),
+            )
+            .with_hint(
+                "find what listens there and stop it, or listen on another port; if a client \
+                 may have sent the key to it already, revoke the key (\"snob mcp key revoke\") \
+                 and make a new one",
+            )
+            .into())
+        }
     }
+}
+
+/// Whether a bind failed because the address's family is not there at all:
+/// the address is not one of the machine's (IPv6 turned off in the system),
+/// or the family is not supported (no IPv6 stack), which `WSAEAFNOSUPPORT` on
+/// Windows and `EAFNOSUPPORT` elsewhere say. Nobody can listen there either.
+fn family_absent(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    const NOT_SUPPORTED: i32 = 10047; // WSAEAFNOSUPPORT, from winerror.h
+    #[cfg(unix)]
+    const NOT_SUPPORTED: i32 = libc::EAFNOSUPPORT;
+    e.kind() == std::io::ErrorKind::AddrNotAvailable || e.raw_os_error() == Some(NOT_SUPPORTED)
 }
 
 /// The next connection on the twin listener, or never when there is none.
@@ -904,6 +930,86 @@ mod tests {
         );
         let elsewhere = SocketAddr::new("127.0.0.2".parse().unwrap(), port);
         assert!(twin(elsewhere, true).await.unwrap().is_none());
+    }
+
+    /// A process holding the other family's wildcard with exclusive use, as
+    /// any user may on Windows, is handed the connections to `[::1]`, though
+    /// binding `[::1]` then fails with access denied rather than in use: the
+    /// server does not start on a named port.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_wildcard_held_with_exclusive_use_is_taken_too() {
+        let Some(stranger) = exclusive_ipv6_wildcard() else {
+            // No IPv6 here: nobody can listen on it either.
+            return;
+        };
+        let port = stranger.local_addr().unwrap().port();
+        let ours = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let refused = twin(ours, true).await.unwrap_err();
+        assert!(
+            refused.to_string().contains("taken by another process"),
+            "{refused}"
+        );
+        assert!(twin(ours, false).await.unwrap().is_none());
+    }
+
+    /// A listener on `[::]` and a port the system picks, bound with
+    /// `SO_EXCLUSIVEADDRUSE`; none where IPv6 is not there.
+    #[cfg(windows)]
+    fn exclusive_ipv6_wildcard() -> Option<std::net::TcpListener> {
+        use std::os::windows::io::{FromRawSocket, RawSocket};
+        use windows_sys::Win32::Networking::WinSock::{
+            AF_INET6, INVALID_SOCKET, IPPROTO_TCP, SO_EXCLUSIVEADDRUSE, SOCK_STREAM, SOCKADDR_IN6,
+            SOL_SOCKET, WSADATA, WSAStartup, bind, listen, setsockopt, socket,
+        };
+        // SAFETY: `WSADATA` is a plain C structure, for which all zeros is a
+        // valid value; `WSAStartup` fills it in.
+        let mut data: WSADATA = unsafe { std::mem::zeroed() };
+        // SAFETY: `data` is a valid, writable `WSADATA` for the whole call.
+        // Winsock counts its starts, so this one alongside std's is harmless.
+        if unsafe { WSAStartup(0x0202, &mut data) } != 0 {
+            return None;
+        }
+        // SAFETY: a plain call with constant arguments; the result is checked.
+        let raw = unsafe { socket(i32::from(AF_INET6), SOCK_STREAM, IPPROTO_TCP) };
+        if raw == INVALID_SOCKET {
+            return None;
+        }
+        // SAFETY: `raw` is a socket just opened that nothing else owns; from
+        // here on the listener owns it and closes it on drop.
+        let listener = unsafe { std::net::TcpListener::from_raw_socket(raw as RawSocket) };
+        let on: i32 = 1;
+        // SAFETY: the option points at an `i32` that outlives the call, and
+        // the length given is its size.
+        let set = unsafe {
+            setsockopt(
+                raw,
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                (&raw const on).cast(),
+                size_of::<i32>() as i32,
+            )
+        };
+        assert_eq!(set, 0, "SO_EXCLUSIVEADDRUSE");
+        // SAFETY: all zeros in a `SOCKADDR_IN6` is `[::]` and port 0, once
+        // the family is set.
+        let mut any: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
+        any.sin6_family = AF_INET6;
+        // SAFETY: the address points at a `SOCKADDR_IN6` that outlives the
+        // call, and the length given is its size.
+        let bound = unsafe {
+            bind(
+                raw,
+                (&raw const any).cast(),
+                size_of::<SOCKADDR_IN6>() as i32,
+            )
+        };
+        if bound != 0 {
+            return None;
+        }
+        // SAFETY: `raw` is the bound socket the listener owns.
+        assert_eq!(unsafe { listen(raw, 1) }, 0, "listen");
+        Some(listener)
     }
 
     /// A new session closes the one asked anything longest ago that has no

@@ -640,7 +640,8 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   could have been taken. Bound to `127.0.0.1` or `[::1]`, it also holds the
   same port of the other family (`http::twin`), since `localhost` may
   resolve to either, and refuses to start, exit 1, when something else
-  holds it. Each request, in order: the path (`/mcp`
+  holds it (its family's wildcard held with exclusive use included) or it
+  cannot be held for any reason but the family being absent. Each request, in order: the path (`/mcp`
   only, `/.well-known/*` included is 404); the key (`Authorization:
   Bearer`, the scheme in any case), checked **before any of the body is
   read** by comparing HMACs of both sides under a key drawn at start, and
