@@ -2058,6 +2058,11 @@ pub struct McpKeyNewArgs {
     /// Print the key even when standard output is not a terminal
     #[arg(long)]
     pub print: bool,
+
+    /// Make a key for SNOB_MCP_KEY: printed, kept nowhere, and the system
+    /// keyring left as it is
+    #[arg(long, conflicts_with = "force")]
+    pub env: bool,
 }
 
 #[cfg(feature = "mcp-http")]

@@ -6969,6 +6969,39 @@ async fn a_task_of_another_account_is_unknown() {
 #[cfg(feature = "mcp-http")]
 const MCP_KEY: &str = "snob_mcp_N2u3l9q0aYyK0w7mQxk1vR4cT8bZp5sJdE6fGhIoUjA";
 
+/// `new --env` makes a key for `SNOB_MCP_KEY`: printed only to a terminal
+/// or with `--print`, kept nowhere, and in the form a server takes. It never
+/// reads or writes the keyring, so it runs here as it would anywhere.
+#[cfg(feature = "mcp-http")]
+#[test]
+fn mcp_key_new_env_prints_a_key_for_the_variable_and_keeps_none() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let refused = snob(tmp.path(), None, &["mcp", "key", "new", "--env"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(stdout(&refused).is_empty(), "{}", stdout(&refused));
+
+    let out = snob(tmp.path(), None, &["mcp", "key", "new", "--env", "--print"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let key = stdout(&out).trim().to_string();
+    assert!(key.starts_with("snob_mcp_"), "{key}");
+    assert_eq!(key.len(), MCP_KEY.len(), "{key}");
+    assert!(stderr(&out).contains("Kept nowhere"), "{}", stderr(&out));
+
+    // What it printed is a key a server takes.
+    let shown = snob_with(
+        tmp.path(),
+        None,
+        &[("SNOB_MCP_KEY", key.as_str())],
+        &["mcp", "key", "show"],
+    );
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    assert!(stdout(&shown).contains("fingerprint"), "{}", stdout(&shown));
+
+    let both = snob(tmp.path(), None, &["mcp", "key", "new", "--env", "--force"]);
+    assert_eq!(both.status.code(), Some(2), "{}", stderr(&both));
+}
+
 /// `show` says where the key comes from and names it by a fingerprint, and
 /// with the key in `SNOB_MCP_KEY` warns that the variable overrides the
 /// keyring. The key itself is printed only on request, and then only to a

@@ -152,7 +152,8 @@ can read:
   over the network and keeps it in the system keyring, printing it once to
   your terminal; `show` names it by a fingerprint, `revoke` removes it, and
   on a machine with no keyring `SNOB_MCP_KEY` in the server's environment
-  takes its place. `snob mcp --listen 127.0.0.1:8750` serves the same over
+  takes its place (`snob mcp key new --env` makes one for it, keeping it
+  nowhere). `snob mcp --listen 127.0.0.1:8750` serves the same over
   HTTP on this machine's loopback, for a tunnel of your own (`ssh -L`,
   cloudflared, a VPN) to reach from elsewhere: it refuses any address that
   is not loopback and any request without the key (`Authorization: Bearer`),

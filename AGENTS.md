@@ -278,7 +278,8 @@ with a documented reason in the same place.
   like the monitor's secrets; `--no-keyring` does not change it): on a
   machine without one, `SNOB_MCP_KEY` in the server's environment is the
   way, and it wins over the keyring wherever it is set, which `show` and
-  `revoke` warn about. A client reads its copy from `SNOB_MCP_TOKEN`, never
+  `revoke` warn about; `new --env` makes one for it, printed and kept
+  nowhere, the keyring not even read. A client reads its copy from `SNOB_MCP_TOKEN`, never
   the server's name. The key is printed only to a terminal unless `--print`
   (an agent with a shell would keep it in its transcript), and is named
   everywhere else by a 12-digit fingerprint. Neither variable reaches a

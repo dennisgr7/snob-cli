@@ -137,8 +137,9 @@ impl Source {
         match self {
             Self::Keyring => "revoke the key (\"snob mcp key revoke\") and make a new one",
             Self::Environment => {
-                "replace SNOB_MCP_KEY with a new key (\"snob mcp key new --print\") wherever \
-                 the server is started, and give the clients the new one"
+                "replace SNOB_MCP_KEY with a new key (\"snob mcp key new --env\", which \
+                 leaves the keyring alone) wherever the server is started, and give the clients \
+                 the new one"
             }
         }
     }
@@ -250,6 +251,9 @@ pub fn run(command: &McpKeyCommand, store: &SecretStore) -> Result<ExitCode> {
 
 fn new(args: &McpKeyNewArgs, store: &SecretStore) -> Result<ExitCode> {
     let printable = may_print(args.print, std::io::stdout().is_terminal());
+    if args.env {
+        return for_the_environment(printable);
+    }
     // Read before anything is drawn: whether there is one decides whether
     // to go on at all. A key in a form snob does not take is replaced the
     // same, with --force, which is what the refusal of one says to do.
@@ -313,6 +317,28 @@ fn new(args: &McpKeyNewArgs, store: &SecretStore) -> Result<ExitCode> {
         ui::info("Every client given the old key stops working.");
     }
     environment_wins(plan == Plan::Keep);
+    Ok(ExitCode::Ok)
+}
+
+/// `new --env`: a key for [`ENV`], what replacing one taken from there
+/// needs (`Source::replace_it`). **The keyring is left as it is**, a key it
+/// holds included, since another server may be serving that one.
+fn for_the_environment(printable: bool) -> Result<ExitCode> {
+    if !printable {
+        return Err(ExitError::new(
+            ExitCode::Error,
+            format!("a key for {ENV} is kept nowhere, and is printed only to a terminal"),
+        )
+        .with_hint("run it in a terminal, or with --print")
+        .into());
+    }
+    let key = Key::generate()?;
+    ui::say!("{}", key.expose());
+    ui::info(&format!(
+        "Kept nowhere, fingerprint {}; set {ENV} to it wherever the server is started, and \
+         give it to the clients. The system keyring was not touched.",
+        key.fingerprint()
+    ));
     Ok(ExitCode::Ok)
 }
 
@@ -433,6 +459,16 @@ mod tests {
         let environment = Source::Environment.replace_it();
         assert!(environment.contains(ENV), "{environment}");
         assert!(!environment.contains("revoke"), "{environment}");
+        // The way it names makes a key and keeps it nowhere, whatever the
+        // keyring holds: "new --print" would be refused where it holds one.
+        assert!(environment.contains("new --env"), "{environment}");
+    }
+
+    #[test]
+    fn a_key_for_the_environment_is_printed_only_where_it_may_be() {
+        let refused = for_the_environment(false).unwrap_err();
+        assert_eq!(crate::exit::exit_code_for(&refused), ExitCode::Error);
+        assert!(refused.to_string().contains(ENV), "{refused}");
     }
 
     #[test]
