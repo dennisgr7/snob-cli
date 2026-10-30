@@ -659,7 +659,9 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   tasks are the stdio server's, shared by every session; a chat token from
   a stateless call is bound to its command only (see "A yes counts once").
   Ctrl+C (or the system, or `--stop-when-stdin-closes`) stops accepting,
-  stops every call's child as a canceled call's is stopped, waits for them
+  stops every call's child as a canceled call's is stopped, answers a call
+  still waiting on a form as not confirmed (`Server::in_a_form` races the
+  question against `Server::stopped`), waits for the children
   (`child::GRACE` and 5 s), **then for their answers to be written** (rmcp
   drops an answer it has not handed over once its token is canceled), and
   only then ends the streams and exits 130. **What the tunnel sees**: TLS

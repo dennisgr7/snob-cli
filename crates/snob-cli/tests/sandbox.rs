@@ -7142,12 +7142,17 @@ impl HttpMcp {
     /// The handshake of a client on 2025-11-25, which opens a session: its
     /// id.
     async fn open(&mut self) -> String {
+        self.open_with(serde_json::json!({})).await
+    }
+
+    /// [`Self::open`], for a client that declares `capabilities`.
+    async fn open_with(&mut self, capabilities: serde_json::Value) -> String {
         self.next += 1;
         let hello = serde_json::json!({
             "jsonrpc": "2.0", "id": self.next, "method": "initialize",
             "params": {
                 "protocolVersion": "2025-11-25",
-                "capabilities": {},
+                "capabilities": capabilities,
                 "clientInfo": { "name": "test", "version": "0" }
             }
         });
@@ -7931,6 +7936,76 @@ async fn ctrl_c_gives_running_calls_their_grace() {
 #[tokio::test]
 async fn ctrl_c_gives_a_stateless_call_its_answer() {
     stopped_during_a_call(false).await;
+}
+
+/// Asked to stop while a call waits for the person's answer in a form, the
+/// server answers that call (with a refusal: nobody said yes) before it
+/// ends the streams, rather than drop it with the form still on screen.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn ctrl_c_answers_a_call_waiting_on_a_form() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let session = server
+        .open_with(serde_json::json!({ "elicitation": { "form": {} } }))
+        .await;
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 600, "method": "tools/call",
+        "params": { "name": "snob_list", "arguments": { "list": "followers", "account": "someone" } }
+    });
+    let response = server
+        .http
+        .post(server.url())
+        .header("Authorization", format!("Bearer {MCP_KEY}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Mcp-Session-Id", &session)
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .body(request.to_string())
+        .send()
+        .await
+        .expect("the server answers");
+    assert_eq!(response.status().as_u16(), 200);
+    let (asked_tx, asked) = tokio::sync::oneshot::channel();
+    let read = tokio::spawn(async move {
+        let mut response = response;
+        let mut body = String::new();
+        let mut asked_tx = Some(asked_tx);
+        while let Ok(Some(chunk)) = response.chunk().await {
+            body.push_str(&String::from_utf8_lossy(&chunk));
+            if body.contains("elicitation/create")
+                && let Some(tx) = asked_tx.take()
+            {
+                let _ = tx.send(());
+            }
+        }
+        body
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(60), asked)
+        .await
+        .expect("asked within a minute")
+        .expect("asked");
+
+    let exited = server.stop().await;
+    assert_eq!(exited.code(), Some(130), "{}", server.said());
+    let body = tokio::time::timeout(std::time::Duration::from_secs(30), read)
+        .await
+        .expect("the stream ended")
+        .unwrap();
+    let answer = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data.trim()).ok())
+        .find(|message| message["id"] == 600)
+        .unwrap_or_else(|| panic!("the call was answered: {body}"));
+    assert_eq!(answer["result"]["isError"], true, "{answer}");
+    assert_eq!(followers_asked(&instagram).await, 0, "nothing was read");
 }
 
 #[cfg(feature = "mcp-http")]

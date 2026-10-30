@@ -1061,16 +1061,27 @@ impl Server {
             ))));
         }
 
-        // Raced against the call being canceled: a person who never answers
-        // is not a reason to hold a canceled call for ten minutes. No ticket
-        // here: the answer comes back to this very call, which runs once.
+        // Raced against the call being canceled, **and the server stopping**
+        // ([`Server::stopped`]): a person who never answers is not a reason
+        // to hold a canceled call for ten minutes, nor to keep a stopping
+        // server from answering it. A call still asking has no child, so it
+        // is not among those the server waits for; it answers here, at once,
+        // within the time the server gives every answer to be written
+        // (`http::CLOSING_WITHIN`), rather than be dropped with the form on
+        // screen. No ticket here: the answer comes back to this very call,
+        // which runs once.
         let asking = context
             .peer
             .create_elicitation_with_timeout(form()?, Some(ANSWER_WITHIN));
+        let stopped = self.stopped(context);
         let answer = tokio::select! {
             answer = asking => answer,
-            () = context.ct.cancelled() => { // spelling-allow: the SDK's name
-                return Ok(Some(Consent::refused("not_confirmed", "the call was canceled")));
+            () = stopped => {
+                return Ok(Some(Consent::refused(
+                    "not_confirmed",
+                    "the call was canceled, or the server is stopping, before anybody \
+                     answered; nothing was done",
+                )));
             }
         };
         Ok(Some(match answer {
