@@ -126,13 +126,15 @@ impl User {
 /// of mathematical symbols and CJK compatibility ideographs use, are removed
 /// outright, and U+FE0E/U+FE0F (text or emoji presentation; U+FE0F is what
 /// asks for an emoji drawn in color) are kept only alone, right after a
-/// character that can take a presentation ([`takes_a_presentation`]): a
-/// symbol outside ASCII, or a keycap base (`0`-`9`, `#`, `*`) when U+20E3
-/// follows and the keycap is drawn; never a letter, a combining mark,
-/// whitespace or any other ASCII character. What is left hides at most one
-/// bit per visible symbol, and nothing in a name written in letters and
-/// digits. Judged on what has been kept, so a selector cannot slip in behind
-/// a removed character.
+/// character that can take a presentation ([`takes_a_presentation`]): one
+/// in the ranges where Unicode puts the bases of those sequences (symbols,
+/// arrows, dingbats, the emoji blocks), or a keycap base (`0`-`9`, `#`,
+/// `*`) when U+20E3 follows and the keycap is drawn; never a letter, a
+/// digit, a combining mark of any script, whitespace, or punctuation but
+/// the four marks that are emoji themselves (U+203C, U+2049, U+3030,
+/// U+303D). What is left hides at most one bit per visible symbol, and
+/// nothing in a name written in letters, marks and digits. Judged on what
+/// has been kept, so a selector cannot slip in behind a removed character.
 pub fn printable(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -161,52 +163,47 @@ pub fn printable(text: &str) -> String {
 /// the only place [`printable`] keeps U+FE0E or U+FE0F; `keycap` is whether
 /// U+20E3 comes right after the selector.
 ///
-/// **An approximation, on purpose**: the real list of bases
-/// (`emoji-variation-sequences.txt`) is some 350 characters, and a table of
-/// it would have to follow every Unicode release. What matters is that no
-/// letter of any script qualifies, nor any digit but a drawn keycap's, so a
-/// name written in letters and digits can hide nothing; that no selector
-/// does, so a run keeps at most one; and that no combining mark does
-/// ([`is_combining_mark`]), so neither a mark stacked on a letter nor a
-/// keycap's U+20E3 drawn again over the same keycap carries one. The keycap
-/// bases are ASCII and are named, and qualify only before U+20E3 (`1`
-/// U+FE0F U+20E3); every other base is a symbol or punctuation outside
-/// ASCII, which costs a reader at most one invisible bit per visible
-/// character.
+/// **A positive list, on purpose**: the ranges where
+/// `emoji-variation-sequences.txt` puts every base it names (some 350
+/// characters), taken whole rather than character by character, so the
+/// table need not follow every Unicode release. No letter of any script,
+/// no decimal digit and no combining mark is in them, and of punctuation
+/// only four marks that are emoji bases themselves (U+203C, U+2049, U+3030,
+/// U+303D), so a name written in any script's letters, marks stacked on
+/// them included (a Devanagari virama, a Thai tone mark, the kana voiced
+/// mark of text in NFD), can hide nothing; no selector is, so a run keeps
+/// at most one; and U+20E3 is not, so a keycap's mark drawn again over the
+/// same keycap carries none. The symbols in them that Unicode counts as
+/// letters or numbers (U+2139 INFORMATION SOURCE, U+24C2, the enclosed
+/// letters and digits from U+1F100) are symbols to a reader, and several
+/// are emoji bases (U+2139, U+24C2, the squared A, B, O and P), so they
+/// keep their selector and are drawn in color. The keycap bases are ASCII
+/// and qualify only before U+20E3 (`1` U+FE0F U+20E3). Every character in
+/// the ranges is drawn as a symbol of its own, so what is kept costs a
+/// reader at most one invisible bit per visible symbol.
 fn takes_a_presentation(c: char, keycap: bool) -> bool {
-    if matches!(c, '0'..='9' | '#' | '*') {
-        return keycap;
+    match c {
+        '0'..='9' | '#' | '*' => keycap,
+        '\u{a9}'
+        | '\u{ae}'
+        | '\u{203c}'
+        | '\u{2049}'
+        | '\u{2122}'
+        | '\u{2139}'
+        | '\u{2194}'..='\u{21aa}'
+        | '\u{231a}'..='\u{23fa}'
+        | '\u{24c2}'
+        | '\u{25aa}'..='\u{25fe}'
+        | '\u{2600}'..='\u{27bf}'
+        | '\u{2934}'..='\u{2935}'
+        | '\u{2b05}'..='\u{2b55}'
+        | '\u{3030}'
+        | '\u{303d}'
+        | '\u{3297}'
+        | '\u{3299}'
+        | '\u{1f000}'..='\u{1faff}' => true,
+        _ => false,
     }
-    !c.is_ascii()
-        && !c.is_alphanumeric()
-        && !c.is_whitespace()
-        && !is_combining_mark(c)
-        && !matches!(c, '\u{fe00}'..='\u{fe0f}')
-}
-
-/// Whether `c` is in one of the blocks of combining marks a selector may not
-/// follow ([`takes_a_presentation`]).
-///
-/// An approximation too: the marks of most scripts (an Indic vowel sign, an
-/// Arabic vowel mark) are `Alphabetic`, which `char::is_alphanumeric`
-/// already turns away, so what is left to name is the marks that belong to
-/// no one script's letters: the combining diacritics with their extended and
-/// supplementary blocks, the marks for symbols (U+20E3, the keycap, among
-/// them) and the half marks; and the Cyrillic, Hebrew and Arabic marks that
-/// are not `Alphabetic`.
-fn is_combining_mark(c: char) -> bool {
-    matches!(c,
-        '\u{0300}'..='\u{036f}'
-        | '\u{0483}'..='\u{0489}'
-        | '\u{0591}'..='\u{05c7}'
-        | '\u{0610}'..='\u{061a}'
-        | '\u{064b}'..='\u{065f}'
-        | '\u{0670}'
-        | '\u{06d6}'..='\u{06ed}'
-        | '\u{1ab0}'..='\u{1aff}'
-        | '\u{1dc0}'..='\u{1dff}'
-        | '\u{20d0}'..='\u{20ff}'
-        | '\u{fe20}'..='\u{fe2f}')
 }
 
 /// The characters that show nothing but change how their neighbors read.
@@ -236,7 +233,7 @@ fn is_combining_mark(c: char) -> bool {
 ///   drawn as nothing, which may follow any letter as often as anyone likes;
 ///   a Mongolian letter they would shape is drawn in its plain form, and
 ///   nothing else is lost. (Of the standard sixteen, [`printable`] keeps
-///   U+FE0E and U+FE0F alone after a symbol, and nothing else.)
+///   U+FE0E and U+FE0F alone after an emoji base, and nothing else.)
 /// - **Blank by rendering rather than by category** — the soft hyphen, the
 ///   combining grapheme joiner (U+034F, a mark, `Mn`), the Khmer inherent
 ///   vowels (U+17B4–U+17B5, marks too), the Mongolian vowel separator, the
@@ -586,8 +583,10 @@ mod tests {
     }
 
     /// The sequences a selector is for come through whole: an emoji asking
-    /// for color or for text, a copyright sign drawn as an emoji, and a
-    /// keycap, whose base is an ASCII digit or `#`.
+    /// for color or for text, a copyright sign drawn as an emoji, a keycap,
+    /// whose base is an ASCII digit or `#`, and the emoji whose base Unicode
+    /// counts as a letter (the information sign, the circled M, the squared
+    /// A and P).
     #[test]
     fn real_presentation_sequences_come_back_whole() {
         for real in [
@@ -597,6 +596,10 @@ mod tests {
             "1\u{fe0f}\u{20e3}",
             "#\u{fe0f}\u{20e3}",
             "Ana \u{2600}\u{fe0f} Sol",
+            "\u{2139}\u{fe0f}",
+            "\u{24c2}\u{fe0f}",
+            "\u{1f170}\u{fe0f}",
+            "\u{1f17f}\u{fe0f}",
         ] {
             assert_eq!(printable(real), real);
         }
@@ -640,12 +643,25 @@ mod tests {
     }
 
     /// A combining mark is no base for a selector: not one stacked on a
-    /// letter, which would hide a bit per letter of a plain Latin name, and
-    /// not a keycap's U+20E3 drawn again over the same keycap.
+    /// letter, which would hide a bit per letter of a plain Latin name, nor
+    /// the marks of ordinary Hindi, Thai and Japanese in NFD (a virama, a
+    /// tone mark, the voiced mark), nor a run of marks stacked on one
+    /// letter, and not a keycap's U+20E3 drawn again over the same keycap.
     #[test]
     fn a_selector_after_a_combining_mark_does_not_survive() {
         assert_eq!(printable("a\u{301}\u{fe0f}"), "a\u{301}");
         assert_eq!(printable("e\u{20dd}\u{fe0e}"), "e\u{20dd}");
+        assert_eq!(printable("a\u{94d}\u{fe0f}"), "a\u{94d}");
+        assert_eq!(printable("\u{e01}\u{e48}\u{fe0f}"), "\u{e01}\u{e48}");
+        assert_eq!(printable("\u{304b}\u{3099}\u{fe0e}"), "\u{304b}\u{3099}");
+        let stacked: String = (0..40)
+            .flat_map(|i| ['\u{951}', if i % 2 == 0 { '\u{fe0e}' } else { '\u{fe0f}' }])
+            .collect();
+        let marks = "\u{951}".repeat(40);
+        assert_eq!(
+            printable(&format!("Maria{stacked}")),
+            format!("Maria{marks}")
+        );
         assert_eq!(
             printable("1\u{fe0f}\u{20e3}\u{fe0f}\u{20e3}\u{fe0e}\u{20e3}\u{fe0f}"),
             "1\u{fe0f}\u{20e3}\u{20e3}\u{20e3}"

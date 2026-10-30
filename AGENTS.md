@@ -736,9 +736,12 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   and the marks that draw nothing (the whole of `Default_Ignorable_Code_Point`:
   the combining grapheme joiner, the Mongolian and supplementary variation
   selectors, U+FE00 to U+FE0D, and U+FE0E/U+FE0F anywhere but alone right
-  after a symbol, or after a keycap base with U+20E3 next; never after a
-  letter, a digit or a combining mark: one selector per letter hides four
-  bits a letter, a run a byte each); whitespace controls become a space.
+  after a symbol in the ranges where Unicode puts the bases of presentation
+  sequences (a positive list, `takes_a_presentation`), or after a keycap
+  base with U+20E3 next; never after a letter, a digit, a combining mark
+  of any script or punctuation that is no emoji: one selector per letter or
+  mark hides four bits each, a run a byte each); whitespace controls become
+  a space.
 - **No `@` in a command handed over to be typed back** (PowerShell's splatting
   eats an unquoted `@name`, and the command then answers about the user's own
   account). Names are accepted with or without it; the help explains quoting.
