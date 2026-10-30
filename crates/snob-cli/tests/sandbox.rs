@@ -5861,6 +5861,41 @@ async fn a_start_that_waited_while_the_session_went_makes_no_job() {
     assert!(made.is_empty(), "no job was made: {made:?}");
 }
 
+/// A jobs directory that cannot be made keeps neither `logout` nor `purge`
+/// from deleting the session: there are no jobs to stop there, and none
+/// could start.
+#[tokio::test]
+async fn a_jobs_directory_that_cannot_be_made_keeps_no_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mine = snob_store::paths::AppPaths::rooted_at(tmp.path()).account(PK);
+
+    log_in(tmp.path(), &instagram);
+    std::fs::write(mine.jobs_dir(), b"x").unwrap();
+    assert!(mine.session_file().exists());
+    let out = snob(tmp.path(), Some(&instagram), &["logout"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(!mine.session_file().exists(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("could not hold the jobs"),
+        "{}",
+        stderr(&out)
+    );
+
+    std::fs::remove_file(mine.jobs_dir()).unwrap();
+    log_in(tmp.path(), &instagram);
+    std::fs::write(mine.jobs_dir(), b"x").unwrap();
+    let pk = PK.get().to_string();
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["purge", "--account", &pk, "--yes"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(!mine.session_file().exists(), "{}", stderr(&out));
+    assert!(!mine.db_file().exists(), "{}", stderr(&out));
+}
+
 /// `logout` stops the account's jobs too: a walk would otherwise go on with
 /// a session being deleted.
 #[tokio::test]

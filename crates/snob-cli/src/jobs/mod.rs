@@ -504,27 +504,58 @@ impl Stopping {
     /// dropped: a start waiting on the lock then finds the session gone and
     /// makes nothing (`start::make`). An account with no directory of its
     /// own has no jobs and gets none.
-    pub fn every_job_of(account: &AccountPaths) -> io::Result<Self> {
-        let Some(lock) = lock_jobs(account)? else {
-            return Ok(Self {
-                ids: Vec::new(),
-                account: account.clone(),
-                _lock: None,
-            });
+    ///
+    /// **Never a reason to keep a session**: `purge` and `logout` call this
+    /// before they delete anything, and bookkeeping for jobs that may not
+    /// exist must not keep a credential from going. So it does not fail. A
+    /// jobs directory or `.lock` that cannot be made or taken (a stray file
+    /// in its place, a full disk, an ACL that refuses) is warned about and
+    /// taken as no jobs to stop: where the lock cannot be taken, no job can
+    /// start either (`start::make` takes the same one). A job that cannot be
+    /// read or told to stop is warned about and not waited for.
+    pub fn every_job_of(account: &AccountPaths) -> Self {
+        let none = || Self {
+            ids: Vec::new(),
+            account: account.clone(),
+            _lock: None,
+        };
+        let lock = match lock_jobs(account) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return none(),
+            Err(e) => {
+                crate::ui::warn(&format!(
+                    "could not hold the jobs of {}: {e}; going on without stopping them",
+                    account.dir().display()
+                ));
+                return none();
+            }
         };
         let now = snob_core::clock::now_ms().get();
+        let jobs = all(account, now).unwrap_or_else(|e| {
+            crate::ui::warn(&format!(
+                "could not read the jobs of {}: {e}; going on without stopping them",
+                account.dir().display()
+            ));
+            Vec::new()
+        });
         let mut ids = Vec::new();
-        for seen in all(account, now)? {
-            if !seen.status.is_over() {
-                ask_to_stop(&seen)?;
-                ids.push(seen.id);
+        for seen in jobs {
+            if seen.status.is_over() {
+                continue;
+            }
+            match ask_to_stop(&seen) {
+                Ok(()) => ids.push(seen.id),
+                Err(e) => crate::ui::warn(&format!(
+                    "could not ask job {} to stop: {e}; going on",
+                    seen.id.as_str()
+                )),
             }
         }
-        Ok(Self {
+        Self {
             ids,
             account: account.clone(),
             _lock: Some(lock),
-        })
+        }
     }
 
     /// Waits, at most `within`, for every job asked to stop to be over and
@@ -556,25 +587,24 @@ impl Stopping {
 /// the supervisor to write its ending.
 pub const STOPPING_WITHIN: Duration = Duration::from_secs(GRACE.as_secs() + 5);
 
-/// For `purge` and `logout`: stops the jobs of `accounts`, holding each one's jobs lock so no other
-/// starts, and waits for them to have stopped (`jobs::Stopping`). Said when
-/// there were any, and warned when one did not stop in time; the removal goes
-/// on either way.
+/// For `purge` and `logout`: stops the jobs of `accounts`, holding each
+/// one's jobs lock so no other starts, and waits for them to have stopped
+/// (`jobs::Stopping`). Said when there were any, and warned when one did not
+/// stop in time, or could not be held; **the removal goes on either way**
+/// ([`Stopping::every_job_of`] does not fail), so a session is never kept
+/// over its jobs.
 pub async fn stop_before_leaving(accounts: Vec<AccountPaths>) -> anyhow::Result<Vec<Stopping>> {
     let (stopping, settled) = tokio::task::spawn_blocking(move || {
-        let stopping = accounts
-            .iter()
-            .map(Stopping::every_job_of)
-            .collect::<std::io::Result<Vec<_>>>()?;
+        let stopping: Vec<Stopping> = accounts.iter().map(Stopping::every_job_of).collect();
         // Every one waited for, whether or not one before it settled.
         let late = stopping
             .iter()
             .filter(|jobs| !jobs.wait(STOPPING_WITHIN))
             .count();
         let settled = late == 0;
-        Ok::<_, std::io::Error>((stopping, settled))
+        (stopping, settled)
     })
-    .await??;
+    .await?;
     let count: usize = stopping.iter().map(|jobs| jobs.ids.len()).sum();
     if count > 0 {
         crate::ui::say!(
@@ -805,7 +835,7 @@ mod tests {
         let now = snob_core::clock::now_ms().get();
         let queued = made(&account, now, None);
         let done = made(&account, now, Some((Status::Succeeded, now)));
-        let stopping = Stopping::every_job_of(&account).unwrap();
+        let stopping = Stopping::every_job_of(&account);
         assert_eq!(stopping.ids, std::slice::from_ref(&queued));
         assert!(account.job_dir(&queued).join("stop").exists());
         assert!(!account.job_dir(&done).join("stop").exists());
@@ -820,12 +850,28 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let account = account(&tmp);
         account.ensure_dirs().unwrap();
-        let stopping = Stopping::every_job_of(&account).unwrap();
+        let stopping = Stopping::every_job_of(&account);
         assert!(stopping.ids.is_empty());
         let lock = account.jobs_dir().join(".lock");
         assert!(paths::try_lock_file(&lock).unwrap().is_none(), "held");
         drop(stopping);
         assert!(paths::try_lock_file(&lock).unwrap().is_some(), "let go of");
+    }
+
+    /// A jobs directory that cannot be made (a plain file in its place) is no
+    /// jobs to stop, not a failure that would keep `logout` or `purge` from
+    /// deleting the session; no job could start there either.
+    #[tokio::test]
+    async fn a_jobs_directory_that_cannot_be_made_stops_nothing_and_fails_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = account(&tmp);
+        account.ensure_dirs().unwrap();
+        std::fs::write(account.jobs_dir(), b"x").unwrap();
+        assert!(lock_jobs(&account).is_err(), "the lock cannot be taken");
+        let stopping = stop_before_leaving(vec![account.clone()]).await.unwrap();
+        assert_eq!(stopping.len(), 1);
+        assert!(stopping[0].ids.is_empty());
+        assert!(stopping[0]._lock.is_none());
     }
 
     /// A read sweeps what is past its keeping when nobody holds the jobs
@@ -853,7 +899,7 @@ mod tests {
     fn an_account_with_no_jobs_has_none_to_stop_and_gets_no_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let account = account(&tmp);
-        let stopping = Stopping::every_job_of(&account).unwrap();
+        let stopping = Stopping::every_job_of(&account);
         assert!(stopping.ids.is_empty());
         assert!(stopping.wait(Duration::ZERO));
         assert!(!account.jobs_dir().exists());
