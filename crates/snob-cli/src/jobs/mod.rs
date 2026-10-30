@@ -33,8 +33,10 @@
 //! `snob jobs` and `purge` work in every build (`tokio`'s `process` is the
 //! `mcp` feature's).
 //!
-//! Files in a job's directory, each `0600` on Unix and under the account's
-//! user-only directory on Windows:
+//! Files in a job's directory, each `0600` on Unix (created so, by
+//! `paths::replace_private`, `supervise::private`, `detach` and
+//! [`private_marker`]) and under the account's user-only directory on
+//! Windows:
 //! - `job.json`, written by `start`, and once more with how it was detached;
 //! - `state.json`, written by the supervisor alone, or by `start` for a
 //!   supervisor that could not be started;
@@ -382,12 +384,18 @@ pub(crate) fn lock_jobs(account: &AccountPaths) -> io::Result<std::fs::File> {
 /// Asks a job to stop. Nothing else is touched: its supervisor reads the
 /// file.
 pub(crate) fn ask_to_stop(seen: &Seen) -> io::Result<()> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(file(&seen.dir, "stop"))
-        .map(drop)
+    private_marker(&file(&seen.dir, "stop"))
+}
+
+/// An empty file whose being there is what it says (`lock`, `stop`), made
+/// `0600` on Unix like every other file of a job's, and left as it is when
+/// it is there already.
+pub(crate) fn private_marker(path: &Path) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path).map(drop)
 }
 
 /// Forgets what `account`'s jobs no longer need, under the jobs lock the

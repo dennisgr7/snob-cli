@@ -2,9 +2,9 @@
 //!
 //! **Only the account's own jobs**, the account this run acts as: an id is
 //! looked for in that account's jobs directory and nowhere else, so an agent
-//! served for one account cannot read, or stop, a walk of another's (C1-6 in
-//! the plan's review). An id of another account's, or one that is not an id,
-//! is "no such job".
+//! served for one account cannot read, or stop, a walk of another's
+//! (AGENTS.md, "The MCP server", the jobs). An id of another account's, or
+//! one that is not an id, is "no such job".
 //!
 //! Nothing here writes but `cancel`'s `stop` file, so `snob jobs` and
 //! `snob status` keep the promise that reading costs nothing.

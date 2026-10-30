@@ -547,6 +547,15 @@ impl ServerHandler for Server {
             Ok(permits) => permits,
             Err(busy) => return Ok(refusal("busy", &busy.why()).into()),
         };
+        // Before the person is asked, too: what would refuse the call once
+        // it has its yes that this server's permits do not see, the
+        // account's jobs (`refused_ahead`).
+        if plan.ask.is_some()
+            && plan.spends != tools::Spends::Nothing
+            && let Some(refused) = self.refused_ahead(&plan, &request.name, &context).await?
+        {
+            return Ok(refused.into());
+        }
         let mut via = None;
         if let Some(question) = &plan.ask {
             // So that a token printed in one conversation is no yes in
@@ -673,6 +682,73 @@ impl ServerHandler for Server {
 }
 
 impl Server {
+    /// What would refuse a call that may reach Instagram once it was given
+    /// its yes, asked before the person is, so nobody says yes to a call
+    /// that is then refused and no ticket is spent on one: **the account's
+    /// jobs**, which this server's permits do not see, since a job's walk
+    /// goes on in a process of its own once the call that started it has
+    /// answered. Read through a `snob __job` child, which spends nothing, as
+    /// all job I/O is (AGENTS.md, "The MCP server").
+    ///
+    /// - A walk run as a job: `__job start --check` ([`tools::Plan::
+    ///   check_line`]), whose refusal (`too_many_jobs`, `job_stopping`,
+    ///   `walked_elsewhere`, no session) is the call's own.
+    /// - Any other call that may reach Instagram, a write: `__job list`, and
+    ///   `busy` while a job of the account is queued or walking, since its
+    ///   walk holds the account (`--spend-alone`).
+    ///
+    /// Not seen ahead: another process that holds the account (another
+    /// server's call, or a job started between this and the yes), which the
+    /// call's child still refuses as `busy` after the yes.
+    async fn refused_ahead(
+        &self,
+        plan: &tools::Plan,
+        tool: &str,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<Option<CallToolResult>, McpError> {
+        let asked = match plan.run {
+            Run::Job { .. } => plan.check_line(),
+            Run::Inline => [crate::jobs::start::COMMAND, "list", "--json"]
+                .map(String::from)
+                .to_vec(),
+            Run::Show { .. } | Run::Cancel => return Ok(None),
+        };
+        let _running = self.in_flight.enter();
+        let mut line = vec![self.waits.flag(Run::Inline)];
+        line.extend(asked);
+        let stop = self.stopped(context);
+        let finished = self
+            .launch
+            .run(&line, stop, HEARTBEAT, |_| std::future::ready(()))
+            .await
+            .map_err(|e| McpError::internal_error(format!("snob could not be run: {e}"), None))?;
+        if finished.code != ExitCode::Ok {
+            return Ok(Some(result(answer::from(plan, finished), tool)));
+        }
+        if matches!(plan.run, Run::Job { .. }) {
+            return Ok(None);
+        }
+        let walking = finished
+            .json
+            .as_ref()
+            .and_then(|doc| doc.get("jobs"))
+            .and_then(Value::as_array)
+            .and_then(|jobs| jobs.iter().find(|doc| job::going(doc)))
+            .and_then(|doc| doc.get("job_id"))
+            .and_then(Value::as_str)
+            .map(snob_core::model::printable);
+        Ok(walking.map(|id| {
+            refusal(
+                "busy",
+                &format!(
+                    "job {id} of this account is walking a list, and one call that reaches \
+                     Instagram runs at a time; nothing was asked or sent. Call this again once \
+                     it has ended (snob_job tells when), or stop it with snob_job_cancel"
+                ),
+            )
+        }))
+    }
+
     /// What a call's child said, as the call's result, read as its plan
     /// says it runs. `as_task`: a walk that has not ended is answered with
     /// a task rather than with how its job stands (`tasks.rs`).

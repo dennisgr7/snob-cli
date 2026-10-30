@@ -11,7 +11,10 @@
 //! beside it.
 //!
 //! **Taken before anything is asked**, so nobody says yes to a call that is
-//! then refused, and no ticket is spent on one. **Never queued**: a call over
+//! then refused, and no ticket is spent on one; so is a look at the
+//! account's jobs, whose walks run in processes of their own and hold none
+//! of these permits once the call that started them has answered
+//! (`mod.rs`, `Server::refused_ahead`). **Never queued**: a call over
 //! a limit answers `busy` at once, and the agent calls again when the other
 //! has finished. A queue would hold a call for as long as another walks, past
 //! what the client waits for. Permits are held until the call returns, which
@@ -21,6 +24,8 @@
 //! that may reach Instagram is run with `--spend-alone` (`tools::Plan::
 //! command_line`) and takes the account's lock before it sends anything
 //! (`app::spend_alone`), which holds across servers, clients and processes.
+//! What holds that lock in another process, another server's call, can
+//! still refuse a call after its yes, as `busy`.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

@@ -196,13 +196,16 @@ pub fn standing(doc: &Value, cancel: bool) -> (Answer, String) {
         );
     }
 
-    let said = if cancel {
-        if going {
-            format!(
-                "Job {id} was asked to stop and is stopping; what it read is kept. snob_job \
-                 tells when it has stopped."
-            )
-        } else if doc.get("stop_asked") == Some(&Value::Bool(true)) {
+    // A job on its way out is never told as one that goes on, whoever
+    // asked it to stop.
+    let stopping = doc.get("stop_asked") == Some(&Value::Bool(true));
+    let said = if going && (cancel || stopping) {
+        format!(
+            "Job {id} was asked to stop and is stopping; what it read is kept. snob_job tells \
+             when it has stopped."
+        )
+    } else if cancel {
+        if stopping {
             format!(
                 "Job {id} has stopped ({status}); what it read is kept, and the next walk of \
                  the list continues from it. snob_job with its job_id gives what it read."

@@ -424,9 +424,9 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   failure: exit 3 is what it was asked, as exit 5 is in a cooldown. **Every
   hint that is advice to the person at a terminal is replaced the same
   way**, by the failure's `reason` (`answer::agent_hint`: `too_many_jobs`,
-  `no_such_job`, `nothing_stored`, `budget_wait`), with the tools that do it
-  instead; a failure's message is its sentences, the records of the log left
-  out (`jobs::show::sentences`).
+  `no_such_job`, `job_stopping`, `nothing_stored`, `budget_wait`), with the
+  tools that do it instead; a failure's message is its sentences, the
+  records of the log left out (`jobs::show::sentences`).
 - **`snob_profile` stays inline, not a job**: its walk of the mutual
   followers is at most `MUTUAL_PAGE_CAP` (10) pages, and it pays first any
   rest between sittings an earlier walk of the account left owed, up to 15
@@ -451,9 +451,15 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   60 calls a minute, which also keeps the tickets alive under `seal.rs`'s
   4096. Taken before anything is asked, so nobody says yes to a call that is
   then refused; past a limit the call answers `busy` at once and is never
-  queued; held until the child has exited. Across processes, every child
-  that may reach Instagram is run with the hidden `--spend-alone`
-  (`tools::Plan::command_line`, outside the binding) and takes
+  queued; held until the child has exited. **The account's jobs are asked
+  before anything is asked too** (`Server::refused_ahead`), since a job's
+  walk holds no permit once its call answered: a walk run as a job through
+  `__job start --check`, which makes nothing and fails as the start would
+  (`too_many_jobs`, `job_stopping`, `walked_elsewhere`), and a write through
+  `__job list`, `busy` while a job is queued or walking. Only another
+  process holding `spend.lock` can still refuse after the yes. Across
+  processes, every child that may reach Instagram is run with the hidden
+  `--spend-alone` (`tools::Plan::command_line`, outside the binding) and takes
   `accounts/<pk>/spend.lock` in `App::open`, before any request; held
   elsewhere, it exits 1 with `reason: "busy"` in its JSON failure, which the
   server hands the agent as code `busy`. Why: the persistent budget bounds
@@ -503,10 +509,12 @@ reaches a server already listening: no command, no key, see "Over HTTP").
 - **A walk can outlive the call that started it, as a job** (`jobs/`, in
   every build: `std` processes and threads, no `mcp` feature). `snob __job
   start` checks the walk, makes the job under the account's `jobs/.lock`
-  (one running per account: the same command again is `reused`, another is
-  `too_many_jobs`; a list a lost job may still hold is `walked_elsewhere`,
-  with until when), starts its supervisor detached (`detach.rs`) and answers
-  with **one** compact JSON document: the record, and the walk's answer under
+  (one running per account: the same command again is `reused`, the
+  `--confirmed-*` aside, another is `too_many_jobs`, and one asked to stop
+  that has not yet is `job_stopping`, never reused; a list a lost job may
+  still hold is `walked_elsewhere`, with until when), starts its supervisor
+  detached (`detach.rs`) and answers with **one** compact JSON document:
+  the record, and the walk's answer under
   `finished` when it ended within `--wait`. Asked to stop before it answered
   (its standard input closing), it stops the job it made, since nobody would
   ever be told the id. The supervisor, `__job run <id>`, holds the job's
@@ -644,7 +652,8 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   exit's token, and `reason` a finer one when there is one
   (`ExitError::with_reason`, e.g. `busy`, `mcp_write_cap`,
   `walked_elsewhere`, `nothing_stored`, `budget_wait` for a wait past
-  `--max-wait`, and a job's `too_many_jobs`, `no_such_job`, `refused_argv`).
+  `--max-wait`, and a job's `too_many_jobs`, `job_stopping`, `no_such_job`,
+  `refused_argv`).
   `cooldown_until` is when a cooldown that refused the run lifts
   (`ExitError::with_cooldown_until`).
 - **Exit codes are stable** (`exit.rs`, `snob_core::watch::RunOutcome`, the

@@ -5,7 +5,7 @@
 //! it, and the walk's answer under `finished` when it ended within `--wait`.
 //! One document and nothing before it, so a caller reads it the way it reads
 //! any command's output, once it has ended; a first line with the id would be
-//! read as a document of its own (C2-8 in the plan's review).
+//! read as a document of its own.
 //!
 //! What it does, in order:
 //! - checks the command (`argv::check`) and that a session is stored, which
@@ -15,14 +15,23 @@
 //! - under the account's jobs lock, so two starts at once make one job:
 //!   sweeps (`jobs::sweep`); answers with the job already running when it
 //!   runs the same command (`reused`), and refuses when it runs another
-//!   (`too_many_jobs`: one at a time per account); refuses a walk of a list a
-//!   lost job may still hold, saying until when (`walked_elsewhere`); and
-//!   makes the job's directory and record;
+//!   (`too_many_jobs`: one at a time per account), or when it was asked to
+//!   stop and has not yet (`job_stopping`: **a job on its way out is never
+//!   handed to a new start**, which would be given a walk about to end
+//!   `canceled`); refuses a walk of a list a lost job may still hold, saying
+//!   until when (`walked_elsewhere`); and makes the job's directory and
+//!   record;
 //! - starts the supervisor, detached (`detach.rs`), with the global flags of
 //!   this run that decide where its files are and nothing else
 //!   (`argv::globals`); never `--stop-when-stdin-closes`, which this process
 //!   may carry;
 //! - waits up to 10 s for the supervisor, then up to `--wait` for the walk.
+//!
+//! **`--check` makes nothing**: past the command's and the session's checks
+//! it answers `{"would": "start"}`, or `{"would": "reuse", "job_id": …}`, or
+//! the refusal a start would meet now, reading the jobs and writing nothing.
+//! It is what the MCP server asks before it asks the person for a yes, so
+//! nobody says yes to a walk a running job then refuses.
 //!
 //! **A job is left running only once its id has been handed over.** Asked to
 //! stop before it has answered (Ctrl+C, or, under `--stop-when-stdin-closes`,
@@ -61,6 +70,13 @@ enum Made {
     Reused(JobId),
 }
 
+/// What the account's jobs leave a start of a walk: nothing in its way, or
+/// the job already running it to reuse ([`vet`]).
+enum Found {
+    Free,
+    Reuse(JobId),
+}
+
 fn refused(why: String) -> anyhow::Error {
     ExitError::new(ExitCode::Error, format!("{why}; nothing was started"))
         .with_reason("refused_argv")
@@ -91,6 +107,20 @@ pub async fn run(
             session.ds_user_id
         ),
         Some(_) => {}
+    }
+    if args.check {
+        let account = account.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            let now = snob_core::clock::now_ms().get();
+            vet(&super::all(&account, now)?, &checked, now)
+        })
+        .await??;
+        let out = match found {
+            Found::Free => json!({ "would": "start" }),
+            Found::Reuse(id) => json!({ "would": "reuse", "job_id": id.as_str() }),
+        };
+        crate::ui::say!("{}", serde_json::to_string(&out)?);
+        return Ok(ExitCode::Ok);
     }
     // What it would cost, said with the job; nothing is sent to know it, and
     // a job is still started when it cannot be told.
@@ -175,25 +205,38 @@ pub async fn run(
     Ok(ExitCode::Ok)
 }
 
-/// Under the account's jobs lock: sweeps, finds a job to reuse or a reason to
-/// refuse, or makes the job and starts its supervisor.
-fn make(
-    account: &AccountPaths,
-    mut job: Job,
-    checked: &argv::Checked,
-    supervisor_globals: Vec<OsString>,
-) -> Result<Made> {
-    let _lock = super::lock_jobs(account)?;
-    let now = snob_core::clock::now_ms().get();
-    super::sweep(account, now);
-    let jobs = super::all(account, now)?;
+/// Whether the walk `checked` may start now among the account's `jobs`, read
+/// at `now`: the job already running it, to reuse; or a refusal, for another
+/// job running, one asked to stop that has not stopped yet, or a lost job's
+/// claim on a list it walks. It writes nothing: a start calls it under the
+/// jobs lock, and `--check` without it.
+fn vet(jobs: &[super::Seen], checked: &argv::Checked, now: i64) -> Result<Found> {
     if let Some(running) = jobs.iter().find(|seen| !seen.status.is_over()) {
+        // On its way out: reused, it would hand this start a walk about to
+        // end `canceled`, and another may not start beside it.
+        if running.stop_asked {
+            return Err(ExitError::new(
+                ExitCode::Error,
+                format!(
+                    "{} ({}) was asked to stop and is stopping, and one job runs at a time; \
+                     nothing was started",
+                    running.id,
+                    show::walks(running)
+                ),
+            )
+            .with_reason("job_stopping")
+            .with_hint(format!(
+                "ask again once it has stopped, which \"snob jobs show {}\" tells",
+                running.id
+            ))
+            .into());
+        }
         if running
             .job
             .as_ref()
-            .is_some_and(|other| other.argv == job.argv)
+            .is_some_and(|other| same_walk(&other.argv, &checked.args))
         {
-            return Ok(Made::Reused(running.id.clone()));
+            return Ok(Found::Reuse(running.id.clone()));
         }
         return Err(ExitError::new(
             ExitCode::Error,
@@ -210,7 +253,7 @@ fn make(
     }
     // A job that died without letting go of its list: another walk of the
     // list is refused until its claim runs out, and saying when is the one
-    // useful answer (C1-11 in the plan's review).
+    // useful answer.
     if let Some(lost) = jobs.iter().find(|seen| {
         seen.status == Status::Lost
             && seen.claim_frees_at() > now
@@ -235,23 +278,60 @@ fn make(
         .with_hint("ask again after that, and the walk continues where it stopped")
         .into());
     }
+    Ok(Found::Free)
+}
+
+/// Whether two command lines walk the same list in the same way: the same
+/// but for how a yes to them was given (`--confirmed-via`, `--confirmed-for`),
+/// which shapes what is recorded, not what is walked. A yes given in a form
+/// and one given in the chat are for the same walk.
+fn same_walk(one: &[String], other: &[String]) -> bool {
+    fn walk(line: &[String]) -> Vec<&str> {
+        let mut kept = Vec::with_capacity(line.len());
+        let mut tokens = line.iter();
+        while let Some(token) = tokens.next() {
+            if token.starts_with("--confirmed-") {
+                // Its value, when it was given apart from the flag.
+                if !token.contains('=') {
+                    tokens.next();
+                }
+                continue;
+            }
+            kept.push(token.as_str());
+        }
+        kept
+    }
+    walk(one) == walk(other)
+}
+
+/// Under the account's jobs lock: sweeps, finds a job to reuse or a reason to
+/// refuse ([`vet`]), or makes the job and starts its supervisor.
+fn make(
+    account: &AccountPaths,
+    mut job: Job,
+    checked: &argv::Checked,
+    supervisor_globals: Vec<OsString>,
+) -> Result<Made> {
+    let _lock = super::lock_jobs(account)?;
+    let now = snob_core::clock::now_ms().get();
+    super::sweep(account, now);
+    if let Found::Reuse(id) = vet(&super::all(account, now)?, checked, now)? {
+        return Ok(Made::Reused(id));
+    }
 
     let id = super::id::new(u64::try_from(now).unwrap_or(0))?;
     let dir = account.job_dir(&id);
     paths::create_private_dir(&dir)?;
     // The lock the supervisor holds, there before it is: a job whose lock
     // file is missing reads as nobody running it.
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(super::file(&dir, "lock"))?;
+    super::private_marker(&super::file(&dir, "lock"))?;
     job.id = id.to_string();
     super::write(&dir, "job.json", &job)?;
 
     let mut args = supervisor_globals;
     args.extend([COMMAND.into(), "run".into(), id.as_str().into()]);
-    // The program is this one, never a path read from anywhere (C1-5).
+    // The program is this one, never a path read from anywhere (AGENTS.md,
+    // "The MCP server": a supervisor runs itself).
     let exe = std::env::current_exe()?;
     let started = crate::detach::spawn(&exe, &args, None, &super::file(&dir, "supervisor.log"));
     let started = match started {
@@ -284,4 +364,117 @@ fn make(
     });
     super::write(&dir, "job.json", &job)?;
     Ok(Made::New(id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FOLLOWERS: [&str; 4] = ["followers", "--format", "json", "--no-interactive"];
+
+    fn checked(line: &[&str]) -> argv::Checked {
+        let line: Vec<String> = line.iter().map(|arg| arg.to_string()).collect();
+        argv::check(&line).unwrap()
+    }
+
+    /// A job of the account, read as `status`, running `line`.
+    fn seen(status: Status, stop_asked: bool, line: &[&str]) -> super::super::Seen {
+        let id = super::super::id::new(1).unwrap();
+        super::super::Seen {
+            id: id.clone(),
+            dir: std::path::PathBuf::new(),
+            job: Some(Job {
+                schema: SCHEMA,
+                id: id.to_string(),
+                created_at: 1,
+                viewer_pk: snob_core::Pk::new(42),
+                tool: None,
+                arguments: Value::Null,
+                argv: line.iter().map(|arg| arg.to_string()).collect(),
+                globals: Vec::new(),
+                estimate: None,
+                detached: None,
+                started_by: None,
+                max_wait_seconds: None,
+            }),
+            state: None,
+            held: true,
+            stop_asked,
+            status,
+        }
+    }
+
+    fn reason(refused: Result<Found>) -> Option<&'static str> {
+        match refused {
+            Ok(_) => None,
+            Err(e) => e.downcast_ref::<ExitError>().and_then(ExitError::reason),
+        }
+    }
+
+    /// **A job asked to stop is never handed to a new start** of its walk,
+    /// which would be given a walk about to end `canceled`; nor may another
+    /// start beside it.
+    #[test]
+    fn a_job_asked_to_stop_is_never_reused() {
+        for status in [Status::Queued, Status::Running] {
+            let stopping = [seen(status, true, &FOLLOWERS)];
+            assert_eq!(
+                reason(vet(&stopping, &checked(&FOLLOWERS), 2)),
+                Some("job_stopping")
+            );
+            assert_eq!(
+                reason(vet(
+                    &stopping,
+                    &checked(&["following", "--format", "json"]),
+                    2
+                )),
+                Some("job_stopping")
+            );
+        }
+        // Once it has stopped, a new job may start.
+        let stopped = [seen(Status::Canceled, true, &FOLLOWERS)];
+        assert!(matches!(
+            vet(&stopped, &checked(&FOLLOWERS), 2),
+            Ok(Found::Free)
+        ));
+    }
+
+    /// The same walk is the job already running it, however its yes was
+    /// given; another walk is refused.
+    #[test]
+    fn the_same_walk_is_reused_whatever_its_yes_and_another_is_refused() {
+        let running = [seen(
+            Status::Running,
+            false,
+            &[
+                "followers",
+                "someone",
+                "-y",
+                "--format",
+                "json",
+                "--confirmed-via=elicitation",
+                "--confirmed-for=test 0",
+            ],
+        )];
+        for line in [
+            &["followers", "someone", "-y", "--format", "json"][..],
+            &[
+                "followers",
+                "someone",
+                "-y",
+                "--format",
+                "json",
+                "--confirmed-via=chat",
+            ][..],
+        ] {
+            assert!(
+                matches!(vet(&running, &checked(line), 2), Ok(Found::Reuse(_))),
+                "{line:?}"
+            );
+        }
+        assert_eq!(
+            reason(vet(&running, &checked(&FOLLOWERS), 2)),
+            Some("too_many_jobs")
+        );
+    }
 }

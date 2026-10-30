@@ -68,6 +68,10 @@ fn agent_hint(reason: &str) -> Option<&'static str> {
              it has ended"
         }
         "no_such_job" => "snob_jobs lists this account's jobs and their ids",
+        "job_stopping" => {
+            "the account's job was asked to stop and is stopping: snob_job tells when it has \
+             stopped (its id is in the message); call this again then"
+        }
         "nothing_stored" => {
             "nothing of this list is stored yet: call snob_list again without offset and with \
              mode \"auto\" to read it"
@@ -333,6 +337,7 @@ mod tests {
         for (reason, exit, tool) in [
             ("too_many_jobs", ExitCode::Error, "snob_job_cancel"),
             ("no_such_job", ExitCode::Error, "snob_jobs"),
+            ("job_stopping", ExitCode::Error, "snob_job "),
             ("nothing_stored", ExitCode::Error, "mode \"auto\""),
             ("budget_wait", ExitCode::Interrupted, "snob_status"),
         ] {

@@ -615,6 +615,11 @@ pub struct JobStartArgs {
     #[arg(long, value_name = "CLIENT")]
     pub started_by: Option<String>,
 
+    /// Make nothing: say whether the walk would start now, or be the job
+    /// already running it, or what would refuse it
+    #[arg(long)]
+    pub check: bool,
+
     /// The walk, after `--`: one of the list commands and its flags
     #[arg(last = true, required = true, value_name = "COMMAND")]
     pub command: Vec<String>,

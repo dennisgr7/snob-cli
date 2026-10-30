@@ -513,6 +513,24 @@ impl Plan {
         line
     }
 
+    /// What asks, before the person is asked for a yes, whether the walk
+    /// this call starts as a job would start now (`snob __job start
+    /// --check`): it makes nothing and sends nothing, and fails with the
+    /// refusal a start would meet (`too_many_jobs`, `job_stopping`,
+    /// `walked_elsewhere`). The command as it is before a yes, which the
+    /// start compares with the running job's leaving out how a yes was
+    /// given (`jobs::start::same_walk`).
+    pub fn check_line(&self) -> Vec<String> {
+        let mut line = vec![
+            crate::jobs::start::COMMAND.to_string(),
+            "start".to_string(),
+            "--check".to_string(),
+            "--".to_string(),
+        ];
+        line.extend(self.command(None));
+        line
+    }
+
     /// The command and, for a call run on a yes, how it was given (see
     /// [`Plan::command_line`]).
     fn command(&self, confirmed: Option<&Confirmed<'_>>) -> Vec<String> {
@@ -1496,6 +1514,23 @@ mod tests {
                 .any(|plan| plan.spends != Spends::Nothing);
             assert_eq!(spec.open_world, may_reach, "{}", spec.name);
         }
+    }
+
+    /// A walk is checked, before anybody is asked about it, as the command
+    /// it is with no yes yet, and the check spends nothing.
+    #[test]
+    fn a_walk_is_checked_before_it_is_asked_about_as_its_own_command() {
+        let plan = call(
+            "snob_list",
+            json!({ "list": "followers", "account": "someone" }),
+        )
+        .unwrap();
+        assert!(plan.ask.is_some());
+        let line = plan.check_line();
+        assert_eq!(line[..4], ["__job", "start", "--check", "--"]);
+        assert_eq!(line[4..], plan.args[..]);
+        assert!(!line.iter().any(|arg| arg.starts_with("--confirmed-")));
+        assert!(!line.iter().any(|arg| arg == "--spend-alone"));
     }
 
     #[test]

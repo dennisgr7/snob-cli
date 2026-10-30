@@ -8,7 +8,7 @@
 //! not pass, running nothing. It is never re-planned from the call's
 //! arguments: `-y` is in the stored command line because the call that
 //! started the job was given it, and re-planning would put it there for a
-//! call that never was (C1-5 in the plan's review).
+//! call that never was.
 //!
 //! The command is judged by clap, on the subcommand it parses to, and the
 //! flags token by token against [`ALLOWED`]: an account called `follow` is a
@@ -223,7 +223,7 @@ pub(crate) fn globals(cli: &Cli, account: Pk) -> std::io::Result<Vec<OsString>> 
 /// [`globals`] and the job's `--max-wait`, **once**: what a supervisor is
 /// started with ahead of `__job run <id>`. The value is the one the process
 /// starting the job was given, and is never appended to one already there,
-/// which clap refuses (C2-9 in the plan's review).
+/// which clap refuses (a global flag given twice is an error).
 pub(crate) fn supervisor(cli: &Cli, account: Pk) -> std::io::Result<Vec<OsString>> {
     let mut args = globals(cli, account)?;
     push_max_wait(&mut args, cli.max_wait);

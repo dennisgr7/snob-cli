@@ -4676,6 +4676,74 @@ async fn a_second_write_while_one_is_asked_is_refused_as_busy() {
     assert_eq!(again["isError"], false, "{again}");
 }
 
+/// While a job of the account walks, a call it would refuse is refused
+/// before anything is asked, as the call itself would have been: another
+/// walk as `too_many_jobs`, a write as `busy`. Nobody says yes to a call
+/// that then does not run, though the job's walk holds none of the
+/// server's permits once its call has answered.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn nothing_is_asked_for_a_call_a_running_job_would_refuse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    // `answer` stays `None`: a question would fail the test.
+    let mut client = McpClient::start_with(
+        tmp.path(),
+        &instagram,
+        &["--allow-writes"],
+        serde_json::json!({ "elicitation": {} }),
+    )
+    .await;
+    let started = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "wait_seconds": 1 }),
+        )
+        .await;
+    assert_eq!(
+        started["structuredContent"]["status"], "running",
+        "{started}"
+    );
+    let id = started["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let theirs = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "account": "someone" }),
+        )
+        .await;
+    assert_eq!(theirs["isError"], true, "{theirs}");
+    let error = &theirs["structuredContent"]["error"];
+    assert_eq!(error["code"], "too_many_jobs", "{theirs}");
+    assert!(
+        error["hint"].as_str().unwrap().contains("snob_job_cancel"),
+        "{theirs}"
+    );
+
+    let follow = client
+        .call("snob_follow", serde_json::json!({ "account": "someone" }))
+        .await;
+    assert_eq!(follow["isError"], true, "{follow}");
+    assert_eq!(
+        follow["structuredContent"]["error"]["code"], "busy",
+        "{follow}"
+    );
+    assert_eq!(writes_sent(&instagram).await, 0, "nothing was written");
+
+    let stopped = client
+        .call("snob_job_cancel", serde_json::json!({ "job_id": id }))
+        .await;
+    assert_eq!(stopped["isError"], false, "{stopped}");
+}
+
 /// A child given `--spend-alone` refuses, before any request, while another
 /// run holds the account, with exit 1 and `busy` as the reason; the server
 /// gives the flag to the children that may reach Instagram, and an agent is
@@ -5536,6 +5604,65 @@ async fn a_second_job_for_the_account_is_refused_or_reused() {
         serde_json::from_str(stderr(&out).trim().lines().last().unwrap()).unwrap();
     assert_eq!(told["error"]["reason"], "too_many_jobs", "{told}");
     assert_eq!(jobs.dirs().len(), 1);
+}
+
+/// A job asked to stop that has not stopped yet is never handed to a new
+/// start of its walk, which would be given a walk about to end `canceled`:
+/// the start is refused as `job_stopping` with nothing started, and its
+/// `--check` says the same, writing nothing.
+#[tokio::test]
+async fn a_job_asked_to_stop_is_not_reused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let walk = &FOLLOWERS_JOB;
+    // Free to start, and the check says so.
+    let (out, told) = jobs.start("0s", &[&["--check"][..], &walk[..]].concat());
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(told.unwrap()["would"], "start");
+    assert!(jobs.dirs().is_empty(), "the check made nothing");
+
+    // A finished job made to stand as one still running and asked to stop:
+    // its ending taken away, its lock held here as its supervisor's would
+    // be, and a stop file written.
+    let id = jobs.started("60s", walk)["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dir = jobs.dirs()[0].clone();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+    state["status"] = "running".into();
+    state["finished_at"] = serde_json::Value::Null;
+    std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
+    std::fs::write(dir.join("stop"), b"").unwrap();
+    let held = snob_store::paths::try_lock_file(&dir.join("lock"))
+        .unwrap()
+        .expect("nobody holds the job's lock");
+    let standing = jobs.ask(&["show", &id, "--json"]);
+    assert_eq!(standing["status"], "running", "{standing}");
+    assert_eq!(standing["stop_asked"], true, "{standing}");
+
+    for check in [true, false] {
+        let mut line: Vec<&str> = if check { vec!["--check"] } else { Vec::new() };
+        line.extend_from_slice(walk);
+        let (out, told) = jobs.start("0s", &line);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        assert!(told.is_none(), "{}", stdout(&out));
+        let told: serde_json::Value =
+            serde_json::from_str(stderr(&out).trim().lines().last().unwrap()).unwrap();
+        assert_eq!(told["error"]["reason"], "job_stopping", "{told}");
+        assert!(
+            told["error"]["message"].as_str().unwrap().contains(&id),
+            "{told}"
+        );
+    }
+    assert_eq!(jobs.dirs().len(), 1, "nothing was started");
+    drop(held);
 }
 
 /// Two starts at once make one job: the count and the making are one step,
