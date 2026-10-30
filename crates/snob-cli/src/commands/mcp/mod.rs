@@ -178,10 +178,12 @@ impl Waits {
 ///   list walked as a job is bounded here whatever its length: the call
 ///   answers with the job's id once its wait is over, and the walk goes on.
 /// - **A profile** (`snob_profile`), which asks nothing and is run inline,
-///   and whose walk of the mutual followers pays first any rest between
-///   sittings an earlier walk of the account left owed, which `--max-wait`
-///   never cuts (AGENTS.md, "Pace"): the wait for the budget and the
-///   longest rest.
+///   and whose walk of the mutual followers counts toward the account's
+///   sitting, so it may wait out one rest between sittings before or
+///   between its pages (one an earlier walk left owed, or one its own
+///   pages draw), which `--max-wait` never cuts (AGENTS.md, "Pace"): the
+///   wait for the budget and the longest rest. One at most: a rest paid
+///   leaves a fresh sitting, which its ten pages cannot fill.
 pub fn longest_call(max_wait: Duration) -> Duration {
     let job = Duration::from_secs(tools::MOST_WAIT_SECONDS) + crate::jobs::start::SUPERVISOR_WITHIN;
     let asked = ANSWER_WITHIN + max_wait.max(job);

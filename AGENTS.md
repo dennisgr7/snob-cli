@@ -443,9 +443,12 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   message is its sentences, the records of the log and the progress lines
   left out (`jobs::show::sentences`).
 - **`snob_profile` stays inline, not a job**: its walk of the mutual
-  followers is at most `MUTUAL_PAGE_CAP` (10) pages, and it pays first any
-  rest between sittings an earlier walk of the account left owed, up to 15
-  minutes, which its description says and `mcp::longest_call` counts.
+  followers is at most `MUTUAL_PAGE_CAP` (10) pages, which count toward the
+  account's sitting as a list's do, so it may wait out one rest between
+  sittings, up to 15 minutes, before or between those pages (one an
+  earlier walk left owed, or one its own pages draw; a rest paid first
+  leaves a sitting ten pages cannot fill), which its description says and
+  `mcp::longest_call` counts.
   `openWorldHint` is per tool (`tools::Spec::open_world`): false for the
   tools whose every plan spends nothing (`snob_status` and the three job
   tools).

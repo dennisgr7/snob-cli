@@ -449,9 +449,10 @@ pub enum Command {
                       you follow each other, the accounts you follow that follow them, the \
                       highlights and whether anything is up right now. A few requests for the \
                       page, and up to ten pages of the accounts you follow that follow them, \
-                      which count toward the account's sitting as a list's pages do: a rest \
-                      between sittings that an earlier walk left owed, up to 15 minutes, is \
-                      waited out first. It walks neither of its lists and stores nothing.\n\n\
+                      which count toward the account's sitting as a list's pages do, so it may \
+                      wait out one rest between sittings, up to 15 minutes, before or between \
+                      those pages (one an earlier walk left owed, or one its own pages draw). \
+                      It walks neither of its lists and stores nothing.\n\n\
                       From the browser, finding another account's id costs one more until snob \
                       has walked its lists or a list that names it; your own is the session's. A \
                       name that cannot be an Instagram username is not found, for no request. \
