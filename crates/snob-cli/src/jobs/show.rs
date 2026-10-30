@@ -65,6 +65,69 @@ fn seconds(ms: i64) -> Epoch {
     EpochMs::new(ms).to_epoch()
 }
 
+/// Whether `line` is a record of the log, as `main::init_tracing` writes
+/// one (an optional time, a level, the spans and the module it came from,
+/// each ending in a colon), and not a sentence a command wrote for its
+/// reader. Such a record may carry what Instagram answered, and is no
+/// answer to hand an agent or a person reading a job's failure. Colors, when
+/// the log has them, are left out first.
+pub(crate) fn is_log_record(line: &str) -> bool {
+    let plain = without_colors(line);
+    let mut words = plain.split_whitespace();
+    let mut word = words.next();
+    // The time `--verbose` puts first: `2026-10-30T05:01:02.123456Z`.
+    if word.is_some_and(|w| w.starts_with(|c: char| c.is_ascii_digit())) {
+        word = words.next();
+    }
+    if !word.is_some_and(|w| matches!(w, "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR")) {
+        return false;
+    }
+    // Spans, `name{field=value}:`, before the module.
+    let Some(target) = words.find(|w| !(w.contains('{') && w.ends_with(':'))) else {
+        return false;
+    };
+    let Some(path) = target.strip_suffix(':') else {
+        return false;
+    };
+    path.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && path
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == ':')
+}
+
+/// `line` without its terminal's color sequences (`ESC [ … letter`).
+fn without_colors(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// What a command said, less the records of the log among it
+/// ([`is_log_record`]): the lines its reader is meant to read. All of them
+/// when nothing else is left, so a failure that said nothing else is not
+/// told as having said nothing.
+pub(crate) fn sentences(lines: Vec<&str>) -> Vec<&str> {
+    let kept: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| !is_log_record(line))
+        .collect();
+    if kept.is_empty() { lines } else { kept }
+}
+
 /// The newest progress line a walk wrote (`--progress-json`), from the end of
 /// its log: the object under `progress`.
 pub fn newest_progress(dir: &Path) -> Option<Value> {
@@ -189,15 +252,16 @@ pub fn finished(seen: &Seen) -> Option<Value> {
                 .unwrap_or_else(|_| Value::String(text.into()))
         });
     let log = tail_of(&file(&seen.dir, "err.log"), 4 * TAIL).unwrap_or_default();
-    let lines: Vec<&str> = log
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter(|line| {
-            serde_json::from_str::<Value>(line.trim())
-                .ok()
-                .is_none_or(|value| value.get("progress").is_none())
-        })
-        .collect();
+    let lines = sentences(
+        log.lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter(|line| {
+                serde_json::from_str::<Value>(line.trim())
+                    .ok()
+                    .is_none_or(|value| value.get("progress").is_none())
+            })
+            .collect(),
+    );
     let error = lines
         .last()
         .and_then(|line| serde_json::from_str::<Value>(line.trim()).ok())
@@ -356,11 +420,7 @@ pub fn line(seen: &Seen, now: i64) -> String {
         }
     }
     if let Some((least, most)) = eta(seen, newest_progress(&seen.dir).as_ref(), now) {
-        line.push_str(&format!(
-            "; {} to {} left",
-            report::rest_left(Duration::from_secs(least)),
-            report::rest_left(Duration::from_secs(most))
-        ));
+        line.push_str(&format!("; {} left", report::time_left(least, most)));
     }
     if seen.status == Status::Lost {
         line.push_str(&format!(
@@ -374,6 +434,40 @@ pub fn line(seen: &Seen, now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The records of the log are told from the sentences around them,
+    /// with or without a time, spans or colors.
+    #[test]
+    fn a_log_record_is_told_from_a_sentence() {
+        for record in [
+            " WARN snob_store::store::rate_budget: account in cooldown reason=\"rate_limit\"",
+            " WARN snob_ig::client: Instagram pushed back status=429 body={\"message\":\"x\"}",
+            "ERROR snob_cli::owner: gone",
+            "2026-10-30T05:01:02.123456Z DEBUG snob_ig::pager: page 3",
+            "  INFO walk{list=followers}: snob_ig::pager: page",
+            "\u{1b}[33m WARN\u{1b}[0m \u{1b}[2msnob_ig::client\u{1b}[0m\u{1b}[2m:\u{1b}[0m pushed",
+        ] {
+            assert!(is_log_record(record), "{record}");
+        }
+        for sentence in [
+            "warning: Instagram asked to slow down; the account is in cooldown for 2 hours",
+            "error: the account is in cooldown until Oct 30 at 05:01",
+            "WARN this is not a module",
+            "hint: run it again later",
+            "",
+        ] {
+            assert!(!is_log_record(sentence), "{sentence}");
+        }
+        assert_eq!(
+            sentences(vec![" WARN snob_ig::client: x", "warning: the sentence"]),
+            ["warning: the sentence"]
+        );
+        assert_eq!(
+            sentences(vec![" WARN snob_ig::client: x"]),
+            [" WARN snob_ig::client: x"],
+            "all of it, when nothing else is left"
+        );
+    }
 
     #[test]
     fn the_newest_progress_line_is_read_from_the_tail() {

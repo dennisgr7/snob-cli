@@ -421,7 +421,19 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   every answer that comes of having no session carries a hint that the
   person runs `snob login` in their own terminal, in place of the command's
   own (`answer::SIGN_IN`). `snob_status` with no session is an answer, not a
-  failure: exit 3 is what it was asked, as exit 5 is in a cooldown.
+  failure: exit 3 is what it was asked, as exit 5 is in a cooldown. **Every
+  hint that is advice to the person at a terminal is replaced the same
+  way**, by the failure's `reason` (`answer::agent_hint`: `too_many_jobs`,
+  `no_such_job`, `nothing_stored`, `budget_wait`), with the tools that do it
+  instead; a failure's message is its sentences, the records of the log left
+  out (`jobs::show::sentences`).
+- **`snob_profile` stays inline, not a job**: its walk of the mutual
+  followers is at most `MUTUAL_PAGE_CAP` (10) pages, and it pays first any
+  rest between sittings an earlier walk of the account left owed, up to 15
+  minutes, which its description says and `mcp::longest_call` counts.
+  `openWorldHint` is per tool (`tools::Spec::open_world`): false for the
+  tools whose every plan spends nothing (`snob_status` and the three job
+  tools).
 - Arguments are checked, not passed through: an `account` must be a possible
   username, so it can never be read as a flag, and an unknown argument is
   refused rather than ignored. A tool that is not listed (the writes without
@@ -559,11 +571,13 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   (size and modification time, `child::Launch::upgraded`) refuses every
   call with `upgraded` and starts nothing; the client restarts it.
 - Codex's snippet carries `tool_timeout_sec` from `mcp::longest_call`: the
-  person's answer (`ANSWER_WITHIN`), the longer of `--max-wait`
-  (`mcp::MAX_WAIT` when not given) and a list's wait for its job
-  (`MOST_WAIT_SECONDS` plus `jobs::start::SUPERVISOR_WITHIN`), the child's
-  grace and a margin. A list's walk is bounded by it however long it is: the
-  call hands back the job and the walk goes on.
+  longer of a call that asks (the person's answer, `ANSWER_WITHIN`, then
+  the longer of `--max-wait`, `mcp::MAX_WAIT` when not given, and a list's
+  wait for its job, `MOST_WAIT_SECONDS` plus
+  `jobs::start::SUPERVISOR_WITHIN`) and a profile (`--max-wait` and the
+  longest rest between sittings), then the child's grace and a margin. A
+  list's walk is bounded by it however long it is: the call hands back the
+  job and the walk goes on.
 - **Over HTTP, for a tunnel of your own** (`snob mcp --listen <addr>`,
   `commands/mcp/http.rs`). **Loopback only**: any other address is refused
   with exit 2, and TLS is the tunnel's job (`--public-url`, `https` only,
@@ -629,8 +643,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   the last line of standard error (`main::wording_for`); its `code` is the
   exit's token, and `reason` a finer one when there is one
   (`ExitError::with_reason`, e.g. `busy`, `mcp_write_cap`,
-  `walked_elsewhere`, and a job's `too_many_jobs`, `no_such_job`,
-  `refused_argv`).
+  `walked_elsewhere`, `nothing_stored`, `budget_wait` for a wait past
+  `--max-wait`, and a job's `too_many_jobs`, `no_such_job`, `refused_argv`).
+  `cooldown_until` is when a cooldown that refused the run lifts
+  (`ExitError::with_cooldown_until`).
 - **Exit codes are stable** (`exit.rs`, `snob_core::watch::RunOutcome`, the
   `watch_runs.outcome` column and the `--json` `outcome` field share one
   vocabulary): 0 worked (a list cut short by `--limit`/`--max-pages` is still

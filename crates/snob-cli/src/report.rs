@@ -107,10 +107,12 @@ pub enum Wording {
 /// `$?` are told the same thing; `message` and `causes` are the chain the
 /// prose prints, in the same order; `hint` is the advice the prose sets
 /// apart; `url` is the address a challenge has to be cleared at;
-/// `cooldown_until` is when a cooldown that refused the run lifts, and only
-/// that: a push-back met in this run starts one this does not look up;
-/// `reason` is a finer token than `code` when the failure has one
-/// (`ExitError::with_reason`: `busy`), and null otherwise.
+/// `cooldown_until` is when a cooldown that refused the run lifts (the
+/// refusal's own, `ExitError::with_cooldown_until`, or the client's
+/// backstop), and only that: a push-back met in this run starts one this
+/// does not look up; `reason` is a finer token than `code` when the failure
+/// has one (`ExitError::with_reason`: `busy`; `budget_wait` for a wait for
+/// the request budget past `--max-wait`), and null otherwise.
 /// Printed as one line, the last on standard error. Filtered line by line
 /// like the prose, and for the same reason -- a name is filtered before
 /// anything draws it, and a JSON consumer may well print it. `viewer`, beside
@@ -125,9 +127,22 @@ fn error_json_for(error: &anyhow::Error, viewer: Option<&Viewer>) -> serde_json:
     let instagram = instagram_in(error);
     let hint = advice_in(error).map(|hint| filtered(hint, "\n"));
     let url = instagram.and_then(|e| e.challenge_url());
-    let lifts = instagram.and_then(|e| match e {
-        snob_ig::error::IgError::InCooldown { until_ms } => Some(until_ms.to_epoch()),
-        _ => None,
+    let ours = error.chain().find_map(|c| c.downcast_ref::<ExitError>());
+    let lifts = ours
+        .and_then(ExitError::cooldown_until)
+        .or_else(|| {
+            instagram.and_then(|e| match e {
+                snob_ig::error::IgError::InCooldown { until_ms } => Some(*until_ms),
+                _ => None,
+            })
+        })
+        .map(|until_ms| until_ms.to_epoch());
+    // A wait past `--max-wait` exits as a stop does (130), and is told
+    // apart from one by this: it is the one worth trying again later.
+    let reason = ours.and_then(ExitError::reason).or_else(|| {
+        instagram
+            .is_some_and(|e| matches!(e, snob_ig::error::IgError::WaitTooLong { .. }))
+            .then_some("budget_wait")
     });
 
     serde_json::json!({
@@ -140,10 +155,7 @@ fn error_json_for(error: &anyhow::Error, viewer: Option<&Viewer>) -> serde_json:
             "hint": hint,
             "url": url,
             "cooldown_until": lifts,
-            "reason": error
-                .chain()
-                .find_map(|c| c.downcast_ref::<ExitError>())
-                .and_then(ExitError::reason),
+            "reason": reason,
         }
     })
 }
@@ -444,6 +456,7 @@ pub enum Blocked<'a> {
 
 /// The account is in cooldown and storage cannot answer either.
 pub fn refuse_in_cooldown(held: &Held, blocked: Blocked<'_>) -> anyhow::Error {
+    let lifts = held.until_ms;
     let held = held_until(held);
     let detail = match blocked {
         Blocked::RefreshWanted => format!("{held}; --refresh cannot walk until it lifts"),
@@ -462,7 +475,9 @@ pub fn refuse_in_cooldown(held: &Held, blocked: Blocked<'_>) -> anyhow::Error {
              is nothing to serve"
         ),
     };
-    ExitError::new(ExitCode::RateLimited, detail).into()
+    ExitError::new(ExitCode::RateLimited, detail)
+        .with_cooldown_until(lifts)
+        .into()
 }
 
 /// A cooldown, or the brake, that landed between the check and the walk.
@@ -471,6 +486,7 @@ pub fn refuse_cooldown_mid_walk(held: &Held) -> anyhow::Error {
         ExitCode::RateLimited,
         format!("{}; nothing can be walked until it lifts", held_until(held)),
     )
+    .with_cooldown_until(held.until_ms)
     .into()
 }
 
@@ -549,6 +565,28 @@ pub fn rest_left(left: std::time::Duration) -> String {
     match left.as_secs().div_ceil(60) {
         1 => "1 minute".to_string(),
         minutes => format!("{minutes} minutes"),
+    }
+}
+
+/// How long a walk has left, from the fewest and the most seconds it may
+/// take, as a person says it: whole minutes rounded up, as [`rest_left`]
+/// counts them, **one figure when both round to the same**, and "under a
+/// minute" when not one is left. The one home of the sentence the MCP
+/// answers, a task's message and `snob jobs` end with.
+pub fn time_left(least: u64, most: u64) -> String {
+    let (least, most) = (least.min(most), least.max(most));
+    let minutes = |n: u64| {
+        if n == 1 {
+            "1 minute".to_string()
+        } else {
+            format!("{n} minutes")
+        }
+    };
+    match (least.div_ceil(60), most.div_ceil(60)) {
+        (_, 0) => "under a minute".to_string(),
+        (low, high) if low == high => format!("about {}", minutes(high)),
+        (0, high) => format!("up to {}", minutes(high)),
+        (low, high) => format!("about {low} to {high} minutes"),
     }
 }
 
@@ -933,16 +971,24 @@ pub fn pager_warning(warning: Warning) -> String {
 /// account is known but this list of it has never been walked. They get the
 /// same answer because there is one thing to do about either.
 ///
-/// It carries the `hint:` its four siblings here carry. It gains no exit code:
-/// the `anyhow` fallback is already `Error`, and this is the shape that keeps
-/// the advice apart from what happened.
-pub fn refuse_nothing_stored(kind: ListKind) -> anyhow::Error {
-    ExitError::new(
-        ExitCode::Error,
-        format!("no {kind} list is stored, and --offline says not to look for one"),
-    )
-    .with_hint(format!("run \"snob {kind}\" once, or drop --offline"))
-    .into()
+/// It carries the `hint:` its four siblings here carry, naming the account
+/// the list is of, `target` as it was typed (`None` is the viewer's own):
+/// the command without it would read somebody else's list, the viewer's.
+/// Exit 1, with `nothing_stored` as the reason a program reads, which the
+/// MCP server answers with advice in its own tools' words (`answer.rs`):
+/// an agent never passed `--offline`, which its server added.
+pub fn refuse_nothing_stored(kind: ListKind, target: Option<&str>) -> anyhow::Error {
+    let target = target.map(|name| printable(name.strip_prefix('@').unwrap_or(name)));
+    let (of, command) = match &target {
+        Some(name) => (format!(" of @{name}"), format!("snob {kind} {name}")),
+        None => (String::new(), format!("snob {kind}")),
+    };
+    ExitError::new(ExitCode::Error, format!("no {kind} list{of} is stored"))
+        .with_reason("nothing_stored")
+        .with_hint(format!(
+            "run \"{command}\" once, or drop --offline, which says not to look for one"
+        ))
+        .into()
 }
 
 /// "pepito, carlos and 4 others", or `None` when there is nobody to name.
@@ -1044,6 +1090,83 @@ mod tests {
     use super::*;
     use crate::engine::ListOutcome;
     use snob_core::Pk;
+
+    /// The time a walk has left says one figure when both ends round to the
+    /// same minute, and never "0 minutes".
+    #[test]
+    fn the_time_left_is_one_figure_when_both_ends_are_the_same_minute() {
+        assert_eq!(time_left(0, 0), "under a minute");
+        assert_eq!(time_left(3, 10), "about 1 minute");
+        assert_eq!(time_left(61, 90), "about 2 minutes");
+        assert_eq!(time_left(30, 200), "about 1 to 4 minutes");
+        assert_eq!(time_left(0, 200), "up to 4 minutes");
+        assert_eq!(time_left(0, 45), "up to 1 minute");
+        assert_eq!(
+            time_left(400, 130),
+            "about 3 to 7 minutes",
+            "in either order"
+        );
+    }
+
+    /// Nothing stored names the account the list is of, in the command to
+    /// type back, without an at sign, and carries its reason.
+    #[test]
+    fn nothing_stored_names_whose_list_it_is() {
+        let theirs = refuse_nothing_stored(ListKind::Followers, Some("@user3"));
+        let json = error_json_for(&theirs, None);
+        assert_eq!(json["error"]["reason"], "nothing_stored");
+        assert_eq!(
+            json["error"]["message"],
+            "no followers list of @user3 is stored"
+        );
+        let hint = json["error"]["hint"].as_str().unwrap();
+        assert!(hint.contains("run \"snob followers user3\" once"), "{hint}");
+        let own = refuse_nothing_stored(ListKind::Following, None);
+        let json = error_json_for(&own, None);
+        assert!(
+            json["error"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("run \"snob following\" once"),
+            "{json}"
+        );
+    }
+
+    /// A refusal by a cooldown says when it lifts as a moment, not only in
+    /// the sentence.
+    #[test]
+    fn a_cooldown_refusal_says_when_it_lifts_in_its_json() {
+        let held = Held {
+            until_ms: EpochMs::new(1_700_000_000_000),
+            braked: Vec::new(),
+        };
+        for refused in [
+            refuse_in_cooldown(&held, Blocked::RefreshWanted),
+            refuse_in_cooldown(&held, Blocked::NothingStored(ListKind::Followers)),
+            refuse_cooldown_mid_walk(&held),
+        ] {
+            let json = error_json_for(&refused, None);
+            assert_eq!(
+                json["error"]["cooldown_until"],
+                serde_json::json!(held.until_ms.to_epoch()),
+                "{json}"
+            );
+            assert_eq!(json["error"]["code"], "rate_limited");
+        }
+    }
+
+    /// A wait for the budget past `--max-wait` exits as a stop does, and is
+    /// told apart by its reason.
+    #[test]
+    fn a_wait_past_the_limit_has_a_reason_of_its_own() {
+        let error = anyhow::Error::new(snob_ig::error::IgError::WaitTooLong {
+            wait: std::time::Duration::from_secs(900),
+            limit: std::time::Duration::from_secs(300),
+        });
+        let json = error_json_for(&error, None);
+        assert_eq!(json["error"]["code"], "interrupted");
+        assert_eq!(json["error"]["reason"], "budget_wait");
+    }
 
     /// What is left of a rest is said in whole minutes, never fewer than it
     /// is: a second over a minute is two.

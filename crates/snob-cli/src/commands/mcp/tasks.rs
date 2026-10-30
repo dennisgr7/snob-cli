@@ -171,11 +171,7 @@ fn said(doc: &Value, status: TaskStatus) -> String {
                 .get("eta_seconds")
                 .and_then(|eta| Some((eta.get("least")?.as_u64()?, eta.get("most")?.as_u64()?)))
                 .map(|(least, most)| {
-                    format!(
-                        ", with about {} to {} left",
-                        crate::report::rest_left(Duration::from_secs(least)),
-                        crate::report::rest_left(Duration::from_secs(most))
-                    )
+                    format!(", with {} left", crate::report::time_left(least, most))
                 })
                 .unwrap_or_default();
             format!("The walk of the {list} goes on at a human pace{read}{left}.")
@@ -318,7 +314,7 @@ mod tests {
             running.status_message.as_deref(),
             Some(
                 "The walk of the followers list goes on at a human pace, 24 of 300 accounts read \
-                 so far, with about 2 minutes to 7 minutes left."
+                 so far, with about 2 to 7 minutes left."
             )
         );
         // A command that is not one of ours is not repeated.

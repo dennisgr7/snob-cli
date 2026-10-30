@@ -168,17 +168,25 @@ impl Waits {
 
 /// The longest one tool call may take when children wait at most `max_wait`
 /// for the budget, for a client that cuts calls short (`config`, Codex's
-/// `tool_timeout_sec`): the person's answer to the question, asked with
-/// `elicitation/create` while the call waits ([`ANSWER_WITHIN`]), then the
-/// longer of the wait for the budget and a list's wait for its job (at most
-/// [`tools::MOST_WAIT_SECONDS`], once its supervisor has started), then the
-/// grace a stopped child gets, and half a minute for the request itself.
+/// `tool_timeout_sec`): the longer of two calls, then the grace a stopped
+/// child gets, and half a minute for the request itself.
 ///
-/// A list walked as a job is bounded here whatever its length: the call
-/// answers with the job's id once its wait is over, and the walk goes on.
+/// - **A call that asks**: the person's answer to the question, asked with
+///   `elicitation/create` while the call waits ([`ANSWER_WITHIN`]), then the
+///   longer of the wait for the budget and a list's wait for its job (at
+///   most [`tools::MOST_WAIT_SECONDS`], once its supervisor has started). A
+///   list walked as a job is bounded here whatever its length: the call
+///   answers with the job's id once its wait is over, and the walk goes on.
+/// - **A profile** (`snob_profile`), which asks nothing and is run inline,
+///   and whose walk of the mutual followers pays first any rest between
+///   sittings an earlier walk of the account left owed, which `--max-wait`
+///   never cuts (AGENTS.md, "Pace"): the wait for the budget and the
+///   longest rest.
 pub fn longest_call(max_wait: Duration) -> Duration {
     let job = Duration::from_secs(tools::MOST_WAIT_SECONDS) + crate::jobs::start::SUPERVISOR_WITHIN;
-    ANSWER_WITHIN + max_wait.max(job) + child::GRACE + Duration::from_secs(30)
+    let asked = ANSWER_WITHIN + max_wait.max(job);
+    let profile = max_wait + Duration::from_millis(snob_ig::pace::SITTING_PAUSE_MS.1);
+    asked.max(profile) + child::GRACE + Duration::from_secs(30)
 }
 
 /// The key the question is answered under, in `inputResponses`.
@@ -450,8 +458,9 @@ impl ServerHandler for Server {
                             .read_only(spec.read_only)
                             .destructive(spec.destructive)
                             .idempotent(spec.idempotent)
-                            // Instagram is the open world each of them reaches.
-                            .open_world(true),
+                            // Instagram is the open world, for the tools
+                            // that may reach it.
+                            .open_world(spec.open_world),
                     )
             })
             .collect();
@@ -1308,13 +1317,23 @@ mod tests {
     #[test]
     fn a_list_call_is_bounded_by_its_wait_for_the_job_whatever_its_walk() {
         // With no wait for the budget at all, a list still waits for its
-        // job and the supervisor's start: 50 s and 10 s, past the question.
+        // job and the supervisor's start, 50 s and 10 s past the question,
+        // and a profile the longest rest between sittings, which is longer.
+        let rest = Duration::from_secs(15 * 60);
+        assert!(ANSWER_WITHIN + Duration::from_secs(60) < rest);
         assert_eq!(
             longest_call(Duration::ZERO),
-            ANSWER_WITHIN + Duration::from_secs(60) + child::GRACE + Duration::from_secs(30)
+            rest + child::GRACE + Duration::from_secs(30)
         );
-        // Past that, the wait for the budget is the longer.
-        assert_eq!(longest_call(MAX_WAIT), Duration::from_secs(960));
+        // With the default wait for the budget, a profile that waits for it
+        // and then rests: 5 and 15 minutes, the grace and the margin.
+        assert_eq!(longest_call(MAX_WAIT), Duration::from_secs(1260));
+        // Whatever the wait for the budget, a profile is the longer: both
+        // grow with it alike, and the rest is longer than the answer.
+        assert_eq!(
+            longest_call(Duration::from_secs(3600)),
+            Duration::from_secs(3600) + rest + child::GRACE + Duration::from_secs(30)
+        );
     }
 
     #[test]

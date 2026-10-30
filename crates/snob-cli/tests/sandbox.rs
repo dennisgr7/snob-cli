@@ -1397,6 +1397,30 @@ async fn a_cooldown_stops_every_read_of_one_account() {
             "{command} spent a request during a cooldown"
         );
     }
+
+    // The refusal says when the cooldown lifts as a moment a program reads,
+    // for a profile and for a list with nothing stored to serve, both.
+    for args in [
+        &["profile", "someone", "--format", "json"][..],
+        &["followers", "--format", "json"][..],
+    ] {
+        let out = snob(tmp.path(), Some(&throttled), args);
+        let said = stderr(&out);
+        assert_eq!(out.status.code(), Some(5), "{args:?}: {said}");
+        let last = said
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
+        let told: serde_json::Value = serde_json::from_str(last)
+            .expect("the last line of standard error is the error object");
+        assert_eq!(told["error"]["code"], "rate_limited", "{args:?}: {said}");
+        assert!(
+            told["error"]["cooldown_until"].as_i64().is_some(),
+            "{args:?}: {said}"
+        );
+    }
+    assert_eq!(posted(&throttled).await.len(), spent);
 }
 
 /// **Nothing that would register a view goes out**, walking the whole
@@ -4443,6 +4467,14 @@ async fn the_mcp_server_hands_a_long_list_back_a_page_at_a_time() {
         theirs["structuredContent"].get("status").is_none(),
         "nothing asked: {theirs}"
     );
+    // Told in its own tools' words: no command to type, which would read the
+    // person's own list, and no --offline, which the agent never passed.
+    let error = &theirs["structuredContent"]["error"];
+    assert_eq!(error["code"], "nothing_stored", "{theirs}");
+    let hint = error["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("mode \"auto\""), "{theirs}");
+    assert!(!hint.contains("snob followers"), "{theirs}");
+    assert!(!hint.contains("--offline"), "{theirs}");
     // Nor is a refresh paged, which would walk it again.
     let refresh = other
         .call(

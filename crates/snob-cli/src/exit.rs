@@ -1,6 +1,7 @@
 //! Exit codes, so a caller can tell "log in again" apart from "wait a while"
 //! without parsing message text.
 
+use snob_core::EpochMs;
 use snob_core::model::StopReason;
 use snob_ig::error::IgError;
 
@@ -146,6 +147,10 @@ pub struct ExitError {
     /// from others with the same exit status (`busy`: another run holds the
     /// account, `--spend-alone`). The JSON failure carries it as `reason`.
     reason: Option<&'static str>,
+    /// When the cooldown that refused the run lifts, for a refusal by one.
+    /// The JSON failure carries it as `cooldown_until`, so a program reads
+    /// the moment rather than the sentence, which says it in local time.
+    cooldown_until: Option<EpochMs>,
 }
 
 impl ExitError {
@@ -155,6 +160,7 @@ impl ExitError {
             message: message.into(),
             hint: None,
             reason: None,
+            cooldown_until: None,
         }
     }
 
@@ -180,6 +186,17 @@ impl ExitError {
 
     pub fn reason(&self) -> Option<&'static str> {
         self.reason
+    }
+
+    /// Adds when the cooldown that refused the run lifts.
+    #[must_use]
+    pub fn with_cooldown_until(mut self, until: EpochMs) -> Self {
+        self.cooldown_until = Some(until);
+        self
+    }
+
+    pub fn cooldown_until(&self) -> Option<EpochMs> {
+        self.cooldown_until
     }
 }
 

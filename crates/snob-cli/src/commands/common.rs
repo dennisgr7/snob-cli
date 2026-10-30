@@ -328,6 +328,7 @@ pub fn refuse_during_cooldown(app: &App, doing: &str) -> Result<()> {
             ExitCode::RateLimited,
             format!("{}, so {doing}", report::held_until(&held)),
         )
+        .with_cooldown_until(held.until_ms)
         .into());
     }
     Ok(())

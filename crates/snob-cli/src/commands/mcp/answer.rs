@@ -53,6 +53,33 @@ pub const PAGE_BYTES: usize = 30_000;
 pub const SIGN_IN: &str = "the person signs in with \"snob login\" in their own terminal; \
                            never ask them for a password or a session id";
 
+/// What an agent is told to do about a refusal, by the reason the command
+/// gave it, **in place of the command's own hint**, which is advice to the
+/// person at a terminal: a command to type (`snob jobs cancel`), or a flag
+/// the agent never passed and cannot (`--offline`, which its server adds for
+/// a stored list, `--max-wait`, which its server sets). As [`SIGN_IN`] is
+/// for no session; a reason not named here keeps its hint, which is already
+/// one an agent can act on.
+fn agent_hint(reason: &str) -> Option<&'static str> {
+    Some(match reason {
+        "too_many_jobs" => {
+            "one job runs at a time for the account: ask snob_job how that one is going (its \
+             id is in the message), or stop it with snob_job_cancel, and call this again once \
+             it has ended"
+        }
+        "no_such_job" => "snob_jobs lists this account's jobs and their ids",
+        "nothing_stored" => {
+            "nothing of this list is stored yet: call snob_list again without offset and with \
+             mode \"auto\" to read it"
+        }
+        "budget_wait" => {
+            "the request budget has no room within the wait this server allows: call it again \
+             later; snob_status says when the budget has room"
+        }
+        _ => return None,
+    })
+}
+
 /// Reads a finished child against what its plan counts as an answer.
 pub fn from(plan: &Plan, finished: Finished) -> Answer {
     let exit = finished.code;
@@ -107,6 +134,9 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
             .and_then(Value::as_str)
             .map(str::to_string)
         {
+            if let Some(hint) = agent_hint(&reason) {
+                failure["hint"] = json!(hint);
+            }
             failure["code"] = json!(reason);
         }
         // What a list walk kept is still worth having: it is stored, and the
@@ -226,9 +256,12 @@ pub fn next_page(body: &Value, tool: &str) -> Option<String> {
 }
 
 /// The last few lines of what a command said, which is where its sentence
-/// about the failure is.
+/// about the failure is: the records of the log left out first
+/// (`jobs::show::sentences`), which carry what Instagram answered and would
+/// push the sentence out.
 fn last_lines(said: &str) -> String {
-    let lines: Vec<&str> = said.lines().filter(|l| !l.trim().is_empty()).collect();
+    let lines =
+        crate::jobs::show::sentences(said.lines().filter(|l| !l.trim().is_empty()).collect());
     lines[lines.len().saturating_sub(6)..].join("\n")
 }
 
@@ -291,6 +324,70 @@ mod tests {
             .iter()
             .map(|item| item["username"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    /// A refusal whose hint is advice to the person at a terminal is told
+    /// to the agent in its own tools' words.
+    #[test]
+    fn a_hint_for_the_terminal_is_told_to_the_agent_in_its_tools() {
+        for (reason, exit, tool) in [
+            ("too_many_jobs", ExitCode::Error, "snob_job_cancel"),
+            ("no_such_job", ExitCode::Error, "snob_jobs"),
+            ("nothing_stored", ExitCode::Error, "mode \"auto\""),
+            ("budget_wait", ExitCode::Interrupted, "snob_status"),
+        ] {
+            let told = from(
+                &plan(&[ExitCode::Ok]),
+                finished(
+                    exit,
+                    None,
+                    Some(json!({"error": {
+                        "code": exit.as_str(),
+                        "reason": reason,
+                        "message": "it was refused",
+                        "hint": "run \"snob jobs cancel\", or drop --offline, or --max-wait",
+                    }})),
+                ),
+            );
+            assert!(told.failed);
+            let error = &told.body["error"];
+            assert_eq!(error["code"], reason);
+            let hint = error["hint"].as_str().unwrap();
+            assert!(hint.contains(tool), "{reason}: {hint}");
+            assert!(!hint.contains("snob jobs cancel"), "{reason}: {hint}");
+            assert!(!hint.contains("--"), "{reason}: {hint}");
+        }
+        // A reason with a hint an agent can already act on keeps it.
+        let told = from(
+            &plan(&[ExitCode::Ok]),
+            finished(
+                ExitCode::Error,
+                None,
+                Some(json!({"error": {"code": "error", "reason": "busy", "hint": "wait"}})),
+            ),
+        );
+        assert_eq!(told.body["error"]["hint"], "wait");
+    }
+
+    /// The records of the log a failed walk wrote are no part of what the
+    /// agent is told: the sentences are.
+    #[test]
+    fn a_failure_says_its_sentences_not_its_log() {
+        let mut walked = finished(ExitCode::RateLimited, Some(accounts(2)), None);
+        walked.said = " WARN snob_store::store::rate_budget: account in cooldown \
+                       reason=\"rate_limit\" minutes=120\n \
+                       WARN snob_ig::client: Instagram pushed back endpoint=\"/api/v1/x/\" \
+                       status=429 body={\"message\":\"Please wait a few minutes\"}\n\
+                       warning: Instagram asked to slow down\n\
+                       warning: the walk stopped after 2 accounts; they are stored\n"
+            .into();
+        let told = from(&list_at(0), walked);
+        assert!(told.failed);
+        assert_eq!(
+            told.body["error"]["message"],
+            "warning: Instagram asked to slow down \
+             warning: the walk stopped after 2 accounts; they are stored"
+        );
     }
 
     #[test]

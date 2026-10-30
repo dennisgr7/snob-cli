@@ -438,12 +438,13 @@ fn render(
         // otherwise (`tool_timeout_sec`), which is less than the person may
         // take to answer a question alone. A list's call is bounded by its
         // wait for the job it starts, and the walk goes on past it, so the
-        // longest call is one that waits for the budget (`mcp::longest_call`).
+        // longest call is one that waits for the budget, a profile's with a
+        // rest between sittings after it (`mcp::longest_call`).
         McpClient::Codex => (
             format!(
                 "[mcp_servers.snob]\ncommand = {}\nargs = [{}]\n\
-                 # A call may wait for your answer, then for the request budget;\n\
-                 # a list that takes longer goes on as a job.\n\
+                 # A call may wait for your answer, or for the request budget and\n\
+                 # a rest; a list that takes longer goes on as a job.\n\
                  tool_timeout_sec = {}",
                 toml_string(exe),
                 args.iter()
@@ -529,8 +530,8 @@ fn render_remote(client: McpClient, url: &str, within: Duration) -> (String, &'s
         McpClient::Codex => (
             format!(
                 "[mcp_servers.snob]\nurl = {}\nbearer_token_env_var = {}\n\
-                 # A call may wait for your answer, then for the request budget;\n\
-                 # a list that takes longer goes on as a job.\n\
+                 # A call may wait for your answer, or for the request budget and\n\
+                 # a rest; a list that takes longer goes on as a job.\n\
                  tool_timeout_sec = {}",
                 toml_string(url),
                 toml_string(TOKEN),
@@ -734,15 +735,16 @@ mod tests {
         assert!(snippet.contains("\nargs = [\"mcp\"]\n"), "{snippet}");
     }
 
-    /// Ten minutes for the person's answer, five for the budget by default,
-    /// the child's grace and a margin: sixteen minutes.
+    /// Five minutes for the budget by default and a profile's rest of up to
+    /// fifteen (longer than the ten for the person's answer), the child's
+    /// grace and a margin: twenty-one minutes.
     #[test]
     fn codex_is_given_a_tool_timeout_past_the_longest_call() {
         let (snippet, _) = render(McpClient::Codex, EXE, &args(), within());
-        assert!(snippet.ends_with("\ntool_timeout_sec = 960"), "{snippet}");
+        assert!(snippet.ends_with("\ntool_timeout_sec = 1260"), "{snippet}");
         let longer = super::super::longest_call(Duration::from_secs(3600));
         let (snippet, _) = render(McpClient::Codex, EXE, &args(), longer);
-        assert!(snippet.ends_with("\ntool_timeout_sec = 4260"), "{snippet}");
+        assert!(snippet.ends_with("\ntool_timeout_sec = 4560"), "{snippet}");
         // Every other line is a table, a key or a comment.
         assert!(
             snippet
@@ -770,7 +772,7 @@ mod tests {
             snippet.contains("\nbearer_token_env_var = \"SNOB_MCP_TOKEN\"\n"),
             "{snippet}"
         );
-        assert!(snippet.ends_with("\ntool_timeout_sec = 960"), "{snippet}");
+        assert!(snippet.ends_with("\ntool_timeout_sec = 1260"), "{snippet}");
         assert!(!snippet.contains("command"), "{snippet}");
         assert!(!snippet.contains("args"), "{snippet}");
         assert!(

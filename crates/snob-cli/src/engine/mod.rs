@@ -361,7 +361,10 @@ async fn decide(
 
     if args.cache {
         let Some(snapshot) = stored else {
-            return Err(crate::report::refuse_nothing_stored(kind));
+            return Err(crate::report::refuse_nothing_stored(
+                kind,
+                args.target.as_deref(),
+            ));
         };
         // `--offline` is a promise not to spend a request, so nothing here
         // checked whether the stored list is still true. That is exactly what

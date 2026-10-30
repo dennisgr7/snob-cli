@@ -216,13 +216,7 @@ pub fn standing(doc: &Value, cancel: bool) -> (Answer, String) {
         let left = doc
             .get("eta_seconds")
             .and_then(|eta| Some((eta.get("least")?.as_u64()?, eta.get("most")?.as_u64()?)))
-            .map(|(least, most)| {
-                format!(
-                    ", with about {} to {} left",
-                    crate::report::rest_left(std::time::Duration::from_secs(least)),
-                    crate::report::rest_left(std::time::Duration::from_secs(most))
-                )
-            })
+            .map(|(least, most)| format!(", with {} left", crate::report::time_left(least, most)))
             .unwrap_or_default();
         let mut said = format!(
             "The walk goes on as job {id}{left}. Call snob_job with \"job_id\": \"{id}\" to hear \
@@ -382,7 +376,7 @@ mod tests {
         assert_eq!(told.body["poll_with"], "snob_job");
         assert_eq!(told.body["eta_seconds"]["most"], 400);
         assert!(said.contains("snob_job with \"job_id\": \"j0000"), "{said}");
-        assert!(said.contains("about 2 minutes to 7 minutes left"), "{said}");
+        assert!(said.contains("with about 2 to 7 minutes left"), "{said}");
         assert!(!said.contains("Closing this client"), "{said}");
 
         let mut held = doc("running", Value::Null);
