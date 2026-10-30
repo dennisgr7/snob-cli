@@ -53,12 +53,15 @@
 //! Any other user of the machine who binds it first is handed the key by
 //! the next request, and the key lasts until it is revoked. So `--listen` is
 //! for a machine where nobody else can run code, and a key that may have
-//! been read so is revoked and made again (`snob mcp key revoke`, `new`);
-//! startup says so ([`started`]). **The other loopback family is held
-//! too** ([`twin`]): a client told `localhost` may try `[::1]` before
+//! been read so is replaced (`snob mcp key revoke` and `new` for the
+//! keyring's, a new `SNOB_MCP_KEY` for the environment's); startup says so
+//! ([`started`], `key::Source::replace_it`). **The other loopback family is
+//! held too** ([`twin`]): a client told `localhost` may try `[::1]` before
 //! `127.0.0.1`, so bound to one of the two, the server listens on the same
-//! port of the other, and refuses to start when somebody else already does,
-//! on that address or on its family's wildcard.
+//! port of the other, and, on a port the person named, refuses to start
+//! when somebody else already does, on that address or on its family's
+//! wildcard held with exclusive use (a plain wildcard holder is not handed
+//! the connections to the address the server binds).
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -256,7 +259,7 @@ pub async fn serve(
         .await
         .with_context(|| format!("could not listen on {}", listen.address))?;
     let bound = listener.local_addr()?;
-    let twin = twin(bound, listen.address.port() != 0).await?;
+    let twin = twin(bound, listen.address.port() != 0, source).await?;
     let gate = Gate::new(&key)?;
     drop(key);
 
@@ -370,8 +373,9 @@ pub async fn serve(
 /// ([`family_absent`]: IPv6 turned off), where nobody can listen either,
 /// lets the server go on with one; any other refuses. On a port the system
 /// picked (`:0`, which only a test or a tunnel set up
-/// afterwards would use) a taken twin is not a reason to refuse.
-async fn twin(bound: SocketAddr, named: bool) -> Result<Option<TcpListener>> {
+/// afterwards would use) a taken twin is not a reason to refuse. `source`
+/// is where the key came from, which says how to replace it.
+async fn twin(bound: SocketAddr, named: bool, source: key::Source) -> Result<Option<TcpListener>> {
     let other = match bound.ip() {
         IpAddr::V4(ip) if ip == Ipv4Addr::LOCALHOST => IpAddr::V6(Ipv6Addr::LOCALHOST),
         IpAddr::V6(ip) if ip == Ipv6Addr::LOCALHOST => IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -398,11 +402,11 @@ async fn twin(bound: SocketAddr, named: bool) -> Result<Option<TcpListener>> {
                      {bound} and hand it the key"
                 ),
             )
-            .with_hint(
+            .with_hint(format!(
                 "find what listens there and stop it, or listen on another port; if a client \
-                 may have sent the key to it already, revoke the key (\"snob mcp key revoke\") \
-                 and make a new one",
-            )
+                 may have sent the key to it already, {}",
+                source.replace_it()
+            ))
             .into())
         }
     }
@@ -493,12 +497,12 @@ fn started(
             "It also holds {twin}, where a client told localhost may connect first."
         ));
     }
-    ui::info(
+    ui::info(&format!(
         "Clients send the key to whatever answers on this port, and another user of this \
          machine who listens on it while snob is not running is handed it: serve this only on a \
-         machine where nobody else can run code, and if the port could have been taken, revoke \
-         the key (\"snob mcp key revoke\") and make a new one.",
-    );
+         machine where nobody else can run code, and if the port could have been taken, {}.",
+        source.replace_it()
+    ));
     if let Some(public) = &listen.public {
         ui::info(&format!(
             "It takes requests addressed to {}; TLS ends at the tunnel, which sees the key and \
@@ -918,18 +922,31 @@ mod tests {
         };
         let port = stranger.local_addr().unwrap().port();
         let ours = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        let refused = twin(ours, true).await.unwrap_err();
+        let refused = twin(ours, true, key::Source::Keyring).await.unwrap_err();
         assert!(refused.to_string().contains("taken by another process"));
-        assert!(twin(ours, false).await.unwrap().is_none());
+        assert!(
+            twin(ours, false, key::Source::Keyring)
+                .await
+                .unwrap()
+                .is_none()
+        );
         drop(stranger);
 
-        let held = twin(ours, true).await.unwrap().expect("[::1] is free now");
+        let held = twin(ours, true, key::Source::Keyring)
+            .await
+            .unwrap()
+            .expect("[::1] is free now");
         assert_eq!(
             held.local_addr().unwrap(),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)
         );
         let elsewhere = SocketAddr::new("127.0.0.2".parse().unwrap(), port);
-        assert!(twin(elsewhere, true).await.unwrap().is_none());
+        assert!(
+            twin(elsewhere, true, key::Source::Keyring)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A process holding the other family's wildcard with exclusive use, as
@@ -945,12 +962,17 @@ mod tests {
         };
         let port = stranger.local_addr().unwrap().port();
         let ours = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        let refused = twin(ours, true).await.unwrap_err();
+        let refused = twin(ours, true, key::Source::Keyring).await.unwrap_err();
         assert!(
             refused.to_string().contains("taken by another process"),
             "{refused}"
         );
-        assert!(twin(ours, false).await.unwrap().is_none());
+        assert!(
+            twin(ours, false, key::Source::Keyring)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A listener on `[::]` and a port the system picks, bound with

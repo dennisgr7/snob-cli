@@ -643,12 +643,15 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   does not prove itself to its clients.** A client or tunnel sends the key
   to whatever answers on the port, so another local user who binds it while
   snob is not listening is handed the key; `--listen` is for a machine where
-  nobody else can run code, and startup says to revoke the key if the port
-  could have been taken. Bound to `127.0.0.1` or `[::1]`, it also holds the
-  same port of the other family (`http::twin`), since `localhost` may
-  resolve to either, and refuses to start, exit 1, when something else
-  holds it (its family's wildcard held with exclusive use included) or it
-  cannot be held for any reason but the family being absent. Each request, in order: the path (`/mcp`
+  nobody else can run code, and startup says to replace the key if the
+  port could have been taken (revoking the keyring's, or replacing
+  `SNOB_MCP_KEY`, by where the key came from). Bound to `127.0.0.1` or
+  `[::1]`, it also holds the same port of the other family (`http::twin`),
+  since `localhost` may resolve to either, and, on a port the person
+  named, refuses to start, exit 1, when something else holds it (its
+  family's wildcard held with exclusive use included) or it cannot be held
+  for any reason but the family being absent; on a port the system picked
+  (`:0`) it goes on with one family. Each request, in order: the path (`/mcp`
   only, `/.well-known/*` included is 404); the key (`Authorization:
   Bearer`, the scheme in any case), checked **before any of the body is
   read** by comparing HMACs of both sides under a key drawn at start, and

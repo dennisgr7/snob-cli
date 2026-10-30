@@ -166,7 +166,8 @@ can read:
   whatever answers on the port, so another user of the machine who listens
   there while snob is not running is handed it. Serve it only on a machine
   where nobody else can run code, and if the port could have been taken,
-  revoke the key and make a new one. `snob
+  revoke the key and make a new one (for a key in `SNOB_MCP_KEY`, put a
+  new one there instead: revoking touches only the keyring). `snob
   mcp config codex --remote https://your-tunnel/mcp` (or any other client)
   prints what a client needs to reach that server: no command and no key.
   The client sends the key from `SNOB_MCP_TOKEN` in its own environment;

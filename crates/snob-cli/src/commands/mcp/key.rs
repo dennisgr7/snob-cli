@@ -127,6 +127,21 @@ impl Source {
             Self::Keyring => "the system keyring",
         }
     }
+
+    /// What to do with a key from here that may have been read, as a
+    /// clause (`http::started`, `http::twin`). **By where it came from**:
+    /// `revoke` touches only the keyring, so for a key in [`ENV`] it would
+    /// leave the one in force as it was (and, with no keyring, only say
+    /// there is none).
+    pub fn replace_it(self) -> &'static str {
+        match self {
+            Self::Keyring => "revoke the key (\"snob mcp key revoke\") and make a new one",
+            Self::Environment => {
+                "replace SNOB_MCP_KEY with a new key (\"snob mcp key new --print\") wherever \
+                 the server is started, and give the clients the new one"
+            }
+        }
+    }
 }
 
 /// The key a server started now would take: [`ENV`] when it is set and not
@@ -407,6 +422,17 @@ mod tests {
     /// A key made here, in the form it is stored and sent.
     fn made() -> String {
         Key::generate().unwrap().expose().to_string()
+    }
+
+    /// A key that may have been read is told to be replaced where it came
+    /// from: revoking touches only the keyring, and would leave a key from
+    /// the environment in force.
+    #[test]
+    fn a_key_is_told_to_be_replaced_where_it_came_from() {
+        assert!(Source::Keyring.replace_it().contains("snob mcp key revoke"));
+        let environment = Source::Environment.replace_it();
+        assert!(environment.contains(ENV), "{environment}");
+        assert!(!environment.contains("revoke"), "{environment}");
     }
 
     #[test]
