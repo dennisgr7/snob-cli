@@ -24,6 +24,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde_json::{Map, Value};
+
 /// How many lists are held at once: the few an agent pages through in one
 /// conversation. The oldest goes first.
 const HELD: usize = 4;
@@ -46,31 +48,42 @@ pub struct Held {
     lists: Mutex<VecDeque<List>>,
 }
 
+/// A whole list as a call read it.
+#[derive(Debug, PartialEq)]
+pub struct Whole {
+    /// Each item as its compact JSON, which is how pages are measured
+    /// (`answer::page`).
+    pub items: Vec<String>,
+    /// What the first page said about the whole list (`answer::ABOUT`):
+    /// where it came from and when, and whether it is all of it, which every
+    /// later page says again.
+    pub about: Map<String, Value>,
+}
+
 struct List {
     /// The call that read it (`tools::Page::of`).
     of: String,
     at: Instant,
-    /// Each item as its compact JSON, which is how pages are measured
-    /// (`answer::page`).
-    items: Arc<Vec<String>>,
+    whole: Arc<Whole>,
     bytes: usize,
 }
 
 impl Held {
-    /// Holds `items`, the whole list the call `of` read, in place of what an
+    /// Holds `whole`, the whole list the call `of` read, in place of what an
     /// earlier run of that call read. One too big to hold beside nothing
     /// else is not held, and its later pages are read from the store.
-    pub fn keep(&self, of: String, items: Vec<String>) {
-        self.keep_at(of, items, Instant::now());
+    pub fn keep(&self, of: String, whole: Whole) {
+        self.keep_at(of, whole, Instant::now());
     }
 
     /// The whole list the call `of` read, while it is held.
-    pub fn get(&self, of: &str) -> Option<Arc<Vec<String>>> {
+    pub fn get(&self, of: &str) -> Option<Arc<Whole>> {
         self.get_at(of, Instant::now())
     }
 
-    fn keep_at(&self, of: String, items: Vec<String>, now: Instant) {
-        let bytes = items.iter().map(String::len).sum();
+    fn keep_at(&self, of: String, whole: Whole, now: Instant) {
+        let bytes = whole.items.iter().map(String::len).sum::<usize>()
+            + Value::Object(whole.about.clone()).to_string().len();
         let mut lists = self.lock();
         lists.retain(|list| list.of != of && !expired(list, now));
         if bytes > HELD_BYTES {
@@ -79,7 +92,7 @@ impl Held {
         lists.push_front(List {
             of,
             at: now,
-            items: Arc::new(items),
+            whole: Arc::new(whole),
             bytes,
         });
         lists.truncate(HELD);
@@ -88,13 +101,13 @@ impl Held {
         }
     }
 
-    fn get_at(&self, of: &str, now: Instant) -> Option<Arc<Vec<String>>> {
+    fn get_at(&self, of: &str, now: Instant) -> Option<Arc<Whole>> {
         let mut lists = self.lock();
         lists.retain(|list| !expired(list, now));
         lists
             .iter()
             .find(|list| list.of == of)
-            .map(|list| Arc::clone(&list.items))
+            .map(|list| Arc::clone(&list.whole))
     }
 
     /// The lists, whatever a call that panicked while holding them left:
@@ -115,8 +128,11 @@ fn expired(list: &List, now: Instant) -> bool {
 mod tests {
     use super::*;
 
-    fn items(n: usize) -> Vec<String> {
-        (0..n).map(|n| format!(r#"{{"pk":{n}}}"#)).collect()
+    fn items(n: usize) -> Whole {
+        Whole {
+            items: (0..n).map(|n| format!(r#"{{"pk":{n}}}"#)).collect(),
+            about: Map::new(),
+        }
     }
 
     #[test]
@@ -124,11 +140,11 @@ mod tests {
         let held = Held::default();
         let now = Instant::now();
         held.keep_at("a".into(), items(3), now);
-        assert_eq!(held.get_at("a", now).unwrap().len(), 3);
+        assert_eq!(held.get_at("a", now).unwrap().items.len(), 3);
         assert!(held.get_at("b", now).is_none());
 
         held.keep_at("a".into(), items(5), now);
-        assert_eq!(held.get_at("a", now).unwrap().len(), 5);
+        assert_eq!(held.get_at("a", now).unwrap().items.len(), 5);
         assert_eq!(held.lock().len(), 1, "one list per call");
     }
 
@@ -159,7 +175,10 @@ mod tests {
     fn what_is_held_stays_under_its_bytes() {
         let held = Held::default();
         let now = Instant::now();
-        let big = |n: usize| vec!["x".repeat(n)];
+        let big = |n: usize| Whole {
+            items: vec!["x".repeat(n)],
+            about: Map::new(),
+        };
         held.keep_at("too big".into(), big(HELD_BYTES + 1), now);
         assert!(held.get_at("too big", now).is_none());
 

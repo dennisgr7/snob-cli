@@ -433,9 +433,11 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   hint that is advice to the person at a terminal is replaced the same
   way**, by the failure's `reason` (`answer::agent_hint`: `too_many_jobs`,
   `no_such_job`, `job_stopping`, `nothing_stored`, `budget_wait`, `busy`,
-  `mcp_write_cap`), with the tools that do it instead; a failure's message
-  is its sentences, the records of the log left out
-  (`jobs::show::sentences`).
+  `mcp_write_cap`), with the tools that do it instead, and a push-back the
+  call met itself, whose cooldown the failure does not date, by
+  `answer::PUSHED_BACK` (ask `snob_status` when it lifts); a failure's
+  message is its sentences, the records of the log and the progress lines
+  left out (`jobs::show::sentences`).
 - **`snob_profile` stays inline, not a job**: its walk of the mutual
   followers is at most `MUTUAL_PAGE_CAP` (10) pages, and it pays first any
   rest between sittings an earlier walk of the account left owed, up to 15
@@ -513,16 +515,27 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   (`answer::PAGE_BYTES`, as a page of accounts with a picture's address is
   some 65), since the result goes into the model's context twice (structured
   and as text) and clients cut long ones (Claude Code at 25,000 tokens, as
-  quoted). `{count, offset, items, next_offset}`, `count` the whole list's;
+  quoted). `{count, offset, items, next_offset}`, `count` the whole list's,
+  or at most `limit` when one is given (the command prints the cut list);
   a failure's `partial` is one page with no `next_offset`, since what a walk
-  stopped short read is not stored as a whole list. The client's `offset` is
-  sliced with `get`, never indexed. **A page past the first never walks**:
-  `offset` stays out of `Plan.args` (and the binding), and the call is
-  planned as the same list read with `--offline`, which asks nothing and
-  spends nothing (`tools::Page`); `offset` with `mode: "refresh"` or
-  `dry_run` is `invalid_arguments`. It is handed back from the whole list
-  the server holds from the call that read it (`commands/mcp/pages.rs`: in
-  memory, 4 lists, 30 min, 16 MiB), since the store would not always serve
+  stopped short read is not stored as a whole list. **A list is never
+  handed back as more than it is**: where it came from is the walk's
+  `served` progress line (`Progress::served`, read from a job's log, or
+  from a stored read's own standard error, which `mode: "stored"` and a
+  later page get `--progress-json` for), with its date, a sentence beside
+  it when it was not read now (`answer::not_read_now`), and `complete:
+  false` with what was read of how many and a sentence
+  (`answer::incomplete`) when a walk cut short by `max_pages` exited 0. The
+  client's `offset` is sliced with `get`, never indexed. **A page past the
+  first never walks**: `offset` stays out of `Plan.args` (and the binding),
+  and the call is planned as the same list read with `--offline`, which
+  asks nothing and spends nothing (`tools::Page`), whatever its mode;
+  `offset` with `dry_run` is `invalid_arguments`. It is handed back from the
+  whole list the server holds from the call that read it
+  (`commands/mcp/pages.rs`: in memory, 4 lists, 30 min, 16 MiB), under the
+  call's binding without `--refresh`, so a refresh and a later page of it
+  meet, and with what the first page said of the whole list (`served`,
+  `cooldown_until`, `complete`), since the store would not always serve
   the same list: a walk cut by `max_pages` is not a whole one, and a
   crossing checked against Instagram on the first page is refused offline
   when its lists were walked far apart. Not held, the page is read from the

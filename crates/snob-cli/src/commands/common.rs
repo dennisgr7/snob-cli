@@ -648,8 +648,13 @@ pub async fn walk_named(
                     .map(|held| held.until_ms.to_epoch_not_before()),
                 _ => None,
             };
-            app.progress()
-                .served(kind, outcome.provenance.as_str(), outcome.taken_at, lifts);
+            app.progress().served(
+                kind,
+                outcome.provenance.as_str(),
+                outcome.taken_at,
+                lifts,
+                outcome.reason,
+            );
         }
     }
     result

@@ -895,6 +895,7 @@ fn handed_back(doc: &Value, walk: child::Finished, offset: usize, tool: &str) ->
 fn result(told: answer::Answer, tool: &str) -> CallToolResult {
     let said = [
         answer::not_read_now(&told.body),
+        answer::incomplete(&told.body),
         answer::next_page(&told.body, tool),
     ]
     .into_iter()

@@ -4477,18 +4477,46 @@ async fn the_mcp_server_hands_a_long_list_back_a_page_at_a_time() {
     assert!(hint.contains("mode \"auto\""), "{theirs}");
     assert!(!hint.contains("snob followers"), "{theirs}");
     assert!(!hint.contains("--offline"), "{theirs}");
-    // Nor is a refresh paged, which would walk it again.
+    // A later page of a refresh is the same later page, which walks
+    // nothing: "the same arguments and an offset" works whatever the mode.
+    // Read from the store, it says so and when that was.
     let refresh = other
         .call(
             "snob_list",
             serde_json::json!({ "list": "followers", "mode": "refresh", "offset": 200 }),
         )
         .await;
+    assert_eq!(refresh["isError"], false, "{refresh}");
     assert_eq!(
-        refresh["structuredContent"]["error"]["code"], "invalid_arguments",
+        usernames(&refresh["structuredContent"])[0],
+        "user200",
+        "{refresh}"
+    );
+    assert_eq!(
+        refresh["structuredContent"]["served"][0]["from"], "stored",
+        "{refresh}"
+    );
+    assert!(
+        refresh["structuredContent"]["served"][0]["taken_at"]
+            .as_i64()
+            .is_some(),
         "{refresh}"
     );
     assert_eq!(posted(&instagram).await.len(), sent, "and nothing was sent");
+
+    // So is a list asked for as stored, on its first page.
+    let stored = other
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "mode": "stored", "limit": 2 }),
+        )
+        .await;
+    assert_eq!(stored["isError"], false, "{stored}");
+    let told = &stored["structuredContent"];
+    assert_eq!(told["count"], 2, "at most the limit: {stored}");
+    assert_eq!(told["served"][0]["from"], "stored", "{stored}");
+    let sentence = stored["content"][1]["text"].as_str().unwrap_or_default();
+    assert!(sentence.contains("Read from what is stored"), "{stored}");
 
     // A walk given max_pages may stop short, and what it read is then not
     // stored as a whole list: its later pages come from the server that
@@ -4505,6 +4533,138 @@ async fn the_mcp_server_hands_a_long_list_back_a_page_at_a_time() {
     assert_eq!(
         gone["structuredContent"]["error"]["code"], "page_unavailable",
         "{gone}"
+    );
+
+    // A refresh's later page is held where the page looks for it.
+    let refreshed = serde_json::json!({ "list": "followers", "mode": "refresh", "max_pages": 40 });
+    let first = client.call("snob_list", refreshed.clone()).await;
+    assert_eq!(first["isError"], false, "{first}");
+    let mut later = refreshed;
+    later["offset"] = serde_json::json!(200);
+    let held = client.call("snob_list", later).await;
+    assert_eq!(held["isError"], false, "{held}");
+    assert_eq!(usernames(&held["structuredContent"])[0], "user200");
+}
+
+/// A walk cut short by `max_pages` exits 0 with what it read, as a list cut
+/// by the cap a person asked for does; the agent is told it is not the whole
+/// list, how much of it was read and of how many, and that `count` is not
+/// the account's total.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_walk_cut_short_by_max_pages_says_it_is_not_the_whole_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(25, 2).await;
+    // Two pages of followers, ahead of the one-page list.
+    let page = |from: u64, to: u64, next: Option<u64>| {
+        let users: Vec<String> = (from..to)
+            .map(|n| format!(r#"{{"pk":{},"username":"user{n}"}}"#, 1_000 + n))
+            .collect();
+        let next = next.map_or(String::new(), |n| format!(r#","next_max_id":"{n}""#));
+        ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"users":[{}],"big_list":true{next},"status":"ok"}}"#,
+            users.join(",")
+        ))
+    };
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .and(query_param("max_id", "12"))
+        .respond_with(page(12, 25, None))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(page(0, 12, Some(12)))
+        .with_priority(2)
+        .mount(&instagram)
+        .await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let short = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "max_pages": 1 }),
+        )
+        .await;
+    assert_eq!(short["isError"], false, "{short}");
+    let told = &short["structuredContent"];
+    assert_eq!(told["complete"], false, "{short}");
+    assert_eq!(told["count"], 12, "{short}");
+    assert_eq!(told["served"][0]["stopped"], "page_limit", "{short}");
+    assert_eq!(told["served"][0]["read"], 12, "{short}");
+    assert_eq!(told["served"][0]["of"], 25, "{short}");
+    let said: Vec<&str> = short["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    assert!(
+        said.iter()
+            .any(|text| text.contains("Not the whole list") && text.contains("12 of about 25")),
+        "{short}"
+    );
+
+    // Walked whole, it says nothing of the kind.
+    let whole = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "mode": "refresh" }),
+        )
+        .await;
+    assert_eq!(whole["isError"], false, "{whole}");
+    assert_eq!(whole["structuredContent"]["count"], 25, "{whole}");
+    assert!(
+        whole["structuredContent"].get("complete").is_none(),
+        "{whole}"
+    );
+}
+
+/// A push-back met by the call itself starts a cooldown its failure does not
+/// date: the agent is pointed at `snob_status`, which does, rather than told
+/// to run it again once the cooldown lifts.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_push_back_met_by_a_walk_points_the_agent_at_snob_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(25, 2).await;
+    log_in(tmp.path(), &instagram);
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(r#"{"message":"Please wait a few minutes"}"#),
+        )
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let met = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "mode": "refresh" }),
+        )
+        .await;
+    assert_eq!(met["isError"], true, "{met}");
+    let error = &met["structuredContent"]["error"];
+    assert_eq!(error["code"], "rate_limited", "{met}");
+    let hint = error["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("snob_status"), "{met}");
+
+    let status = client.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(
+        status["structuredContent"]["exit"], "rate_limited",
+        "{status}"
     );
 }
 
@@ -5151,6 +5311,19 @@ async fn a_cooldown_refuses_a_call_before_anybody_is_asked() {
     assert!(told["cooldown_until"].as_i64().is_some(), "{served}");
     let sentence = served["content"][1]["text"].as_str().unwrap_or_default();
     assert!(sentence.contains("Not read now"), "{served}");
+
+    // Asked for as stored, the same: dated, with the cooldown's end.
+    let stored = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "account": "someone", "mode": "stored" }),
+        )
+        .await;
+    assert_eq!(stored["isError"], false, "{stored}");
+    let told = &stored["structuredContent"];
+    assert!(told["served"][0]["taken_at"].as_i64().is_some(), "{stored}");
+    assert!(told["cooldown_until"].as_i64().is_some(), "{stored}");
+    assert!(stored["content"][1]["text"].is_string(), "{stored}");
 
     // An estimate in the cooldown is the answer asked for, not an error.
     let estimate = client

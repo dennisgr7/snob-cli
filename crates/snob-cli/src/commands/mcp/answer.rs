@@ -10,13 +10,22 @@
 //! **A list is handed back a page at a time** ([`page`]): a client reads a
 //! tool's whole result into the model's context, and cuts what is too long
 //! (Claude Code at 25,000 tokens, `MAX_MCP_OUTPUT_TOKENS`, as its documents
-//! were quoted to us; not checked here). The page says the whole list's
-//! `count` and the `next_offset` to call again with, and the later pages are
-//! handed back from what was already read (`pages.rs`, `tools::Page`).
+//! were quoted to us; not checked here). The page says the `count` of the
+//! list the command printed and the `next_offset` to call again with, and
+//! the later pages are handed back from what was already read (`pages.rs`,
+//! `tools::Page`), with what the first page said of where the list came from.
+//!
+//! **A list is never handed back as more than it is.** One served from
+//! storage says so and how old it is (`served`, [`not_read_now`]), and one
+//! a walk cut short by `max_pages` says it is not the whole list
+//! (`complete: false`, [`incomplete`]), since both are a success to the
+//! command, whose warnings a person reads on standard error and an agent
+//! never sees.
 
 use serde_json::{Value, json};
 
 use super::child::Finished;
+use super::pages::Whole;
 use super::tools::Plan;
 use crate::exit::ExitCode;
 
@@ -26,9 +35,15 @@ pub struct Answer {
     pub failed: bool,
     pub body: Value,
     /// The whole list, each item as its compact JSON, when `body` is one page
-    /// of a longer one: for the server to hold for the pages after it.
-    pub whole: Option<Vec<String>>,
+    /// of a longer one: for the server to hold for the pages after it, with
+    /// what the page said about the list ([`ABOUT`]).
+    pub whole: Option<Whole>,
 }
+
+/// The fields of a list's answer that are about the whole list rather than
+/// the page, which every later page handed back from it repeats: where it
+/// came from and when, when a cooldown lifts, and whether it is all of it.
+const ABOUT: [&str; 3] = ["served", "cooldown_until", "complete"];
 
 /// The most accounts on a page.
 pub const PAGE: usize = 200;
@@ -94,11 +109,20 @@ fn agent_hint(reason: &str) -> Option<&'static str> {
     })
 }
 
+/// What an agent is told of a push-back met by this very call, which
+/// started a cooldown the failure does not date (`report::error_json_for`
+/// dates only one that refused the run): the command's own sentence says to
+/// run it again once the cooldown lifts, which an agent cannot see.
+pub const PUSHED_BACK: &str = "Instagram pushed back and a cooldown has started for this \
+                               account: snob_status, which sends nothing, says when it lifts; \
+                               call nothing that reaches Instagram before then, and tell the \
+                               person when the wait ends";
+
 /// Reads a finished child against what its plan counts as an answer.
 pub fn from(plan: &Plan, finished: Finished) -> Answer {
     let exit = finished.code;
     let offset = plan.page.as_ref().map_or(0, |page| page.offset);
-    let mut whole = None;
+    let mut whole_items = None;
     // Past 0, only with the document it is an answer for: `status` and a dry
     // run print one whatever their exit, and the same exit with nothing on
     // standard output is a refusal, which an empty answer would hide.
@@ -117,7 +141,7 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
                 // A call that takes no offset has no next page to offer.
                 let body = page(&items, offset, plan.page.is_some());
                 if !body["next_offset"].is_null() {
-                    whole = Some(items);
+                    whole_items = Some(items);
                 }
                 body
             }
@@ -172,6 +196,13 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
         if exit == ExitCode::NoSession {
             failure["hint"] = json!(SIGN_IN);
         }
+        // A push-back this call met: the cooldown it started is not in the
+        // failure, and the command's advice is to type it again later.
+        if exit == ExitCode::RateLimited
+            && !failure.get("cooldown_until").is_some_and(Value::is_i64)
+        {
+            failure["hint"] = json!(PUSHED_BACK);
+        }
         return Answer {
             failed: true,
             body: cleaned(json!({ "exit": exit.as_str(), "error": failure })),
@@ -183,18 +214,37 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
     // is handed to the agent as one, with its date, as a person is told it
     // in the warning, never as if it had just been read. `body` is an object
     // for every list (a page), and nothing is indexed into one that is not.
+    //
+    // **And whether it is all of the list**: a walk cut short by `max_pages`
+    // is a success, exit 0, and its `reason` (`page_limit`), with how many
+    // accounts it read of how many the counter declared, is the only place
+    // that says the list is short. An agent told nothing would give `count`
+    // as how many followers the account has.
     if !finished.served.is_empty() && body.is_object() {
         let served: Vec<Value> = finished
             .served
             .iter()
             .map(|said| {
-                json!({
+                let mut told = json!({
                     "list": said.get("list"),
                     "from": said.get("from"),
                     "taken_at": said.get("taken_at"),
-                })
+                });
+                if let Some(reason) = said
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .filter(|reason| *reason != "completed")
+                {
+                    told["stopped"] = json!(reason);
+                    told["read"] = said.get("accounts").cloned().unwrap_or(Value::Null);
+                    told["of"] = said.get("of").cloned().unwrap_or(Value::Null);
+                }
+                told
             })
             .collect();
+        if served.iter().any(|told| told.get("stopped").is_some()) {
+            body["complete"] = json!(false);
+        }
         let lifts = finished
             .served
             .iter()
@@ -219,6 +269,13 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
             None => body["hint"] = json!(SIGN_IN),
         }
     }
+    let whole = whole_items.map(|items| Whole {
+        items,
+        about: ABOUT
+            .iter()
+            .filter_map(|key| Some((key.to_string(), body.get(*key)?.clone())))
+            .collect(),
+    });
     Answer {
         failed: false,
         body: cleaned(body),
@@ -227,11 +284,16 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
 }
 
 /// The page at `offset` of a list the server holds (`pages.rs`), as the
-/// answer of a call that ran nothing.
-pub fn held(items: &[String], offset: usize) -> Answer {
+/// answer of a call that ran nothing, saying what the first page said of
+/// the whole list.
+pub fn held(whole: &Whole, offset: usize) -> Answer {
+    let mut body = page(&whole.items, offset, true);
+    if let Some(fields) = body.as_object_mut() {
+        fields.extend(whole.about.clone());
+    }
     Answer {
         failed: false,
-        body: cleaned(page(items, offset, true)),
+        body: cleaned(body),
         whole: None,
     }
 }
@@ -244,9 +306,11 @@ fn compact(items: &[Value]) -> Vec<String> {
 
 /// The page of `items` that starts at `offset`: as many as fit in
 /// [`PAGE_BYTES`], at most [`PAGE`] and at least one, so a page always moves
-/// on. `{count, offset, items, next_offset}`, where `count` is the whole
-/// list's and `next_offset` is null on the last page, or always when the
-/// call cannot be made again for another (`pages` false). An offset past the
+/// on. `{count, offset, items, next_offset}`, where `count` is how many the
+/// command printed: the whole list, or at most `limit` when the call gave
+/// one, or what a walk cut short read (which `complete: false` says), and
+/// `next_offset` is null on the last page, or always when the call cannot
+/// be made again for another (`pages` false). An offset past the
 /// end is an empty page. **Sliced with `get`, never by indexing**: the offset
 /// is the client's number, and a panic here is the whole server gone.
 pub fn page(items: &[String], offset: usize, pages: bool) -> Value {
@@ -301,58 +365,133 @@ pub fn next_page(body: &Value, tool: &str) -> Option<String> {
     ))
 }
 
-/// What an agent is told beside a list that was not read now: served from
-/// storage in a cooldown, or because the check of its counter failed,
-/// **however old it is** (`engine::cooldown::serve`, `engine::freshness`).
-/// The moments in UTC: the agent and the person may be in another zone than
+/// What an agent is told beside a list that was not read now, **however
+/// old it is**: served from storage in a cooldown, or because the check of
+/// its counter failed (`engine::cooldown::serve`, `engine::freshness`), or
+/// because the call asked for what is stored (`mode: "stored"`, and a later
+/// page read from the store), or because its counter moved but it was
+/// walked too recently to walk again. A list whose counter was checked now
+/// and had not moved was as good as read now, and has no sentence. The
+/// moments in UTC: the agent and the person may be in another zone than
 /// this machine. `None` for any other answer.
 pub fn not_read_now(body: &Value) -> Option<String> {
-    let utc = |seconds: i64| {
-        chrono::DateTime::from_timestamp(seconds, 0).map_or_else(
-            || seconds.to_string(),
-            |at| at.format("%Y-%m-%d %H:%M UTC").to_string(),
-        )
+    let served = body.get("served")?.as_array()?;
+    let dated = |wanted: &[&str]| -> Vec<String> {
+        served
+            .iter()
+            .filter(|said| {
+                said.get("from")
+                    .and_then(Value::as_str)
+                    .is_some_and(|from| wanted.contains(&from))
+            })
+            .filter_map(|said| {
+                let list = said.get("list")?.as_str()?;
+                let at = said.get("taken_at")?.as_i64()?;
+                Some(format!("the {list} list as it was stored at {}", utc(at)))
+            })
+            .collect()
     };
-    let stale: Vec<String> = body
+    let mut said = Vec::new();
+    let stale = dated(&["stored_in_cooldown", "stored_after_failed_poll"]);
+    if !stale.is_empty() {
+        let why = match body.get("cooldown_until").and_then(Value::as_i64) {
+            Some(until) => format!(
+                "the account is in cooldown until {}, when nothing may be sent",
+                utc(until)
+            ),
+            None => "checking whether it had changed failed".to_string(),
+        };
+        said.push(format!(
+            "Not read now: {why}, so this is {}",
+            stale.join(" and ")
+        ));
+    }
+    let asked = dated(&["stored"]);
+    if !asked.is_empty() {
+        said.push(format!(
+            "Read from what is stored, not from Instagram: this is {}",
+            asked.join(" and ")
+        ));
+    }
+    let recent = dated(&["stored_walked_recently"]);
+    if !recent.is_empty() {
+        said.push(format!(
+            "Not read now: its counter has moved, but it was walked too recently to walk \
+             again, so this is {}",
+            recent.join(" and ")
+        ));
+    }
+    if said.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}, however old that is. Say so, with that date, when you present it.",
+        said.join("; ")
+    ))
+}
+
+/// What an agent is told beside a list that is not all of it: a walk cut
+/// short by `max_pages`, or stopped for another reason that still printed
+/// what it read. `None` for a whole list.
+pub fn incomplete(body: &Value) -> Option<String> {
+    if body.get("complete").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let short: Vec<String> = body
         .get("served")?
         .as_array()?
         .iter()
-        .filter(|said| {
-            matches!(
-                said.get("from").and_then(Value::as_str),
-                Some("stored_in_cooldown" | "stored_after_failed_poll")
-            )
-        })
         .filter_map(|said| {
             let list = said.get("list")?.as_str()?;
-            let at = said.get("taken_at")?.as_i64()?;
-            Some(format!("the {list} list as it was stored at {}", utc(at)))
+            let why = match said.get("stopped")?.as_str()? {
+                "page_limit" => "at max_pages".to_string(),
+                "truncated" => "where Instagram stopped serving pages".to_string(),
+                other => format!("early ({other})"),
+            };
+            let read = said.get("read").and_then(Value::as_u64).unwrap_or(0);
+            let of = match said.get("of").and_then(Value::as_u64) {
+                Some(of) => format!(" of about {of}"),
+                None => String::new(),
+            };
+            Some(format!(
+                "the {list} list stopped {why}, with {read}{of} accounts read"
+            ))
         })
         .collect();
-    if stale.is_empty() {
+    if short.is_empty() {
         return None;
     }
-    let why = match body.get("cooldown_until").and_then(Value::as_i64) {
-        Some(until) => format!(
-            "the account is in cooldown until {}, when nothing may be sent",
-            utc(until)
-        ),
-        None => "checking whether it had changed failed".to_string(),
-    };
     Some(format!(
-        "Not read now: {why}, so this is {}, however old that is. Say so, with that date, \
-         when you present it.",
-        stale.join(" and ")
+        "Not the whole list: {}. count is what was read, not how many the account has; say \
+         so when you present it. Calling snob_list again without max_pages reads the rest.",
+        short.join(" and ")
     ))
+}
+
+/// A moment in seconds since the epoch, in UTC, as an agent is told it.
+fn utc(seconds: i64) -> String {
+    chrono::DateTime::from_timestamp(seconds, 0).map_or_else(
+        || seconds.to_string(),
+        |at| at.format("%Y-%m-%d %H:%M UTC").to_string(),
+    )
 }
 
 /// The last few lines of what a command said, which is where its sentence
 /// about the failure is: the records of the log left out first
 /// (`jobs::show::sentences`), which carry what Instagram answered and would
-/// push the sentence out.
+/// push the sentence out, and the lines of `--progress-json`, which a stored
+/// read is given for its `served` line.
 fn last_lines(said: &str) -> String {
-    let lines =
-        crate::jobs::show::sentences(said.lines().filter(|l| !l.trim().is_empty()).collect());
+    let lines = crate::jobs::show::sentences(
+        said.lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter(|line| {
+                serde_json::from_str::<Value>(line.trim())
+                    .ok()
+                    .is_none_or(|value| value.get("progress").is_none())
+            })
+            .collect(),
+    );
     lines[lines.len().saturating_sub(6)..].join("\n")
 }
 
@@ -519,7 +658,7 @@ mod tests {
         }
         let every: Vec<String> = (0..450).map(|n| format!("user{n}")).collect();
         assert_eq!(read, every, "each account once, in the order served");
-        assert_eq!(kept.unwrap().len(), 450);
+        assert_eq!(kept.unwrap().items.len(), 450);
     }
 
     #[test]
@@ -551,7 +690,11 @@ mod tests {
             assert_eq!(told.body["items"], json!([]), "{offset}");
             assert_eq!(told.body["count"], 450, "{offset}");
             assert!(told.body["next_offset"].is_null(), "{offset}");
-            assert_eq!(held(&[], offset).body["items"], json!([]), "{offset}");
+            let none = Whole {
+                items: vec![],
+                about: serde_json::Map::new(),
+            };
+            assert_eq!(held(&none, offset).body["items"], json!([]), "{offset}");
         }
     }
 
@@ -688,6 +831,108 @@ mod tests {
         assert_eq!(told.body["served"][0]["from"], "walked");
         assert!(told.body.get("cooldown_until").is_none());
         assert!(not_read_now(&told.body).is_none());
+    }
+
+    /// A walk cut short by `max_pages` exits 0 with what it read, and only
+    /// its `served` line says it stopped: the answer says it is not the whole
+    /// list, how much of it was read, and so does every later page.
+    #[test]
+    fn a_walk_cut_short_says_it_is_not_the_whole_list() {
+        let mut short = finished(ExitCode::Ok, Some(accounts(250)), None);
+        short.served = vec![json!({
+            "event": "served",
+            "list": "followers",
+            "from": "walked",
+            "taken_at": 1_793_340_000,
+            "cooldown_until": null,
+            "reason": "page_limit",
+            "page": 21,
+            "accounts": 250,
+            "of": 2500,
+        })];
+        let told = from(&list_at(0), short);
+        assert!(!told.failed);
+        assert_eq!(told.body["complete"], false);
+        assert_eq!(told.body["count"], 250);
+        assert_eq!(
+            told.body["served"],
+            json!([{
+                "list": "followers", "from": "walked", "taken_at": 1_793_340_000,
+                "stopped": "page_limit", "read": 250, "of": 2500,
+            }])
+        );
+        let said = incomplete(&told.body).expect("a sentence");
+        assert!(said.contains("stopped at max_pages"), "{said}");
+        assert!(said.contains("250 of about 2500 accounts read"), "{said}");
+        assert!(not_read_now(&told.body).is_none(), "it was read now");
+
+        // The next page, handed back from what the server holds, says it too.
+        let whole = told.whole.expect("a page after this one");
+        let later = held(&whole, 200);
+        assert_eq!(later.body["complete"], false);
+        assert_eq!(later.body["served"], told.body["served"]);
+        assert!(incomplete(&later.body).is_some());
+
+        // A whole walk says nothing of the kind.
+        let mut whole_walk = finished(ExitCode::Ok, Some(accounts(2)), None);
+        whole_walk.served = vec![json!({
+            "list": "followers", "from": "walked", "taken_at": 1, "reason": "completed",
+            "accounts": 2, "of": 2,
+        })];
+        let told = from(&list_at(0), whole_walk);
+        assert!(told.body.get("complete").is_none());
+        assert!(told.body["served"][0].get("stopped").is_none());
+        assert!(incomplete(&told.body).is_none());
+    }
+
+    /// What is read from storage because the call asked for it is dated as
+    /// any other stored list is.
+    #[test]
+    fn a_list_read_from_storage_as_asked_is_dated() {
+        let mut stored = finished(ExitCode::Ok, Some(accounts(2)), None);
+        stored.served = vec![json!({
+            "list": "fans", "from": "stored", "taken_at": 1_793_340_000,
+            "cooldown_until": null, "reason": "completed",
+        })];
+        let told = from(&list_at(0), stored);
+        assert_eq!(told.body["served"][0]["taken_at"], 1_793_340_000);
+        let said = not_read_now(&told.body).expect("a sentence");
+        assert!(said.contains("Read from what is stored"), "{said}");
+        assert!(said.contains("stored at 2026-10-30 06:00 UTC"), "{said}");
+    }
+
+    /// A push-back met by the call itself has started a cooldown that the
+    /// failure does not date: the agent is pointed at `snob_status`, in
+    /// place of the command's own advice to type it again later. One that
+    /// an existing cooldown refused is dated, and keeps its own hint.
+    #[test]
+    fn a_push_back_met_now_points_at_snob_status() {
+        let met = finished(
+            ExitCode::RateLimited,
+            None,
+            Some(json!({"error": {
+                "code": "rate_limited",
+                "message": "Instagram is throttling requests",
+                "cooldown_until": null,
+                "hint": null,
+            }})),
+        );
+        let told = from(&list_at(0), met);
+        assert!(told.failed);
+        assert_eq!(told.body["error"]["hint"], PUSHED_BACK);
+
+        let refused = finished(
+            ExitCode::RateLimited,
+            None,
+            Some(json!({"error": {
+                "code": "rate_limited",
+                "message": "in cooldown",
+                "cooldown_until": 1_793_347_200,
+                "hint": "wait",
+            }})),
+        );
+        let told = from(&list_at(0), refused);
+        assert_eq!(told.body["error"]["hint"], "wait");
     }
 
     #[test]
