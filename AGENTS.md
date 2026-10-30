@@ -701,9 +701,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   reader may be a model, and `serde_json` writes `Cf` as it is): all of `Cc`
   and all of `Cf` removed, plus the invisible letters such as Hangul fillers
   and the marks that draw nothing (the combining grapheme joiner, the
-  supplementary variation selectors, and every standard selector but one
-  right after its base, since a run of them hides a byte each);
-  whitespace controls become a space.
+  supplementary variation selectors, U+FE00 to U+FE0D, and U+FE0E/U+FE0F
+  anywhere but alone right after a symbol or a keycap base, never after a
+  letter: one selector per letter hides four bits a letter, a run a byte
+  each); whitespace controls become a space.
 - **No `@` in a command handed over to be typed back** (PowerShell's splatting
   eats an unquoted `@name`, and the command then answers about the user's own
   account). Names are accepted with or without it; the help explains quoting.
