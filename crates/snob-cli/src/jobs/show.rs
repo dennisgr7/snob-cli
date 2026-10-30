@@ -152,13 +152,42 @@ fn tail_of(path: &Path, bytes: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&read).into_owned())
 }
 
+/// The lists a walk has answered with so far, by name, from the `served`
+/// lines of its log (`Progress::served`): for a crossing, the lists it is
+/// done with.
+pub fn served_lists(dir: &Path) -> Vec<String> {
+    let Some(tail) = tail_of(&file(dir, "err.log"), 4 * TAIL) else {
+        return Vec::new();
+    };
+    tail.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .filter_map(|value| value.get("progress").cloned())
+        .filter(|progress| progress["event"] == "served")
+        .filter_map(|progress| progress["list"].as_str().map(str::to_string))
+        .collect()
+}
+
 /// How long the walk has left, the fewest and the most seconds, from where
-/// its newest progress line puts it: the pages left of the list it is on,
-/// timed by the pace alone (`engine::estimate::walk_seconds`), and what is
-/// left of a wait it is in. Before its first line, the estimate it was
-/// started with, less the time since. `None` when there is nothing to tell it
-/// by, which is also the case between the two lists of a crossing.
-pub fn eta(seen: &Seen, progress: Option<&Value>, now: i64) -> Option<(u64, u64)> {
+/// its newest progress line puts it, timed by the pace alone
+/// (`engine::estimate::walks_seconds`):
+///
+/// - the pages left of the list it is on, and **of the lists of a crossing
+///   it has not reached**, from the estimate it was started with (a list
+///   that may be reused counts none at least), each with its dwell;
+/// - **from where the account's sitting is**, as the newest line says it
+///   (`sitting`, `rest_until`), not from where the walk began: a walk that
+///   starts on a sitting earlier work left part full rests sooner;
+/// - and what is left of a wait it is in.
+///
+/// Before its first line, the estimate it was started with, less the time
+/// since. `None` when there is nothing to tell it by. `served` names the
+/// lists it is done with ([`served_lists`]).
+pub fn eta(
+    seen: &Seen,
+    progress: Option<&Value>,
+    served: &[String],
+    now: i64,
+) -> Option<(u64, u64)> {
     if seen.status.is_over() {
         return None;
     }
@@ -173,16 +202,43 @@ pub fn eta(seen: &Seen, progress: Option<&Value>, now: i64) -> Option<(u64, u64)
         let most = estimate["seconds"]["most"].as_u64()?;
         return Some((least.saturating_sub(gone), most.saturating_sub(gone)));
     };
-    if progress["event"] == "finished" {
-        return None;
-    }
-    let of = progress["of"].as_u64()?;
-    let read = progress["accounts"].as_u64().unwrap_or(0);
-    let pages = of
-        .saturating_sub(read)
-        .div_ceil(u64::from(snob_ig::pace::ACCOUNTS_PER_PAGE));
-    let into_sitting =
-        progress["page"].as_u64().unwrap_or(0) % u64::from(snob_ig::pace::PAGES_PER_SITTING);
+    let current = progress["list"].as_str();
+    // The lists of the estimate not yet reached: neither answered with nor
+    // the one under way. A crossing's estimate names both, in the order they
+    // are read.
+    let to_come: Vec<(u64, u64)> = seen
+        .job
+        .as_ref()
+        .and_then(|job| job.estimate.as_ref())
+        .and_then(|estimate| estimate["lists"].as_array())
+        .into_iter()
+        .flatten()
+        .filter(|list| {
+            let name = list["list"].as_str();
+            name != current && !name.is_some_and(|name| served.iter().any(|s| s == name))
+        })
+        .filter_map(|list| {
+            let least = list["pages"]["least"].as_u64()?;
+            let most = list["pages"]["most"].as_u64()?;
+            match list["fate"].as_str()? {
+                "walked" => Some((least, most)),
+                "reused_unless_moved" => Some((0, most)),
+                _ => None,
+            }
+        })
+        .collect();
+    let pages = if progress["event"] == "finished" {
+        // Between two lists: nothing left of the one that ended.
+        if to_come.is_empty() {
+            return None;
+        }
+        0
+    } else {
+        let of = progress["of"].as_u64()?;
+        let read = progress["accounts"].as_u64().unwrap_or(0);
+        of.saturating_sub(read)
+            .div_ceil(u64::from(snob_ig::pace::ACCOUNTS_PER_PAGE))
+    };
     let waited = progress["at"]
         .as_i64()
         .map_or(0, |at| u64::try_from(now.saturating_sub(at)).unwrap_or(0));
@@ -191,14 +247,29 @@ pub fn eta(seen: &Seen, progress: Option<&Value>, now: i64) -> Option<(u64, u64)
     } else {
         0
     };
+    let full = u64::from(snob_ig::pace::PAGES_PER_SITTING);
     // A rest is what the walk owes before its next page, which the pace
-    // already counts; any other wait is on top of it.
+    // already counts; any other wait is on top of it. A rest the sitting
+    // owes and the walk has not begun to wait is the sitting's own.
+    let owed = progress["rest_until"].as_i64().map_or(0, |until| {
+        u64::try_from(until.saturating_sub(now)).unwrap_or(0)
+    });
     let (rest, other) = if progress["kind"] == "sitting" {
         (wait_left, 0)
     } else {
-        (0, wait_left.div_ceil(1000))
+        (owed, wait_left.div_ceil(1000))
     };
-    let (least, most) = crate::engine::estimate::walk_seconds((pages, pages), into_sitting, rest);
+    // The account's sitting, as the newest page left it; an older line that
+    // does not say it is read as the walk's own pages. A full one whose rest
+    // is over is a new sitting.
+    let into_sitting = match progress["sitting"].as_u64() {
+        Some(pages) if pages >= full && rest == 0 => 0,
+        Some(pages) => pages,
+        None => progress["page"].as_u64().unwrap_or(0) % full,
+    };
+    let mut walks = vec![(pages, pages)];
+    walks.extend(to_come);
+    let (least, most) = crate::engine::estimate::walks_seconds(&walks, into_sitting, rest);
     Some((least + other, most + other))
 }
 
@@ -208,7 +279,7 @@ pub fn record(seen: &Seen, now: i64) -> Value {
     let state = seen.state.as_ref();
     let checked = job.and_then(|job| argv::check(&job.argv).ok());
     let progress = newest_progress(&seen.dir);
-    let eta = eta(seen, progress.as_ref(), now);
+    let eta = eta(seen, progress.as_ref(), &served_lists(&seen.dir), now);
     json!({
         "job_id": seen.id.as_str(),
         "status": seen.status.as_str(),
@@ -439,7 +510,8 @@ pub fn line(seen: &Seen, now: i64) -> String {
             None => line.push_str(&format!("; {read} read")),
         }
     }
-    if let Some((least, most)) = eta(seen, newest_progress(&seen.dir).as_ref(), now) {
+    let served = served_lists(&seen.dir);
+    if let Some((least, most)) = eta(seen, newest_progress(&seen.dir).as_ref(), &served, now) {
         line.push_str(&format!("; {} left", report::time_left(least, most)));
     }
     if seen.status == Status::Lost {
@@ -513,5 +585,101 @@ mod tests {
         assert_eq!(newest["event"], "waiting");
         assert_eq!(newest["seconds"], 300);
         assert_eq!(newest_progress(&tmp.path().join("nowhere")), None);
+    }
+
+    /// A running job of a crossing whose estimate names `lists`.
+    fn crossing(lists: Value) -> Seen {
+        let now = snob_core::clock::now_ms().get();
+        Seen {
+            id: JobId::parse("j01M661CR224ZNFPRANE9AWWZDM").unwrap(),
+            dir: std::path::PathBuf::from("nowhere"),
+            job: Some(super::super::Job {
+                schema: super::super::SCHEMA,
+                id: "j01M661CR224ZNFPRANE9AWWZDM".into(),
+                created_at: now,
+                viewer_pk: snob_core::Pk::new(42),
+                tool: None,
+                arguments: Value::Null,
+                argv: vec![],
+                globals: vec![],
+                estimate: Some(json!({ "lists": lists })),
+                detached: None,
+                started_by: None,
+                max_wait_seconds: None,
+            }),
+            state: None,
+            held: true,
+            stop_asked: false,
+            status: Status::Running,
+        }
+    }
+
+    /// The time a walk takes, by the pace alone, from a fresh sitting.
+    fn walking(pages: &[(u64, u64)], into_sitting: u64) -> (u64, u64) {
+        crate::engine::estimate::walks_seconds(pages, into_sitting, 0)
+    }
+
+    /// In the first list of a crossing, the time left counts the second
+    /// list too, which it has not reached; once the first is answered with,
+    /// only the second.
+    #[test]
+    fn a_crossing_in_its_first_list_counts_the_second() {
+        let now = snob_core::clock::now_ms().get();
+        let seen = crossing(json!([
+            {"list": "followers", "fate": "walked", "pages": {"least": 20, "most": 20}},
+            {"list": "following", "fate": "walked", "pages": {"least": 30, "most": 30}},
+        ]));
+        // Ten pages into the first list of 240 accounts: ten left of it.
+        let line = json!({
+            "event": "page", "at": now, "page": 10, "accounts": 120, "of": 240,
+            "list": "followers", "sitting": 10, "rest_until": null,
+        });
+        let (least, most) = eta(&seen, Some(&line), &[], now).unwrap();
+        assert_eq!((least, most), walking(&[(10, 10), (30, 30)], 10));
+        let alone = walking(&[(10, 10)], 10);
+        assert!(most > alone.1, "{most} against {alone:?}");
+
+        // Between the lists, the first answered with: the second alone.
+        let finished = json!({
+            "event": "finished", "at": now, "page": 20, "accounts": 240, "of": 240,
+            "list": "followers", "sitting": 20, "rest_until": null,
+        });
+        let served = ["followers".to_string()];
+        assert_eq!(
+            eta(&seen, Some(&finished), &served, now).unwrap(),
+            walking(&[(0, 0), (30, 30)], 20)
+        );
+    }
+
+    /// A walk that began on a sitting earlier work left part full rests
+    /// sooner than its own pages say: the time left counts from the
+    /// account's sitting, which the newest page line carries.
+    #[test]
+    fn a_part_full_sitting_brings_the_rest_forward() {
+        let now = snob_core::clock::now_ms().get();
+        let seen = crossing(json!([
+            {"list": "followers", "fate": "walked", "pages": {"least": 20, "most": 20}},
+        ]));
+        // Its own fifth page, the sitting's thirty-fifth: twenty pages left,
+        // and a rest after five of them.
+        let line = json!({
+            "event": "page", "at": now, "page": 5, "accounts": 60, "of": 300,
+            "list": "followers", "sitting": 35, "rest_until": null,
+        });
+        let (_, most) = eta(&seen, Some(&line), &[], now).unwrap();
+        let from_its_own_pages = walking(&[(20, 20)], 5).1;
+        let longest_rest = snob_ig::pace::SITTING_PAUSE_MS.1 / 1000;
+        assert!(
+            most >= from_its_own_pages + longest_rest - 1,
+            "{most} against {from_its_own_pages}"
+        );
+
+        // A full sitting whose rest is owed counts what is left of it.
+        let full = json!({
+            "event": "page", "at": now, "page": 5, "accounts": 60, "of": 300,
+            "list": "followers", "sitting": 40, "rest_until": now + 600_000,
+        });
+        let (least, _) = eta(&seen, Some(&full), &[], now).unwrap();
+        assert!(least >= 600, "{least}");
     }
 }

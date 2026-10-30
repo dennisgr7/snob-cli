@@ -261,14 +261,23 @@ pub fn compute(inputs: &Inputs) -> Estimate {
 /// For what has to say how long a walk under way has left, which knows its
 /// pages and not the buckets' standing at every one of them.
 pub fn walk_seconds(pages: (u64, u64), into_sitting: u64, rest_owed_ms: u64) -> (u64, u64) {
-    let time = |scenario, pages| {
+    walks_seconds(&[pages], into_sitting, rest_owed_ms)
+}
+
+/// [`walk_seconds`] for walks one after the other, as a crossing reads its
+/// two lists: each its dwell, and the sitting carried from one to the next,
+/// since it is the account's.
+pub fn walks_seconds(walks: &[(u64, u64)], into_sitting: u64, rest_owed_ms: u64) -> (u64, u64) {
+    let time = |scenario, pick: fn(&(u64, u64)) -> u64| {
         let mut run = Run::unpaced(scenario, into_sitting, rest_owed_ms);
-        run.walk(pages, false);
+        for walk in walks {
+            run.walk(pick(walk), false);
+        }
         run.ms
     };
     (
-        time(Scenario::Least, pages.0) / 1000,
-        time(Scenario::Most, pages.1).div_ceil(1000),
+        time(Scenario::Least, |walk| walk.0) / 1000,
+        time(Scenario::Most, |walk| walk.1).div_ceil(1000),
     )
 }
 

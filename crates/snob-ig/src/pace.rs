@@ -334,17 +334,25 @@ impl Pacer {
     /// list a page at a time, one process a page. Kept by the budget, in
     /// the account's database, so it outlives the process; off the async
     /// worker for the reason [`Self::off_thread`] gives, since it is a write
-    /// transaction after every page.
-    pub async fn page_walked(&self, pace: &Pace, at: EpochMs) -> Result<(), crate::error::IgError> {
+    /// transaction after every page. Answers with the sitting as this page
+    /// left it, which a walk under way says in its progress (`Event::Page`)
+    /// so that how long it has left can count the rests to come from where
+    /// the account's sitting is, not from where the walk began.
+    pub async fn page_walked(
+        &self,
+        pace: &Pace,
+        at: EpochMs,
+    ) -> Result<Sitting, crate::error::IgError> {
         let rule = pace.sitting_rule();
         if self.budget.keeps_sitting() {
             return self
-                .off_thread(move |budget| budget.sitting_page(at, rule).map(drop))
+                .off_thread(move |budget| budget.sitting_page(at, rule))
                 .await;
         }
         let mut sitting = self.sitting.lock().unwrap_or_else(|e| e.into_inner());
-        *sitting = Some(Sitting::after_page(*sitting, at, rule));
-        Ok(())
+        let after = Sitting::after_page(*sitting, at, rule);
+        *sitting = Some(after);
+        Ok(after)
     }
 
     /// The rest owed at `now`, if one is: when it ends, and what is left of

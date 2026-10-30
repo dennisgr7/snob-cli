@@ -626,6 +626,7 @@ pub async fn walk_named(
     check: impl FnOnce(&ListOutcome) -> Result<()>,
 ) -> Result<(Vec<User>, ListOutcome)> {
     app.progress().begin(&report::walking(kind, subject));
+    app.progress().walking(kind);
 
     // Both failures leave through one door, so the rule this function exists to
     // hold is written once inside it too. Two copies of `finish()` here would

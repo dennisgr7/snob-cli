@@ -53,6 +53,14 @@ struct Told {
     page: u32,
     accounts: usize,
     of: Option<u64>,
+    /// The list being walked (`Progress::walking`), and the account's
+    /// sitting as the last page left it: its pages and when the rest it owes
+    /// ends. **Kept from one walk to the next**, as the sitting is the
+    /// account's and a crossing walks two lists in a row; `jobs::show::eta`
+    /// counts the rests to come from them.
+    list: Option<&'static str>,
+    sitting: Option<u32>,
+    rest_until: Option<i64>,
 }
 
 /// Cloning shares the same stack rather than making a second one: the pacer
@@ -171,6 +179,9 @@ impl Progress {
             "page": told.page,
             "accounts": told.accounts,
             "of": told.of,
+            "list": told.list,
+            "sitting": told.sitting,
+            "rest_until": told.rest_until,
         });
         if let (Some(line), serde_json::Value::Object(more)) = (line.as_object_mut(), more) {
             line.extend(more);
@@ -323,6 +334,9 @@ impl Progress {
                     |told| {
                         *told = Told {
                             of: *estimated,
+                            list: told.list,
+                            sitting: told.sitting,
+                            rest_until: told.rest_until,
                             ..Told::default()
                         }
                     },
@@ -373,6 +387,7 @@ impl Progress {
             Event::Page {
                 number,
                 running_total,
+                sitting,
                 ..
             } => {
                 self.tell(
@@ -380,6 +395,8 @@ impl Progress {
                     |told| {
                         told.page = *number;
                         told.accounts = *running_total;
+                        told.sitting = Some(sitting.pages);
+                        told.rest_until = sitting.rest_until.map(|until| until.get());
                     },
                     serde_json::Value::Null,
                 );
@@ -572,6 +589,14 @@ impl Progress {
     /// with this flag, so an agent is told a stored list is one, and how old,
     /// and a short one is short, as a person is told in the warning and the
     /// summary; nothing is drawn for it.
+    /// Under `--progress-json`, the list the walk about to start reads, said
+    /// on every line from then on (`list`); nothing is drawn for it.
+    pub fn walking(&self, list: snob_core::model::ListKind) {
+        if let Some(told) = &self.told {
+            told.lock().unwrap_or_else(|e| e.into_inner()).list = Some(list.as_str());
+        }
+    }
+
     pub fn served(
         &self,
         list: snob_core::model::ListKind,
@@ -886,6 +911,11 @@ mod tests {
             running_total,
             added: 50,
             received: 50,
+            sitting: snob_core::budget::Sitting {
+                pages: number % 40,
+                last_page_at: snob_core::EpochMs::new(0),
+                rest_until: None,
+            },
         }
     }
 

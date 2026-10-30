@@ -105,6 +105,9 @@ pub enum Event {
         received: usize,
         added: usize,
         running_total: usize,
+        /// The account's sitting as this page left it: its pages, which
+        /// carry across walks, and the rest it owes once full.
+        sitting: snob_core::budget::Sitting,
     },
     Waiting {
         kind: WaitKind,
@@ -526,7 +529,7 @@ impl<'a> ListWalker<'a> {
             // Counted whether or not the walk goes on: the sitting is the
             // account's, and the page that fills it owes the rest to
             // whatever walks next, this walk's next page included.
-            pacer
+            let sitting = pacer
                 .page_walked(&self.pace, (self.wall)())
                 .await
                 .map_err(WalkError::Budget)?;
@@ -538,6 +541,7 @@ impl<'a> ListWalker<'a> {
                 received,
                 added,
                 running_total: state.users,
+                sitting,
             });
 
             // No rest here, after the page: the rest is owed and paid by
