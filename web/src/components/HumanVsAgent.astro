@@ -43,3 +43,20 @@ import { AGENTS } from '@/lib/content';
     </dl>
   </div>
 </div>
+<div class="mt-16 grid items-start gap-10 lg:grid-cols-2">
+  <div>
+    <h3 class="font-mono text-sm font-bold">{AGENTS.mcp.title}</h3>
+    <p class="mt-4 text-sm text-muted">{AGENTS.mcp.lead}</p>
+    <dl class="mt-6 space-y-3 text-sm">
+      {
+        AGENTS.mcp.points.map((item) => (
+          <div>
+            <dt class="font-mono text-text">{item.term}</dt>
+            <dd class="text-muted">{item.means}</dd>
+          </div>
+        ))
+      }
+    </dl>
+  </div>
+  <Terminal label="Printing the MCP configuration for Claude Code" lines={AGENTS.mcp.sample} />
+</div>

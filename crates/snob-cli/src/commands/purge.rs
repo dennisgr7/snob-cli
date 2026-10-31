@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use snob_core::Pk;
-use snob_store::paths::{self, AppPaths};
+use snob_store::paths::{self, AccountPaths, AppPaths, JobId};
 use snob_store::registry::Registry;
 use snob_store::secrets::{Kind, SecretStore};
 use snob_store::store::shared::Shared;
@@ -41,7 +41,8 @@ pub struct Plan {
     /// registry names and every one with a directory, in case the registry is
     /// gone or damaged. `only` names the one when one goes.
     pub accounts: Vec<Pk>,
-    /// The monitor's stored secrets, when there are any.
+    /// The secrets stored that are not a session, when there are any: the
+    /// monitor's and the MCP key.
     ///
     /// **For the listing only.** What `execute` removes is `Kind::ALL`, always,
     /// and it does not consult this: the deletion must not be gated on a survey
@@ -52,6 +53,11 @@ pub struct Plan {
     /// The one account `purge --account` removes, its place in the registry
     /// with it; `None` is everything.
     pub only: Option<Viewer>,
+    /// The jobs still running in what goes, which are stopped before
+    /// anything is removed (`jobs`): a walk left running would write into
+    /// the directories as they went, and start the owner of the browsers
+    /// again into them.
+    pub jobs: Vec<JobId>,
 }
 
 impl Plan {
@@ -75,22 +81,40 @@ impl Plan {
         // Named separately from the session, because they are a different
         // thing to lose: a webhook token and a signing key belong to the
         // user's own server, not to Instagram, and somebody re-running `setup`
-        // afterwards has to know they will have to enter them again.
+        // afterwards has to know they will have to enter them again. The MCP
+        // key is named as what it is, not as one of the monitor's: every
+        // client given it stops working, and has to be given a new one.
         if !self.secrets.is_empty() {
-            let named: Vec<&str> = self
-                .secrets
-                .iter()
-                .map(|kind| match kind {
-                    Kind::WatchToken => "webhook token",
-                    Kind::WatchSigningKey => "signing key",
-                })
-                .collect();
+            let mut monitor = Vec::new();
+            let mut mcp = false;
+            for kind in &self.secrets {
+                match kind {
+                    Kind::WatchToken => monitor.push("webhook token"),
+                    Kind::WatchSigningKey => monitor.push("signing key"),
+                    Kind::McpKey => mcp = true,
+                }
+            }
+            let mut named = Vec::new();
+            if !monitor.is_empty() {
+                named.push(format!("the monitor's {}", monitor.join(" and ")));
+            }
+            if mcp {
+                named.push("the MCP key".to_string());
+            }
             lines.push(format!(
-                "the monitor's stored {}, from the system keyring",
-                named.join(" and ")
+                "stored secrets from the system keyring: {}",
+                named.join(", ")
             ));
         }
         lines.extend(self.directories.iter().map(|d| d.display().to_string()));
+        if !self.jobs.is_empty() {
+            let ids: Vec<&str> = self.jobs.iter().map(JobId::as_str).collect();
+            lines.push(format!(
+                "the {} still running ({}), stopped first",
+                if ids.len() == 1 { "job" } else { "jobs" },
+                ids.join(", ")
+            ));
+        }
         if let Some(account) = &self.only {
             lines.push(format!(
                 "{} from the accounts signed in here",
@@ -110,7 +134,7 @@ pub fn survey(store: &SecretStore, app_paths: &AppPaths) -> Plan {
         // corrupt to parse as well as a readable one.
         session: store.sessions_stored(&accounts),
         accounts,
-        secrets: store.monitor_secrets_stored(),
+        secrets: store.secrets_stored(),
         directories: app_paths
             .owned_dirs()
             .into_iter()
@@ -127,12 +151,29 @@ pub fn survey(store: &SecretStore, app_paths: &AppPaths) -> Plan {
             })
             .collect(),
         only: None,
+        jobs: app_paths
+            .account_dirs()
+            .into_iter()
+            .flat_map(|pk| running_jobs(&app_paths.account(pk)))
+            .collect(),
     }
+}
+
+/// The jobs of `account`'s not over yet, read without writing anything.
+fn running_jobs(account: &AccountPaths) -> Vec<JobId> {
+    let now = snob_core::clock::now_ms().get();
+    crate::jobs::all(account, now)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|seen| !seen.status.is_over())
+        .map(|seen| seen.id)
+        .collect()
 }
 
 /// What `purge --account` removes: one account's session, its directory and
 /// its browser profile, and its place in the registry. Nothing of any other
-/// account's, and none of the monitor's secrets.
+/// account's, and none of the secrets that are not a session: the monitor's
+/// and the MCP key are the machine's, not the account's.
 pub fn survey_account(store: &SecretStore, app_paths: &AppPaths, account: Viewer) -> Plan {
     let paths = app_paths.account(account.pk);
     Plan {
@@ -143,6 +184,7 @@ pub fn survey_account(store: &SecretStore, app_paths: &AppPaths, account: Viewer
             .into_iter()
             .filter(|dir| dir.exists() && paths::is_safe_to_remove(dir))
             .collect(),
+        jobs: running_jobs(&paths),
         only: Some(account),
     }
 }
@@ -170,8 +212,16 @@ pub struct Failure {
 ///
 /// The session goes first, on purpose: it is the only item here that is a live
 /// credential, and it must not be held hostage by a directory that turns out to
-/// be locked.
-pub fn execute(plan: &Plan, store: &SecretStore, app_paths: &AppPaths) -> Vec<Failure> {
+/// be locked. `between` runs once it has gone and before any directory does:
+/// where the jobs locks a purge holds are let go of (`jobs::Stopping`), so a
+/// job start that waited on one wakes to find no session and makes nothing
+/// (`jobs::start::make`), and no file is held open in what is removed.
+pub fn execute(
+    plan: &Plan,
+    store: &SecretStore,
+    app_paths: &AppPaths,
+    between: impl FnOnce(),
+) -> Vec<Failure> {
     let mut failures = Vec::new();
 
     // `delete_all`, not `delete`: this is the command whose whole promise is
@@ -198,6 +248,7 @@ pub fn execute(plan: &Plan, store: &SecretStore, app_paths: &AppPaths) -> Vec<Fa
             credential: true,
         });
     }
+    between();
 
     for dir in &plan.directories {
         // `remove_tree`, not `remove_dir_all`: the scratch root sits at a
@@ -310,12 +361,48 @@ pub async fn run_for_account(
 ) -> Result<ExitCode> {
     let account = crate::account::named(name, &Registry::load(app_paths)?)
         .map_err(crate::account::Unresolved::into_error)?;
-    // Its browser would write into the profile as it went, or keep Windows
-    // from removing it. The owner and the other accounts' browsers stay.
-    crate::owner::release(app_paths, Some(account.pk)).await;
     warn_about_watched(app_paths, &account);
+    let pk = account.pk;
     let plan = survey_account(&store, app_paths, account);
-    carry_out(args, &plan, &store, app_paths, ui::can_be_asked())
+    if let Some(code) = ask(&args, &plan, ui::can_be_asked())? {
+        return Ok(code);
+    }
+    // Its jobs first, so none starts a browser again; then its browser, which
+    // would write into the profile as it went, or keep Windows from removing
+    // it. The owner and the other accounts' browsers stay.
+    let stopping = crate::jobs::stop_before_leaving(vec![app_paths.account(pk)]).await?;
+    crate::owner::release(app_paths, Some(pk)).await;
+    // **The session goes while the jobs lock is held**, and the lock is let
+    // go of before the removal, which Windows refuses while a file in it is
+    // open: a start waiting on the lock then finds no session and makes
+    // nothing (`jobs::start::make`).
+    finish(&plan, &store, app_paths, || drop(stopping))
+}
+
+/// `purge` of everything, from the command line: what [`run`] does, with
+/// every account's jobs stopped and the owner of the browsers asked to leave
+/// between the question and the removal.
+pub async fn run_everything(
+    args: PurgeArgs,
+    store: SecretStore,
+    app_paths: &AppPaths,
+) -> Result<ExitCode> {
+    let plan = survey(&store, app_paths);
+    if let Some(code) = ask(&args, &plan, ui::can_be_asked())? {
+        return Ok(code);
+    }
+    let accounts = app_paths
+        .account_dirs()
+        .into_iter()
+        .map(|pk| app_paths.account(pk))
+        .collect();
+    let stopping = crate::jobs::stop_before_leaving(accounts).await?;
+    // The whole data directory goes, the owner's log with it, so the owner is
+    // asked to leave, not only to close its browsers; after the jobs, which
+    // would start it again.
+    crate::owner::quit(app_paths).await;
+    // The sessions go while the jobs locks are held (see `run_for_account`).
+    finish(&plan, &store, app_paths, || drop(stopping))
 }
 
 /// Says which of the monitor's entries name `account` as their viewer.
@@ -346,10 +433,19 @@ fn carry_out(
     app_paths: &AppPaths,
     someone_is_there: bool,
 ) -> Result<ExitCode> {
+    match ask(&args, plan, someone_is_there)? {
+        Some(code) => Ok(code),
+        None => finish(plan, store, app_paths, || {}),
+    }
+}
+
+/// Shows the plan and asks: `Some` with the exit code when nothing is to be
+/// removed (nothing there, a dry run, or a no), `None` to go on.
+fn ask(args: &PurgeArgs, plan: &Plan, someone_is_there: bool) -> Result<Option<ExitCode>> {
     if plan.is_empty() {
         crate::ui::say!("There is nothing of snob's stored on this computer.");
         report_the_binary();
-        return Ok(ExitCode::Ok);
+        return Ok(Some(ExitCode::Ok));
     }
 
     crate::ui::say!("This will delete, from this computer:");
@@ -359,7 +455,7 @@ fn carry_out(
 
     if args.dry_run {
         crate::ui::say!("\nNothing was deleted (--dry-run).");
-        return Ok(ExitCode::Ok);
+        return Ok(Some(ExitCode::Ok));
     }
 
     // With no terminal, `confirm` keeps its default without asking anything —
@@ -395,10 +491,20 @@ fn carry_out(
     // not had its purge, and 0 said it had.
     if !args.consent.yes && !ui::confirm("\nDelete all of it?", false)? {
         crate::ui::say!("Nothing was deleted.");
-        return Ok(ExitCode::Interrupted);
+        return Ok(Some(ExitCode::Interrupted));
     }
 
-    let failures = execute(plan, store, app_paths);
+    Ok(None)
+}
+
+/// Removes what the plan says, and says how it went.
+fn finish(
+    plan: &Plan,
+    store: &SecretStore,
+    app_paths: &AppPaths,
+    between: impl FnOnce(),
+) -> Result<ExitCode> {
+    let failures = execute(plan, store, app_paths, between);
 
     if failures.is_empty() {
         crate::ui::say!("Done.");
@@ -496,6 +602,7 @@ mod tests {
             secrets: vec![],
             directories: vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")],
             only: None,
+            jobs: vec![],
         };
         let lines = plan.lines();
         assert_eq!(lines.len(), 3);
@@ -516,6 +623,7 @@ mod tests {
             secrets: vec![Kind::WatchToken, Kind::WatchSigningKey],
             directories: vec![],
             only: None,
+            jobs: vec![],
         };
         assert!(!plan.is_empty(), "two live credentials are not nothing");
 
@@ -526,6 +634,34 @@ mod tests {
         assert!(
             !lines[0].contains("session"),
             "there is no session here to claim: {lines:?}"
+        );
+    }
+
+    /// The MCP key is named as itself, and never as one of the monitor's:
+    /// somebody reading the list has to know that the clients given it stop
+    /// working.
+    #[test]
+    fn the_listing_names_the_mcp_key_as_its_own() {
+        let plan = |secrets: Vec<Kind>| Plan {
+            secrets,
+            ..Plan::default()
+        };
+
+        let lines = plan(vec![Kind::McpKey]).lines();
+        assert_eq!(
+            lines,
+            vec!["stored secrets from the system keyring: the MCP key".to_string()]
+        );
+        assert!(!lines[0].contains("monitor"), "{lines:?}");
+
+        let lines = plan(vec![Kind::WatchToken, Kind::WatchSigningKey, Kind::McpKey]).lines();
+        assert_eq!(
+            lines,
+            vec![
+                "stored secrets from the system keyring: the monitor's webhook token and \
+                 signing key, the MCP key"
+                    .to_string()
+            ]
         );
     }
 
@@ -543,7 +679,7 @@ mod tests {
         let store = SecretStore::new(paths.clone(), true)
             .with_service(&format!("snob-ig-test-purge-empty-{}", std::process::id()));
 
-        let failures = execute(&Plan::default(), &store, &paths);
+        let failures = execute(&Plan::default(), &store, &paths, || {});
         assert!(failures.is_empty());
     }
 }

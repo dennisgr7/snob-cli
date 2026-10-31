@@ -247,24 +247,51 @@ pub fn confirm(question: &str, default: bool) -> Result<bool> {
 pub enum LoginMethod {
     Paste,
     Browser,
+    /// The browser on this machine, shown in one on another through an SSH
+    /// tunnel (`crate::relay`).
+    Remote,
+}
+
+/// The methods the menu offers, in its order, for someone sitting at `seat`:
+/// the window first where it opens in front of them, the tunnel first where
+/// it would not, and the window left out where it cannot open at all.
+pub fn login_methods(seat: &crate::seat::Seat) -> Vec<(LoginMethod, &'static str)> {
+    use crate::seat::Window;
+    const REMOTE: &str =
+        "Log in from the browser of the computer you are at, through an SSH tunnel";
+    const REMOTE_FIRST: &str = "Log in from the browser of the computer you are at, through an \
+                                SSH tunnel  (recommended)";
+    const PASTE: &str = "Paste the sessionid from the developer tools";
+    match seat.window {
+        Window::Seen => vec![
+            (
+                LoginMethod::Browser,
+                "Open a browser and log in there  (recommended)",
+            ),
+            (LoginMethod::Paste, PASTE),
+            (LoginMethod::Remote, REMOTE),
+        ],
+        Window::Elsewhere => vec![
+            (LoginMethod::Remote, REMOTE_FIRST),
+            (LoginMethod::Paste, PASTE),
+            (
+                LoginMethod::Browser,
+                "Open a browser on this machine's own screen",
+            ),
+        ],
+        Window::Nowhere => vec![
+            (LoginMethod::Remote, REMOTE_FIRST),
+            (LoginMethod::Paste, PASTE),
+        ],
+    }
 }
 
 /// Arrow-key selection menu. Returns `None` if canceled with Esc.
-pub fn choose_login_method() -> Result<Option<LoginMethod>> {
-    let chosen = menu::choose(
-        "How do you want to log in?",
-        &[
-            "Open a browser and log in there  (recommended)",
-            "Paste the sessionid from the developer tools",
-        ],
-    )?;
-    Ok(chosen.map(|i| {
-        if i == 0 {
-            LoginMethod::Browser
-        } else {
-            LoginMethod::Paste
-        }
-    }))
+pub fn choose_login_method(seat: &crate::seat::Seat) -> Result<Option<LoginMethod>> {
+    let methods = login_methods(seat);
+    let labels: Vec<&str> = methods.iter().map(|(_, label)| *label).collect();
+    let chosen = menu::choose("How do you want to log in?", &labels)?;
+    Ok(chosen.and_then(|i| methods.get(i).map(|(method, _)| *method)))
 }
 
 /// Undoes what a menu or a browser did to the terminal, for an exit that
@@ -395,6 +422,49 @@ pub fn looks_like_console_dump(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{can_be_asked, can_mask, can_show_a_menu, looks_like_console_dump, mask};
+
+    /// The menu puts first the login that works where the person sits, and
+    /// leaves out the window where none can open.
+    #[test]
+    fn the_login_menu_follows_the_seat() {
+        use super::{LoginMethod, login_methods};
+        use crate::seat::{Seat, Window};
+        let at = |window| Seat { ssh: None, window };
+        let order = |window| -> Vec<LoginMethod> {
+            login_methods(&at(window))
+                .into_iter()
+                .map(|(m, _)| m)
+                .collect()
+        };
+        assert_eq!(
+            order(Window::Seen),
+            [
+                LoginMethod::Browser,
+                LoginMethod::Paste,
+                LoginMethod::Remote
+            ]
+        );
+        assert_eq!(
+            order(Window::Elsewhere),
+            [
+                LoginMethod::Remote,
+                LoginMethod::Paste,
+                LoginMethod::Browser
+            ]
+        );
+        assert_eq!(
+            order(Window::Nowhere),
+            [LoginMethod::Remote, LoginMethod::Paste]
+        );
+        for window in [Window::Seen, Window::Elsewhere, Window::Nowhere] {
+            let methods = login_methods(&at(window));
+            let recommended: Vec<_> = methods
+                .iter()
+                .filter(|(_, label)| label.contains("recommended"))
+                .collect();
+            assert_eq!(recommended, [&methods[0]], "{window:?}");
+        }
+    }
 
     /// The masked prompt needs both streams, because it uses both.
     ///

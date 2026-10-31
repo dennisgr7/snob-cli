@@ -1,6 +1,7 @@
 //! Exit codes, so a caller can tell "log in again" apart from "wait a while"
 //! without parsing message text.
 
+use snob_core::EpochMs;
 use snob_core::model::StopReason;
 use snob_ig::error::IgError;
 
@@ -24,6 +25,22 @@ pub fn code(outcome: ExitCode) -> u8 {
         // 128 + SIGINT, the shell convention.
         ExitCode::Interrupted => 130,
     }
+}
+
+/// The outcome a process exit number stands for, read back from a child or a
+/// job; `None` for one no run of this program exits with (a signal, clap's 2,
+/// or a newer build's).
+pub fn outcome_of(number: i32) -> Option<ExitCode> {
+    [
+        ExitCode::Ok,
+        ExitCode::Error,
+        ExitCode::NoSession,
+        ExitCode::Challenge,
+        ExitCode::RateLimited,
+        ExitCode::Interrupted,
+    ]
+    .into_iter()
+    .find(|outcome| i32::from(code(*outcome)) == number)
 }
 
 /// The code for what Instagram said, when a walk stopped because it said
@@ -50,6 +67,9 @@ pub fn from_ig_error(e: &IgError) -> ExitCode {
         // error — and it is still the user stopping, which `from_stop_reason`
         // answers with 130 for the very same event.
         IgError::Canceled => ExitCode::Interrupted,
+        // The same stop at a limit the caller set rather than a key, so the
+        // same code `from_stop_reason` gives the walk it ends (`Canceled`).
+        IgError::WaitTooLong { .. } => ExitCode::Interrupted,
         _ => ExitCode::Error,
     }
 }
@@ -123,6 +143,21 @@ pub struct ExitError {
     /// put it on its own `hint:` line rather than under `error:`, where it
     /// would read as more of the complaint.
     hint: Option<String>,
+    /// A finer token than the code, for a program to tell this failure apart
+    /// from others with the same exit status (`busy`: another run holds the
+    /// account, `--spend-alone`). The JSON failure carries it as `reason`.
+    reason: Option<&'static str>,
+    /// When the cooldown that refused the run lifts, for a refusal by one.
+    /// The JSON failure carries it as `cooldown_until`, so a program reads
+    /// the moment rather than the sentence, which says it in local time.
+    cooldown_until: Option<EpochMs>,
+    /// When the run would no longer be refused for this reason, for a
+    /// refusal that is no cooldown but ends at a known moment (the day's cap
+    /// on an agent's writes, `mcp_write_cap`). The JSON failure carries it as
+    /// `retry_at`, for the reason `cooldown_until` is a field: the sentence
+    /// says it in the local time of the machine that wrote it, with no zone,
+    /// and the reader may be a model in another one.
+    retry_at: Option<EpochMs>,
 }
 
 impl ExitError {
@@ -131,6 +166,9 @@ impl ExitError {
             code,
             message: message.into(),
             hint: None,
+            reason: None,
+            cooldown_until: None,
+            retry_at: None,
         }
     }
 
@@ -145,6 +183,39 @@ impl ExitError {
 
     pub fn hint(&self) -> Option<&str> {
         self.hint.as_deref()
+    }
+
+    /// Adds the finer token a program tells this failure apart by.
+    #[must_use]
+    pub fn with_reason(mut self, reason: &'static str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    pub fn reason(&self) -> Option<&'static str> {
+        self.reason
+    }
+
+    /// Adds when the cooldown that refused the run lifts.
+    #[must_use]
+    pub fn with_cooldown_until(mut self, until: EpochMs) -> Self {
+        self.cooldown_until = Some(until);
+        self
+    }
+
+    pub fn cooldown_until(&self) -> Option<EpochMs> {
+        self.cooldown_until
+    }
+
+    /// Adds when a refusal that is no cooldown stops applying.
+    #[must_use]
+    pub fn with_retry_at(mut self, at: EpochMs) -> Self {
+        self.retry_at = Some(at);
+        self
+    }
+
+    pub fn retry_at(&self) -> Option<EpochMs> {
+        self.retry_at
     }
 }
 

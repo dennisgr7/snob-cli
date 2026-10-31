@@ -19,7 +19,9 @@ use snob_store::paths::{AccountPaths, AppPaths};
 use snob_store::secrets::{SecretStore, SessionStore};
 
 use crate::app::{App, Viewer};
-use crate::cli::{Attr, BrowseArgs, FilterArgs, Format, ListArgs, OutputArgs, ScanArgs, WalkArgs};
+use crate::cli::{
+    AgentArgs, Attr, BrowseArgs, FilterArgs, Format, ListArgs, OutputArgs, ScanArgs, WalkArgs,
+};
 use crate::engine::{self, ListOutcome};
 use crate::exit::{ExitCode, ExitError};
 use crate::output::{self, Presentation, Rendered};
@@ -127,6 +129,144 @@ pub fn app(secrets: &SessionStore, paths: &AccountPaths, with_progress: bool) ->
     App::open(secrets, paths, with_progress)?
         .map(Box::new)
         .ok_or_else(no_session)
+}
+
+/// How a client is named in the record of what it was told yes to: its name
+/// and version as it declared them, **through `printable`, then cut to
+/// letters, digits, spaces and `._/-`, and to 64 characters**. It is the
+/// client's own text, it becomes an argument of a command line, and the
+/// person reads it in `snob status` and `snob jobs`. `None` when nothing is
+/// left.
+pub fn client_label(name: &str, version: &str) -> Option<String> {
+    let said = snob_core::model::printable(&format!("{name} {version}"));
+    let kept: String = said
+        .chars()
+        .filter(|&c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '/' | '-'))
+        .collect();
+    let kept: String = kept
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(64)
+        .collect();
+    let kept = kept.trim_end();
+    (!kept.is_empty()).then(|| kept.to_string())
+}
+
+/// Records what an agent was told yes to through `snob mcp`, for a run given
+/// `--confirmed-via` (`cli::AgentArgs`), **before the run sends anything**,
+/// and refuses a write past the day's cap with nothing sent. The id of the
+/// row, or `None` for a run that was not an agent's, and for a walk in a
+/// cooldown, which reads nothing.
+///
+/// `action` is the command (`follow`, `followers`, ...), `target` the account
+/// as the call named it. `write_cap` is `--mcp-write-cap`, which counts only
+/// for a write, and is [`mcp_acts::WRITES_A_DAY`] when not given.
+///
+/// [`mcp_acts::WRITES_A_DAY`]: snob_store::store::mcp_acts::WRITES_A_DAY
+pub fn record_agent_act(
+    app: &mut App,
+    agent: &AgentArgs,
+    action: &str,
+    target: Option<&str>,
+    write_cap: Option<u32>,
+) -> Result<Option<i64>> {
+    use snob_store::store::mcp_acts::{self, NewAct, Recorded};
+    let Some(via) = agent.confirmed_via else {
+        return Ok(None);
+    };
+    // A walk in a cooldown reads nothing of the account: `engine::list`
+    // serves what is stored, or refuses, so there is no act to record, and
+    // recording one would show the person a walk that never ran. (A write
+    // in a cooldown is refused before it is recorded, by
+    // `refuse_during_cooldown`.)
+    if !mcp_acts::is_write(action) && app.held()?.is_some() {
+        return Ok(None);
+    }
+    let cap = mcp_acts::is_write(action).then(|| write_cap.unwrap_or(mcp_acts::WRITES_A_DAY));
+    let act = NewAct {
+        action,
+        target: target.map(engine::target::clean),
+        via: via.as_str(),
+        client: agent
+            .confirmed_for
+            .as_deref()
+            .filter(|client| !client.is_empty()),
+    };
+    match mcp_acts::record(app.db_mut(), &act, cap, snob_core::clock::now_ms())? {
+        Recorded::Done(id) => Ok(Some(id)),
+        Recorded::Capped { writes, free_at } => Err(write_cap_reached(writes, free_at)),
+    }
+}
+
+/// The refusal of a write an agent asked for once `writes` of them in the
+/// last day reach the cap; the next is free at `free_at`. One home, for the
+/// run that would record it ([`record_agent_act`]) and for the check `snob
+/// mcp` makes before it asks the person (`follow --check-ahead`).
+pub fn write_cap_reached(writes: u32, free_at: snob_core::EpochMs) -> anyhow::Error {
+    ExitError::new(
+        ExitCode::Error,
+        format!(
+            "agents made {writes} follows and unfollows through snob mcp in the last 24 \
+             hours, as many as it allows in a day; nothing was sent"
+        ),
+    )
+    // A token a program tells this refusal apart by: the MCP server hands
+    // it to the agent as the error's code.
+    .with_reason("mcp_write_cap")
+    // The moment as data, `retry_at`: the hint says it in this machine's
+    // local time with no zone, and an agent over a tunnel may be in another.
+    .with_retry_at(free_at)
+    .with_hint(format!(
+        "the next is allowed {}; the person can still follow and unfollow in their own \
+         terminal, or start the server with a higher --max-writes-per-day",
+        report::stored_on(free_at.to_epoch_not_before())
+    ))
+    .into()
+}
+
+/// The account's database and its request budget as they stand at `now`,
+/// read **writing nothing**: an account that has never sent anything is read
+/// over an empty database rather than having its file made, and a
+/// `shared.db` that cannot be read counts no brake. What `--dry-run` reads,
+/// and the checks `snob mcp` makes before it asks the person for a yes
+/// (`follow --check-ahead`, `__job start --check`).
+pub fn standing(
+    paths: &AccountPaths,
+    now: snob_core::EpochMs,
+) -> Result<(
+    snob_store::store::Store,
+    snob_store::store::rate_budget::BudgetState,
+)> {
+    use snob_store::store::Store;
+    use snob_store::store::shared::Shared;
+    let store = match Store::read_existing(paths)? {
+        Some(store) => store,
+        None => Store::in_memory()?,
+    };
+    let shared = Shared::read_existing(paths).unwrap_or_else(|e| {
+        tracing::debug!(error = %e, "shared.db could not be read; no brake is counted");
+        None
+    });
+    let budget = snob_store::store::rate_budget::state(store.conn(), shared.as_ref(), now)?;
+    Ok((store, budget))
+}
+
+/// The cooldown the account is in at `now`, if it is in one, out of its
+/// budget's state ([`standing`]), named as a run would name it
+/// (`App::held`).
+pub fn held_in(
+    budget: &snob_store::store::rate_budget::BudgetState,
+    paths: &AccountPaths,
+    now: snob_core::EpochMs,
+) -> Option<crate::app::Held> {
+    let until = budget.held_until(now)?;
+    Some(crate::app::held_by(
+        until,
+        budget.brake.as_ref(),
+        Some(&**paths),
+    ))
 }
 
 /// The refusal every command gives when there is no session.
@@ -246,14 +386,21 @@ pub async fn target_or_own(app: &App, target: Option<&str>) -> Result<String> {
 /// is asked of a person and before anything is spent; what is shared is the
 /// sentence.
 pub fn refuse_during_cooldown(app: &App, doing: &str) -> Result<()> {
-    if let Some(held) = app.held()? {
-        return Err(ExitError::new(
-            ExitCode::RateLimited,
-            format!("{}, so {doing}", report::held_until(&held)),
-        )
-        .into());
+    match app.held()? {
+        Some(held) => Err(in_cooldown(&held, doing)),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// The refusal [`refuse_during_cooldown`] gives, for `held`: also what
+/// `follow --check-ahead` answers, which has the budget's state and no `App`.
+pub fn in_cooldown(held: &crate::app::Held, doing: &str) -> anyhow::Error {
+    ExitError::new(
+        ExitCode::RateLimited,
+        format!("{}, so {doing}", report::held_until(held)),
+    )
+    .with_cooldown_until(held.until_ms)
+    .into()
 }
 
 /// What switching a view to another account came to.
@@ -479,6 +626,7 @@ pub async fn walk_named(
     check: impl FnOnce(&ListOutcome) -> Result<()>,
 ) -> Result<(Vec<User>, ListOutcome)> {
     app.progress().begin(&report::walking(kind, subject));
+    app.progress().walking(kind);
 
     // Both failures leave through one door, so the rule this function exists to
     // hold is written once inside it too. Two copies of `finish()` here would
@@ -487,8 +635,28 @@ pub async fn walk_named(
         check(&pair.1)?;
         Ok(pair)
     });
-    if result.is_err() {
-        app.progress().finish();
+    match &result {
+        Err(_) => app.progress().finish(),
+        // Where it came from, for a program that reads the walk's progress
+        // (a job's, `--progress-json`): a person is told the same in the
+        // warning a stored list is served with, which a program never reads.
+        Ok((_, outcome)) => {
+            let lifts = match outcome.provenance {
+                engine::Provenance::Cooldown => app
+                    .held()
+                    .ok()
+                    .flatten()
+                    .map(|held| held.until_ms.to_epoch_not_before()),
+                _ => None,
+            };
+            app.progress().served(
+                kind,
+                outcome.provenance.as_str(),
+                outcome.taken_at,
+                lifts,
+                outcome.reason,
+            );
+        }
     }
     result
 }

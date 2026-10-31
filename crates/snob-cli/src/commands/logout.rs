@@ -34,6 +34,15 @@ pub async fn run(
     // login's unfinished profile and one nobody could be named for hold live
     // sessions too, and nothing else would ever clear them.
     let sweep = all || everyone.len() <= 1;
+    // The jobs of the accounts leaving first: a walk still running would go
+    // on with the session being deleted, and start a browser again on the
+    // profile about to go. Their locks are held to the end, an account's
+    // that never ran a job included, so none starts meanwhile: a start
+    // waiting on one checks the session again once it has it, and finds it
+    // gone (`jobs::start::make`).
+    let _stopping =
+        crate::jobs::stop_before_leaving(leaving.iter().map(|pk| paths.account(*pk)).collect())
+            .await?;
     // A browser still running on a profile about to go would write into it
     // as it went, or keep Windows from removing it. Only the profiles going:
     // another account's browser is left to the commands using it.

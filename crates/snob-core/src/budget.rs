@@ -67,6 +67,16 @@ pub trait RateBudget: Send + Sync {
         Ok(Duration::ZERO)
     }
 
+    /// How long [`Self::reserve`] would wait if it were asked now. Zero means
+    /// now. Asks without spending, so a caller with a limit on how long it
+    /// may wait can refuse before the reservation is committed rather than
+    /// after (`Pacer::waiting_at_most`).
+    ///
+    /// The default is none, which is what every test double wants.
+    fn read_wait(&self) -> Result<Duration, RateBudgetError> {
+        Ok(Duration::ZERO)
+    }
+
     /// Until when the account is in cooldown.
     fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError>;
 
@@ -108,6 +118,154 @@ pub trait RateBudget: Send + Sync {
     /// knows only one account can say.
     fn brake(&self) -> Result<Option<Brake>, RateBudgetError> {
         Ok(None)
+    }
+
+    /// Whether this budget keeps the sitting ([`Sitting`]), so that it
+    /// outlives the process: [`Self::sitting_page`], [`Self::rest_owed`]
+    /// and [`Self::rest_paid`] then answer for it.
+    ///
+    /// The default is no, which is what every test double wants: the pacer
+    /// then counts the sitting in the process, with the same arithmetic
+    /// ([`Sitting::after_page`]). The real budget, `SqliteRateBudget`, keeps
+    /// it in the account's database, so a run stopped during its rest, or a
+    /// page cap reached on the page that filled a sitting, leaves the rest
+    /// owed to whatever walks that account next.
+    fn keeps_sitting(&self) -> bool {
+        false
+    }
+
+    /// Records a page of a list walked at `at`, and answers the sitting it
+    /// leaves: one transaction, so two processes walking the same account
+    /// count each other's pages. See [`Sitting::after_page`].
+    ///
+    /// The default keeps nothing and answers as if this were the first page
+    /// ever walked; nothing reads it unless [`Self::keeps_sitting`] says yes.
+    fn sitting_page(&self, at: EpochMs, rule: SittingRule) -> Result<Sitting, RateBudgetError> {
+        Ok(Sitting::after_page(None, at, rule))
+    }
+
+    /// Until when the rest the sitting owes runs, if it is still owed at
+    /// `now`. Asks without writing.
+    fn rest_owed(&self, now: EpochMs) -> Result<Option<EpochMs>, RateBudgetError> {
+        let _ = now;
+        Ok(None)
+    }
+
+    /// Records that the rest running until `until` was paid: the sitting
+    /// starts again. A rest that is not that one any more (another process
+    /// paid it, and a new sitting filled since) is left as it is.
+    fn rest_paid(&self, until: EpochMs) -> Result<(), RateBudgetError> {
+        let _ = until;
+        Ok(())
+    }
+}
+
+/// The pages of lists walked on one account since its last rest, and the
+/// rest they owe once they fill a sitting.
+///
+/// **A rest is owed, not taken on the spot.** The page that fills a sitting
+/// draws its rest once and writes down when it ends (`rest_until`), whether
+/// or not the walk that read it goes on; and before any page of any walk of
+/// the account, the walker pays what is left of it. Paid only by a walk
+/// that went on, as the rest once was, it was skipped by a walk that ended
+/// on its page cap, by a run stopped during it, and by every caller that
+/// reads a list a page at a time, which is how an agent reads one.
+///
+/// The arithmetic is here, over plain numbers, so that the database that
+/// keeps it (`snob-store`) and the pacer that counts it in a process for a
+/// budget that keeps nothing (`snob-ig`) are the same rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sitting {
+    /// Pages walked in it.
+    pub pages: u32,
+    /// When the last of them was walked.
+    pub last_page_at: EpochMs,
+    /// When the rest it owes ends, once it is full; `None` before.
+    pub rest_until: Option<EpochMs>,
+}
+
+/// What makes a sitting, from the pace (`snob_ig::pace::Pace`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SittingRule {
+    /// How many pages fill it.
+    pub pages: u32,
+    /// The rest the page that fills it owes, drawn by the caller: kept only
+    /// when this page is the one that fills it.
+    pub rest: Duration,
+    /// How long with no page a sitting that is not full ends on its own: the
+    /// longest rest. Left alone that long, the reading has rested by any
+    /// account of it; a shorter gap, even the shortest rest, would let a run
+    /// stopped and started again just past it walk a second sitting with no
+    /// rest drawn for the first.
+    pub idle: Duration,
+}
+
+impl Sitting {
+    /// The sitting after a page walked at `at`, from the one `before` it
+    /// (`None`: no page was ever walked here).
+    ///
+    /// - A rest that has ended by `at` ends its sitting: this page is the
+    ///   first of the next.
+    /// - A rest still owed stays owed, and the page is counted in the full
+    ///   sitting: walked by somebody who did not wait for it, it is no
+    ///   reason to forget the rest.
+    /// - A sitting that is not full and was left alone for longer than
+    ///   [`SittingRule::idle`] ends too.
+    /// - The page that brings the count to [`SittingRule::pages`] owes
+    ///   [`SittingRule::rest`] from `at`.
+    ///
+    /// A clock set back is not idleness: a page "before" the last one counts
+    /// on in the same sitting, the direction that rests sooner.
+    pub fn after_page(before: Option<Sitting>, at: EpochMs, rule: SittingRule) -> Sitting {
+        let idle = i64::try_from(rule.idle.as_millis()).unwrap_or(i64::MAX);
+        let (pages, owed) = match before {
+            None => (0, None),
+            Some(s) => match s.rest_until {
+                Some(until) if at >= until => (0, None),
+                Some(until) => (s.pages, Some(until)),
+                None if at - s.last_page_at > idle => (0, None),
+                None => (s.pages, None),
+            },
+        };
+        let pages = pages.saturating_add(1);
+        let rest_until = owed.or_else(|| (pages >= rule.pages.max(1)).then(|| at + rule.rest));
+        Sitting {
+            pages,
+            last_page_at: at,
+            rest_until,
+        }
+    }
+
+    /// When the rest ends, if it is still owed at `now`.
+    pub fn rest_owed(&self, now: EpochMs) -> Option<EpochMs> {
+        self.rest_until.filter(|until| *until > now)
+    }
+
+    /// The sitting once the rest running until `until` is paid: a new one,
+    /// with no page in it yet. Any other rest stays owed.
+    #[must_use]
+    pub fn rested(self, until: EpochMs) -> Sitting {
+        if self.rest_until == Some(until) {
+            Sitting {
+                pages: 0,
+                rest_until: None,
+                ..self
+            }
+        } else {
+            self
+        }
+    }
+
+    /// How many pages into a sitting the next page walked at `now` would
+    /// come after: none once a rest has ended or the sitting was left alone
+    /// past `idle`, as [`Self::after_page`] counts. For an estimate.
+    pub fn pages_at(&self, now: EpochMs, idle: Duration) -> u32 {
+        let rule = SittingRule {
+            pages: u32::MAX,
+            rest: Duration::ZERO,
+            idle,
+        };
+        Self::after_page(Some(*self), now, rule).pages - 1
     }
 }
 
@@ -304,6 +462,99 @@ mod tests {
             accounts_per_day(Some(EpochMs::new(now.get() - 7 * day)), now),
             2_000
         );
+    }
+
+    const RULE: SittingRule = SittingRule {
+        pages: 3,
+        rest: Duration::from_secs(600),
+        idle: Duration::from_secs(900),
+    };
+
+    /// Walks `pages` pages a second apart from `from`, and answers the
+    /// sitting they leave.
+    fn walked(before: Option<Sitting>, from: i64, pages: i64) -> Sitting {
+        let mut sitting = before;
+        for n in 0..pages {
+            sitting = Some(Sitting::after_page(
+                sitting,
+                EpochMs::new(from + n * 1_000),
+                RULE,
+            ));
+        }
+        sitting.expect("at least one page")
+    }
+
+    /// The page that fills a sitting owes its rest from when it was walked,
+    /// and the rest stays owed however many pages come before it ends.
+    #[test]
+    fn the_page_that_fills_a_sitting_owes_its_rest() {
+        let two = walked(None, 0, 2);
+        assert_eq!((two.pages, two.rest_until), (2, None));
+
+        let full = walked(Some(two), 2_000, 1);
+        assert_eq!(full.pages, 3);
+        assert_eq!(full.rest_until, Some(EpochMs::new(2_000 + 600_000)));
+        assert_eq!(
+            full.rest_owed(EpochMs::new(3_000)),
+            Some(EpochMs::new(602_000))
+        );
+
+        let unwaited = walked(Some(full), 3_000, 1);
+        assert_eq!(unwaited.pages, 4, "a page walked anyway still counts");
+        assert_eq!(
+            unwaited.rest_until, full.rest_until,
+            "and owes the same rest"
+        );
+    }
+
+    /// Once the rest has ended, or once it is paid, the next page is the
+    /// first of a new sitting.
+    #[test]
+    fn a_rest_ended_or_paid_starts_the_sitting_again() {
+        let full = walked(None, 0, 3);
+        let until = full.rest_until.expect("full");
+        assert_eq!(full.rest_owed(until), None, "a rest has ended at its end");
+
+        let after = Sitting::after_page(Some(full), until, RULE);
+        assert_eq!((after.pages, after.rest_until), (1, None));
+
+        let paid = full.rested(until);
+        assert_eq!((paid.pages, paid.rest_until), (0, None));
+        let after = Sitting::after_page(Some(paid), EpochMs::new(3_000), RULE);
+        assert_eq!(after.pages, 1);
+
+        let other = full.rested(EpochMs::new(until.get() + 1));
+        assert_eq!(other, full, "another rest is not this one paid");
+    }
+
+    /// A sitting left alone for longer than the longest rest ends; one left
+    /// alone for less, or a clock set back, counts on.
+    #[test]
+    fn a_sitting_left_alone_past_the_longest_rest_ends() {
+        let two = walked(None, 0, 2);
+        let soon = Sitting::after_page(Some(two), EpochMs::new(1_000 + 900_000), RULE);
+        assert_eq!(
+            soon.pages, 3,
+            "fifteen minutes to the millisecond is not past"
+        );
+
+        let late = Sitting::after_page(Some(two), EpochMs::new(1_000 + 900_001), RULE);
+        assert_eq!((late.pages, late.rest_until), (1, None));
+
+        let back = Sitting::after_page(Some(two), EpochMs::new(-50_000), RULE);
+        assert_eq!(back.pages, 3, "a clock set back rests sooner, not later");
+
+        assert_eq!(two.pages_at(EpochMs::new(2_000), RULE.idle), 2);
+        assert_eq!(two.pages_at(EpochMs::new(1_000 + 900_001), RULE.idle), 0);
+    }
+
+    /// A sitting of zero pages is a sitting of one, rather than a rest owed
+    /// before anything was walked or never.
+    #[test]
+    fn a_sitting_of_no_pages_is_one_of_one() {
+        let rule = SittingRule { pages: 0, ..RULE };
+        let first = Sitting::after_page(None, EpochMs::new(0), rule);
+        assert_eq!(first.rest_until, Some(EpochMs::new(600_000)));
     }
 
     /// The three cooldowns, written out rather than derived.

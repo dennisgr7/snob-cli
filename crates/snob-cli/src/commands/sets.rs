@@ -117,6 +117,13 @@ pub async fn run(
     let (filter, destination, browses) = common::prepare(&args.filter, &args.output, &args.browse)?;
 
     let mut app = common::open(&args.walk, &store.session_of(paths), paths)?;
+    common::record_agent_act(
+        &mut app,
+        &args.agent,
+        op.name(),
+        args.target.as_deref(),
+        None,
+    )?;
     let crossed = cross(
         &mut app,
         engine::ListQuery::from(&args),
@@ -190,7 +197,9 @@ async fn cross(
     app.progress().finish();
     let (base, base_outcome) = second?;
 
-    engine::cooldown::check_same_moment(&against_outcome, &base_outcome)?;
+    engine::cooldown::check_same_moment_dated(&against_outcome, &base_outcome, || {
+        app.held().ok().flatten().map(|held| held.until_ms)
+    })?;
 
     let result = match op {
         SetOp::Unfollowers | SetOp::Fans => sets::difference(&base, &against),

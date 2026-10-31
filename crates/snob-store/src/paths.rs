@@ -320,6 +320,27 @@ impl AccountPaths {
         self.app.browser_profile_for(self.pk)
     }
 
+    /// Held, with [`try_lock_file`], by a run that may send requests for this
+    /// account only while no other such run does (`--spend-alone`). The lock
+    /// is the operating system's and goes with the process, so a run that
+    /// was killed leaves nothing held; the empty file it leaves behind means
+    /// nothing.
+    pub fn spend_lock(&self) -> PathBuf {
+        self.dir().join("spend.lock")
+    }
+
+    /// Where the account's jobs are kept (`snob-cli`'s `jobs`), one
+    /// directory each, beside the `.lock` every start and every sweep holds.
+    pub fn jobs_dir(&self) -> PathBuf {
+        self.dir().join("jobs")
+    }
+
+    /// One job's directory. Only ever from a [`JobId`], which is checked, so
+    /// no name read from anywhere can reach outside [`AccountPaths::jobs_dir`].
+    pub fn job_dir(&self, id: &JobId) -> PathBuf {
+        self.jobs_dir().join(id.as_str())
+    }
+
     /// Creates the data directory and the account's, both private.
     pub fn ensure_dirs(&self) -> Result<(), PathError> {
         self.app.ensure_dirs()?;
@@ -332,6 +353,61 @@ impl std::ops::Deref for AccountPaths {
 
     fn deref(&self) -> &AppPaths {
         &self.app
+    }
+}
+
+/// The name of one job: `j` and 26 characters of Crockford's base32, the
+/// first ten of them the moment it was made (`snob-cli`'s `jobs/id.rs` makes
+/// them; this only checks them).
+///
+/// **Parsed, never trusted.** An id arrives from an agent's call and from a
+/// directory listing, and becomes a path ([`AccountPaths::job_dir`]): the
+/// pattern admits no separator, no dot and no case but upper, so nothing that
+/// passes can name anything but a directory directly inside the jobs
+/// directory.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct JobId(String);
+
+impl JobId {
+    /// The letters Crockford's base32 is written in: the digits and the
+    /// upper-case letters but I, L, O and U.
+    pub const ALPHABET: &'static [u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+    /// `^j[0-9A-HJKMNP-TV-Z]{26}$`, and nothing else.
+    pub fn parse(text: &str) -> Option<Self> {
+        let rest = text.strip_prefix('j')?;
+        (rest.len() == 26 && rest.bytes().all(|b| Self::ALPHABET.contains(&b)))
+            .then(|| Self(text.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for JobId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Whether somebody holds the lock on `path`, asked **without writing
+/// anything**: `None` when there is no file, which nobody can be holding.
+///
+/// [`try_lock_file`] creates the file it is asked about, and so does
+/// [`lock_file`], which is a write `snob status` and `--dry-run` promise not
+/// to make. This opens what is there for reading, and only that, tries the
+/// lock and lets it go at once.
+pub fn lock_is_held(path: &Path) -> std::io::Result<Option<bool>> {
+    let file = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(Some(false)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(Some(true)),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
     }
 }
 
@@ -468,6 +544,22 @@ pub fn lock_file(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)?;
     file.lock()?;
     Ok(file)
+}
+
+/// [`lock_file`] that does not wait: `None` when another holder has the lock,
+/// in this process or another, and the lock otherwise, held until the file is
+/// dropped.
+pub fn try_lock_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
 }
 
 /// Creates a file only its owner can read, at exactly this name, and syncs
@@ -965,6 +1057,69 @@ mod tests {
                 .is_some_and(|n| n.contains(&std::process::id().to_string())),
             "the run has to be named in the path: {}",
             mine.display()
+        );
+    }
+
+    /// A lock somebody holds is refused at once rather than waited for, by a
+    /// second handle in the same process as by another process, and is free
+    /// again once its holder lets go.
+    #[test]
+    fn a_held_lock_is_refused_without_waiting_and_free_once_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spend.lock");
+        let held = try_lock_file(&path).unwrap().expect("nobody holds it yet");
+        assert!(try_lock_file(&path).unwrap().is_none(), "it is held");
+        drop(held);
+        assert!(try_lock_file(&path).unwrap().is_some(), "it was let go");
+    }
+
+    /// An id becomes a path, so only the exact shape passes: no separator, no
+    /// dot, no lower case after the `j`, none of the four letters Crockford
+    /// leaves out, and exactly 26 after the prefix.
+    #[test]
+    fn a_job_id_is_refused_unless_it_is_ours() {
+        let ours = "j01JCZ3X8K9Q2W4E5R6T7Y8V9A0";
+        assert_eq!(ours.len(), 27);
+        let id = JobId::parse(ours).expect("one of ours");
+        assert_eq!(id.as_str(), ours);
+        let paths = AppPaths::rooted_at("/tmp/test").account(snob_core::Pk::new(42));
+        assert_eq!(paths.job_dir(&id), paths.jobs_dir().join(ours));
+        for refused in [
+            "",
+            "j",
+            "J01JCZ3X8K9Q2W4E5R6T7Y8V9A0",
+            "j01jcz3x8k9q2w4e5r6t7y8v9a0",
+            "j01JCZ3X8K9Q2W4E5R6T7Y8V9A",
+            "j01JCZ3X8K9Q2W4E5R6T7Y8V9A00",
+            "j01JCZ3X8K9Q2W4E5R6T7Y8V9AI",
+            "j01JCZ3X8K9Q2W4E5R6T7Y8V9AU",
+            "j../../../../../../../../..",
+            "j01JCZ3X8K9Q2W4E5R6T7Y8V9/0",
+            " j01JCZ3X8K9Q2W4E5R6T7Y8V9A0",
+        ] {
+            assert_eq!(JobId::parse(refused), None, "{refused:?}");
+        }
+    }
+
+    /// Asking whether a job is running creates nothing: a missing lock file
+    /// is "nobody", and a present one is held or not without being changed.
+    #[test]
+    fn liveness_is_read_without_creating_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("lock");
+        assert_eq!(lock_is_held(&path).unwrap(), None);
+        assert!(!path.exists(), "asking made the file");
+
+        let held = try_lock_file(&path).unwrap().expect("nobody holds it yet");
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(lock_is_held(&path).unwrap(), Some(true));
+        drop(held);
+        assert_eq!(lock_is_held(&path).unwrap(), Some(false));
+        // And asking took nothing: the lock is still there to be had.
+        assert!(try_lock_file(&path).unwrap().is_some());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
         );
     }
 

@@ -50,6 +50,7 @@ pub use self::read::Direction;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use snob_core::session::Session;
@@ -340,6 +341,35 @@ impl IgClient {
                 .cancel_token()
                 .sleep_or_cancel(pace.dwell())
                 .await
+    }
+
+    /// Pays the rest a sitting owes, if one is owed (`Pacer::rest_owed`),
+    /// before a page of a list read by hand rather than through the walker,
+    /// which pays it itself; `Ok(true)` when it was canceled. `tell` hears
+    /// how long the rest is before it begins, since nothing else on screen
+    /// would say why the command went quiet.
+    ///
+    /// Slept only against Instagram, as [`Self::step_between`]; against a
+    /// test server the rest is counted paid as soon as it is told, as the
+    /// walker counts it.
+    pub async fn rest_before_a_page(
+        &self,
+        pace: &Pace,
+        tell: impl FnOnce(Duration),
+    ) -> Result<bool, IgError> {
+        let Some((until, left)) = self
+            .pacer
+            .rest_owed(pace, snob_core::clock::now_ms())
+            .await?
+        else {
+            return Ok(false);
+        };
+        tell(left);
+        if self.is_live() && self.pacer.cancel_token().sleep_or_cancel(left).await {
+            return Ok(true);
+        }
+        self.pacer.rested(until).await?;
+        Ok(false)
     }
 
     /// Turns what Instagram said into either the value asked for or an error,

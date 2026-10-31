@@ -6,8 +6,10 @@
 //! however old it is: stale beats nothing, and the warning names the date.
 
 use anyhow::Result;
+use snob_core::Pk;
 use snob_core::model::{ListKind, User};
-use snob_store::store::snapshots;
+use snob_store::store::Store;
+use snob_store::store::snapshots::{self, Snapshot};
 
 use crate::app::{App, Held};
 use crate::engine::{ListOutcome, ListQuery, Provenance, target};
@@ -23,15 +25,34 @@ pub fn serve(
     kind: ListKind,
     held: &Held,
 ) -> Result<(Vec<User>, ListOutcome)> {
+    let snapshot = stored(app.db(), app.viewer().pk, args, kind, held)?;
+    let taken_at = snapshot.taken_at.unwrap_or_default();
+    app.warn(&report::serving_stored_in_cooldown(held, kind, taken_at));
+
+    super::serve_stored(app, &snapshot, Provenance::Cooldown)
+}
+
+/// The stored capture a cooldown serves the list of `kind` that `args` asks
+/// for from, as `viewer`, or the refusal when there is none to serve.
+/// **Reads only**: [`serve`]'s decision, and what `snob __job start --check`
+/// asks before `snob mcp` asks the person for a yes to a walk, so nobody says
+/// yes to one a cooldown then refuses.
+pub fn stored(
+    store: &Store,
+    viewer: Pk,
+    args: &ListQuery,
+    kind: ListKind,
+    held: &Held,
+) -> Result<Snapshot> {
     if args.refresh {
         return Err(report::refuse_in_cooldown(held, Blocked::RefreshWanted));
     }
 
     let pk = match args.target.as_deref() {
-        None => app.viewer().pk,
+        None => viewer,
         Some(typed) => {
             let username = target::clean(typed);
-            match snob_store::store::accounts::find_pk_by_username(app.db().conn(), username)? {
+            match snob_store::store::accounts::find_pk_by_username(store.conn(), username)? {
                 Some(pk) => pk,
                 None => {
                     return Err(report::refuse_in_cooldown(
@@ -43,17 +64,8 @@ pub fn serve(
         }
     };
 
-    let Some(snapshot) = snapshots::latest_complete(app.db().conn(), pk, kind)? else {
-        return Err(report::refuse_in_cooldown(
-            held,
-            Blocked::NothingStored(kind),
-        ));
-    };
-
-    let taken_at = snapshot.taken_at.unwrap_or_default();
-    app.warn(&report::serving_stored_in_cooldown(held, kind, taken_at));
-
-    super::serve_stored(app, &snapshot, Provenance::Cooldown)
+    snapshots::latest_complete(store.conn(), pk, kind)?
+        .ok_or_else(|| report::refuse_in_cooldown(held, Blocked::NothingStored(kind)))
 }
 
 /// Two lists may only be crossed if they describe roughly the same moment.
@@ -86,6 +98,31 @@ pub fn check_same_moment(a: &ListOutcome, b: &ListOutcome) -> Result<()> {
         a.taken_at,
         b.taken_at,
     ))
+}
+
+/// [`check_same_moment`] for a run, with a refusal over a list a cooldown
+/// served dated by when that cooldown lifts (`held`, asked only then), as
+/// every refusal a cooldown is behind is (`ExitError::with_cooldown_until`).
+/// Undated, the refusal exits 5 like a push-back met by the run itself, and
+/// an agent is told one was (`commands::mcp::answer::PUSHED_BACK`) when
+/// nothing was sent at all.
+pub fn check_same_moment_dated(
+    a: &ListOutcome,
+    b: &ListOutcome,
+    held: impl FnOnce() -> Option<snob_core::EpochMs>,
+) -> Result<()> {
+    check_same_moment(a, b).map_err(|error| {
+        if a.provenance != Provenance::Cooldown && b.provenance != Provenance::Cooldown {
+            return error;
+        }
+        match error.downcast::<crate::exit::ExitError>() {
+            Ok(refused) => match held() {
+                Some(until) => refused.with_cooldown_until(until).into(),
+                None => refused.into(),
+            },
+            Err(error) => error,
+        }
+    })
 }
 
 /// How much dead time there may be between two walks and still be one moment:
@@ -292,5 +329,35 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(crate::exit::from_chain(&asked_for), Some(ExitCode::Error));
+    }
+
+    /// Lists a cooldown served, too far apart to cross, are refused with
+    /// when it lifts, so the refusal reads as the cooldown's and not as a
+    /// push-back the run met; a refusal no cooldown is behind is not dated,
+    /// and the cooldown is not even asked about.
+    #[test]
+    fn a_refusal_over_lists_a_cooldown_served_says_when_it_lifts() {
+        let until = snob_core::EpochMs::new(7_000_000_000);
+        let throttled = check_same_moment_dated(
+            &outcome(Provenance::Cooldown, 0),
+            &outcome(Provenance::CounterVerified, 5_000_000),
+            || Some(until),
+        )
+        .unwrap_err();
+        let refused = throttled.downcast_ref::<crate::exit::ExitError>().unwrap();
+        assert_eq!(refused.cooldown_until(), Some(until));
+        assert_eq!(
+            crate::exit::from_chain(&throttled),
+            Some(ExitCode::RateLimited)
+        );
+
+        let asked_for = check_same_moment_dated(
+            &outcome(Provenance::CacheFlag, 0),
+            &outcome(Provenance::CacheFlag, 5_000_000),
+            || panic!("no cooldown is behind it"),
+        )
+        .unwrap_err();
+        let refused = asked_for.downcast_ref::<crate::exit::ExitError>().unwrap();
+        assert_eq!(refused.cooldown_until(), None);
     }
 }

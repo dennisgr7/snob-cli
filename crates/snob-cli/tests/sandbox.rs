@@ -59,12 +59,18 @@ const PK: Pk = Pk::new(42);
 /// `CARGO_BIN_EXE_snob` is the binary this test's own build produced, so it
 /// carries the `testing` feature and nothing else has to be arranged. Every
 /// invocation gets `--sandbox-root`, which is what keeps the keyring and the
-/// user's real data directory out of it. The five variables removed below do
-/// not reach the run when set outside the test: an account, a token, a key, a
+/// user's real data directory out of it. The variables removed below do not
+/// reach the run when set outside the test: an account, a token, a key, a
 /// cooldown override or a log level named in the developer's environment is
-/// not this test's.
+/// not this test's, and neither is the SSH session the suite may be run from,
+/// which changes what `login` offers (`seat`).
 fn command(root: &Path, instagram: Option<&MockServer>) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_snob"));
+    command_of(Path::new(env!("CARGO_BIN_EXE_snob")), root, instagram)
+}
+
+/// The same, for a copy of the binary at `program`.
+fn command_of(program: &Path, root: &Path, instagram: Option<&MockServer>) -> Command {
+    let mut command = Command::new(program);
     command.arg("--sandbox-root").arg(root);
     if let Some(server) = instagram {
         command.arg("--ig-base-url").arg(server.uri());
@@ -76,8 +82,13 @@ fn command(root: &Path, instagram: Option<&MockServer>) -> Command {
         "SNOB_ACCOUNT",
         "SNOB_CSRFTOKEN",
         "SNOB_SIGNING_KEY",
+        "SNOB_MCP_KEY",
+        "SNOB_MCP_TOKEN",
         "SNOB_IGNORE_COOLDOWN",
         "SNOB_LOG",
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
+        "SSH_TTY",
     ] {
         command.env_remove(inherited);
     }
@@ -1386,6 +1397,30 @@ async fn a_cooldown_stops_every_read_of_one_account() {
             "{command} spent a request during a cooldown"
         );
     }
+
+    // The refusal says when the cooldown lifts as a moment a program reads,
+    // for a profile and for a list with nothing stored to serve, both.
+    for args in [
+        &["profile", "someone", "--format", "json"][..],
+        &["followers", "--format", "json"][..],
+    ] {
+        let out = snob(tmp.path(), Some(&throttled), args);
+        let said = stderr(&out);
+        assert_eq!(out.status.code(), Some(5), "{args:?}: {said}");
+        let last = said
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
+        let told: serde_json::Value = serde_json::from_str(last)
+            .expect("the last line of standard error is the error object");
+        assert_eq!(told["error"]["code"], "rate_limited", "{args:?}: {said}");
+        assert!(
+            told["error"]["cooldown_until"].as_i64().is_some(),
+            "{args:?}: {said}"
+        );
+    }
+    assert_eq!(posted(&throttled).await.len(), spent);
 }
 
 /// **Nothing that would register a view goes out**, walking the whole
@@ -1675,6 +1710,61 @@ async fn a_walk_asked_to_stop_by_the_system_stops_as_for_ctrl_c() {
         };
         assert_eq!(status.code(), Some(130), "signal {signal}");
     }
+}
+
+/// With `--stop-when-stdin-closes`, the parent closing the pipe stops a walk
+/// mid-request the way a signal does, on every platform: the one way a parent
+/// on Windows has to stop it in order rather than kill it.
+#[tokio::test]
+async fn a_walk_stops_as_for_ctrl_c_when_its_stdin_closes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(120)))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    let walks = || async {
+        instagram
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/followers/"))
+            .count()
+    };
+
+    let mut child = command(tmp.path(), Some(&instagram))
+        .args(["followers", "--stop-when-stdin-closes"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the binary runs");
+    let asked = std::time::Instant::now();
+    while walks().await == 0 {
+        assert!(
+            asked.elapsed() < std::time::Duration::from_secs(30),
+            "the walk never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    drop(child.stdin.take());
+
+    let stopped = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            stopped.elapsed() < std::time::Duration::from_secs(15),
+            "closing standard input did not stop the walk"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(status.code(), Some(130));
 }
 
 #[tokio::test]
@@ -2210,6 +2300,17 @@ async fn a_write_nobody_could_confirm_is_not_made() {
         stdout(&out),
         stderr(&out)
     );
+    // Asked for JSON, the refusal is the JSON error a program can read.
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["follow", "someone", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(130), "{}", stderr(&out));
+    let told: serde_json::Value =
+        serde_json::from_str(stderr(&out).lines().last().unwrap_or_default())
+            .expect("the last line of standard error is JSON");
+    assert_eq!(told["error"]["code"], "interrupted", "{told}");
     assert!(
         posted(&instagram)
             .await
@@ -2224,45 +2325,22 @@ async fn a_write_nobody_could_confirm_is_not_made() {
 async fn a_confirmed_unfollow_sends_one_post() {
     let tmp = tempfile::tempdir().unwrap();
     let instagram = fake_instagram(3, 2).await;
-    // The page that hands out the tokens a mutation needs, served to the
-    // session's account, and the mutation.
-    Mock::given(method("GET"))
-        .and(url_path("/someone/"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            r#"<html>{"define":[["DTSGInitData",[],{"token":"DTSG"},1],
-               ["LSD",[],{"token":"LSD"},2],
-               ["PolarisViewer",[],{"data":{"id":"42","username":"me","fbid":"17841400000000042"},"id":"42"},3]]}
-               <script src="https://static.cdninstagram.com/rsrc.php/v4/a.js"></script></html>"#,
-        ))
-        .with_priority(1)
-        .mount(&instagram)
-        .await;
-    Mock::given(method("POST"))
-        .and(url_path("/api/graphql"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(r#"{"result":"unfollowed","status":"ok"}"#),
-        )
-        .mount(&instagram)
-        .await;
-    // The profile has to say the relationship exists, or the command correctly
-    // decides there is nothing to do and sends nothing.
-    Mock::given(method("GET"))
-        .and(url_path("/api/v1/users/web_profile_info/"))
-        .and(query_param("username", "someone"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            r#"{"data":{"user":{"id":"9001","username":"someone","followed_by_viewer":true}}}"#,
-        ))
-        // Ahead of the catch-all mounted by `fake_instagram`, which answers for
-        // any username with the session's own account. At equal priority
-        // wiremock takes the first matching mount, and that one is first.
-        .with_priority(1)
-        .mount(&instagram)
-        .await;
+    serve_an_unfollow(&instagram).await;
     log_in_writing(tmp.path(), &instagram);
     common::remember_doc_ids(tmp.path());
 
-    let out = snob(tmp.path(), Some(&instagram), &["unfollow", "someone", "-y"]);
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["unfollow", "someone", "-y", "--json"],
+    );
     assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    // `--json` says what happened in a word, on standard output.
+    let told = json(&out);
+    assert_eq!(told["action"], "unfollow", "{told}");
+    assert_eq!(told["outcome"], "unfollowed", "{told}");
+    assert_eq!(told["changed"], true, "{told}");
+    assert_eq!(told["target"]["username"], "someone", "{told}");
 
     let writes: Vec<_> = posted(&instagram)
         .await
@@ -2317,6 +2395,16 @@ async fn unfollowing_somebody_you_do_not_follow_sends_nothing() {
     );
     assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
     assert!(stderr(&out).contains("do not follow"), "{}", stderr(&out));
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["unfollow", "stranger", "-y", "--json"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let told = json(&out);
+    assert_eq!(told["outcome"], "not_following", "{told}");
+    assert_eq!(told["changed"], false, "{told}");
 
     assert!(
         posted(&instagram)
@@ -3344,6 +3432,73 @@ async fn a_dry_run_refuses_what_it_would_ignore() {
     assert_eq!(stdout(&out).lines().count(), 1, "{}", stdout(&out));
 }
 
+/// A command that walks the page that fills the account's sitting leaves
+/// the rest owed in the account's database, where the next command finds
+/// it: a dry run counts what is left of it, and the next walk pays it
+/// before its first page and begins a new sitting. The sitting it fills is
+/// one earlier commands left there, thirty-nine pages in.
+///
+/// Against a test server nothing is slept, so the rest is paid the moment
+/// it is found; that the next command found it is what this holds down.
+/// The walker's own tests (`pager.rs`) hold down that, against Instagram, a
+/// walk started during the rest sends nothing until it is over.
+#[tokio::test]
+async fn a_rest_owed_when_a_command_ends_is_kept_for_the_next_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let store = || snob_store::store::Store::open_at(&database(tmp.path())).unwrap();
+    let sitting = || snob_store::store::rate_budget::sitting(store().conn()).unwrap();
+    store()
+        .conn()
+        .execute(
+            "INSERT INTO sitting (id, pages, last_page_at, rest_until) VALUES (1, 39, ?1, NULL)",
+            [snob_core::clock::now_ms().get()],
+        )
+        .expect("the sitting can be written");
+    let minutes = |n: u64| std::time::Duration::from_secs(60 * n);
+
+    let before = snob_core::clock::now_ms();
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["followers", "--refresh", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let after = snob_core::clock::now_ms();
+    let owed = sitting().expect("a page was walked");
+    assert_eq!(owed.pages, 40, "the page counts in the stored sitting");
+    let until = owed.rest_until.expect("the fortieth page owes a rest");
+    assert!(
+        until >= before + minutes(5) && until <= after + minutes(15),
+        "a rest of five to fifteen minutes: {until} after {before}"
+    );
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["followers", "--dry-run", "--refresh", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let rest = json(&out)["rest_owed_seconds"].as_u64();
+    assert!(
+        rest.is_some_and(|rest| (1..=900).contains(&rest)),
+        "the dry run counts the rest owed: {rest:?}"
+    );
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["followers", "--refresh", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        sitting().map(|s| (s.pages, s.rest_until)),
+        Some((1, None)),
+        "the next command found the rest owed, paid it, and began a new sitting"
+    );
+}
+
 /// A dry run writes nothing: no database is made for an account that has
 /// none, as `status` makes none.
 #[tokio::test]
@@ -3547,4 +3702,4661 @@ async fn a_dry_run_in_a_cooldown_exits_five() {
     let out = snob(tmp.path(), Some(&instagram), &["fans", "--dry-run"]);
     assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
     assert!(stdout(&out).contains("cooldown"), "{}", stdout(&out));
+}
+
+/// The `SSH_CONNECTION` of a session to a machine at 192.168.1.50.
+const OVER_SSH: (&str, &str) = ("SSH_CONNECTION", "192.168.1.20 52344 192.168.1.50 22");
+
+/// Over SSH to a Linux machine with no display, a window cannot open, and
+/// `--browser` says so and what works instead, before any browser is looked
+/// for — rather than Chromium exiting 1 and the advice being a guess.
+#[cfg(not(any(target_os = "macos", windows)))]
+#[test]
+fn a_window_over_ssh_with_no_display_points_at_the_tunnel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = command(tmp.path(), None)
+        .env(OVER_SSH.0, OVER_SSH.1)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .args(["login", "--browser"])
+        .output()
+        .expect("the binary runs");
+    assert!(!out.status.success());
+    let said = stderr(&out);
+    assert!(said.contains("SSH session"), "{said}");
+    assert!(said.contains("snob login --remote"), "{said}");
+    assert!(said.contains("snob login --paste"), "{said}");
+    assert!(
+        !snob_store::paths::AppPaths::rooted_at(tmp.path())
+            .browser_profile()
+            .exists(),
+        "no profile was made for a browser that could not open"
+    );
+}
+
+/// With nobody to show the menu to, over SSH, the methods named are the two
+/// that work from there.
+#[test]
+fn a_login_with_no_terminal_over_ssh_names_the_tunnel() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A display would put the person at this machine (`seat`), and then only
+    // `--paste` is named.
+    let out = command(tmp.path(), None)
+        .env(OVER_SSH.0, OVER_SSH.1)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .arg("login")
+        .output()
+        .expect("the binary runs");
+    assert!(!out.status.success());
+    let said = stderr(&out);
+    assert!(said.contains("snob login --remote"), "{said}");
+    assert!(said.contains("snob login --paste"), "{said}");
+}
+
+/// One method per login: `--remote` with either other is refused by the
+/// command line itself.
+#[test]
+fn the_tunnel_is_one_method_among_three() {
+    let tmp = tempfile::tempdir().unwrap();
+    for both in [
+        &["login", "--remote", "--paste"][..],
+        &["login", "--remote", "--browser"][..],
+    ] {
+        let out = snob(tmp.path(), None, both);
+        assert_eq!(out.status.code(), Some(2), "{both:?}: {}", stderr(&out));
+    }
+}
+
+/// One `snob mcp` over its standard input and output, spoken to as a client
+/// on the 2025-11-25 revision does.
+#[cfg(feature = "mcp")]
+struct McpClient {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    next: u64,
+    /// What the person answers when the server asks with
+    /// `elicitation/create`; `None` is a client that never expects to be asked.
+    /// An object with an `error` key is sent back as a JSON-RPC error rather
+    /// than a result, as a client that declared elicitation and cannot do it
+    /// answers.
+    answer: Option<serde_json::Value>,
+    /// The `_meta` every request carries on the stateless revision, which
+    /// starts with no `initialize`.
+    meta: Option<serde_json::Value>,
+}
+
+#[cfg(feature = "mcp")]
+impl McpClient {
+    async fn start(root: &Path, instagram: &MockServer, args: &[&str]) -> Self {
+        Self::start_with(root, instagram, args, serde_json::json!({})).await
+    }
+
+    /// The same, declaring `capabilities` at `initialize`.
+    async fn start_with(
+        root: &Path,
+        instagram: &MockServer,
+        args: &[&str],
+        capabilities: serde_json::Value,
+    ) -> Self {
+        let client = Self::spawn(root, instagram, args);
+        client.initialize(capabilities).await
+    }
+
+    /// A server started from a copy of the binary at `program`.
+    async fn start_from(program: &Path, root: &Path, instagram: &MockServer) -> Self {
+        let client = Self::spawn_from(program, root, instagram, &[]);
+        client.initialize(serde_json::json!({})).await
+    }
+
+    /// The handshake of a client on 2025-11-25, declaring `capabilities`.
+    async fn initialize(mut self, capabilities: serde_json::Value) -> Self {
+        let hello = self
+            .ask(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": capabilities,
+                    "clientInfo": { "name": "test", "version": "0" }
+                }),
+            )
+            .await;
+        assert_eq!(hello["result"]["serverInfo"]["name"], "snob", "{hello}");
+        self.send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        self
+    }
+
+    /// A client on 2026-07-28: no `initialize`, and the revision and the
+    /// capabilities in the `_meta` of every request.
+    fn stateless(root: &Path, instagram: &MockServer, capabilities: serde_json::Value) -> Self {
+        let mut client = Self::spawn(root, instagram, &[]);
+        client.meta = Some(serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": capabilities,
+            "io.modelcontextprotocol/clientInfo": { "name": "test", "version": "0" }
+        }));
+        client
+    }
+
+    fn spawn(root: &Path, instagram: &MockServer, args: &[&str]) -> Self {
+        Self::spawn_from(Path::new(env!("CARGO_BIN_EXE_snob")), root, instagram, args)
+    }
+
+    fn spawn_from(program: &Path, root: &Path, instagram: &MockServer, args: &[&str]) -> Self {
+        use tokio::io::AsyncBufReadExt;
+        let mut command = tokio::process::Command::from(command_of(program, root, Some(instagram)));
+        command
+            .arg("mcp")
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("the binary runs");
+        let stdin = child.stdin.take().unwrap();
+        let lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        Self {
+            child,
+            stdin,
+            lines,
+            next: 0,
+            answer: None,
+            meta: None,
+        }
+    }
+
+    async fn send(&mut self, message: serde_json::Value) {
+        use tokio::io::AsyncWriteExt;
+        let mut line = message.to_string();
+        line.push('\n');
+        self.stdin.write_all(line.as_bytes()).await.unwrap();
+        self.stdin.flush().await.unwrap();
+    }
+
+    /// Sends a request and waits for its answer, stepping over notifications.
+    async fn ask(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let id = self.send_raw(method, params).await;
+        self.read_until(id, method).await
+    }
+
+    /// Sends a request and returns its id, without waiting for the answer:
+    /// for a call that is to be left asking while another is made.
+    async fn send_raw(&mut self, method: &str, params: serde_json::Value) -> u64 {
+        self.next += 1;
+        let id = self.next;
+        let mut params = params;
+        if let Some(meta) = &self.meta {
+            params["_meta"] = meta.clone();
+        }
+        self.send(
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+        )
+        .await;
+        id
+    }
+
+    /// Reads until the server asks a question with `elicitation/create`, and
+    /// hands it back unanswered, stepping over everything else.
+    async fn question(&mut self) -> serde_json::Value {
+        let asked = async {
+            while let Some(line) = self.lines.next_line().await.unwrap() {
+                let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if message["method"] == "elicitation/create" {
+                    return message;
+                }
+            }
+            panic!("the server went away before asking");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), asked)
+            .await
+            .expect("a question within a minute")
+    }
+
+    /// Reads until the answer to request `id` (sent as `method`), answering
+    /// a question the server asks on the way with [`McpClient::answer`].
+    async fn read_until(&mut self, id: u64, method: &str) -> serde_json::Value {
+        let answer = async {
+            while let Some(line) = self.lines.next_line().await.unwrap() {
+                let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if message["method"] == "elicitation/create" {
+                    let answer = self.answer.clone().expect("the server asked, unexpectedly");
+                    let reply = match answer.get("error") {
+                        Some(error) => serde_json::json!({
+                            "jsonrpc": "2.0", "id": message["id"].clone(), "error": error
+                        }),
+                        None => serde_json::json!({
+                            "jsonrpc": "2.0", "id": message["id"].clone(), "result": answer
+                        }),
+                    };
+                    self.send(reply).await;
+                    continue;
+                }
+                if message["id"] == id {
+                    return message;
+                }
+            }
+            panic!("the server went away before answering {method}");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), answer)
+            .await
+            .expect("an answer within a minute")
+    }
+
+    async fn call(&mut self, tool: &str, arguments: serde_json::Value) -> serde_json::Value {
+        let answer = self
+            .ask(
+                "tools/call",
+                serde_json::json!({ "name": tool, "arguments": arguments }),
+            )
+            .await;
+        answer["result"].clone()
+    }
+}
+
+/// The server offers the reads and not the writes, answers each call with
+/// what the command it runs printed, runs nothing that needs a yes before it
+/// has one, and answers a tool it does not offer as the protocol says.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_runs_the_commands_and_nothing_it_was_not_told_yes_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let listed = client.ask("tools/list", serde_json::json!({})).await;
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"snob_status") && names.contains(&"snob_list"),
+        "{names:?}"
+    );
+    assert!(!names.contains(&"snob_follow"), "{names:?}");
+
+    let status = client.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(status["isError"], false, "{status}");
+
+    let followers = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(followers["isError"], false, "{followers}");
+    assert_eq!(followers["structuredContent"]["count"], 3, "{followers}");
+
+    // Somebody else's list needs a yes, and this client declared no way to
+    // ask for one: the question comes back to be asked in the chat, and no
+    // walk of that account was started.
+    let before = posted(&instagram).await.len();
+    let theirs = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "account": "someone" }),
+        )
+        .await;
+    assert_eq!(
+        theirs["structuredContent"]["status"], "confirmation_required",
+        "{theirs}"
+    );
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // A tool that was never listed is no tool at all: a protocol error, as
+    // for a name made up, and not a result the model reads as the tool's.
+    for name in ["snob_follow", "snob_nothing"] {
+        let write = client
+            .ask(
+                "tools/call",
+                serde_json::json!({ "name": name, "arguments": { "account": "someone" } }),
+            )
+            .await;
+        assert_eq!(write["error"]["code"], -32602, "{write}");
+        assert!(write.get("result").is_none(), "{write}");
+    }
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // And the server answers the next call: none of it took it down.
+    let again = client.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(again["isError"], false, "{again}");
+    assert!(client.child.id().is_some(), "the server is still up");
+}
+
+/// The mocks a confirmed unfollow of `someone` needs: the page that hands
+/// out the tokens a mutation needs, served to the session's account, the
+/// mutation, and a profile saying the relationship exists (without it the
+/// command correctly decides there is nothing to do and sends nothing).
+async fn serve_an_unfollow(instagram: &MockServer) {
+    Mock::given(method("GET"))
+        .and(url_path("/someone/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<html>{"define":[["DTSGInitData",[],{"token":"DTSG"},1],
+               ["LSD",[],{"token":"LSD"},2],
+               ["PolarisViewer",[],{"data":{"id":"42","username":"me","fbid":"17841400000000042"},"id":"42"},3]]}
+               <script src="https://static.cdninstagram.com/rsrc.php/v4/a.js"></script></html>"#,
+        ))
+        .with_priority(1)
+        .mount(instagram)
+        .await;
+    Mock::given(method("POST"))
+        .and(url_path("/api/graphql"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"result":"unfollowed","status":"ok"}"#),
+        )
+        .mount(instagram)
+        .await;
+    Mock::given(method("GET"))
+        .and(url_path("/api/v1/users/web_profile_info/"))
+        .and(query_param("username", "someone"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":{"user":{"id":"9001","username":"someone","followed_by_viewer":true}}}"#,
+        ))
+        // Ahead of the catch-all mounted by `fake_instagram`, which answers for
+        // any username with the session's own account. At equal priority
+        // wiremock takes the first matching mount, and that one is first.
+        .with_priority(1)
+        .mount(instagram)
+        .await;
+}
+
+/// The POSTs Instagram was sent, which are the writes.
+#[cfg(feature = "mcp")]
+async fn writes_sent(instagram: &MockServer) -> usize {
+    posted(instagram)
+        .await
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::POST)
+        .count()
+}
+
+/// A client that cannot show a form is handed the question to put to the
+/// person in the chat, with a token good once, for that call; the call runs
+/// when the token comes back with it, and never twice.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_asks_in_the_chat_when_the_client_cannot_ask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+    let with = |token: &str, account: &str| serde_json::json!({ "list": "followers", "account": account, "confirmation": token });
+    let before = posted(&instagram).await.len();
+
+    // Asked, and nothing done: an answer, not an error.
+    let asking = client.call("snob_list", theirs.clone()).await;
+    assert_eq!(asking["isError"], false, "{asking}");
+    let told = &asking["structuredContent"];
+    assert_eq!(told["status"], "confirmation_required", "{asking}");
+    assert_eq!(told["done"], false, "{asking}");
+    assert!(told["previous"].is_null(), "{asking}");
+    let question = told["question"].as_str().unwrap();
+    assert!(question.contains("@someone's followers"), "{question}");
+    let token = told["confirmation"].as_str().expect("a token").to_string();
+    let said = asking["content"][0]["text"].as_str().unwrap();
+    assert!(said.contains(question) && said.contains(&token), "{said}");
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // The token for another account's call, or no token at all, is no yes:
+    // that call is asked again, and says why.
+    for (offered, account) in [(token.as_str(), "somebody_else"), ("garbage", "someone")] {
+        let other = client.call("snob_list", with(offered, account)).await;
+        assert_eq!(
+            other["structuredContent"]["status"], "confirmation_required",
+            "{other}"
+        );
+        assert_eq!(
+            other["structuredContent"]["previous"], "not_for_this_call",
+            "{other}"
+        );
+        assert_ne!(other["structuredContent"]["confirmation"], token.as_str());
+    }
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // Brought back with its own call, spelled with the at sign or not, it
+    // is the yes: the walk runs.
+    let done = client.call("snob_list", with(&token, "@someone")).await;
+    assert_eq!(done["isError"], false, "{done}");
+    assert_eq!(done["structuredContent"]["count"], 3, "{done}");
+    let sent = posted(&instagram).await.len();
+    assert!(sent > before, "the walk ran");
+
+    // Once.
+    let again = client.call("snob_list", with(&token, "someone")).await;
+    assert_eq!(again["isError"], true, "{again}");
+    assert_eq!(
+        again["structuredContent"]["error"]["code"], "confirmation_used",
+        "{again}"
+    );
+    assert_eq!(
+        posted(&instagram).await.len(),
+        sent,
+        "nothing more was sent"
+    );
+
+    // A call that asks nothing takes no confirmation.
+    let status = client
+        .call("snob_status", serde_json::json!({ "confirmation": token }))
+        .await;
+    assert_eq!(
+        status["structuredContent"]["error"]["code"], "invalid_arguments",
+        "{status}"
+    );
+    let own = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "confirmation": "x" }),
+        )
+        .await;
+    assert_eq!(
+        own["structuredContent"]["error"]["code"], "invalid_arguments",
+        "{own}"
+    );
+    let not_text = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "account": "someone", "confirmation": 7 }),
+        )
+        .await;
+    assert_eq!(
+        not_text["structuredContent"]["error"]["code"], "invalid_arguments",
+        "{not_text}"
+    );
+
+    // On the stateless revision, a client with no form is asked in the
+    // chat the same way.
+    let mut stateless = McpClient::stateless(tmp.path(), &instagram, serde_json::json!({}));
+    let asking = stateless.call("snob_list", theirs).await;
+    assert_eq!(
+        asking["structuredContent"]["status"], "confirmation_required",
+        "{asking}"
+    );
+}
+
+/// A yes given in the chat sends one unfollow, and the same token again
+/// sends nothing more.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_yes_given_in_the_chat_sends_one_unfollow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    serve_an_unfollow(&instagram).await;
+    log_in_writing(tmp.path(), &instagram);
+    common::remember_doc_ids(tmp.path());
+    let mut client = McpClient::start(tmp.path(), &instagram, &["--allow-writes"]).await;
+
+    let asking = client
+        .call("snob_unfollow", serde_json::json!({ "account": "someone" }))
+        .await;
+    let told = &asking["structuredContent"];
+    assert_eq!(told["status"], "confirmation_required", "{asking}");
+    assert_eq!(told["question"], "Unfollow @someone on Instagram?");
+    let token = told["confirmation"].as_str().unwrap().to_string();
+    assert_eq!(writes_sent(&instagram).await, 0, "nothing was sent");
+
+    let yes = serde_json::json!({ "account": "someone", "confirmation": token });
+    let done = client.call("snob_unfollow", yes.clone()).await;
+    assert_eq!(done["isError"], false, "{done}");
+    assert_eq!(done["structuredContent"]["outcome"], "unfollowed", "{done}");
+    assert_eq!(writes_sent(&instagram).await, 1, "one yes, one write");
+
+    let again = client.call("snob_unfollow", yes).await;
+    assert_eq!(
+        again["structuredContent"]["error"]["code"], "confirmation_used",
+        "{again}"
+    );
+    assert_eq!(writes_sent(&instagram).await, 1, "and never a second");
+}
+
+/// `--confirm-in-chat` says what a yes in the chat may cover, and a call it
+/// does not cover, from a client that cannot show a form, runs nothing.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn confirm_in_chat_none_refuses_a_client_that_cannot_ask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    // A session that can write: one that cannot is refused before it is
+    // asked about (`follow --check-ahead`).
+    log_in_writing(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+    let follow = serde_json::json!({ "account": "someone" });
+    let before = posted(&instagram).await.len();
+
+    let mut none = McpClient::start(
+        tmp.path(),
+        &instagram,
+        &["--allow-writes", "--confirm-in-chat", "none"],
+    )
+    .await;
+    for (tool, arguments) in [("snob_list", &theirs), ("snob_follow", &follow)] {
+        let refused = none.call(tool, arguments.clone()).await;
+        assert_eq!(refused["isError"], true, "{tool}: {refused}");
+        assert_eq!(
+            refused["structuredContent"]["error"]["code"], "cannot_confirm",
+            "{tool}: {refused}"
+        );
+    }
+
+    // `lists`: the walk is asked in the chat, the write is not.
+    let mut lists = McpClient::start(
+        tmp.path(),
+        &instagram,
+        &["--allow-writes", "--confirm-in-chat", "lists"],
+    )
+    .await;
+    let walk = lists.call("snob_list", theirs).await;
+    assert_eq!(
+        walk["structuredContent"]["status"], "confirmation_required",
+        "{walk}"
+    );
+    let write = lists.call("snob_follow", follow.clone()).await;
+    let refusal = &write["structuredContent"]["error"];
+    assert_eq!(refusal["code"], "cannot_confirm", "{write}");
+    assert!(
+        refusal["message"]
+            .as_str()
+            .unwrap()
+            .contains("--confirm-in-chat all"),
+        "{write}"
+    );
+    // And a token from the server that took it is none here.
+    let token = walk["structuredContent"]["confirmation"].as_str().unwrap();
+    let forged = lists
+        .call(
+            "snob_follow",
+            serde_json::json!({ "account": "someone", "confirmation": token }),
+        )
+        .await;
+    assert_eq!(
+        forged["structuredContent"]["error"]["code"], "cannot_confirm",
+        "{forged}"
+    );
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+}
+
+/// A client on 2025-11-25 that declared elicitation and answers the request
+/// with "no such method" is asked in the chat instead; one that declines is
+/// not.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn an_older_client_that_cannot_answer_the_form_is_asked_in_the_chat() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start_with(
+        tmp.path(),
+        &instagram,
+        &[],
+        serde_json::json!({ "elicitation": {} }),
+    )
+    .await;
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+    let before = posted(&instagram).await.len();
+
+    client.answer = Some(serde_json::json!({
+        "error": { "code": -32601, "message": "Method not found" }
+    }));
+    let asking = client.call("snob_list", theirs.clone()).await;
+    assert_eq!(
+        asking["structuredContent"]["status"], "confirmation_required",
+        "{asking}"
+    );
+
+    client.answer = Some(serde_json::json!({ "action": "decline" }));
+    let declined = client.call("snob_list", theirs).await;
+    assert_eq!(
+        declined["structuredContent"]["error"]["code"], "not_confirmed",
+        "{declined}"
+    );
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+}
+
+/// With nobody signed in, `snob_status` still answers (that is what it was
+/// asked), and every answer that comes of having no session tells the agent
+/// that signing in is the person's, in their own terminal.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_status_without_a_session_is_an_answer_with_a_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let hello = client.ask("tools/list", serde_json::json!({})).await;
+    assert!(hello["result"]["tools"].is_array(), "{hello}");
+
+    let status = client.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(status["isError"], false, "{status}");
+    let told = &status["structuredContent"];
+    assert_eq!(told["exit"], "no_session", "{status}");
+    assert_eq!(told["error"]["code"], "no_session", "{status}");
+    let hint = told["error"]["hint"].as_str().expect("a hint");
+    assert!(
+        hint.contains("snob login") && hint.contains("their own terminal"),
+        "{hint}"
+    );
+
+    // A list asked for with no session is a failure, with the same hint in
+    // place of the one meant for a person at the terminal.
+    let followers = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(followers["isError"], true, "{followers}");
+    assert_eq!(
+        followers["structuredContent"]["error"]["hint"], told["error"]["hint"],
+        "{followers}"
+    );
+    assert!(posted(&instagram).await.is_empty(), "nothing was sent");
+}
+
+/// The usernames on a page a list call handed back.
+#[cfg(feature = "mcp")]
+fn usernames(told: &serde_json::Value) -> Vec<String> {
+    told["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a page: {told}"))
+        .iter()
+        .map(|item| item["username"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A list longer than a page comes back a page at a time, and every page
+/// after the first walks nothing, asks nothing and sends nothing: it is
+/// handed back from what the first call read, or, by a server that never
+/// read it, from the store.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_hands_a_long_list_back_a_page_at_a_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(450, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let first = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(first["isError"], false, "{first}");
+    let told = &first["structuredContent"];
+    assert_eq!(told["count"], 450, "the whole list's: {told}");
+    assert_eq!(told["offset"], 0, "{told}");
+    let mut read = usernames(told);
+    assert!(read.len() < 450, "one page of it");
+    let mut next = told["next_offset"].as_u64().expect("a next page");
+    // Said in words too, for a client that shows the model only the text.
+    let says = |result: &serde_json::Value, next: u64| {
+        result["content"].as_array().unwrap().iter().any(|block| {
+            block["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(&format!("\"offset\": {next}")))
+        })
+    };
+    assert!(says(&first, next), "{first}");
+
+    let sent = posted(&instagram).await.len();
+    loop {
+        let later = client
+            .call(
+                "snob_list",
+                serde_json::json!({ "list": "followers", "offset": next }),
+            )
+            .await;
+        assert_eq!(later["isError"], false, "{later}");
+        let told = &later["structuredContent"];
+        assert_eq!(told["count"], 450, "{told}");
+        assert_eq!(told["offset"], next, "{told}");
+        read.extend(usernames(told));
+        match told["next_offset"].as_u64() {
+            Some(after) => {
+                assert!(says(&later, after), "{later}");
+                next = after;
+            }
+            None => break,
+        }
+    }
+    let every: Vec<String> = (0..450).map(|n| format!("user{n}")).collect();
+    assert_eq!(read, every, "every account once, in the order served");
+    assert_eq!(
+        posted(&instagram).await.len(),
+        sent,
+        "no page after the first sent anything"
+    );
+
+    // A server that never read the list hands the same page back from the
+    // store, and sends nothing for it either.
+    let mut other = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let stored = other
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "offset": 200 }),
+        )
+        .await;
+    assert_eq!(stored["isError"], false, "{stored}");
+    let page = usernames(&stored["structuredContent"]);
+    assert!(!page.is_empty());
+    assert_eq!(page[..], every[200..200 + page.len()]);
+
+    // Another account's list at a later page is not asked about and not
+    // walked: nothing of it is stored, and the answer says so.
+    let theirs = other
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "account": "someone", "offset": 200 }),
+        )
+        .await;
+    assert_eq!(theirs["isError"], true, "{theirs}");
+    assert!(
+        theirs["structuredContent"].get("status").is_none(),
+        "nothing asked: {theirs}"
+    );
+    // Told in its own tools' words: no command to type, which would read the
+    // person's own list, and no --offline, which the agent never passed.
+    let error = &theirs["structuredContent"]["error"];
+    assert_eq!(error["code"], "nothing_stored", "{theirs}");
+    let hint = error["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("mode \"auto\""), "{theirs}");
+    assert!(!hint.contains("snob followers"), "{theirs}");
+    assert!(!hint.contains("--offline"), "{theirs}");
+    // A later page of a refresh is the same later page, which walks
+    // nothing: "the same arguments and an offset" works whatever the mode.
+    // Read from the store, it says so and when that was.
+    let refresh = other
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "mode": "refresh", "offset": 200 }),
+        )
+        .await;
+    assert_eq!(refresh["isError"], false, "{refresh}");
+    assert_eq!(
+        usernames(&refresh["structuredContent"])[0],
+        "user200",
+        "{refresh}"
+    );
+    assert_eq!(
+        refresh["structuredContent"]["served"][0]["from"], "stored",
+        "{refresh}"
+    );
+    assert!(
+        refresh["structuredContent"]["served"][0]["taken_at"]
+            .as_i64()
+            .is_some(),
+        "{refresh}"
+    );
+    assert_eq!(posted(&instagram).await.len(), sent, "and nothing was sent");
+
+    // So is a list asked for as stored, on its first page.
+    let stored = other
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "mode": "stored", "limit": 2 }),
+        )
+        .await;
+    assert_eq!(stored["isError"], false, "{stored}");
+    let told = &stored["structuredContent"];
+    assert_eq!(told["count"], 2, "at most the limit: {stored}");
+    assert_eq!(told["served"][0]["from"], "stored", "{stored}");
+    let sentence = stored["content"][1]["text"].as_str().unwrap_or_default();
+    assert!(sentence.contains("Read from what is stored"), "{stored}");
+
+    // A refresh's later page is held where the page looks for it. Asked
+    // before any other list given max_pages, so the refresh's own is the
+    // only one held that could answer it: with max_pages, the store is not
+    // asked (`page_unavailable`).
+    let refreshed = serde_json::json!({ "list": "followers", "mode": "refresh", "max_pages": 40 });
+    let first = client.call("snob_list", refreshed.clone()).await;
+    assert_eq!(first["isError"], false, "{first}");
+    let mut later = refreshed;
+    later["offset"] = serde_json::json!(200);
+    let held = client.call("snob_list", later).await;
+    assert_eq!(held["isError"], false, "{held}");
+    assert_eq!(usernames(&held["structuredContent"])[0], "user200");
+    assert_eq!(
+        held["structuredContent"]["served"], first["structuredContent"]["served"],
+        "{held}"
+    );
+
+    // A walk given max_pages may stop short, and what it read is then not
+    // stored as a whole list: its later pages come from the server that
+    // read it, and another server says it cannot hand them back.
+    let capped = serde_json::json!({ "list": "followers", "max_pages": 40 });
+    let first = client.call("snob_list", capped.clone()).await;
+    assert_eq!(first["isError"], false, "{first}");
+    let mut later = capped.clone();
+    later["offset"] = serde_json::json!(200);
+    let held = client.call("snob_list", later.clone()).await;
+    assert_eq!(held["isError"], false, "{held}");
+    assert_eq!(usernames(&held["structuredContent"])[0], "user200");
+    let gone = other.call("snob_list", later).await;
+    assert_eq!(
+        gone["structuredContent"]["error"]["code"], "page_unavailable",
+        "{gone}"
+    );
+}
+
+/// A walk cut short by `max_pages` exits 0 with what it read, as a list cut
+/// by the cap a person asked for does; the agent is told it is not the whole
+/// list, how much of it was read and of how many, and that `count` is not
+/// the account's total.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_walk_cut_short_by_max_pages_says_it_is_not_the_whole_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(25, 2).await;
+    // Two pages of followers, ahead of the one-page list.
+    let page = |from: u64, to: u64, next: Option<u64>| {
+        let users: Vec<String> = (from..to)
+            .map(|n| format!(r#"{{"pk":{},"username":"user{n}"}}"#, 1_000 + n))
+            .collect();
+        let next = next.map_or(String::new(), |n| format!(r#","next_max_id":"{n}""#));
+        ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"users":[{}],"big_list":true{next},"status":"ok"}}"#,
+            users.join(",")
+        ))
+    };
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .and(query_param("max_id", "12"))
+        .respond_with(page(12, 25, None))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(page(0, 12, Some(12)))
+        .with_priority(2)
+        .mount(&instagram)
+        .await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let short = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "max_pages": 1 }),
+        )
+        .await;
+    assert_eq!(short["isError"], false, "{short}");
+    let told = &short["structuredContent"];
+    assert_eq!(told["complete"], false, "{short}");
+    assert_eq!(told["count"], 12, "{short}");
+    assert_eq!(told["served"][0]["stopped"], "page_limit", "{short}");
+    assert_eq!(told["served"][0]["read"], 12, "{short}");
+    assert_eq!(told["served"][0]["of"], 25, "{short}");
+    let said: Vec<&str> = short["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    assert!(
+        said.iter()
+            .any(|text| text.contains("Not the whole list") && text.contains("12 of about 25")),
+        "{short}"
+    );
+
+    // Walked whole, it says nothing of the kind.
+    let whole = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "mode": "refresh" }),
+        )
+        .await;
+    assert_eq!(whole["isError"], false, "{whole}");
+    assert_eq!(whole["structuredContent"]["count"], 25, "{whole}");
+    assert!(
+        whole["structuredContent"].get("complete").is_none(),
+        "{whole}"
+    );
+}
+
+/// A push-back met by the call itself starts a cooldown its failure does not
+/// date: the agent is pointed at `snob_status`, which does, rather than told
+/// to run it again once the cooldown lifts.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_push_back_met_by_a_walk_points_the_agent_at_snob_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(25, 2).await;
+    log_in(tmp.path(), &instagram);
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(r#"{"message":"Please wait a few minutes"}"#),
+        )
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let met = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "mode": "refresh" }),
+        )
+        .await;
+    assert_eq!(met["isError"], true, "{met}");
+    let error = &met["structuredContent"]["error"];
+    assert_eq!(error["code"], "rate_limited", "{met}");
+    let hint = error["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("snob_status"), "{met}");
+
+    let status = client.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(
+        status["structuredContent"]["exit"], "rate_limited",
+        "{status}"
+    );
+}
+
+/// A server whose binary is moved aside under it, as WinGet and
+/// `install.ps1` do on an upgrade and Homebrew's cleanup does by removing it,
+/// refuses every call from then on and starts nothing, rather than run a
+/// child of whatever is at its path now.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_refuses_calls_once_its_binary_is_upgraded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let original = Path::new(env!("CARGO_BIN_EXE_snob"));
+    let program = bin.path().join(original.file_name().unwrap());
+    std::fs::copy(original, &program).unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut client = McpClient::start_from(&program, tmp.path(), &instagram).await;
+
+    let before = client.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(before["isError"], false, "{before}");
+    assert_eq!(
+        before["structuredContent"]["exit"], "no_session",
+        "{before}"
+    );
+
+    // Renaming a running program is allowed on every platform, Windows
+    // included; removing it is not, there.
+    std::fs::rename(&program, bin.path().join("snob.old")).unwrap();
+    for (tool, arguments) in [
+        ("snob_status", serde_json::json!({})),
+        ("snob_list", serde_json::json!({ "list": "followers" })),
+    ] {
+        let after = client.call(tool, arguments).await;
+        assert_eq!(after["isError"], true, "{tool}: {after}");
+        assert_eq!(
+            after["structuredContent"]["error"]["code"], "upgraded",
+            "{tool}: {after}"
+        );
+        let message = after["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap();
+        assert!(message.contains("restart the MCP server"), "{message}");
+    }
+    assert!(posted(&instagram).await.is_empty(), "nothing was sent");
+
+    // Stopped before the directory goes, which Windows would refuse while
+    // the program in it runs.
+    let McpClient {
+        mut child, stdin, ..
+    } = client;
+    drop(stdin);
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait())
+        .await
+        .expect("the server stops when its input closes")
+        .unwrap();
+    assert!(ended.success(), "{ended:?}");
+}
+
+/// On 2025-11-25 the yes is asked with `elicitation/create` while the call
+/// waits: no is nothing run, yes is the command run with `-y`.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_asks_an_older_client_while_the_call_waits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start_with(
+        tmp.path(),
+        &instagram,
+        &[],
+        serde_json::json!({ "elicitation": {} }),
+    )
+    .await;
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+
+    client.answer = Some(serde_json::json!({ "action": "decline" }));
+    let declined = client.call("snob_list", theirs.clone()).await;
+    assert_eq!(
+        declined["structuredContent"]["error"]["code"], "not_confirmed",
+        "{declined}"
+    );
+
+    client.answer = Some(serde_json::json!({ "action": "accept", "content": { "confirm": true } }));
+    let accepted = client.call("snob_list", theirs).await;
+    assert_eq!(accepted["isError"], false, "{accepted}");
+}
+
+/// While a write waits for the person's answer, it holds the server's one
+/// call that may reach Instagram: a second write, or a walk, is refused as
+/// busy at once, before anything is asked, and nothing is queued; the status
+/// and a stored list go on beside it. Once the first is answered, the next
+/// call that spends runs.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_second_write_while_one_is_asked_is_refused_as_busy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    // A session that can write: one that cannot is refused before it is
+    // asked about (`follow --check-ahead`).
+    log_in_writing(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start_with(
+        tmp.path(),
+        &instagram,
+        &["--allow-writes"],
+        serde_json::json!({ "elicitation": {} }),
+    )
+    .await;
+    // Stored first, so the stored list below has something to answer with.
+    let walked = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(walked["isError"], false, "{walked}");
+
+    let follow = client
+        .send_raw(
+            "tools/call",
+            serde_json::json!({ "name": "snob_follow", "arguments": { "account": "someone" } }),
+        )
+        .await;
+    // Asked, and left unanswered: the call is holding its permits now.
+    let question = client.question().await;
+
+    for (tool, arguments) in [
+        ("snob_unfollow", serde_json::json!({ "account": "other" })),
+        ("snob_follow", serde_json::json!({ "account": "other" })),
+        ("snob_list", serde_json::json!({ "list": "following" })),
+        ("snob_profile", serde_json::json!({})),
+    ] {
+        // `call` would answer a question with `answer`, which is `None`
+        // here: a second question would fail the test, not be answered.
+        let busy = client.call(tool, arguments).await;
+        assert_eq!(busy["isError"], true, "{tool}: {busy}");
+        assert_eq!(
+            busy["structuredContent"]["error"]["code"], "busy",
+            "{tool}: {busy}"
+        );
+    }
+    let status = client.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(status["isError"], false, "{status}");
+    let stored = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "mode": "stored" }),
+        )
+        .await;
+    assert_eq!(stored["isError"], false, "{stored}");
+    assert_eq!(stored["structuredContent"]["count"], 3, "{stored}");
+
+    client
+        .send(serde_json::json!({
+            "jsonrpc": "2.0", "id": question["id"].clone(), "result": { "action": "decline" }
+        }))
+        .await;
+    let declined = client.read_until(follow, "tools/call").await;
+    assert_eq!(
+        declined["result"]["structuredContent"]["error"]["code"], "not_confirmed",
+        "{declined}"
+    );
+    assert_eq!(writes_sent(&instagram).await, 0, "nothing was written");
+
+    // Given back: the next call that spends runs.
+    let again = client
+        .call("snob_list", serde_json::json!({ "list": "following" }))
+        .await;
+    assert_eq!(again["isError"], false, "{again}");
+}
+
+/// While a job of the account walks, a call it would refuse is refused
+/// before anything is asked, as the call itself would have been: another
+/// walk as `too_many_jobs`, a write as `busy`. Nobody says yes to a call
+/// that then does not run, though the job's walk holds none of the
+/// server's permits once its call has answered.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn nothing_is_asked_for_a_call_a_running_job_would_refuse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    // `answer` stays `None`: a question would fail the test.
+    let mut client = McpClient::start_with(
+        tmp.path(),
+        &instagram,
+        &["--allow-writes"],
+        serde_json::json!({ "elicitation": {} }),
+    )
+    .await;
+    let started = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "wait_seconds": 1 }),
+        )
+        .await;
+    assert_eq!(
+        started["structuredContent"]["status"], "running",
+        "{started}"
+    );
+    let id = started["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let theirs = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "account": "someone" }),
+        )
+        .await;
+    assert_eq!(theirs["isError"], true, "{theirs}");
+    let error = &theirs["structuredContent"]["error"];
+    assert_eq!(error["code"], "too_many_jobs", "{theirs}");
+    assert!(
+        error["hint"].as_str().unwrap().contains("snob_job_cancel"),
+        "{theirs}"
+    );
+
+    let follow = client
+        .call("snob_follow", serde_json::json!({ "account": "someone" }))
+        .await;
+    assert_eq!(follow["isError"], true, "{follow}");
+    assert_eq!(
+        follow["structuredContent"]["error"]["code"], "busy",
+        "{follow}"
+    );
+    assert_eq!(writes_sent(&instagram).await, 0, "nothing was written");
+
+    let stopped = client
+        .call("snob_job_cancel", serde_json::json!({ "job_id": id }))
+        .await;
+    assert_eq!(stopped["isError"], false, "{stopped}");
+}
+
+/// A child given `--spend-alone` refuses, before any request, while another
+/// run holds the account, with exit 1 and `busy` as the reason; the server
+/// gives the flag to the children that may reach Instagram, and an agent is
+/// told `busy`. A stored list, and a command a person types, take no lock.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_child_given_spend_alone_refuses_while_another_holds_the_account() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let followers = ["followers", "--format", "json", "--no-interactive"];
+    let first = snob(tmp.path(), Some(&instagram), &followers);
+    assert!(first.status.success(), "{}", stderr(&first));
+
+    let lock = snob_store::paths::AppPaths::rooted_at(tmp.path())
+        .account(PK)
+        .spend_lock();
+    let held = snob_store::paths::try_lock_file(&lock)
+        .unwrap()
+        .expect("nothing holds the account between runs");
+    let before = posted(&instagram).await.len();
+
+    let alone: Vec<&str> = std::iter::once("--spend-alone").chain(followers).collect();
+    let refused = snob(tmp.path(), Some(&instagram), &alone);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    let told: serde_json::Value =
+        serde_json::from_str(stderr(&refused).lines().last().unwrap_or_default())
+            .expect("the last line of standard error is JSON");
+    assert_eq!(told["error"]["code"], "error", "{told}");
+    assert_eq!(told["error"]["reason"], "busy", "{told}");
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // Through the server: the walk is refused as busy, the stored list is
+    // read beside the run that holds the account.
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let busy = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(busy["isError"], true, "{busy}");
+    assert_eq!(busy["structuredContent"]["error"]["code"], "busy", "{busy}");
+    assert_eq!(busy["structuredContent"]["exit"], "error", "{busy}");
+    let stored = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "mode": "stored" }),
+        )
+        .await;
+    assert_eq!(stored["isError"], false, "{stored}");
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // A person's own command does not take the lock in this release.
+    let typed = snob(tmp.path(), Some(&instagram), &followers);
+    assert!(typed.status.success(), "{}", stderr(&typed));
+
+    drop(held);
+    let freed = snob(tmp.path(), Some(&instagram), &alone);
+    assert!(freed.status.success(), "{}", stderr(&freed));
+    let walked = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(walked["isError"], false, "{walked}");
+}
+
+/// A crossing whose two stored lists were read an hour apart is refused
+/// offline, and an agent, whose server passed the `--offline`, is told
+/// what to call instead, never to drop a flag it did not pass.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_stored_crossing_of_lists_far_apart_tells_an_agent_what_to_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    for list in ["followers", "following"] {
+        let out = snob(
+            tmp.path(),
+            Some(&instagram),
+            &[list, "--format", "json", "--no-interactive"],
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    snob_store::store::Store::open_at(&database(tmp.path()))
+        .unwrap()
+        .conn()
+        .execute(
+            "UPDATE snapshots SET started_at = started_at - 3600, taken_at = taken_at - 3600
+             WHERE kind = 'following'",
+            [],
+        )
+        .unwrap();
+    let sent = posted(&instagram).await.len();
+
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let told = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "fans", "mode": "stored" }),
+        )
+        .await;
+    assert_eq!(told["isError"], true, "{told}");
+    let error = &told["structuredContent"]["error"];
+    assert_eq!(error["code"], "stored_moments", "{told}");
+    let hint = error["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("mode \"auto\""), "{told}");
+    assert!(!hint.contains("--offline"), "{told}");
+    assert_eq!(posted(&instagram).await.len(), sent, "nothing was sent");
+}
+
+/// On 2026-07-28 the call answers with the question and a ticket; the
+/// answer counts only when it comes back with that ticket for that same
+/// command, and only once.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_asks_a_stateless_client_in_the_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::stateless(
+        tmp.path(),
+        &instagram,
+        serde_json::json!({ "elicitation": {} }),
+    );
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+    let before = posted(&instagram).await.len();
+
+    let asking = client.call("snob_list", theirs.clone()).await;
+    assert_eq!(asking["resultType"], "input_required", "{asking}");
+    let state = asking["requestState"]
+        .as_str()
+        .expect("a signed state")
+        .to_string();
+    assert!(asking["inputRequests"]["confirm"].is_object(), "{asking}");
+    let yes =
+        serde_json::json!({ "confirm": { "action": "accept", "content": { "confirm": true } } });
+
+    // The same yes, offered for another account, is no answer.
+    let elsewhere = client
+        .ask(
+            "tools/call",
+            serde_json::json!({
+                "name": "snob_list",
+                "arguments": { "list": "followers", "account": "somebody_else" },
+                "inputResponses": yes.clone(),
+                "requestState": state.clone(),
+            }),
+        )
+        .await;
+    assert_eq!(elsewhere["result"]["isError"], true, "{elsewhere}");
+
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // Spelled with the at sign, it is the same command, so the same yes.
+    let answered = serde_json::json!({
+        "name": "snob_list",
+        "arguments": { "list": "followers", "account": "@someone" },
+        "inputResponses": yes,
+        "requestState": state,
+    });
+    let done = client.ask("tools/call", answered.clone()).await;
+    assert_eq!(done["result"]["isError"], false, "{done}");
+    let sent = posted(&instagram).await.len();
+    assert!(sent > before, "the walk ran");
+
+    // The identical answered call again, as a client that retries a request
+    // it heard nothing back from: the yes was used, and nothing runs twice.
+    let again = client.ask("tools/call", answered).await;
+    assert_eq!(again["result"]["isError"], true, "{again}");
+    assert_eq!(
+        again["result"]["structuredContent"]["error"]["code"], "confirmation_used",
+        "{again}"
+    );
+    assert_eq!(
+        posted(&instagram).await.len(),
+        sent,
+        "nothing more was sent"
+    );
+}
+
+/// A call that comes back with the ticket and no answer is asked again, with
+/// a fresh ticket, and the old one is retired: one question open, not two.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_stateless_retry_without_an_answer_is_asked_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::stateless(
+        tmp.path(),
+        &instagram,
+        serde_json::json!({ "elicitation": { "form": {} } }),
+    );
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+    let yes =
+        serde_json::json!({ "confirm": { "action": "accept", "content": { "confirm": true } } });
+    let before = posted(&instagram).await.len();
+
+    let first = client.call("snob_list", theirs.clone()).await;
+    let old = first["requestState"]
+        .as_str()
+        .expect("a ticket")
+        .to_string();
+
+    let retried = client
+        .ask(
+            "tools/call",
+            serde_json::json!({
+                "name": "snob_list",
+                "arguments": theirs.clone(),
+                "requestState": old.clone(),
+            }),
+        )
+        .await;
+    assert_eq!(
+        retried["result"]["resultType"], "input_required",
+        "{retried}"
+    );
+    let fresh = retried["result"]["requestState"]
+        .as_str()
+        .expect("a fresh ticket")
+        .to_string();
+    assert_ne!(fresh, old);
+
+    let with_old = client
+        .ask(
+            "tools/call",
+            serde_json::json!({
+                "name": "snob_list",
+                "arguments": theirs.clone(),
+                "inputResponses": yes.clone(),
+                "requestState": old,
+            }),
+        )
+        .await;
+    assert_eq!(
+        with_old["result"]["structuredContent"]["error"]["code"], "confirmation_used",
+        "{with_old}"
+    );
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    let done = client
+        .ask(
+            "tools/call",
+            serde_json::json!({
+                "name": "snob_list",
+                "arguments": theirs,
+                "inputResponses": yes,
+                "requestState": fresh,
+            }),
+        )
+        .await;
+    assert_eq!(done["result"]["isError"], false, "{done}");
+}
+
+/// Asks `tool` in the chat and calls it again with the token, as an agent
+/// does once the person said yes; the second call's result.
+#[cfg(feature = "mcp")]
+async fn confirmed_in_chat(
+    client: &mut McpClient,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let asking = client.call(tool, arguments.clone()).await;
+    let told = &asking["structuredContent"];
+    assert_eq!(told["status"], "confirmation_required", "{asking}");
+    let mut yes = arguments;
+    yes["confirmation"] = told["confirmation"].clone();
+    client.call(tool, yes).await
+}
+
+/// The acts recorded in the sandbox account's database, of any age.
+#[cfg(feature = "mcp")]
+fn acts_recorded(root: &Path) -> i64 {
+    let db = snob_store::store::Store::open_at(&database(root)).unwrap();
+    snob_store::store::mcp_acts::count(db.conn()).unwrap()
+}
+
+/// Ten follows and unfollows agents were told yes to in the last day are as
+/// many as a server allows when it was given no `--max-writes-per-day`: the
+/// eleventh is refused with nothing sent and nothing recorded, **before the
+/// person is asked**, and says when the next is free as a moment. A write the
+/// person types is not counted, and a server given a higher cap lets it
+/// through.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_eleventh_agent_write_in_a_day_is_refused() {
+    use snob_store::store::mcp_acts::{NewAct, Recorded, record};
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    serve_an_unfollow(&instagram).await;
+    log_in_writing(tmp.path(), &instagram);
+    common::remember_doc_ids(tmp.path());
+    // Ten earlier today, as the children of a server record them.
+    let mut db = snob_store::store::Store::open_at(&database(tmp.path())).unwrap();
+    for _ in 0..10 {
+        let act = NewAct {
+            action: "follow",
+            target: Some("somebody"),
+            via: "chat",
+            client: Some("test 0"),
+        };
+        let recorded = record(&mut db, &act, None, snob_core::clock::now_ms()).unwrap();
+        assert!(matches!(recorded, Recorded::Done(_)));
+    }
+    drop(db);
+    let unfollow = serde_json::json!({ "account": "someone" });
+
+    let mut client = McpClient::start(tmp.path(), &instagram, &["--allow-writes"]).await;
+    let refused = client.call("snob_unfollow", unfollow.clone()).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    let error = &refused["structuredContent"]["error"];
+    assert_eq!(error["code"], "mcp_write_cap", "{refused}");
+    let now = snob_core::clock::now_ms().to_epoch().get();
+    let retry_at = error["retry_at"].as_i64().expect("a moment");
+    // A day after the first of the ten, rounded up to the second.
+    assert!(retry_at > now && retry_at <= now + 86_401, "{refused}");
+    assert!(
+        error["hint"].as_str().unwrap().contains("retry_at"),
+        "{refused}"
+    );
+    assert_eq!(writes_sent(&instagram).await, 0, "nothing was sent");
+    assert_eq!(acts_recorded(tmp.path()), 10, "nor recorded");
+
+    // Typed by the person, it is theirs: sent, and not recorded.
+    let typed = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["unfollow", "someone", "-y", "--json"],
+    );
+    assert_eq!(typed.status.code(), Some(0), "{}", stderr(&typed));
+    assert_eq!(writes_sent(&instagram).await, 1);
+    assert_eq!(acts_recorded(tmp.path()), 10);
+
+    // A server allowed eleven lets this one through, once.
+    let mut eleven = McpClient::start(
+        tmp.path(),
+        &instagram,
+        &["--allow-writes", "--max-writes-per-day", "11"],
+    )
+    .await;
+    let done = confirmed_in_chat(&mut eleven, "snob_unfollow", unfollow.clone()).await;
+    assert_eq!(done["isError"], false, "{done}");
+    assert_eq!(writes_sent(&instagram).await, 2);
+    assert_eq!(acts_recorded(tmp.path()), 11);
+    let twelfth = eleven.call("snob_unfollow", unfollow).await;
+    assert_eq!(
+        twelfth["structuredContent"]["error"]["code"], "mcp_write_cap",
+        "{twelfth}"
+    );
+    assert_eq!(writes_sent(&instagram).await, 2);
+
+    // And no server takes a cap past what the write bucket allows in a day.
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["mcp", "--allow-writes", "--max-writes-per-day", "100"],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+/// In a cooldown a write, a refresh and a list with nothing stored to serve
+/// are refused **before the person is asked**, as their own runs would
+/// refuse them, with when the cooldown lifts; a list with something stored
+/// is still asked about and served, and none of it is recorded as an act,
+/// since nothing was read or sent.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_cooldown_refuses_a_call_before_anybody_is_asked() {
+    use snob_core::budget::RateBudget;
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    serve_an_unfollow(&instagram).await;
+    log_in_writing(tmp.path(), &instagram);
+    common::remember_doc_ids(tmp.path());
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let walked = snob(
+        tmp.path(),
+        Some(&instagram),
+        &[
+            "followers",
+            "someone",
+            "-y",
+            "--format",
+            "json",
+            "--no-interactive",
+        ],
+    );
+    assert!(walked.status.success(), "{}", stderr(&walked));
+    let paths = snob_store::paths::AppPaths::rooted_at(tmp.path()).account(PK);
+    snob_store::store::rate_budget::SqliteRateBudget::open(&paths)
+        .unwrap()
+        .start_cooldown("429", std::time::Duration::from_secs(3600))
+        .unwrap();
+    let before = posted(&instagram).await.len();
+
+    let mut client = McpClient::start(tmp.path(), &instagram, &["--allow-writes"]).await;
+    for (tool, arguments) in [
+        ("snob_unfollow", serde_json::json!({ "account": "someone" })),
+        (
+            "snob_list",
+            serde_json::json!({ "list": "following", "account": "someone" }),
+        ),
+        (
+            "snob_list",
+            serde_json::json!({ "list": "followers", "account": "someone", "mode": "refresh" }),
+        ),
+    ] {
+        let refused = client.call(tool, arguments).await;
+        assert_eq!(refused["isError"], true, "{refused}");
+        let told = &refused["structuredContent"];
+        assert_eq!(told["exit"], "rate_limited", "{refused}");
+        assert!(told.get("confirmation").is_none(), "asked: {refused}");
+        assert!(
+            told["error"]["cooldown_until"].as_i64().is_some(),
+            "{refused}"
+        );
+    }
+
+    let served = confirmed_in_chat(
+        &mut client,
+        "snob_list",
+        serde_json::json!({ "list": "followers", "account": "someone" }),
+    )
+    .await;
+    assert_eq!(served["isError"], false, "{served}");
+    let told = &served["structuredContent"];
+    assert_eq!(told["count"], 3, "{served}");
+    // Handed over as the stored list it is, with its date and the
+    // cooldown's end, in the JSON and in a sentence.
+    assert_eq!(told["served"][0]["from"], "stored_in_cooldown", "{served}");
+    assert!(told["served"][0]["taken_at"].as_i64().is_some(), "{served}");
+    assert!(told["cooldown_until"].as_i64().is_some(), "{served}");
+    let sentence = served["content"][1]["text"].as_str().unwrap_or_default();
+    assert!(sentence.contains("Not read now"), "{served}");
+
+    // Asked for as stored, the same: dated, with the cooldown's end.
+    let stored = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "account": "someone", "mode": "stored" }),
+        )
+        .await;
+    assert_eq!(stored["isError"], false, "{stored}");
+    let told = &stored["structuredContent"];
+    assert!(told["served"][0]["taken_at"].as_i64().is_some(), "{stored}");
+    assert!(told["cooldown_until"].as_i64().is_some(), "{stored}");
+    assert!(stored["content"][1]["text"].is_string(), "{stored}");
+
+    // An estimate in the cooldown is the answer asked for, not an error.
+    let estimate = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "dry_run": true }),
+        )
+        .await;
+    assert_eq!(estimate["isError"], false, "{estimate}");
+    assert_eq!(
+        estimate["structuredContent"]["sends_now"], false,
+        "{estimate}"
+    );
+    assert_eq!(acts_recorded(tmp.path()), 0, "nothing was read or sent");
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+}
+
+/// `snob status` shows what agents were told yes to in the last day: what,
+/// how the yes was given and through which client, an attempt that came to
+/// nothing included; and the agent's own `snob_status` says the same.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn status_shows_what_an_agent_was_told_yes_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    serve_an_unfollow(&instagram).await;
+    log_in_writing(tmp.path(), &instagram);
+    common::remember_doc_ids(tmp.path());
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+
+    let mut chat = McpClient::start(tmp.path(), &instagram, &["--allow-writes"]).await;
+    let done = confirmed_in_chat(
+        &mut chat,
+        "snob_unfollow",
+        serde_json::json!({ "account": "@someone" }),
+    )
+    .await;
+    assert_eq!(done["isError"], false, "{done}");
+    // Any other name is the session's own account to the fake Instagram, and
+    // the command refuses to unfollow yourself after its first request: an
+    // attempt, recorded all the same.
+    let own = confirmed_in_chat(
+        &mut chat,
+        "snob_unfollow",
+        serde_json::json!({ "account": "nobody" }),
+    )
+    .await;
+    assert_eq!(own["isError"], true, "{own}");
+    assert_eq!(writes_sent(&instagram).await, 1);
+
+    // Asked in a form, on the older revision, while the call waits.
+    let mut form = McpClient::start_with(
+        tmp.path(),
+        &instagram,
+        &[],
+        serde_json::json!({ "elicitation": {} }),
+    )
+    .await;
+    form.answer = Some(serde_json::json!({ "action": "accept", "content": { "confirm": true } }));
+    let walked = form
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "fans", "account": "other" }),
+        )
+        .await;
+    assert_eq!(walked["isError"], false, "{walked}");
+    // What needs no yes is not recorded.
+    let own_list = form
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(own_list["isError"], false, "{own_list}");
+
+    let out = snob(tmp.path(), Some(&instagram), &["status", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let agents = &json(&out)["agents"];
+    assert_eq!(agents["writes"], 2, "{agents}");
+    let acts = agents["acts"].as_array().unwrap();
+    assert_eq!(acts.len(), 3, "{agents}");
+    assert_eq!(acts[0]["action"], "unfollow");
+    assert_eq!(acts[0]["write"], true);
+    assert_eq!(acts[0]["target"]["username"], "someone");
+    assert_eq!(acts[0]["target"]["pk"], 9001, "resolved once looked up");
+    assert_eq!(acts[0]["via"], "chat");
+    assert_eq!(acts[0]["client"], "test 0");
+    assert_eq!(acts[1]["target"]["username"], "nobody");
+    assert_eq!(acts[2]["action"], "fans");
+    assert_eq!(acts[2]["write"], false);
+    assert_eq!(acts[2]["target"]["username"], "other");
+    assert_eq!(acts[2]["via"], "elicitation");
+
+    let out = snob(tmp.path(), Some(&instagram), &["status", "--agents"]);
+    let said = stdout(&out);
+    assert!(said.starts_with("Agents\n"), "{said}");
+    assert!(said.contains("2 in the last 24 hours"), "{said}");
+    assert!(
+        said.contains("unfollow @someone, yes given in the chat, through test 0"),
+        "{said}"
+    );
+    assert!(
+        said.contains("read @other's fans, yes given in a form, through test 0"),
+        "{said}"
+    );
+
+    let status = chat.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(
+        status["structuredContent"]["agents"]["writes"], 2,
+        "{status}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Jobs: a walk that outlives the call that started it (`jobs`).
+//
+// **Every test here stops its jobs and waits for their locks before its
+// `TempDir` drops** (`Jobs`, below, on drop, a panic included): a job is a
+// detached process, and one left running would go on writing into a
+// directory being removed, and on Windows keep it from being removed.
+// ---------------------------------------------------------------------------
+
+/// A fake Instagram whose followers list answers after `delay`, the first
+/// `times` it is asked, and at once after that: a walk that is still going
+/// when it is asked about, and one that finishes when it is walked again.
+async fn fake_instagram_slow(followers: u64, delay: std::time::Duration, times: u64) -> MockServer {
+    let server = fake_instagram(followers, 2).await;
+    let users: Vec<String> = (0..followers)
+        .map(|n| format!(r#"{{"pk":{},"username":"user{n}"}}"#, 1_000 + n))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!(r#"{{"users":[{}]}}"#, users.join(",")))
+                .set_delay(delay),
+        )
+        .up_to_n_times(times)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// The walk the tests start as a job, as the MCP server will start it.
+const FOLLOWERS_JOB: [&str; 6] = [
+    "--",
+    "followers",
+    "--format",
+    "json",
+    "--no-interactive",
+    "--no-progress",
+];
+
+/// How many times the walk asked for a page of followers.
+async fn followers_asked(instagram: &MockServer) -> usize {
+    instagram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/followers/"))
+        .count()
+}
+
+/// Waits until the walk has asked for a page `at_least` times.
+async fn until_asked(instagram: &MockServer, at_least: usize) {
+    let since = std::time::Instant::now();
+    while followers_asked(instagram).await < at_least {
+        assert!(
+            since.elapsed() < std::time::Duration::from_secs(60),
+            "the job's walk never asked for its page"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// The jobs of one sandbox, stopped and waited for when this goes.
+struct Jobs<'a> {
+    root: &'a Path,
+    instagram: &'a MockServer,
+}
+
+impl Jobs<'_> {
+    /// `snob __job start --wait <wait> <command>`, and the one document it
+    /// answers with.
+    fn start(&self, wait: &str, command: &[&str]) -> (Output, Option<serde_json::Value>) {
+        let mut args = vec!["__job", "start", "--wait", wait, "--tool", "snob_list"];
+        args.extend_from_slice(command);
+        let out = snob(self.root, Some(self.instagram), &args);
+        let told = serde_json::from_str(&stdout(&out)).ok();
+        (out, told)
+    }
+
+    /// A start that has to have answered: its record.
+    fn started(&self, wait: &str, command: &[&str]) -> serde_json::Value {
+        let (out, told) = self.start(wait, command);
+        assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+        let told = told.unwrap_or_else(|| panic!("one JSON document: {}", stdout(&out)));
+        assert_eq!(
+            stdout(&out).trim().lines().count(),
+            1,
+            "exactly one compact document: {}",
+            stdout(&out)
+        );
+        told
+    }
+
+    /// `snob __job <verb> …`, read as its JSON.
+    fn ask(&self, args: &[&str]) -> serde_json::Value {
+        let mut all = vec!["__job"];
+        all.extend_from_slice(args);
+        let out = snob(self.root, Some(self.instagram), &all);
+        assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+        json(&out)
+    }
+
+    /// The job, once it is over, within a minute.
+    fn finished(&self, id: &str) -> serde_json::Value {
+        let told = self.ask(&["show", id, "--wait", "60s", "--json"]);
+        assert!(
+            !matches!(told["status"].as_str(), Some("running" | "queued")),
+            "still going after a minute: {told}"
+        );
+        told
+    }
+
+    /// Every job of every account of the sandbox's, by its directory.
+    fn dirs(&self) -> Vec<std::path::PathBuf> {
+        let app = snob_store::paths::AppPaths::rooted_at(self.root);
+        app.account_dirs()
+            .into_iter()
+            .flat_map(|pk| {
+                std::fs::read_dir(app.account(pk).jobs_dir())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|entry| entry.path().is_dir())
+                    .map(|entry| entry.path())
+            })
+            .collect()
+    }
+}
+
+impl Drop for Jobs<'_> {
+    fn drop(&mut self) {
+        for dir in self.dirs() {
+            let _ = std::fs::write(dir.join("stop"), b"");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while self.dirs().iter().any(|dir| {
+            snob_store::paths::lock_is_held(&dir.join("lock"))
+                .ok()
+                .flatten()
+                .unwrap_or(false)
+        }) {
+            if std::time::Instant::now() > deadline {
+                // Not a panic inside a drop that may be unwinding already.
+                eprintln!("a job did not stop within a minute");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+/// A walk that ends within the wait is answered with its result, inline,
+/// as one document: the record, and the walk's own answer under `finished`.
+#[tokio::test]
+async fn a_job_that_finishes_within_the_wait_answers_inline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+
+    let told = jobs.started("60s", &FOLLOWERS_JOB);
+    assert_eq!(told["status"], "succeeded", "{told}");
+    assert_eq!(told["reused"], false);
+    assert_eq!(told["command"], "followers");
+    assert_eq!(told["tool"], "snob_list");
+    assert!(told["detached"].is_string(), "{told}");
+    assert!(told["estimate"]["dry_run"] == true, "{told}");
+    assert_eq!(told["finished"]["exit"], "ok", "{told}");
+    let output = told["finished"]["output"].to_string();
+    for user in ["user0", "user1", "user2"] {
+        assert!(output.contains(user), "{output}");
+    }
+    let id = told["job_id"].as_str().unwrap();
+    assert!(snob_store::paths::JobId::parse(id).is_some(), "{id}");
+    // Its walk said how it went, a line a page, and asked once.
+    assert!(told["progress"]["event"] == "finished", "{told}");
+    assert_eq!(followers_asked(&instagram).await, 1);
+    // `--no-progress` was taken out of what it ran.
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(jobs.dirs()[0].join("job.json")).unwrap()).unwrap();
+    assert!(
+        !record["argv"].to_string().contains("no-progress"),
+        "{record}"
+    );
+}
+
+/// A walk that takes longer than the wait is answered with its record while
+/// it runs, and asked about later gives what the walk answered.
+#[tokio::test]
+async fn a_job_polled_to_its_end_gives_the_walks_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(3), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+
+    let told = jobs.started("0s", &FOLLOWERS_JOB);
+    assert!(
+        matches!(told["status"].as_str(), Some("running" | "queued")),
+        "{told}"
+    );
+    assert!(told["finished"].is_null(), "{told}");
+    let id = told["job_id"].as_str().unwrap().to_string();
+
+    // The person sees it, in `snob jobs` and in `snob status`.
+    let listed = jobs.ask(&["list", "--json"]);
+    assert_eq!(listed["jobs"][0]["job_id"], id.as_str(), "{listed}");
+    let out = snob(tmp.path(), Some(&instagram), &["jobs"]);
+    assert!(stdout(&out).contains(&id), "{}", stdout(&out));
+    assert!(stdout(&out).contains("your followers"), "{}", stdout(&out));
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["status", "--jobs", "--json"],
+    );
+    assert_eq!(json(&out)["jobs"]["running"][0]["job_id"], id.as_str());
+
+    let done = jobs.finished(&id);
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert_eq!(done["finished"]["exit"], "ok");
+    assert!(done["finished"]["output"].to_string().contains("user2"));
+    // And `snob jobs show` says the same to a person.
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["jobs", "show", &id, "--json"],
+    );
+    assert_eq!(json(&out)["status"], "succeeded");
+    // Over, it is no longer one `snob jobs` lists, and is with `--all`.
+    assert_eq!(jobs.ask(&["list", "--json"])["jobs"], serde_json::json!([]));
+    assert_eq!(
+        jobs.ask(&["list", "--all", "--json"])["jobs"][0]["job_id"],
+        id.as_str()
+    );
+}
+
+/// Canceling a job stops its walk as Ctrl+C does, which lets go of the list,
+/// so the next walk of it is not refused as walked elsewhere.
+#[tokio::test]
+async fn canceling_a_job_stops_it_like_ctrl_c_and_the_walk_resumes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+
+    let id = jobs.started("0s", &FOLLOWERS_JOB)["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    until_asked(&instagram, 1).await;
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["jobs", "cancel", &id, "--wait", "60s", "--json"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let canceled = json(&out);
+    assert_eq!(canceled["status"], "canceled", "{canceled}");
+    assert_eq!(canceled["exit_number"], 130, "{canceled}");
+    assert_eq!(canceled["finished"]["exit"], "interrupted");
+    // Asked again, nothing changes: it is over.
+    let again = jobs.ask(&["cancel", &id, "--json"]);
+    assert_eq!(again["status"], "canceled");
+
+    // The list was let go of, so it is walked again, and this time answers.
+    let told = jobs.started("60s", &FOLLOWERS_JOB);
+    assert_eq!(told["status"], "succeeded", "{told}");
+    assert_ne!(told["job_id"], id.as_str());
+}
+
+/// The process that started a job is gone long before the walk ends, and the
+/// walk goes on without it.
+#[tokio::test]
+async fn a_job_outlives_the_process_that_started_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(5), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+
+    let since = std::time::Instant::now();
+    let told = jobs.started("0s", &FOLLOWERS_JOB);
+    assert!(
+        since.elapsed() < std::time::Duration::from_secs(5),
+        "the start waited for the walk"
+    );
+    let id = told["job_id"].as_str().unwrap().to_string();
+    assert_eq!(jobs.finished(&id)["status"], "succeeded");
+}
+
+/// A start whose standard input closes before it has answered, as when the
+/// tool call is canceled or the client goes away, stops the job it made:
+/// nobody would ever be told its id.
+#[tokio::test]
+async fn closing_starts_stdin_before_it_answered_stops_the_job() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+
+    let mut args = vec![
+        "--stop-when-stdin-closes",
+        "__job",
+        "start",
+        "--wait",
+        "600s",
+    ];
+    args.extend_from_slice(&FOLLOWERS_JOB);
+    let mut child = command(tmp.path(), Some(&instagram))
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    until_asked(&instagram, 1).await;
+    drop(child.stdin.take());
+    let out = tokio::task::spawn_blocking(move || child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(130), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "", "no id was handed over");
+
+    let listed = jobs.ask(&["list", "--all", "--json"]);
+    let id = listed["jobs"][0]["job_id"].as_str().unwrap().to_string();
+    // Already, without waiting: the start saw it stop before it left.
+    let over = jobs.ask(&["show", &id, "--json"]);
+    assert_eq!(over["status"], "canceled", "{over}");
+    assert_eq!(over["exit_number"], 130, "{over}");
+}
+
+/// `purge` stops the jobs before anything goes: they are listed in what it
+/// will do, stopped, and only then is everything removed. (That the owner of
+/// the browsers is released after them is the order of `purge.rs`; no
+/// browser runs here to tell.)
+#[tokio::test]
+async fn purge_lists_then_stops_running_jobs_before_removing_everything() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let id = jobs.started("0s", &FOLLOWERS_JOB)["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    until_asked(&instagram, 1).await;
+
+    // Listed, and a dry run stops nothing.
+    let out = snob(tmp.path(), Some(&instagram), &["purge", "--dry-run"]);
+    assert!(stdout(&out).contains(&id), "{}", stdout(&out));
+    assert_eq!(jobs.ask(&["show", &id, "--json"])["status"], "running");
+
+    let out = snob(tmp.path(), Some(&instagram), &["purge", "--yes"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(
+        stdout(&out).contains("Stopped 1 job first."),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        !tmp.path().join("data").exists(),
+        "the data directory, the job's with it, is gone"
+    );
+}
+
+/// A job start that waited on the jobs lock while the session was deleted,
+/// as a purge and a logout delete it holding that lock, makes no job and
+/// says there is no session, rather than starting a walk in what is going.
+#[tokio::test]
+async fn a_start_that_waited_while_the_session_went_makes_no_job() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let account = snob_store::paths::AppPaths::rooted_at(tmp.path()).account(PK);
+    snob_store::paths::create_private_dir(&account.jobs_dir()).unwrap();
+    let lock = snob_store::paths::try_lock_file(&account.jobs_dir().join(".lock"))
+        .unwrap()
+        .expect("nothing holds it yet");
+
+    let mut start = command(tmp.path(), Some(&instagram));
+    start
+        .args(["__job", "start", "--wait=0s"])
+        .args(FOLLOWERS_JOB)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = start.spawn().unwrap();
+    // Long enough for it to pass its first look at the session and wait on
+    // the lock; a start that has not got there yet finds no session either.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let session = account.session_file();
+    assert!(session.exists(), "the sandbox keeps the session in a file");
+    std::fs::remove_file(&session).unwrap();
+    drop(lock);
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    let made: Vec<_> = std::fs::read_dir(account.jobs_dir())
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+    assert!(made.is_empty(), "no job was made: {made:?}");
+}
+
+/// A jobs directory that cannot be made keeps neither `logout` nor `purge`
+/// from deleting the session: there are no jobs to stop there, and none
+/// could start.
+#[tokio::test]
+async fn a_jobs_directory_that_cannot_be_made_keeps_no_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mine = snob_store::paths::AppPaths::rooted_at(tmp.path()).account(PK);
+
+    log_in(tmp.path(), &instagram);
+    std::fs::write(mine.jobs_dir(), b"x").unwrap();
+    assert!(mine.session_file().exists());
+    let out = snob(tmp.path(), Some(&instagram), &["logout"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(!mine.session_file().exists(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("could not hold the jobs"),
+        "{}",
+        stderr(&out)
+    );
+
+    std::fs::remove_file(mine.jobs_dir()).unwrap();
+    log_in(tmp.path(), &instagram);
+    std::fs::write(mine.jobs_dir(), b"x").unwrap();
+    let pk = PK.get().to_string();
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["purge", "--account", &pk, "--yes"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(!mine.session_file().exists(), "{}", stderr(&out));
+    assert!(!mine.db_file().exists(), "{}", stderr(&out));
+}
+
+/// `logout` stops the account's jobs too: a walk would otherwise go on with
+/// a session being deleted.
+#[tokio::test]
+async fn logout_stops_running_jobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let id = jobs.started("0s", &FOLLOWERS_JOB)["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    until_asked(&instagram, 1).await;
+
+    let out = snob(tmp.path(), Some(&instagram), &["logout"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(
+        stdout(&out).contains("Stopped 1 job first."),
+        "{}",
+        stdout(&out)
+    );
+    // Read straight from its files: with nobody signed in, no command acts as
+    // the account any more.
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(jobs.dirs()[0].join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["status"], "canceled", "{state}");
+    assert!(jobs.dirs()[0].ends_with(&id));
+}
+
+/// One job runs at a time per account: the same walk again is the job already
+/// running, and another walk is refused with nothing started.
+#[tokio::test]
+async fn a_second_job_for_the_account_is_refused_or_reused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let first = jobs.started("0s", &FOLLOWERS_JOB);
+    let again = jobs.started("0s", &FOLLOWERS_JOB);
+    assert_eq!(again["job_id"], first["job_id"]);
+    assert_eq!(again["reused"], true);
+
+    let (out, _) = jobs.start(
+        "0s",
+        &["--", "following", "--format", "json", "--no-interactive"],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    let told: serde_json::Value =
+        serde_json::from_str(stderr(&out).trim().lines().last().unwrap()).unwrap();
+    assert_eq!(told["error"]["reason"], "too_many_jobs", "{told}");
+    assert_eq!(jobs.dirs().len(), 1);
+}
+
+/// A job asked to stop that has not stopped yet is never handed to a new
+/// start of its walk, which would be given a walk about to end `canceled`:
+/// the start is refused as `job_stopping` with nothing started, and its
+/// `--check` says the same, writing nothing.
+#[tokio::test]
+async fn a_job_asked_to_stop_is_not_reused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let walk = &FOLLOWERS_JOB;
+    // Free to start, and the check says so.
+    let (out, told) = jobs.start("0s", &[&["--check"][..], &walk[..]].concat());
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(told.unwrap()["would"], "start");
+    assert!(jobs.dirs().is_empty(), "the check made nothing");
+
+    // A finished job made to stand as one still running and asked to stop:
+    // its ending taken away, its lock held here as its supervisor's would
+    // be, and a stop file written.
+    let id = jobs.started("60s", walk)["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dir = jobs.dirs()[0].clone();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+    state["status"] = "running".into();
+    state["finished_at"] = serde_json::Value::Null;
+    std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
+    std::fs::write(dir.join("stop"), b"").unwrap();
+    let held = snob_store::paths::try_lock_file(&dir.join("lock"))
+        .unwrap()
+        .expect("nobody holds the job's lock");
+    let standing = jobs.ask(&["show", &id, "--json"]);
+    assert_eq!(standing["status"], "running", "{standing}");
+    assert_eq!(standing["stop_asked"], true, "{standing}");
+
+    for check in [true, false] {
+        let mut line: Vec<&str> = if check { vec!["--check"] } else { Vec::new() };
+        line.extend_from_slice(walk);
+        let (out, told) = jobs.start("0s", &line);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        assert!(told.is_none(), "{}", stdout(&out));
+        let told: serde_json::Value =
+            serde_json::from_str(stderr(&out).trim().lines().last().unwrap()).unwrap();
+        assert_eq!(told["error"]["reason"], "job_stopping", "{told}");
+        assert!(
+            told["error"]["message"].as_str().unwrap().contains(&id),
+            "{told}"
+        );
+    }
+    assert_eq!(jobs.dirs().len(), 1, "nothing was started");
+    drop(held);
+}
+
+/// Two starts at once make one job: the count and the making are one step,
+/// under the account's jobs lock.
+#[tokio::test]
+async fn two_concurrent_starts_make_one_job() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let spawn = || {
+        let mut args = vec!["__job", "start", "--wait", "0s"];
+        args.extend_from_slice(&FOLLOWERS_JOB);
+        command(tmp.path(), Some(&instagram))
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("the binary runs")
+    };
+    let (one, two) = (spawn(), spawn());
+    let one = json(&one.wait_with_output().unwrap());
+    let two = json(&two.wait_with_output().unwrap());
+    assert_eq!(one["job_id"], two["job_id"], "{one} {two}");
+    assert_ne!(one["reused"], two["reused"], "one made it, one found it");
+    assert_eq!(jobs.dirs().len(), 1);
+}
+
+/// A job is looked for in the account's own jobs alone: an agent served for
+/// one account cannot read, or stop, another account's walk by its id.
+#[tokio::test]
+async fn a_job_of_another_account_is_no_such_job() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = two_accounts(tmp.path()).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(120)))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut args = vec!["--account", "other", "__job", "start", "--wait", "0s"];
+    args.extend_from_slice(&FOLLOWERS_JOB);
+    let out = snob(tmp.path(), Some(&instagram), &args);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let id = json(&out)["job_id"].as_str().unwrap().to_string();
+
+    for verb in ["show", "cancel"] {
+        let out = snob(
+            tmp.path(),
+            Some(&instagram),
+            &["--account", "me", "__job", verb, &id, "--json"],
+        );
+        assert_eq!(out.status.code(), Some(1), "{verb}: {}", stdout(&out));
+        let told: serde_json::Value =
+            serde_json::from_str(stderr(&out).trim().lines().last().unwrap()).unwrap();
+        assert_eq!(told["error"]["reason"], "no_such_job", "{told}");
+    }
+    let theirs = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["--account", "other", "__job", "show", &id, "--json"],
+    );
+    let theirs = json(&theirs);
+    assert!(
+        matches!(theirs["status"].as_str(), Some("running" | "queued")),
+        "the cancel as another account stopped nothing: {theirs}"
+    );
+    assert!(!jobs.dirs()[0].join("stop").exists());
+}
+
+/// A job's record is a file anybody running as this user can edit; what it
+/// says to run is checked again where it runs, and a command no job may run
+/// runs nothing.
+#[tokio::test]
+async fn a_hand_edited_job_json_runs_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let told = jobs.started("60s", &FOLLOWERS_JOB);
+    assert_eq!(told["status"], "succeeded");
+    let dir = jobs.dirs()[0].clone();
+    let before = instagram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .len();
+
+    for argv in [
+        serde_json::json!(["unfollow", "someone", "-y", "--json"]),
+        serde_json::json!(["followers", "-o", "elsewhere.json"]),
+        serde_json::json!(["followers", "--sandbox-root", "elsewhere"]),
+    ] {
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("job.json")).unwrap()).unwrap();
+        record["argv"] = argv.clone();
+        std::fs::write(dir.join("job.json"), record.to_string()).unwrap();
+        for name in ["state.json", "out.json"] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        let id = dir.file_name().unwrap().to_str().unwrap();
+        let out = snob(tmp.path(), Some(&instagram), &["__job", "run", id]);
+        assert!(out.status.success(), "{argv}: {}", stderr(&out));
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(state["status"], "failed", "{argv}: {state}");
+        assert_eq!(state["failure"], "refused_argv", "{argv}: {state}");
+    }
+    assert_eq!(
+        instagram
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len(),
+        before,
+        "nothing was sent"
+    );
+    assert!(!tmp.path().join("elsewhere").exists());
+}
+
+/// A job that died without letting go of its list, killed with its client,
+/// holds the list until its claim runs out; a start of a walk of that list
+/// says until when, and starts nothing. Another list is walked.
+#[tokio::test]
+async fn a_lost_job_with_a_live_claim_says_when_it_frees() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    // A finished job, made lost by hand: its ending taken away, as though
+    // its supervisor had been killed while it ran.
+    let told = jobs.started("60s", &FOLLOWERS_JOB);
+    let id = told["job_id"].as_str().unwrap().to_string();
+    let dir = jobs.dirs()[0].clone();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+    state["status"] = "running".into();
+    state["finished_at"] = serde_json::Value::Null;
+    state["updated_at"] = snob_core::clock::now_ms().get().into();
+    std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
+    assert_eq!(jobs.ask(&["show", &id, "--json"])["status"], "lost");
+
+    let (out, _) = jobs.start("0s", &["--", "unfollowers", "--format", "json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let told: serde_json::Value =
+        serde_json::from_str(stderr(&out).trim().lines().last().unwrap()).unwrap();
+    assert_eq!(told["error"]["reason"], "walked_elsewhere", "{told}");
+    let said = told["error"]["message"].as_str().unwrap();
+    assert!(said.contains(&id) && said.contains("until"), "{said}");
+    // The same moment for a program, which the lost job's record names too.
+    // `retry_at` is rounded up to the second, so it is never too early.
+    let frees = jobs.ask(&["show", &id, "--json"])["claim_frees_at"]
+        .as_i64()
+        .unwrap();
+    let retry_at = told["error"]["retry_at"].as_i64().expect("retry_at");
+    assert!((frees..=frees + 1).contains(&retry_at), "{told}");
+    assert_eq!(jobs.dirs().len(), 1, "nothing was started");
+
+    // A list it never walked is another matter.
+    let told = jobs.started(
+        "60s",
+        &["--", "following", "--format", "json", "--no-interactive"],
+    );
+    assert_eq!(told["status"], "succeeded", "{told}");
+}
+
+/// A lost job whose walk never started (its supervisor gone before it
+/// started it, or come too late to) holds no list: its record dates no
+/// claim, and the next walk of the list starts at once instead of being
+/// refused for the claim's 45 minutes as `walked_elsewhere`.
+#[tokio::test]
+async fn a_lost_job_that_never_walked_holds_no_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let told = jobs.started("60s", &FOLLOWERS_JOB);
+    let id = told["job_id"].as_str().unwrap().to_string();
+    let dir = jobs.dirs()[0].clone();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+    state["status"] = "running".into();
+    state["finished_at"] = serde_json::Value::Null;
+    state["child_pid"] = serde_json::Value::Null;
+    state["updated_at"] = snob_core::clock::now_ms().get().into();
+    std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
+    let shown = jobs.ask(&["show", &id, "--json"]);
+    assert_eq!(shown["status"], "lost", "{shown}");
+    assert!(shown["claim_frees_at"].is_null(), "{shown}");
+
+    let told = jobs.started(
+        "60s",
+        &["--", "unfollowers", "--format", "json", "--no-interactive"],
+    );
+    assert_eq!(told["status"], "succeeded", "{told}");
+}
+
+// ---------------------------------------------------------------------------
+// The jobs through `snob mcp`: a list call starts its walk as a job, and the
+// job tools read it back. The same cleanup rule as above: a `Jobs` guard,
+// declared after the `TempDir`, stops them before it goes.
+// ---------------------------------------------------------------------------
+
+/// The text blocks of a tool result, in one string.
+#[cfg(feature = "mcp")]
+fn said(result: &serde_json::Value) -> String {
+    result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A list walk that ends within the call's wait is answered as it always
+/// was, with the job it ran as beside it: the walk is a job all the same,
+/// kept, and seen by the person.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_answers_a_quick_walk_inline_with_its_job_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let followers = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(followers["isError"], false, "{followers}");
+    let told = &followers["structuredContent"];
+    assert_eq!(told["count"], 3, "{told}");
+    assert_eq!(usernames(told), ["user0", "user1", "user2"]);
+    let id = told["job_id"]
+        .as_str()
+        .expect("the job it ran as")
+        .to_string();
+    assert!(snob_store::paths::JobId::parse(&id).is_some(), "{id}");
+
+    // Kept as a job of the account's, with the call it was started for.
+    let listed = jobs.ask(&["list", "--all", "--json"]);
+    let job = &listed["jobs"][0];
+    assert_eq!(job["job_id"], id.as_str(), "{listed}");
+    assert_eq!(job["status"], "succeeded", "{job}");
+    assert_eq!(job["tool"], "snob_list", "{job}");
+    assert_eq!(
+        job["arguments"],
+        serde_json::json!({ "list": "followers" }),
+        "{job}"
+    );
+    assert_eq!(job["started_by"], "test 0", "{job}");
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(jobs.dirs()[0].join("job.json")).unwrap()).unwrap();
+    // A job waits for the budget an hour when the server was given no wait.
+    assert_eq!(record["max_wait_seconds"], 3600, "{record}");
+    assert_eq!(followers_asked(&instagram).await, 1);
+}
+
+/// A walk that outlasts the call's wait is handed back as a job that is
+/// still running, and `snob_job` gives its result once it has ended, as the
+/// list call would have; `snob_jobs` lists it while it runs.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn the_mcp_server_hands_back_a_job_for_a_slow_walk_and_snob_job_gives_its_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(8), 1).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let started = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "wait_seconds": 0 }),
+        )
+        .await;
+    assert_eq!(started["isError"], false, "{started}");
+    let told = &started["structuredContent"];
+    assert!(
+        matches!(told["status"].as_str(), Some("running" | "queued")),
+        "{told}"
+    );
+    assert_eq!(told["done"], false, "{told}");
+    assert_eq!(told["poll_with"], "snob_job", "{told}");
+    assert_eq!(told["command"], "followers", "{told}");
+    let id = told["job_id"].as_str().unwrap().to_string();
+    let text = said(&started);
+    assert!(
+        text.contains(&format!("snob_job with \"job_id\": \"{id}\"")),
+        "{text}"
+    );
+
+    let running = client.call("snob_jobs", serde_json::json!({})).await;
+    assert_eq!(running["isError"], false, "{running}");
+    assert_eq!(
+        running["structuredContent"]["jobs"][0]["job_id"],
+        id.as_str(),
+        "{running}"
+    );
+
+    // The same call again is the same job, not a second walk.
+    let again = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "wait_seconds": 0 }),
+        )
+        .await;
+    assert_eq!(again["structuredContent"]["job_id"], id.as_str(), "{again}");
+    assert_eq!(again["structuredContent"]["reused"], true, "{again}");
+
+    let done = client
+        .call(
+            "snob_job",
+            serde_json::json!({ "job_id": id, "wait_seconds": 50 }),
+        )
+        .await;
+    assert_eq!(done["isError"], false, "{done}");
+    let told = &done["structuredContent"];
+    assert_eq!(told["count"], 3, "{told}");
+    assert_eq!(usernames(told), ["user0", "user1", "user2"]);
+    assert_eq!(told["job_id"], id.as_str(), "{told}");
+    assert_eq!(followers_asked(&instagram).await, 1, "walked once");
+
+    // Ended, it is listed only with all.
+    let listed = client.call("snob_jobs", serde_json::json!({})).await;
+    assert_eq!(
+        listed["structuredContent"]["jobs"],
+        serde_json::json!([]),
+        "{listed}"
+    );
+    let every = client
+        .call("snob_jobs", serde_json::json!({ "all": true }))
+        .await;
+    assert_eq!(
+        every["structuredContent"]["jobs"][0]["status"], "succeeded",
+        "{every}"
+    );
+}
+
+/// `snob_job_cancel` stops the walk as Ctrl+C does, keeping what it read and
+/// letting go of the list, so the next call walks it again.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn snob_job_cancel_stops_the_walk_and_it_resumes_on_the_next_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let started = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "wait_seconds": 0 }),
+        )
+        .await;
+    let id = started["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a job: {started}"))
+        .to_string();
+    until_asked(&instagram, 1).await;
+
+    let canceled = client
+        .call("snob_job_cancel", serde_json::json!({ "job_id": id }))
+        .await;
+    assert_eq!(canceled["isError"], false, "{canceled}");
+    assert_eq!(
+        canceled["structuredContent"]["stop_asked"], true,
+        "{canceled}"
+    );
+    // Stopped as Ctrl+C stops a walk: interrupted, not a failure of its own.
+    let stopped = client
+        .call(
+            "snob_job",
+            serde_json::json!({ "job_id": id, "wait_seconds": 50 }),
+        )
+        .await;
+    assert_eq!(stopped["isError"], true, "{stopped}");
+    assert_eq!(
+        stopped["structuredContent"]["exit"], "interrupted",
+        "{stopped}"
+    );
+    assert_eq!(stopped["structuredContent"]["job_id"], id.as_str());
+    // Canceled again, it says it had stopped and changes nothing.
+    let again = client
+        .call("snob_job_cancel", serde_json::json!({ "job_id": id }))
+        .await;
+    assert_eq!(again["structuredContent"]["status"], "canceled", "{again}");
+    assert_eq!(again["structuredContent"]["done"], true, "{again}");
+
+    // The list was let go of: walked again, and this time it answers.
+    let walked = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(walked["isError"], false, "{walked}");
+    assert_eq!(walked["structuredContent"]["count"], 3, "{walked}");
+    assert_ne!(walked["structuredContent"]["job_id"], id.as_str());
+}
+
+/// A job outlives the server that started it, and another server, of the
+/// same account, reads it back by its id.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_job_started_by_one_server_is_read_by_another() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(5), 1).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut first = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let started = first
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "wait_seconds": 0 }),
+        )
+        .await;
+    let id = started["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a job: {started}"))
+        .to_string();
+    // The server, and the client with it, gone.
+    drop(first);
+
+    let mut second = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let done = second
+        .call(
+            "snob_job",
+            serde_json::json!({ "job_id": id, "wait_seconds": 50 }),
+        )
+        .await;
+    assert_eq!(done["isError"], false, "{done}");
+    assert_eq!(done["structuredContent"]["count"], 3, "{done}");
+}
+
+/// A list call canceled while it waits for its walk stops the job it
+/// started: its id was never handed over, so nobody could ask for it.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_canceled_call_cancels_the_job_it_had_not_handed_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let call = client
+        .send_raw(
+            "tools/call",
+            serde_json::json!({
+                "name": "snob_list",
+                "arguments": { "list": "followers", "wait_seconds": 50 }
+            }),
+        )
+        .await;
+    until_asked(&instagram, 1).await;
+    client
+        .send(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled", // spelling-allow: the protocol's name
+            "params": { "requestId": call, "reason": "the person moved on" }
+        }))
+        .await;
+
+    let since = std::time::Instant::now();
+    let over = loop {
+        let listed = jobs.ask(&["list", "--all", "--json"]);
+        let job = listed["jobs"][0].clone();
+        if !matches!(job["status"].as_str(), Some("running" | "queued")) {
+            break job;
+        }
+        assert!(
+            since.elapsed() < std::time::Duration::from_secs(60),
+            "the job was not stopped: {job}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+    assert_eq!(over["status"], "canceled", "{over}");
+    // And the server goes on.
+    let status = client.call("snob_status", serde_json::json!({})).await;
+    assert_eq!(status["isError"], false, "{status}");
+}
+
+/// `snob_job` takes a job's id and nothing else, and a well-formed id this
+/// account has no job of is "no such job", from the child that looked.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn snob_job_refuses_an_id_that_is_not_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let before = posted(&instagram).await.len();
+
+    for id in ["--all", "../x", "j1"] {
+        for tool in ["snob_job", "snob_job_cancel"] {
+            let refused = client.call(tool, serde_json::json!({ "job_id": id })).await;
+            assert_eq!(refused["isError"], true, "{tool} {id}: {refused}");
+            assert_eq!(
+                refused["structuredContent"]["error"]["code"], "invalid_arguments",
+                "{tool} {id}: {refused}"
+            );
+        }
+    }
+    let nobody = format!("j{}", "0".repeat(26));
+    for tool in ["snob_job", "snob_job_cancel"] {
+        let unknown = client
+            .call(tool, serde_json::json!({ "job_id": nobody }))
+            .await;
+        assert_eq!(unknown["isError"], true, "{tool}: {unknown}");
+        assert_eq!(
+            unknown["structuredContent"]["error"]["code"], "no_such_job",
+            "{tool}: {unknown}"
+        );
+    }
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+}
+
+/// A finished job's result is handed back a page at a time from the job's
+/// own file, by a server that never held it, and sends nothing.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn snob_job_pages_a_finished_result_from_its_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(450, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut first = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let walked = first
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(walked["isError"], false, "{walked}");
+    let id = walked["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(first);
+
+    let sent = posted(&instagram).await.len();
+    let mut other = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let mut read = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = other
+            .call(
+                "snob_job",
+                serde_json::json!({ "job_id": id, "offset": offset }),
+            )
+            .await;
+        assert_eq!(page["isError"], false, "{page}");
+        let told = &page["structuredContent"];
+        assert_eq!(told["count"], 450, "{told}");
+        assert_eq!(told["offset"], offset, "{told}");
+        read.extend(usernames(told));
+        match told["next_offset"].as_u64() {
+            Some(next) => {
+                let text = said(&page);
+                assert!(
+                    text.contains("call snob_job again")
+                        && text.contains(&format!("\"offset\": {next}")),
+                    "{text}"
+                );
+                offset = next;
+            }
+            None => break,
+        }
+    }
+    let every: Vec<String> = (0..450).map(|n| format!("user{n}")).collect();
+    assert_eq!(read, every, "every account once, in the order served");
+    assert_eq!(posted(&instagram).await.len(), sent, "nothing was sent");
+}
+
+/// What a client that takes MCP Tasks declares, at `initialize` or in the
+/// `_meta` of a stateless request.
+#[cfg(feature = "mcp")]
+fn takes_tasks() -> serde_json::Value {
+    serde_json::json!({ "extensions": { "io.modelcontextprotocol/tasks": {} } })
+}
+
+#[cfg(feature = "mcp")]
+impl McpClient {
+    /// A client on 2025-11-25 that takes tasks, having checked that the
+    /// server says it hands them out.
+    async fn taking_tasks(root: &Path, instagram: &MockServer, args: &[&str]) -> Self {
+        let mut client = Self::spawn(root, instagram, args);
+        let hello = client
+            .ask(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": takes_tasks(),
+                    "clientInfo": { "name": "test", "version": "0" }
+                }),
+            )
+            .await;
+        assert!(
+            hello["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"]
+                .is_object(),
+            "the server declares tasks: {hello}"
+        );
+        client
+            .send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        client
+    }
+
+    /// `tasks/get` until the task is no longer working, within a minute and
+    /// a half: the task as it ended.
+    async fn task_over(&mut self, id: &str) -> serde_json::Value {
+        let since = std::time::Instant::now();
+        loop {
+            let got = self
+                .ask("tasks/get", serde_json::json!({ "taskId": id }))
+                .await;
+            let task = got["result"].clone();
+            assert!(task.is_object(), "a task: {got}");
+            assert_eq!(task["taskId"], id, "{task}");
+            if task["status"] != "working" {
+                return task;
+            }
+            assert!(
+                task["pollIntervalMs"]
+                    .as_u64()
+                    .is_some_and(|ms| ms >= 5_000),
+                "a working task says when to ask again: {task}"
+            );
+            assert!(
+                since.elapsed() < std::time::Duration::from_secs(90),
+                "still working after a minute and a half: {task}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+}
+
+/// A client that takes tasks is answered, for a walk that has not ended in a
+/// few seconds, with a task whose id is the job's, whatever wait it asked
+/// for, and `tasks/get` hands back the walk's result once it has ended, as
+/// the call would have answered it.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_tasks_client_gets_a_task_for_a_slow_walk_and_its_result_from_tasks_get() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(20), 1).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::taking_tasks(tmp.path(), &instagram, &[]).await;
+
+    let asked = std::time::Instant::now();
+    let started = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "wait_seconds": 50 }),
+        )
+        .await;
+    assert!(
+        asked.elapsed() < std::time::Duration::from_secs(19),
+        "answered before the walk could end, not after the wait it asked: {:?}",
+        asked.elapsed()
+    );
+    assert_eq!(started["resultType"], "task", "{started}");
+    assert_eq!(started["status"], "working", "{started}");
+    let id = started["taskId"].as_str().unwrap().to_string();
+    assert!(
+        snob_store::paths::JobId::parse(&id).is_some(),
+        "the task is the job: {id}"
+    );
+    assert_eq!(started["ttlMs"], 7 * 24 * 3600 * 1000, "{started}");
+    assert!(started["pollIntervalMs"].as_u64().is_some(), "{started}");
+    assert!(
+        started["statusMessage"]
+            .as_str()
+            .is_some_and(|said| said.contains("followers list")),
+        "{started}"
+    );
+    assert!(chrono::DateTime::parse_from_rfc3339(started["createdAt"].as_str().unwrap()).is_ok());
+
+    let ended = client.task_over(&id).await;
+    assert_eq!(ended["status"], "completed", "{ended}");
+    let result = &ended["result"];
+    assert_eq!(result["isError"], false, "{ended}");
+    let told = &result["structuredContent"];
+    assert_eq!(told["count"], 3, "{told}");
+    assert_eq!(usernames(told), ["user0", "user1", "user2"]);
+    assert_eq!(told["job_id"], id.as_str(), "{told}");
+    assert_eq!(followers_asked(&instagram).await, 1, "walked once");
+
+    // The task is the job: snob_job reads it too, and nothing more is walked.
+    let read = client
+        .call("snob_job", serde_json::json!({ "job_id": id }))
+        .await;
+    assert_eq!(read["structuredContent"]["count"], 3, "{read}");
+    assert_eq!(followers_asked(&instagram).await, 1);
+}
+
+/// `tasks/cancel` stops the walk as `snob_job_cancel` does: the task ends
+/// canceled, what was read is kept, and the list is let go of, so the next
+/// call walks it again. On the stateless revision, the client saying it
+/// takes tasks in every request.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn tasks_cancel_stops_the_walk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::stateless(tmp.path(), &instagram, takes_tasks());
+
+    let started = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(started["resultType"], "task", "{started}");
+    let id = started["taskId"].as_str().unwrap().to_string();
+    until_asked(&instagram, 1).await;
+
+    let canceled = client
+        .ask("tasks/cancel", serde_json::json!({ "taskId": id }))
+        .await;
+    assert!(canceled["error"].is_null(), "{canceled}");
+    assert!(canceled["result"].is_object(), "an empty ack: {canceled}");
+    let ended = client.task_over(&id).await;
+    let canceled = "cancelled"; // spelling-allow: the extension's word for it
+    assert_eq!(ended["status"], canceled, "{ended}");
+    assert!(ended.get("result").is_none(), "{ended}");
+
+    // The list was let go of: walked again, and this time it ends.
+    let again = client
+        .call("snob_list", serde_json::json!({ "list": "followers" }))
+        .await;
+    let told = if again["resultType"] == "task" {
+        let next = again["taskId"].as_str().unwrap().to_string();
+        assert_ne!(next, id, "a walk of its own");
+        let ended = client.task_over(&next).await;
+        assert_eq!(ended["status"], "completed", "{ended}");
+        ended["result"]["structuredContent"].clone()
+    } else {
+        again["structuredContent"].clone()
+    };
+    assert_eq!(told["count"], 3, "{told}");
+}
+
+/// A client that did not say it takes tasks gets the job's id, as before,
+/// and is refused the task methods.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_client_without_tasks_gets_a_job_handle_instead() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(8), 1).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let started = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "wait_seconds": 0 }),
+        )
+        .await;
+    assert!(started.get("taskId").is_none(), "{started}");
+    assert_eq!(started["isError"], false, "{started}");
+    let told = &started["structuredContent"];
+    assert_eq!(told["poll_with"], "snob_job", "{told}");
+    let id = told["job_id"].as_str().unwrap().to_string();
+
+    let refused = client
+        .ask("tasks/get", serde_json::json!({ "taskId": id }))
+        .await;
+    assert!(refused["error"].is_object(), "{refused}");
+
+    let done = client
+        .call(
+            "snob_job",
+            serde_json::json!({ "job_id": id, "wait_seconds": 50 }),
+        )
+        .await;
+    assert_eq!(done["structuredContent"]["count"], 3, "{done}");
+}
+
+/// An id that names no job of the account, well formed or not, is an
+/// unknown task to every task method, and runs nothing.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn an_unknown_task_is_invalid_params() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut client = McpClient::taking_tasks(tmp.path(), &instagram, &[]).await;
+
+    let none_such = format!("j{}", "0".repeat(26));
+    assert!(snob_store::paths::JobId::parse(&none_such).is_some());
+    for id in ["nope", "--all", none_such.as_str()] {
+        for (method, params) in [
+            ("tasks/get", serde_json::json!({ "taskId": id })),
+            ("tasks/cancel", serde_json::json!({ "taskId": id })),
+            (
+                "tasks/update",
+                serde_json::json!({ "taskId": id, "inputResponses": {} }),
+            ),
+        ] {
+            let answer = client.ask(method, params).await;
+            assert_eq!(answer["error"]["code"], -32602, "{method} {id}: {answer}");
+            assert!(
+                answer["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with("unknown task")),
+                "{answer}"
+            );
+        }
+    }
+    assert_eq!(followers_asked(&instagram).await, 0);
+    assert!(jobs.dirs().is_empty(), "no job was made");
+}
+
+/// A server acting as one account does not know another account's job as a
+/// task: it cannot read it or stop it by its id.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_task_of_another_account_is_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = two_accounts(tmp.path()).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(120)))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut args = vec!["--account", "other", "__job", "start", "--wait", "0s"];
+    args.extend_from_slice(&FOLLOWERS_JOB);
+    let out = snob(tmp.path(), Some(&instagram), &args);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let id = json(&out)["job_id"].as_str().unwrap().to_string();
+
+    let mut mine = McpClient::taking_tasks(tmp.path(), &instagram, &["--account", "me"]).await;
+    for method in ["tasks/get", "tasks/cancel"] {
+        let answer = mine.ask(method, serde_json::json!({ "taskId": id })).await;
+        assert_eq!(answer["error"]["code"], -32602, "{method}: {answer}");
+    }
+    assert!(
+        !jobs.dirs()[0].join("stop").exists(),
+        "the cancel as another account stopped nothing"
+    );
+
+    let mut theirs = McpClient::taking_tasks(tmp.path(), &instagram, &["--account", "other"]).await;
+    let got = theirs
+        .ask("tasks/get", serde_json::json!({ "taskId": id }))
+        .await;
+    assert_eq!(got["result"]["status"], "working", "{got}");
+}
+
+/// A key in snob's form, as `snob mcp key new` makes one. A fixed one, since
+/// these tests hand it over through `SNOB_MCP_KEY` and never make one: that
+/// would write the system keyring.
+#[cfg(feature = "mcp-http")]
+const MCP_KEY: &str = "snob_mcp_N2u3l9q0aYyK0w7mQxk1vR4cT8bZp5sJdE6fGhIoUjA";
+
+/// `new --env` makes a key for `SNOB_MCP_KEY`: printed only to a terminal
+/// or with `--print`, kept nowhere, and in the form a server takes. It never
+/// reads or writes the keyring, so it runs here as it would anywhere.
+#[cfg(feature = "mcp-http")]
+#[test]
+fn mcp_key_new_env_prints_a_key_for_the_variable_and_keeps_none() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let refused = snob(tmp.path(), None, &["mcp", "key", "new", "--env"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(stdout(&refused).is_empty(), "{}", stdout(&refused));
+
+    let out = snob(tmp.path(), None, &["mcp", "key", "new", "--env", "--print"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let key = stdout(&out).trim().to_string();
+    assert!(key.starts_with("snob_mcp_"), "{key}");
+    assert_eq!(key.len(), MCP_KEY.len(), "{key}");
+    assert!(stderr(&out).contains("Kept nowhere"), "{}", stderr(&out));
+
+    // What it printed is a key a server takes.
+    let shown = snob_with(
+        tmp.path(),
+        None,
+        &[("SNOB_MCP_KEY", key.as_str())],
+        &["mcp", "key", "show"],
+    );
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    assert!(stdout(&shown).contains("fingerprint"), "{}", stdout(&shown));
+
+    let both = snob(tmp.path(), None, &["mcp", "key", "new", "--env", "--force"]);
+    assert_eq!(both.status.code(), Some(2), "{}", stderr(&both));
+}
+
+/// `show` says where the key comes from and names it by a fingerprint, and
+/// with the key in `SNOB_MCP_KEY` warns that the variable overrides the
+/// keyring. The key itself is printed only on request, and then only to a
+/// terminal unless `--print` says otherwise; a key not in snob's form is
+/// refused without being repeated.
+///
+/// Through the variable only, and so it reads nothing from the keyring: the
+/// variable wins before the keyring is asked (`commands::mcp::key`).
+#[cfg(feature = "mcp-http")]
+#[test]
+fn mcp_key_show_names_the_environment_and_prints_a_fingerprint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let with_key = [("SNOB_MCP_KEY", MCP_KEY)];
+
+    let out = snob_with(tmp.path(), None, &with_key, &["mcp", "key", "show"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = stdout(&out);
+    assert!(said.contains("SNOB_MCP_KEY"), "{said}");
+    let fingerprint = said
+        .split("fingerprint ")
+        .nth(1)
+        .map(|rest| rest.trim_end().trim_end_matches('.'))
+        .unwrap_or_else(|| panic!("no fingerprint: {said}"));
+    assert_eq!(fingerprint.len(), 12, "{said}");
+    assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()), "{said}");
+    assert!(!said.contains(MCP_KEY), "the key was printed: {said}");
+    assert!(
+        stderr(&out).contains("warning: SNOB_MCP_KEY is set"),
+        "{}",
+        stderr(&out)
+    );
+
+    // The same key gives the same fingerprint, every run.
+    let again = snob_with(tmp.path(), None, &with_key, &["mcp", "key", "show"]);
+    assert_eq!(stdout(&again), said);
+
+    // Standard output here is a pipe, so the key is not shown without
+    // --print, and nothing is printed instead of it.
+    let refused = snob_with(
+        tmp.path(),
+        None,
+        &with_key,
+        &["mcp", "key", "show", "--reveal"],
+    );
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(stdout(&refused).is_empty(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("--print"), "{}", stderr(&refused));
+    assert!(!stderr(&refused).contains(MCP_KEY));
+
+    let revealed = snob_with(
+        tmp.path(),
+        None,
+        &with_key,
+        &["mcp", "key", "show", "--reveal", "--print"],
+    );
+    assert!(revealed.status.success(), "{}", stderr(&revealed));
+    assert_eq!(stdout(&revealed).trim_end(), MCP_KEY);
+    assert!(
+        stderr(&revealed).contains(fingerprint),
+        "{}",
+        stderr(&revealed)
+    );
+
+    let typo = format!("{MCP_KEY}x");
+    let malformed = snob_with(
+        tmp.path(),
+        None,
+        &[("SNOB_MCP_KEY", &typo)],
+        &["mcp", "key", "show"],
+    );
+    assert_eq!(malformed.status.code(), Some(1), "{}", stderr(&malformed));
+    assert!(stderr(&malformed).contains("SNOB_MCP_KEY"));
+    assert!(
+        !stderr(&malformed).contains(MCP_KEY) && !stdout(&malformed).contains(MCP_KEY),
+        "the value was repeated: {}",
+        stderr(&malformed)
+    );
+
+    let unparsed = snob(tmp.path(), None, &["mcp", "key", "show", "--print"]);
+    assert_eq!(unparsed.status.code(), Some(2), "--print needs --reveal");
+}
+
+/// `revoke` with the key in `SNOB_MCP_KEY` says that a server started with
+/// the variable still takes it: removing the keyring's changes nothing for
+/// that server. The sandbox's keyring holds no key, so it says there was
+/// none, and removes nothing anywhere else.
+#[cfg(feature = "mcp-http")]
+#[test]
+fn mcp_key_revoke_warns_when_the_environment_holds_the_key() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let out = snob_with(
+        tmp.path(),
+        None,
+        &[("SNOB_MCP_KEY", MCP_KEY)],
+        &["mcp", "key", "revoke"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = stdout(&out);
+    assert!(said.contains("no MCP key"), "{said}");
+    let warned = stderr(&out);
+    assert!(
+        warned.contains("warning: SNOB_MCP_KEY is set")
+            && warned.contains("a server started with it takes that key"),
+        "{warned}"
+    );
+    assert!(!said.contains(MCP_KEY) && !warned.contains(MCP_KEY));
+
+    // Without the variable there is nothing to warn about.
+    let out = snob(tmp.path(), None, &["mcp", "key", "revoke"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("warning"), "{}", stderr(&out));
+}
+
+/// One `snob mcp --listen` on a loopback port of its own, with
+/// [`MCP_KEY`] in its environment, spoken to over HTTP as a client does.
+///
+/// Started with `--stop-when-stdin-closes`, so closing its standard input
+/// asks it to stop as Ctrl+C would, on every platform.
+#[cfg(feature = "mcp-http")]
+struct HttpMcp {
+    child: tokio::process::Child,
+    stdin: Option<tokio::process::ChildStdin>,
+    port: u16,
+    http: reqwest::Client,
+    next: u64,
+    /// What the server said on standard error, as it said it.
+    said: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+/// What an HTTP request to the server came back with.
+#[cfg(feature = "mcp-http")]
+struct Answered {
+    status: u16,
+    session: Option<String>,
+    /// The JSON-RPC messages in the body, from its events or as it is.
+    messages: Vec<serde_json::Value>,
+}
+
+#[cfg(feature = "mcp-http")]
+impl HttpMcp {
+    async fn start(root: &Path, instagram: &MockServer, args: &[&str]) -> Self {
+        use tokio::io::AsyncBufReadExt;
+        let mut command = tokio::process::Command::from(command(root, Some(instagram)));
+        command
+            .args(["--stop-when-stdin-closes", "mcp", "--listen", "127.0.0.1:0"])
+            .args(args)
+            .env("SNOB_MCP_KEY", MCP_KEY)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("the binary runs");
+        let stdin = child.stdin.take();
+        let mut lines = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+        let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let line = lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("the server went away before it listened");
+                said.lock().unwrap().push_str(&format!("{line}\n"));
+                if line.contains("serving on http://") {
+                    return line;
+                }
+            }
+        })
+        .await
+        .expect("listening within a minute");
+        let port = first
+            .split("http://127.0.0.1:")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|port| port.parse().ok())
+            .unwrap_or_else(|| panic!("a port in {first}"));
+        // Read on, so that nothing the server says can fill the pipe.
+        let more = std::sync::Arc::clone(&said);
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                more.lock().unwrap().push_str(&format!("{line}\n"));
+            }
+        });
+        Self {
+            child,
+            stdin,
+            port,
+            http: reqwest::Client::new(),
+            next: 0,
+            said,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/mcp", self.port)
+    }
+
+    /// Posts `message` with the key, in `session` when given, on the
+    /// revision a session speaks (2025-11-25) or else the stateless one.
+    async fn post(&self, session: Option<&str>, message: &serde_json::Value) -> Answered {
+        post_to(&self.http, self.url(), session, message).await
+    }
+}
+
+/// [`HttpMcp::post`], with what it needs of the server, for a request made
+/// from a task of its own.
+#[cfg(feature = "mcp-http")]
+async fn post_to(
+    http: &reqwest::Client,
+    url: String,
+    session: Option<&str>,
+    message: &serde_json::Value,
+) -> Answered {
+    let mut request = http
+        .post(url)
+        .header("Authorization", format!("Bearer {MCP_KEY}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(message.to_string());
+    match session {
+        Some(id) => {
+            request = request
+                .header("Mcp-Session-Id", id)
+                .header("MCP-Protocol-Version", "2025-11-25");
+        }
+        None if message["method"] != "initialize" => {
+            request = request
+                .header("MCP-Protocol-Version", "2026-07-28")
+                .header("Mcp-Method", message["method"].as_str().unwrap_or_default());
+            if let Some(name) = message["params"]["name"].as_str() {
+                request = request.header("Mcp-Name", name);
+            }
+        }
+        None => {}
+    }
+    let response = tokio::time::timeout(std::time::Duration::from_secs(90), request.send())
+        .await
+        .expect("an answer within a minute and a half")
+        .expect("the server answers");
+    let status = response.status().as_u16();
+    let session = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|id| id.to_str().ok())
+        .map(str::to_string);
+    let json = response
+        .headers()
+        .get("content-type")
+        .and_then(|kind| kind.to_str().ok())
+        .is_some_and(|kind| kind.starts_with("application/json"));
+    let body = response.text().await.unwrap_or_default();
+    let messages = if json {
+        serde_json::from_str(&body).into_iter().collect()
+    } else {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .filter_map(|data| serde_json::from_str(data.trim()).ok())
+            .collect()
+    };
+    Answered {
+        status,
+        session,
+        messages,
+    }
+}
+
+#[cfg(feature = "mcp-http")]
+impl HttpMcp {
+    /// A request, and the message that answers it.
+    async fn ask(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        self.next += 1;
+        let id = self.next;
+        let mut params = params;
+        if session.is_none() {
+            params["_meta"] = serde_json::json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": { "name": "test", "version": "0" }
+            });
+        }
+        let message =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let answered = self.post(session, &message).await;
+        assert_eq!(answered.status, 200, "{method}");
+        answered
+            .messages
+            .into_iter()
+            .find(|message| message["id"] == id)
+            .unwrap_or_else(|| panic!("no answer to {method}"))
+    }
+
+    /// The handshake of a client on 2025-11-25, which opens a session: its
+    /// id.
+    async fn open(&mut self) -> String {
+        self.open_with(serde_json::json!({})).await
+    }
+
+    /// [`Self::open`], for a client that declares `capabilities`.
+    async fn open_with(&mut self, capabilities: serde_json::Value) -> String {
+        self.next += 1;
+        let hello = serde_json::json!({
+            "jsonrpc": "2.0", "id": self.next, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": capabilities,
+                "clientInfo": { "name": "test", "version": "0" }
+            }
+        });
+        let answered = self.post(None, &hello).await;
+        assert_eq!(answered.status, 200);
+        assert_eq!(
+            answered.messages[0]["result"]["serverInfo"]["name"], "snob",
+            "{:?}",
+            answered.messages
+        );
+        let session = answered.session.expect("a session id");
+        let done = self
+            .post(
+                Some(&session),
+                &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            )
+            .await;
+        assert_eq!(done.status, 202);
+        session
+    }
+
+    async fn call(
+        &mut self,
+        session: Option<&str>,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let answer = self
+            .ask(
+                session,
+                "tools/call",
+                serde_json::json!({ "name": tool, "arguments": arguments }),
+            )
+            .await;
+        answer["result"].clone()
+    }
+
+    /// Closes the server's standard input, the stop `--stop-when-stdin-
+    /// closes` hears, and waits for it to exit.
+    async fn stop(&mut self) -> std::process::ExitStatus {
+        self.stdin = None;
+        tokio::time::timeout(std::time::Duration::from_secs(90), self.child.wait())
+            .await
+            .expect("the server stopped within a minute and a half")
+            .unwrap()
+    }
+
+    fn said(&self) -> String {
+        self.said.lock().unwrap().clone()
+    }
+
+    /// Whether the server has said `what` on standard error, waiting a few
+    /// seconds for the lines after the first.
+    async fn has_said(&self, what: &str) -> bool {
+        let since = std::time::Instant::now();
+        while since.elapsed() < std::time::Duration::from_secs(10) {
+            if self.said().contains(what) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+}
+
+/// Sends `request` as it is on a connection of its own, and reads what comes
+/// back until the server closes the connection or `within` passes: what it
+/// read, and whether the server closed it.
+#[cfg(feature = "mcp-http")]
+async fn exchange(port: u16, request: &[u8], within: std::time::Duration) -> (String, bool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    // A refusal may close the connection before all of it is written.
+    let _ = stream.write_all(request).await;
+    let mut read = Vec::new();
+    let mut buffer = [0u8; 4096];
+    let closed = tokio::time::timeout(within, async {
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => read.extend_from_slice(&buffer[..n]),
+            }
+        }
+    })
+    .await
+    .is_ok();
+    (String::from_utf8_lossy(&read).into_owned(), closed)
+}
+
+/// A request's head, by hand: `extra` lines go in as they are.
+#[cfg(feature = "mcp-http")]
+fn head(port: u16, extra: &[&str], length: usize) -> String {
+    let mut head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nContent-Length: {length}\r\n"
+    );
+    for line in extra {
+        head.push_str(line);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    head
+}
+
+/// An `initialize` as a client on 2025-11-25 sends it.
+#[cfg(feature = "mcp-http")]
+const HELLO: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"raw","version":"0"}}}"#;
+
+/// No key, no server: it does not start listening, and says how to make
+/// one.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn the_http_server_refuses_to_start_without_a_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut command = tokio::process::Command::from(command(tmp.path(), None));
+    command.args(["mcp", "--listen", "127.0.0.1:0"]);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(60), command.output())
+        .await
+        .expect("it did not stay to serve")
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("snob mcp key new"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stderr(&out).contains("serving on"), "{}", stderr(&out));
+}
+
+/// Loopback only, and a public address only over https and with --listen.
+#[cfg(feature = "mcp-http")]
+#[test]
+fn the_http_server_refuses_a_non_loopback_address() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = [("SNOB_MCP_KEY", MCP_KEY)];
+    for refused in [
+        &["mcp", "--listen", "0.0.0.0:8750"][..],
+        &["mcp", "--listen", "[::]:8750"][..],
+        &["mcp", "--listen", "192.168.1.10:8750"][..],
+        &["mcp", "--listen", "example.com:8750"][..],
+        &[
+            "mcp",
+            "--listen",
+            "127.0.0.1:0",
+            "--public-url",
+            "http://snob.example.com",
+        ][..],
+        &["mcp", "--public-url", "https://snob.example.com"][..],
+    ] {
+        let out = snob_with(tmp.path(), None, &key, refused);
+        assert_eq!(out.status.code(), Some(2), "{refused:?}: {}", stderr(&out));
+        assert!(!stderr(&out).contains("serving on"), "{}", stderr(&out));
+    }
+    let out = snob_with(tmp.path(), None, &key, &["mcp", "--listen", "0.0.0.0:8750"]);
+    assert!(stderr(&out).contains("tunnel"), "{}", stderr(&out));
+}
+
+/// A socket is for Linux and macOS: on Windows `--listen socket` is a
+/// command line refused, which says what to give instead.
+#[cfg(all(windows, feature = "mcp-http"))]
+#[test]
+fn a_socket_is_refused_on_windows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = snob_with(
+        tmp.path(),
+        None,
+        &[("SNOB_MCP_KEY", MCP_KEY)],
+        &["mcp", "--listen", "socket"],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("127.0.0.1:8750"), "{}", stderr(&out));
+}
+
+/// On Unix, `snob mcp --listen socket` serves the same server on a socket
+/// in the data directory, made `0600`, behind the same key, and leaves
+/// nothing at its name once it has stopped.
+#[cfg(all(unix, feature = "mcp-http"))]
+#[tokio::test]
+async fn the_http_server_listens_on_a_socket_only_its_user_can_reach() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// One request on a connection of its own, and the status and body
+    /// that came back.
+    async fn ask(socket: &Path, key: Option<&str>, body: &str) -> (String, String) {
+        let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+        let key = key
+            .map(|key| format!("Authorization: Bearer {key}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8750\r\n{key}Content-Type: \
+             application/json\r\nAccept: application/json, text/event-stream\r\n\
+             MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/list\r\n\
+             Connection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut said = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            stream.read_to_string(&mut said),
+        )
+        .await
+        .expect("an answer within a minute")
+        .unwrap();
+        let status = said.lines().next().unwrap_or_default().to_owned();
+        (status, said)
+    }
+
+    // Under /tmp, so that the socket's path is short on macOS too.
+    let tmp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut command = tokio::process::Command::from(command(tmp.path(), Some(&instagram)));
+    command
+        .args(["--stop-when-stdin-closes", "mcp", "--listen", "socket"])
+        .env("SNOB_MCP_KEY", MCP_KEY)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("the binary runs");
+    let stdin = child.stdin.take();
+    let mut lines = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+    let mut said = String::new();
+    let socket = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            let line = lines.next_line().await.unwrap().unwrap_or_else(|| {
+                panic!("the server went away before it listened, saying:\n{said}")
+            });
+            said.push_str(&line);
+            said.push('\n');
+            if let Some(rest) = line.split("serving on the socket ").nth(1) {
+                return std::path::PathBuf::from(rest.split(", at ").next().unwrap());
+            }
+        }
+    })
+    .await
+    .expect("listening within a minute");
+    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+
+    assert!(socket.starts_with(tmp.path()), "{}", socket.display());
+    let mode = std::fs::symlink_metadata(&socket)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+
+    let list = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+        "params": {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "0"}
+        }}
+    })
+    .to_string();
+    let (status, said) = ask(&socket, None, &list).await;
+    assert!(status.starts_with("HTTP/1.1 401"), "{said}");
+    let (status, said) = ask(&socket, Some(MCP_KEY), &list).await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{said}");
+    assert!(said.contains("snob_status"), "{said}");
+    assert!(
+        instagram
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "listing the tools sends nothing to Instagram"
+    );
+
+    drop(stdin);
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait())
+        .await
+        .expect("it stops when asked")
+        .unwrap();
+    assert_eq!(ended.code(), Some(130));
+    assert!(
+        std::fs::symlink_metadata(&socket).is_err(),
+        "the socket stayed"
+    );
+}
+
+/// A request with no key is refused as soon as its head has arrived: the
+/// body it announced is never waited for, and the connection is closed.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_request_without_the_key_is_refused_before_its_body_is_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+
+    // A body far past the limit, announced and never sent: a server that
+    // read it first would wait, or answer 413.
+    let since = std::time::Instant::now();
+    let (said, closed) = exchange(
+        server.port,
+        head(server.port, &[], 10_000_000).as_bytes(),
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    assert!(said.starts_with("HTTP/1.1 401"), "{said}");
+    assert!(
+        said.contains("www-authenticate: Bearer realm=\"snob\""),
+        "{said}"
+    );
+    assert!(closed, "the connection was closed: {said}");
+    assert!(since.elapsed() < std::time::Duration::from_secs(10));
+
+    // Another path is not found, key or no key.
+    let (said, _) = exchange(
+        server.port,
+        b"GET /.well-known/oauth-protected-resource HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    assert!(said.starts_with("HTTP/1.1 404"), "{said}");
+    assert!(posted(&instagram).await.is_empty());
+}
+
+/// Not the key, or the key under another scheme: 401, and the connection
+/// closed, so a guess costs a connection.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_wrong_key_is_refused_and_the_connection_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let wrong = format!("{}E", &MCP_KEY[..MCP_KEY.len() - 1]);
+    for authorization in [
+        format!("Authorization: Bearer {wrong}"),
+        format!("Authorization: Basic {MCP_KEY}"),
+        format!("Authorization: {MCP_KEY}"),
+        "Authorization: Bearer ".to_string(),
+    ] {
+        let mut request = head(server.port, &[&authorization], HELLO.len());
+        request.push_str(HELLO);
+        let (said, closed) = exchange(
+            server.port,
+            request.as_bytes(),
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+        assert!(said.starts_with("HTTP/1.1 401"), "{authorization}: {said}");
+        assert!(said.contains("connection: close"), "{said}");
+        assert!(closed, "{authorization}: the connection was closed");
+    }
+    // The key, in any case of its scheme, is let in.
+    let key = format!("Authorization: bEaReR {MCP_KEY}");
+    let mut request = head(server.port, &[&key, "Connection: close"], HELLO.len());
+    request.push_str(HELLO);
+    let (said, _) = exchange(
+        server.port,
+        request.as_bytes(),
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    assert!(said.starts_with("HTTP/1.1 200"), "{said}");
+    assert_eq!(server.stop().await.code(), Some(130));
+}
+
+/// Connections that never show the key hold no place a client with it
+/// needs: past the cap, the oldest of them is closed for the new one, so a
+/// local process holding idle sockets locks nobody out.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn connections_without_the_key_do_not_lock_out_a_client_with_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    // More than the cap, sending nothing, all open at once.
+    let mut idle = Vec::new();
+    for _ in 0..40 {
+        idle.push(
+            tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+                .await
+                .unwrap(),
+        );
+    }
+    let since = std::time::Instant::now();
+    let session = server.open().await;
+    let tools = server
+        .ask(Some(&session), "tools/list", serde_json::json!({}))
+        .await;
+    assert!(tools["result"]["tools"].is_array(), "{tools}");
+    assert!(
+        since.elapsed() < std::time::Duration::from_secs(10),
+        "not by waiting for the idle ones to be cut: {:?}",
+        since.elapsed()
+    );
+
+    // And one that sends nothing is closed within seconds, not left to hold
+    // its place for the ten an idle connection between requests gets.
+    let (said, closed) = exchange(server.port, b"", std::time::Duration::from_secs(8)).await;
+    assert!(closed, "closed for sending nothing: {said}");
+    drop(idle);
+    assert_eq!(server.stop().await.code(), Some(130));
+}
+
+/// A `Host` that is neither loopback nor the public URL's is refused, as a
+/// page that reached the port through DNS rebinding would send.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_foreign_host_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let server = HttpMcp::start(
+        tmp.path(),
+        &instagram,
+        &["--public-url", "https://snob.example.com/mcp"],
+    )
+    .await;
+    let key = format!("Authorization: Bearer {MCP_KEY}");
+    for (host, status) in [
+        ("evil.example", "403"),
+        ("snob.example.com", "200"),
+        ("localhost", "200"),
+    ] {
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\n{key}\r\nContent-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\nConnection: close\r\n\
+             Content-Length: {}\r\n\r\n{HELLO}",
+            HELLO.len()
+        );
+        let (said, _) = exchange(
+            server.port,
+            request.as_bytes(),
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+        assert!(
+            said.starts_with(&format!("HTTP/1.1 {status}")),
+            "{host}: {said}"
+        );
+    }
+}
+
+/// An `Origin` other than the public URL's is refused; a request with none,
+/// which is what a client that is not a browser sends, is not.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_foreign_origin_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let server = HttpMcp::start(
+        tmp.path(),
+        &instagram,
+        &["--public-url", "https://snob.example.com"],
+    )
+    .await;
+    let key = format!("Authorization: Bearer {MCP_KEY}");
+    for (origin, status) in [
+        (Some("https://evil.example"), "403"),
+        (Some("http://localhost:8080"), "403"),
+        (Some("https://snob.example.com"), "200"),
+        (None, "200"),
+    ] {
+        let origin_line = origin.map(|origin| format!("Origin: {origin}"));
+        let mut extra = vec![key.as_str(), "Connection: close"];
+        if let Some(line) = &origin_line {
+            extra.push(line);
+        }
+        let mut request = head(server.port, &extra, HELLO.len());
+        request.push_str(HELLO);
+        let (said, _) = exchange(
+            server.port,
+            request.as_bytes(),
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+        assert!(
+            said.starts_with(&format!("HTTP/1.1 {status}")),
+            "{origin:?}: {said}"
+        );
+    }
+}
+
+/// A body past the quarter of a megabyte is refused, announced or not.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_body_past_the_limit_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let key = format!("Authorization: Bearer {MCP_KEY}");
+
+    // Announced: refused before any of it is read.
+    let (said, closed) = exchange(
+        server.port,
+        head(server.port, &[&key], 300_000).as_bytes(),
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    assert!(said.starts_with("HTTP/1.1 413"), "{said}");
+    assert!(closed);
+
+    // In chunks, which announce nothing: refused once past it.
+    let mut request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{key}\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+        server.port
+    );
+    let chunk = "x".repeat(64 * 1024);
+    for _ in 0..5 {
+        request.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+    }
+    request.push_str("0\r\n\r\n");
+    let (said, _) = exchange(
+        server.port,
+        request.as_bytes(),
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    assert!(said.starts_with("HTTP/1.1 413"), "{said}");
+}
+
+/// A body that does not arrive is given half a minute, and then the request
+/// is answered 408 and its connection closed.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_body_that_never_arrives_is_cut() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let key = format!("Authorization: Bearer {MCP_KEY}");
+    let mut request = head(server.port, &[&key], HELLO.len());
+    request.push_str(&HELLO[..10]);
+    let since = std::time::Instant::now();
+    let (said, closed) = exchange(
+        server.port,
+        request.as_bytes(),
+        std::time::Duration::from_secs(60),
+    )
+    .await;
+    assert!(said.starts_with("HTTP/1.1 408"), "{said}");
+    assert!(closed);
+    assert!(since.elapsed() >= std::time::Duration::from_secs(25));
+}
+
+/// `initialize` opens a session, which later requests name; a session the
+/// server never opened is not found. The key is named at start by its
+/// fingerprint, never itself.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn initialize_over_http_opens_a_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let session = server.open().await;
+    let tools = server
+        .ask(Some(&session), "tools/list", serde_json::json!({}))
+        .await;
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"snob_list"), "{names:?}");
+    assert!(
+        !names.contains(&"snob_follow"),
+        "no writes without --allow-writes"
+    );
+
+    let unknown = server
+        .post(
+            Some("not-a-session"),
+            &serde_json::json!({"jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {}}),
+        )
+        .await;
+    assert_eq!(unknown.status, 404);
+    assert!(server.said().contains("fingerprint"), "{}", server.said());
+    assert!(!server.said().contains(MCP_KEY), "the key is never said");
+}
+
+/// What `snob mcp config --remote` prints reaches a real `snob mcp --listen`
+/// as it is: the address, and the header with the token filled in as the
+/// client fills it in from `SNOB_MCP_TOKEN`. The key is never printed, even
+/// with the server's variable set where it runs, and the server's flags and
+/// an address that would carry the key in plain text or hold it are
+/// refused, without saying it back.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_remote_config_reaches_the_server_it_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let with_key = [("SNOB_MCP_KEY", MCP_KEY)];
+    let config = |client: &str, more: &[&str]| {
+        let mut args = vec!["mcp", "config", client];
+        args.extend_from_slice(more);
+        snob_with(tmp.path(), None, &with_key, &args)
+    };
+    let url = server.url();
+
+    let out = config("claude-code", &["--remote", &url]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    for said in [stdout(&out), stderr(&out)] {
+        assert!(!said.contains(MCP_KEY), "the key was printed: {said}");
+    }
+    assert!(stderr(&out).contains("SNOB_MCP_TOKEN"), "{}", stderr(&out));
+    let snippet: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let remote = &snippet["mcpServers"]["snob"];
+    assert_eq!(remote["url"], url.as_str());
+    assert!(remote.get("command").is_none(), "{snippet}");
+    let header = remote["headers"]["Authorization"].as_str().unwrap();
+    let hello = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "0" }
+        }
+    });
+    let send = |authorization: String| {
+        reqwest::Client::new()
+            .post(remote["url"].as_str().unwrap())
+            .header("Authorization", authorization)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(hello.to_string())
+            .send()
+    };
+    let opened = send(header.replace("${SNOB_MCP_TOKEN}", MCP_KEY))
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), 200);
+    assert!(opened.headers().contains_key("mcp-session-id"));
+    // Sent as it is printed, before the client fills it in: no key.
+    let unfilled = send(header.to_string()).await.unwrap();
+    assert_eq!(unfilled.status(), 401);
+
+    let out = config("codex", &["--remote", &url]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let toml = stdout(&out);
+    assert!(toml.contains(&format!("url = \"{url}\"")), "{toml}");
+    assert!(
+        toml.contains("bearer_token_env_var = \"SNOB_MCP_TOKEN\""),
+        "{toml}"
+    );
+    assert!(!toml.contains("command"), "{toml}");
+
+    // An address with no path gets the one the server serves.
+    let bare = format!("http://127.0.0.1:{}", server.port);
+    let out = config("cursor", &["--remote", &bare]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let snippet: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(snippet["mcpServers"]["snob"]["url"], url.as_str());
+
+    // The server's flags belong to the server.
+    for flags in [
+        &["--allow-writes"][..],
+        &["--confirm-in-chat", "all"],
+        &["--allow-writes", "--max-writes-per-day", "3"],
+    ] {
+        let mut args = vec!["--remote", url.as_str()];
+        args.extend_from_slice(flags);
+        let refused = config("codex", &args);
+        assert_eq!(refused.status.code(), Some(2), "{flags:?}");
+        assert!(stdout(&refused).is_empty());
+    }
+    // Plain http off this machine, and a key in the address.
+    let refused = config("codex", &["--remote", "http://snob.example.com/mcp"]);
+    assert_eq!(refused.status.code(), Some(2), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("https"), "{}", stderr(&refused));
+    let holding = format!("https://snob.example.com/{MCP_KEY}/mcp");
+    let refused = config("codex", &["--remote", &holding]);
+    assert_eq!(refused.status.code(), Some(2), "{}", stderr(&refused));
+    assert!(stdout(&refused).is_empty());
+    assert!(
+        !stderr(&refused).contains(MCP_KEY),
+        "the key was said back: {}",
+        stderr(&refused)
+    );
+
+    assert_eq!(server.stop().await.code(), Some(130));
+}
+
+/// On the stateless revision a call carries everything it needs, and no
+/// session is opened for it.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_stateless_call_over_http_needs_no_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let status = server
+        .call(None, "snob_status", serde_json::json!({}))
+        .await;
+    assert_eq!(status["isError"], false, "{status}");
+    assert_eq!(
+        status["structuredContent"]["error"]["code"], "no_session",
+        "{status}"
+    );
+}
+
+/// Eight sessions at once, left by clients that went away without a
+/// `DELETE`: a ninth `initialize` closes the one left idle longest rather
+/// than being refused, and that client is told its session is gone; the
+/// others go on, and a stateless call, which opens none, is answered too.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_ninth_session_closes_the_one_left_idle_longest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let mut sessions = Vec::new();
+    for _ in 0..8 {
+        sessions.push(server.open().await);
+    }
+    // The first is asked something again, so the second is the idlest.
+    let status = server
+        .call(Some(&sessions[0]), "snob_status", serde_json::json!({}))
+        .await;
+    assert_eq!(status["isError"], false, "{status}");
+
+    let ninth = server
+        .post(None, &serde_json::from_str(HELLO).unwrap())
+        .await;
+    assert_eq!(ninth.status, 200);
+    assert!(ninth.session.is_some());
+    let ping = serde_json::json!({"jsonrpc": "2.0", "id": 900, "method": "ping"});
+    let closed = server.post(Some(&sessions[1]), &ping).await;
+    assert_eq!(closed.status, 404, "the idlest session is gone");
+    let kept = server.post(Some(&sessions[0]), &ping).await;
+    assert_eq!(kept.status, 200, "the one asked lately is kept");
+
+    let status = server
+        .call(None, "snob_status", serde_json::json!({}))
+        .await;
+    assert_eq!(status["isError"], false, "{status}");
+}
+
+/// Over HTTP, whoever holds the key may be the one saying yes in the chat,
+/// so by default a yes in the chat covers reading lists and not the writes.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_remote_server_takes_no_chat_yes_for_a_write_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    serve_an_unfollow(&instagram).await;
+    log_in_writing(tmp.path(), &instagram);
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &["--allow-writes"]).await;
+    assert!(
+        server
+            .has_said("whoever holds the key can call follow and unfollow")
+            .await,
+        "{}",
+        server.said()
+    );
+    let session = server.open().await;
+    let before = posted(&instagram).await.len();
+    for tool in ["snob_follow", "snob_unfollow"] {
+        let refused = server
+            .call(
+                Some(&session),
+                tool,
+                serde_json::json!({ "account": "someone" }),
+            )
+            .await;
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert_eq!(
+            refused["structuredContent"]["error"]["code"], "cannot_confirm",
+            "{refused}"
+        );
+    }
+    let walk = server
+        .call(
+            Some(&session),
+            "snob_list",
+            serde_json::json!({ "list": "followers", "account": "someone" }),
+        )
+        .await;
+    assert_eq!(
+        walk["structuredContent"]["status"], "confirmation_required",
+        "{walk}"
+    );
+    assert_eq!(writes_sent(&instagram).await, 0);
+    assert_eq!(posted(&instagram).await.len(), before, "nothing was sent");
+
+    // Given --confirm-in-chat all, the writes are asked in the chat too.
+    let mut all = HttpMcp::start(
+        tmp.path(),
+        &instagram,
+        &["--allow-writes", "--confirm-in-chat", "all"],
+    )
+    .await;
+    assert!(
+        all.has_said("confirm them in the chat").await,
+        "{}",
+        all.said()
+    );
+    let session = all.open().await;
+    let asked = all
+        .call(
+            Some(&session),
+            "snob_unfollow",
+            serde_json::json!({ "account": "someone" }),
+        )
+        .await;
+    assert_eq!(
+        asked["structuredContent"]["status"], "confirmation_required",
+        "{asked}"
+    );
+    assert_eq!(writes_sent(&instagram).await, 0);
+}
+
+/// A token handed out in one session is no yes in another: that call is
+/// asked again, and nothing is walked until the session it was given in
+/// brings it back.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_chat_ticket_from_one_session_is_refused_in_another() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let here = server.open().await;
+    let there = server.open().await;
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+    let asking = server.call(Some(&here), "snob_list", theirs.clone()).await;
+    let token = asking["structuredContent"]["confirmation"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a token: {asking}"))
+        .to_string();
+    let mut with_token = theirs.clone();
+    with_token["confirmation"] = serde_json::json!(token);
+
+    let elsewhere = server
+        .call(Some(&there), "snob_list", with_token.clone())
+        .await;
+    assert_eq!(
+        elsewhere["structuredContent"]["status"], "confirmation_required",
+        "{elsewhere}"
+    );
+    assert_eq!(
+        elsewhere["structuredContent"]["previous"], "not_for_this_call",
+        "{elsewhere}"
+    );
+    assert_eq!(followers_asked(&instagram).await, 0, "nothing was walked");
+
+    let done = server.call(Some(&here), "snob_list", with_token).await;
+    assert_eq!(done["isError"], false, "{done}");
+    assert_eq!(done["structuredContent"]["count"], 3, "{done}");
+}
+
+/// The question in one request and the yes in the next, as a stateless
+/// client makes them: the walk runs on the second, once.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn a_chat_confirmation_of_a_list_works_over_two_http_requests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let theirs = serde_json::json!({ "list": "followers", "account": "someone" });
+    let asking = server.call(None, "snob_list", theirs.clone()).await;
+    assert_eq!(asking["isError"], false, "{asking}");
+    let token = asking["structuredContent"]["confirmation"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a token: {asking}"))
+        .to_string();
+    assert_eq!(followers_asked(&instagram).await, 0);
+
+    let mut with_token = theirs;
+    with_token["confirmation"] = serde_json::json!(token);
+    let done = server.call(None, "snob_list", with_token.clone()).await;
+    assert_eq!(done["isError"], false, "{done}");
+    assert_eq!(done["structuredContent"]["count"], 3, "{done}");
+    let walked = followers_asked(&instagram).await;
+    assert!(walked > 0);
+
+    let again = server.call(None, "snob_list", with_token).await;
+    assert_eq!(
+        again["structuredContent"]["error"]["code"], "confirmation_used",
+        "{again}"
+    );
+    assert_eq!(followers_asked(&instagram).await, walked);
+}
+
+/// Asked to stop while a call runs, the server stops that call's child in
+/// order, as a canceled call would (here, the start of a job, which stops
+/// the job it had not handed over yet), waits for it, **hands the call its
+/// answer**, and exits 130.
+///
+/// Stopped through standard input closing (`--stop-when-stdin-closes`),
+/// which takes the same road as Ctrl+C and can be sent on every platform.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn ctrl_c_gives_running_calls_their_grace() {
+    stopped_during_a_call(true).await;
+}
+
+/// The same for a call on the stateless revision, whose answer the SDK
+/// drops if its own token is canceled first.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn ctrl_c_gives_a_stateless_call_its_answer() {
+    stopped_during_a_call(false).await;
+}
+
+/// Asked to stop while a call waits for the person's answer in a form, the
+/// server answers that call (with a refusal: nobody said yes) before it
+/// ends the streams, rather than drop it with the form still on screen.
+#[cfg(feature = "mcp-http")]
+#[tokio::test]
+async fn ctrl_c_answers_a_call_waiting_on_a_form() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let _jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let session = server
+        .open_with(serde_json::json!({ "elicitation": { "form": {} } }))
+        .await;
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 600, "method": "tools/call",
+        "params": { "name": "snob_list", "arguments": { "list": "followers", "account": "someone" } }
+    });
+    let response = server
+        .http
+        .post(server.url())
+        .header("Authorization", format!("Bearer {MCP_KEY}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Mcp-Session-Id", &session)
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .body(request.to_string())
+        .send()
+        .await
+        .expect("the server answers");
+    assert_eq!(response.status().as_u16(), 200);
+    let (asked_tx, asked) = tokio::sync::oneshot::channel();
+    let read = tokio::spawn(async move {
+        let mut response = response;
+        let mut body = String::new();
+        let mut asked_tx = Some(asked_tx);
+        while let Ok(Some(chunk)) = response.chunk().await {
+            body.push_str(&String::from_utf8_lossy(&chunk));
+            if body.contains("elicitation/create")
+                && let Some(tx) = asked_tx.take()
+            {
+                let _ = tx.send(());
+            }
+        }
+        body
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(60), asked)
+        .await
+        .expect("asked within a minute")
+        .expect("asked");
+
+    let exited = server.stop().await;
+    assert_eq!(exited.code(), Some(130), "{}", server.said());
+    let body = tokio::time::timeout(std::time::Duration::from_secs(30), read)
+        .await
+        .expect("the stream ended")
+        .unwrap();
+    let answer = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data.trim()).ok())
+        .find(|message| message["id"] == 600)
+        .unwrap_or_else(|| panic!("the call was answered: {body}"));
+    assert_eq!(answer["result"]["isError"], true, "{answer}");
+    assert_eq!(followers_asked(&instagram).await, 0, "nothing was read");
+}
+
+#[cfg(feature = "mcp-http")]
+async fn stopped_during_a_call(in_a_session: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram_slow(3, std::time::Duration::from_secs(120), 1).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+    let mut server = HttpMcp::start(tmp.path(), &instagram, &[]).await;
+    let session = if in_a_session {
+        Some(server.open().await)
+    } else {
+        None
+    };
+    let mut params = serde_json::json!({
+        "name": "snob_list", "arguments": { "list": "followers", "wait_seconds": 50 }
+    });
+    if !in_a_session {
+        params["_meta"] = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": { "name": "test", "version": "0" }
+        });
+    }
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 500, "method": "tools/call", "params": params
+    });
+    let call = {
+        let http = server.http.clone();
+        let url = server.url();
+        tokio::spawn(async move { post_to(&http, url, session.as_deref(), &request).await })
+    };
+    until_asked(&instagram, 1).await;
+
+    let since = std::time::Instant::now();
+    let exited = server.stop().await;
+    assert_eq!(exited.code(), Some(130), "{}", server.said());
+    // Within the grace a stopped child gets, and the wait for it.
+    assert!(
+        since.elapsed() < std::time::Duration::from_secs(60),
+        "{:?}",
+        since.elapsed()
+    );
+    let listed = jobs.ask(&["list", "--all", "--json"]);
+    let job = &listed["jobs"][0];
+    assert!(
+        matches!(job["status"].as_str(), Some("canceled" | "stopped")),
+        "the walk was stopped in order: {job}"
+    );
+    let answered = call.await.unwrap();
+    assert_eq!(answered.status, 200, "{:?}", answered.messages);
+    let answer = answered
+        .messages
+        .iter()
+        .find(|message| message["id"] == 500)
+        .unwrap_or_else(|| panic!("the call was answered: {:?}", answered.messages));
+    assert!(
+        answer.get("result").is_some() || answer.get("error").is_some(),
+        "{answer}"
+    );
+    assert!(
+        !server.said().contains("empty response"),
+        "{}",
+        server.said()
+    );
 }

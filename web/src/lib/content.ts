@@ -259,7 +259,7 @@ export const FEATURES_SECTION = {
 export const BEHAVIOR = {
   title: 'A light client,',
   accent: 'on purpose.',
-  lead: "It signs in as you and sends its requests from a Chrome, Edge, Brave or Chromium already on your machine, at a human pace. Your password never goes through snob, and it never reads your own browser's cookies.",
+  lead: "It signs in as you and sends its requests from a Chrome, Edge, Brave or Chromium already on your machine, at a human pace. snob never stores your password, and it never reads your own browser's cookies.",
   /** README, "Staying a light client", word for word. */
   honest:
     "There is no official API for most of this, so snob uses the same web API instagram.com uses, signed in as you. That is outside Instagram's Terms of Use, and the usual consequence is that Instagram asks the account to verify itself. snob keeps to modest volumes, sends only the web app's own requests, and stops at the first sign of push-back. Use it from the connection you normally browse from.",
@@ -312,6 +312,30 @@ export const AGENTS = {
     { code: '5', means: 'rate limited or cooling down' },
     { code: '130', means: 'stopped' },
   ],
+  /** README, the `snob mcp` paragraph, in short. */
+  mcp: {
+    title: 'For AI agents, over MCP',
+    lead: 'snob mcp serves the same commands to an AI agent: Claude Code, Claude Desktop, Codex, Cursor or VS Code. Each call runs one snob command, under the same request budget and cooldown as your terminal.',
+    points: [
+      { term: 'snob_status · snob_list · snob_profile', means: 'the status, the lists and how they cross, and profiles: reads only, unless you start it with --allow-writes' },
+      { term: 'your yes', means: "walking another account's lists, and every follow or unfollow, waits for it, asked in the client or put to you in the chat" },
+      { term: 'snob_job', means: 'a long walk runs as a job the agent asks about later, instead of holding the call for an hour' },
+      { term: 'snob mcp --listen', means: 'the same over HTTP on loopback, behind a key, for a tunnel of your own' },
+    ],
+    /** The real output, its path and its closing hint shortened. */
+    sample: [
+      { command: 'snob mcp config claude-code' },
+      { output: '{' },
+      { output: [{ text: '  "mcpServers"', tone: 'info' }, ': {'] },
+      { output: [{ text: '    "snob"', tone: 'info' }, ': {'] },
+      { output: [{ text: '      "args"', tone: 'info' }, ': ["mcp"],'] },
+      { output: [{ text: '      "command"', tone: 'info' }, ': "…/snob"'] },
+      { output: '    }' },
+      { output: '  }' },
+      { output: '}' },
+      { output: [{ text: 'also claude-desktop, codex, cursor and vscode', tone: 'dim' }] },
+    ] as Sample,
+  },
 } as const;
 
 export const INSTALL_SECTION = { title: 'Install', accent: 'it.', lead: SUPPORT } as const;

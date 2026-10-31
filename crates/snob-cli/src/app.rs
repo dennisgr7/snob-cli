@@ -10,7 +10,7 @@
 //! announcement goes; and the pacer has to exist before the client, because a
 //! client without one cannot be built at all.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use snob_core::{EpochMs, Pk};
@@ -105,7 +105,65 @@ fn pacer(
     Store::open(paths)?;
     Ok(Pacer::new(Arc::new(SqliteRateBudget::open(paths)?))
         .with_cancel(interrupt::install())
+        .waiting_at_most(MAX_WAIT.get().copied().flatten())
         .announcing(announce))
+}
+
+/// `--max-wait`, set once by `main` before any command runs.
+///
+/// Process-wide, like the cancellation token beside it: it is a property of
+/// the run, and every pacer the run builds has to obey it, including the ones
+/// built deep inside the monitor.
+static MAX_WAIT: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+
+/// Sets `--max-wait` for every pacer this run builds. A second call changes
+/// nothing.
+pub fn wait_at_most(limit: Option<std::time::Duration>) {
+    let _ = MAX_WAIT.set(limit);
+}
+
+/// `--max-wait`, for a check that compares a wait with it without building a
+/// pacer (`follow --check-ahead`). `None` when it was not given.
+pub fn max_wait() -> Option<std::time::Duration> {
+    MAX_WAIT.get().copied().flatten()
+}
+
+/// `--stop-when-stdin-closes`, beside `--max-wait`: the other run-wide
+/// setting `main` hands every pacer, through the cancellation token.
+pub use crate::interrupt::stop_when_stdin_closes;
+
+/// `--progress-json`, the third: every progress stack this run builds says
+/// how its walks go in JSON lines rather than drawing a bar.
+pub use crate::progress::progress_json;
+
+/// `--spend-alone`, set once by `main` before any command runs.
+static SPEND_ALONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Makes every account this run opens one it sends requests for only while no
+/// other run given `--spend-alone` does ([`App::open`]).
+///
+/// **For runs an agent started** (`snob mcp` gives it to every child that may
+/// reach Instagram): an agent makes its calls in parallel by habit, and two
+/// processes walking one account interleave their requests. The persistent
+/// budget still bounds the average across processes, but the pause between
+/// two pages and the dwell before a list are waited per process, and the
+/// budget's burst would drain at once. A command a person types does not take
+/// it (AGENTS.md, "The MCP server").
+pub fn spend_alone() {
+    SPEND_ALONE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The refusal of a run given `--spend-alone` while another holds the
+/// account: exit 1, with `busy` as the reason a program reads.
+pub(crate) fn held_elsewhere() -> anyhow::Error {
+    crate::exit::ExitError::new(
+        crate::exit::ExitCode::Error,
+        "another snob started by an agent is using this account on Instagram, and only one \
+         may at a time; nothing was sent",
+    )
+    .with_reason("busy")
+    .with_hint("wait for it to finish, then ask again")
+    .into()
 }
 
 /// `pacer` with the announcement the single-request commands, `login` and
@@ -140,7 +198,20 @@ pub fn held(pacer: &Pacer, paths: Option<&AppPaths>) -> Result<Option<Held>> {
     let Some(until_ms) = pacer.cooldown()? else {
         return Ok(None);
     };
-    let braked = match pacer.brake()? {
+    Ok(Some(held_by(until_ms, pacer.brake()?.as_ref(), paths)))
+}
+
+/// A cooldown until `until_ms`, named as [`held`] names it: by the accounts
+/// whose push-backs braked every account when `brake` is what lasts longest.
+/// For a reader that has the budget's state rather than a pacer
+/// (`rate_budget::state`, which `--dry-run` and the checks made before an
+/// agent's call is asked about read, writing nothing).
+pub fn held_by(
+    until_ms: EpochMs,
+    brake: Option<&snob_core::budget::Brake>,
+    paths: Option<&AppPaths>,
+) -> Held {
+    let braked = match brake {
         Some(brake) if brake.until >= until_ms => {
             let registry = paths
                 .and_then(|paths| Registry::load(paths).ok())
@@ -153,7 +224,7 @@ pub fn held(pacer: &Pacer, paths: Option<&AppPaths>) -> Result<Option<Held>> {
         }
         _ => Vec::new(),
     };
-    Ok(Some(Held { until_ms, braked }))
+    Held { until_ms, braked }
 }
 
 /// How a run could have been given consent before it started.
@@ -213,6 +284,9 @@ pub struct App {
     /// for the next run. Set by the monitor alone, to the battery being
     /// critical ([`App::stops_on_a_critical_battery`]).
     stop_between_pages: Option<fn() -> bool>,
+    /// The account's `spend.lock`, held for as long as the run, under
+    /// `--spend-alone` ([`spend_alone`]). Never read: holding it is the point.
+    _alone: Option<std::fs::File>,
 }
 
 /// One resolution, and the question it answers.
@@ -248,6 +322,19 @@ impl App {
                 session.ds_user_id
             );
         }
+
+        // Before anything that could send a request: a run refused here has
+        // spent nothing. After the session is read, so a sandbox or a machine
+        // with no session still answers "log in" rather than "busy".
+        let alone = if SPEND_ALONE.load(std::sync::atomic::Ordering::SeqCst) {
+            paths.ensure_dirs()?;
+            Some(
+                snob_store::paths::try_lock_file(&paths.spend_lock())?
+                    .ok_or_else(held_elsewhere)?,
+            )
+        } else {
+            None
+        };
 
         // Done here rather than at login because a browser updates long after
         // the session was created, and this is the only moment every command
@@ -295,6 +382,7 @@ impl App {
             consent_in_advance: ConsentInAdvance::default(),
             resolved: None,
             stop_between_pages: None,
+            _alone: alone,
         }))
     }
 
@@ -316,6 +404,7 @@ impl App {
             consent_in_advance: ConsentInAdvance::default(),
             resolved: None,
             stop_between_pages: None,
+            _alone: None,
         }
     }
 
@@ -342,6 +431,12 @@ impl App {
 
     pub fn db(&self) -> &Store {
         &self.db
+    }
+
+    /// The store, for a write that takes a transaction of its own (an act
+    /// an agent was told yes to, `commands::common::record_agent_act`).
+    pub fn db_mut(&mut self) -> &mut Store {
+        &mut self.db
     }
 
     pub fn progress(&self) -> &Progress {

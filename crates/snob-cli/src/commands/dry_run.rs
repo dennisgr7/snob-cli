@@ -19,9 +19,7 @@ use serde_json::{Value, json};
 use snob_core::model::ListKind;
 use snob_store::paths::AccountPaths;
 use snob_store::secrets::SessionStore;
-use snob_store::store::Store;
 use snob_store::store::rate_budget;
-use snob_store::store::shared::Shared;
 
 use crate::app::Viewer;
 use crate::cli::{Format, OutputArgs, WalkArgs};
@@ -52,45 +50,7 @@ pub fn run(
         ));
     }
 
-    let Some(session) = secrets.load()? else {
-        return Err(common::no_session());
-    };
-    if session.ds_user_id != paths.pk() {
-        anyhow::bail!(
-            "the session stored for account {} is account {}'s; log in again with \
-             \"snob login\"",
-            paths.pk(),
-            session.ds_user_id
-        );
-    }
-    let viewer = Viewer {
-        pk: session.ds_user_id,
-        username: session.username.clone(),
-    };
-    report::act_as(viewer.clone());
-
-    // An account that has never sent anything has no database, and its
-    // budget is at rest: read over an empty one rather than making its file.
-    let store = match Store::read_existing(paths)? {
-        Some(store) => store,
-        None => Store::in_memory()?,
-    };
-    let shared = Shared::read_existing(paths).unwrap_or_else(|e| {
-        tracing::debug!(error = %e, "shared.db could not be read; no brake is counted");
-        None
-    });
-    let now = snob_core::clock::now_ms();
-    let budget = rate_budget::state(store.conn(), shared.as_ref(), now)?;
-    let standing = Standing {
-        viewer: &viewer,
-        store: &store,
-        browser: snob_ig::client::page::a_client_would_use_a_page(),
-        budget: &budget,
-        held: budget.held_until(now),
-        now,
-    };
-    let query = common::query(target, walk);
-    let estimate = estimate::compute(&estimate::gather(&standing, &query, kinds)?);
+    let (viewer, estimate) = estimate_for(walk, target, secrets, paths, kinds)?;
     let subject = crate::engine::target::label_for(&viewer, target.as_deref());
 
     let rendered = match format {
@@ -114,6 +74,50 @@ pub fn run(
     })
 }
 
+/// The estimate of the walks of `kinds` of `target`, or of the viewer, out of
+/// what is stored here, **writing nothing and sending nothing**: what
+/// `--dry-run` prints, and what a job is started with (`jobs::start`).
+pub fn estimate_for(
+    walk: &WalkArgs,
+    target: &Option<String>,
+    secrets: &SessionStore,
+    paths: &AccountPaths,
+    kinds: &[ListKind],
+) -> Result<(Viewer, Estimate)> {
+    let Some(session) = secrets.load()? else {
+        return Err(common::no_session());
+    };
+    if session.ds_user_id != paths.pk() {
+        anyhow::bail!(
+            "the session stored for account {} is account {}'s; log in again with \
+             \"snob login\"",
+            paths.pk(),
+            session.ds_user_id
+        );
+    }
+    let viewer = Viewer {
+        pk: session.ds_user_id,
+        username: session.username.clone(),
+    };
+    report::act_as(viewer.clone());
+
+    // An account that has never sent anything has no database, and its
+    // budget is at rest: read over an empty one rather than making its file.
+    let now = snob_core::clock::now_ms();
+    let (store, budget) = common::standing(paths, now)?;
+    let standing = Standing {
+        viewer: &viewer,
+        store: &store,
+        browser: snob_ig::client::page::a_client_would_use_a_page(),
+        budget: &budget,
+        held: budget.held_until(now),
+        now,
+    };
+    let query = common::query(target, walk);
+    let estimate = estimate::compute(&estimate::gather(&standing, &query, kinds)?);
+    Ok((viewer, estimate))
+}
+
 fn fate_token(fate: Fate) -> &'static str {
     match fate {
         Fate::ReusedUnlessMoved => "reused_unless_moved",
@@ -124,7 +128,8 @@ fn fate_token(fate: Fate) -> &'static str {
     }
 }
 
-fn as_json(estimate: &Estimate) -> Value {
+/// The estimate as `--dry-run --format json` gives it, without the viewer.
+pub fn as_json(estimate: &Estimate) -> Value {
     let lists: Vec<Value> = estimate
         .lists
         .iter()
@@ -148,6 +153,9 @@ fn as_json(estimate: &Estimate) -> Value {
         "requests": { "least": estimate.requests.0, "most": estimate.requests.1 },
         "accounts": estimate.accounts,
         "seconds": { "least": estimate.seconds.0, "most": estimate.seconds.1 },
+        // What is left of a rest the account's sitting already owes, which
+        // the seconds above count before the first page.
+        "rest_owed_seconds": estimate.rest_owed,
         "unknown_pages": estimate.unknown(),
         "requests_left": estimate.requests_left,
         "accounts_left": estimate.accounts_left,
@@ -219,6 +227,13 @@ fn as_text(estimate: &Estimate, subject: &str) -> String {
         estimate.accounts,
         span(estimate.seconds)
     ));
+    if estimate.rest_owed > 0 && estimate.lists.iter().any(|list| list.pages.1 > 0) {
+        lines.push(format!(
+            "A rest between sittings is still owed, {} of it: a walk waits for it before its \
+             first page, and the time above counts it.",
+            report::rest_left(std::time::Duration::from_secs(estimate.rest_owed))
+        ));
+    }
     lines.push(format!(
         "Today has {} requests and {} accounts left.",
         estimate.requests_left, estimate.accounts_left

@@ -62,8 +62,10 @@ pub enum WaitKind {
     Dwell,
     /// Between two pages of the walk: [`Pace::step`].
     Step,
-    /// The sitting is full: the rest of [`Pace::sitting_pause`], unless the
-    /// walk ends on that page.
+    /// A sitting is full: what is left of the rest it owes
+    /// ([`Pace::sitting_pause`], `snob_core::budget::Sitting`), paid before
+    /// the next page of any walk of the account, this one's or the next
+    /// run's.
     Sitting,
     /// The day's accounts ran out: the walk sleeps until the last 24 hours
     /// have room for `PAGES_AFTER_A_PAUSE` more pages, then carries on.
@@ -103,6 +105,9 @@ pub enum Event {
         received: usize,
         added: usize,
         running_total: usize,
+        /// The account's sitting as this page left it: its pages, which
+        /// carry across walks, and the rest it owes once full.
+        sitting: snob_core::budget::Sitting,
     },
     Waiting {
         kind: WaitKind,
@@ -346,7 +351,8 @@ impl<'a> ListWalker<'a> {
     {
         self.check_cooldown().await?;
         // A walk is an action, and so is each sitting after its rest below.
-        self.client.pacer().begin_action();
+        let pacer = self.client.pacer();
+        pacer.begin_action();
 
         observe(Event::Started {
             estimated: request.estimated,
@@ -409,6 +415,28 @@ impl<'a> ListWalker<'a> {
                 break StopReason::Canceled;
             }
 
+            // **A rest owed is paid before the page**, whoever owes it: this
+            // walk, a walk before it that ended on the page that filled its
+            // sitting, or a run stopped during its rest. It is the account's
+            // (`Pacer::rest_owed`), kept in its database, so a walk that
+            // ends, by its own end or its cap, leaves it owed rather than
+            // skipped; and before the list is opened, so a walk that starts
+            // owing one sends nothing until it is over. Cancelable as every
+            // wait is, and never cut by `--max-wait`. The loop starts over
+            // afterwards to ask the cancel, the cooldown and the caps again.
+            if let Some((until, left)) = pacer
+                .rest_owed(&self.pace, (self.wall)())
+                .await
+                .map_err(WalkError::Budget)?
+            {
+                if self.wait(WaitKind::Sitting, left, &mut observe).await {
+                    break StopReason::Canceled;
+                }
+                pacer.rested(until).await.map_err(WalkError::Budget)?;
+                pacer.begin_action();
+                continue;
+            }
+
             // The day's accounts, asked before the page rather than found out
             // after it: a page that would go over is not asked for until the
             // day has room for a run of them. The sleep is inside the walk, so
@@ -418,7 +446,6 @@ impl<'a> ListWalker<'a> {
             // same reason there are no waits.
             if self.sleeps && request.over_budget == OverBudget::Pause {
                 let page = expected_on_a_page(&self.pace);
-                let pacer = self.client.pacer();
                 if !pacer
                     .accounts_wait(page)
                     .await
@@ -429,6 +456,11 @@ impl<'a> ListWalker<'a> {
                         .accounts_wait(page * PAGES_AFTER_A_PAUSE)
                         .await
                         .map_err(WalkError::Budget)?;
+                    // Past the caller's limit, the walk stops here as it
+                    // would at Ctrl+C, with every page so far kept.
+                    if let Err(e) = pacer.within_the_limit(wait) {
+                        break self.stop_reason_for(e, &mut state);
+                    }
                     if self.sleep_through_the_day(wait, &mut observe).await? {
                         break StopReason::Canceled;
                     }
@@ -495,8 +527,12 @@ impl<'a> ListWalker<'a> {
             let received = page.users.len();
             let added = save(&page, state.pages + 1).map_err(WalkError::Save)?;
             // Counted whether or not the walk goes on: the sitting is the
-            // process's, and the next walk carries it on.
-            let sitting_full = self.client.pacer().page_walked(&self.pace);
+            // account's, and the page that fills it owes the rest to
+            // whatever walks next, this walk's next page included.
+            let sitting = pacer
+                .page_walked(&self.pace, (self.wall)())
+                .await
+                .map_err(WalkError::Budget)?;
 
             state.pages += 1;
             state.users += added;
@@ -505,25 +541,14 @@ impl<'a> ListWalker<'a> {
                 received,
                 added,
                 running_total: state.users,
+                sitting,
             });
 
+            // No rest here, after the page: the rest is owed and paid by
+            // whatever walks next, before its page, so a walk that ends on
+            // this one waits for nobody and leaves the rest to the next.
             if let Some(end) = state.record_page(received, added, &page, &mut observe) {
                 break end;
-            }
-
-            // The rest is skipped when the walk ends on this page, by its own
-            // end or its cap: a rest with nothing after it is a quarter of an
-            // hour of waiting for nobody. The sitting stays full, and the next
-            // page anybody walks is rested after.
-            if sitting_full && state.cap_reached(&request).is_none() {
-                if self
-                    .wait(WaitKind::Sitting, self.pace.sitting_pause(), &mut observe)
-                    .await
-                {
-                    break StopReason::Canceled;
-                }
-                self.client.pacer().sitting_rested();
-                self.client.pacer().begin_action();
             }
         };
 
@@ -701,6 +726,10 @@ impl<'a> ListWalker<'a> {
                 // client rather than through the token, and it is still the
                 // user stopping rather than anything going wrong.
                 IgError::Canceled => StopReason::Canceled,
+                // A wait past the caller's limit is the caller stopping the
+                // walk, as Ctrl+C is: kept, resumable, and not a failure of
+                // the network or a word from Instagram.
+                IgError::WaitTooLong { .. } => StopReason::Canceled,
                 // The backstop in `Pacer::clear` refusing, which is throttling
                 // and not a network failure however it arrives. Its reaction is
                 // `Abort` — retrying a wait measured in hours is the one thing
@@ -988,6 +1017,8 @@ fn truncated(walked: usize, declared: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use snob_core::session::{Session, SessionOrigin};
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -995,7 +1026,7 @@ mod tests {
     use super::*;
     use crate::client::harness::{SID, UA, client_with};
     use crate::client::page::PageError;
-    use crate::pace::Pacer;
+    use crate::pace::{KeptSitting, PAGES_PER_SITTING, Pacer};
     use crate::web::Told;
 
     #[test]
@@ -1268,6 +1299,9 @@ mod tests {
     /// Pins the pacing policy down: the sitting's rest lands after the
     /// fortieth page and nowhere else, every wait is inside its documented
     /// range, and none is paid after the last page.
+    ///
+    /// The rest is what is left of the one drawn when the fortieth page was
+    /// walked, so it may come out a few milliseconds short of the range.
     #[tokio::test]
     async fn a_sitting_rests_after_its_fortieth_page() {
         let server = server(pages(0, 46)).await;
@@ -1299,7 +1333,7 @@ mod tests {
             let range = match kind {
                 WaitKind::Dwell => (1_500, 4_000),
                 WaitKind::Step => (1_000, 3_000),
-                WaitKind::Sitting => (300_000, 900_000),
+                WaitKind::Sitting => (299_000, 900_000),
                 WaitKind::Day => panic!("a free budget never pauses for the day"),
                 WaitKind::Reconnect => panic!("a machine that never slept never reconnects"),
             };
@@ -1311,7 +1345,7 @@ mod tests {
         assert_eq!(cadence.last().map(String::as_str), Some("P46"));
     }
 
-    /// A sitting is the process's reading, not one walk's: two walks of
+    /// A sitting is the account's reading, not one walk's: two walks of
     /// twenty-five pages on one client meet one rest, fifteen pages into the
     /// second.
     #[tokio::test]
@@ -1338,14 +1372,21 @@ mod tests {
     }
 
     /// A walk that ends on a full sitting does not rest: there is nothing
-    /// after the rest to wait for.
+    /// after the rest to wait for. The rest is left owed instead.
     #[tokio::test]
     async fn no_rest_follows_the_last_page() {
         let server = server(pages(0, 40)).await;
-        let cadence = cadence(&walk_at_pace(&client(&server), request()).await);
+        let client = client(&server);
+        let cadence = cadence(&walk_at_pace(&client, request()).await);
 
         assert!(!cadence.contains(&"Sitting".to_string()), "{cadence:?}");
         assert_eq!(cadence.last().map(String::as_str), Some("P40"));
+        let owed = client
+            .pacer()
+            .rest_owed(&Pace::default(), snob_core::clock::now_ms())
+            .await
+            .unwrap();
+        assert!(owed.is_some(), "the rest is owed to the next walk");
     }
 
     /// A walk that ends on a full sitting at its page cap does not rest
@@ -1374,7 +1415,8 @@ mod tests {
     }
 
     /// The sitting a walk ended on stays full, and the next walk on the
-    /// client rests after its first page.
+    /// client pays its rest before anything else, its list opened and its
+    /// first page included.
     #[tokio::test]
     async fn a_full_sitting_carries_over_to_the_next_walk() {
         let server = server([pages(0, 40), pages(100, 3)].concat()).await;
@@ -1387,8 +1429,140 @@ mod tests {
         let second = cadence(&walk_at_pace(&client, request()).await);
         assert_eq!(
             second,
-            ["Dwell", "P1", "Sitting", "Step", "P2", "Step", "P3"],
-            "the carried-over sitting is rested after the next page"
+            ["Sitting", "Dwell", "P1", "Step", "P2", "Step", "P3"],
+            "the carried-over sitting is rested before the next page"
+        );
+    }
+
+    /// A list read a page at a time, one run a page, as an agent reads one:
+    /// every call ends on its cap, and still the forty-first page waits for
+    /// the rest the fortieth drew. Each call is a client and a pacer of its
+    /// own over one budget, as each is a process of its own over one
+    /// database.
+    #[tokio::test]
+    async fn a_walk_of_one_page_at_a_time_still_rests_after_forty() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ok(body(0, 12, Some("more"))))
+            .mount(&server)
+            .await;
+        let budget = Arc::new(KeptSitting::default());
+        let one_page = || ListRequest {
+            max_pages: Some(1),
+            ..request()
+        };
+
+        for call in 1..=PAGES_PER_SITTING + 1 {
+            let client = client_with(&server, Pacer::new(budget.clone()));
+            let cadence = cadence(&walk_at_pace(&client, one_page()).await);
+            if call <= PAGES_PER_SITTING {
+                assert_eq!(cadence, ["Dwell", "P1"], "call {call}");
+            } else {
+                assert_eq!(cadence, ["Sitting", "Dwell", "P1"], "call {call}");
+            }
+        }
+        assert_eq!(
+            budget.sitting().map(|s| (s.pages, s.rest_until)),
+            Some((1, None)),
+            "the rest was paid and a new sitting begun"
+        );
+    }
+
+    /// A walk stopped during its rest leaves the rest owed, and the next
+    /// walk, a run of its own, pays what is left of it before it sends
+    /// anything; once the rest is over, the next walk goes at once and
+    /// begins a new sitting.
+    #[tokio::test]
+    async fn a_walk_stopped_during_its_rest_leaves_the_rest_owed() {
+        let server = server(pages(0, 10)).await;
+        let budget = Arc::new(KeptSitting::default());
+        let pace = Pace {
+            pages_per_sitting: 2,
+            sitting_pause_ms: (600_000, 600_000),
+            ..zero_pace()
+        };
+
+        /// Walks with real waits, and stops the walk as its rest begins.
+        async fn stopped_in_the_rest(
+            client: &IgClient,
+            pace: Pace,
+            request: ListRequest<'_>,
+        ) -> (WalkSummary, Vec<Event>) {
+            let cancel = client.pacer().cancel_token().clone();
+            let mut walker = ListWalker::new(client).with_pace(pace);
+            walker.sleeps = true;
+            let mut events = Vec::new();
+            let summary = walker
+                .walk(
+                    request,
+                    |p, _| Ok(p.users.len()),
+                    |e| {
+                        if matches!(
+                            e,
+                            Event::Waiting {
+                                kind: WaitKind::Sitting,
+                                ..
+                            }
+                        ) {
+                            cancel.cancel();
+                        }
+                        events.push(e);
+                    },
+                )
+                .await
+                .unwrap();
+            (summary, events)
+        }
+
+        let first = client_with(&server, Pacer::new(budget.clone()));
+        let (summary, events) = stopped_in_the_rest(&first, pace, request()).await;
+        assert_eq!(summary.reason, StopReason::Canceled);
+        assert_eq!(cadence(&events), ["P1", "P2", "Sitting"]);
+        let sent = server.received_requests().await.unwrap().len();
+        let until = budget.sitting().and_then(|s| s.rest_until).expect("owed");
+
+        let next = client_with(&server, Pacer::new(budget.clone()));
+        let (summary, events) = stopped_in_the_rest(&next, pace, request()).await;
+        assert_eq!(summary.reason, StopReason::Canceled);
+        assert_eq!(cadence(&events), ["Sitting"], "{events:?}");
+        let left = events.iter().find_map(|e| match e {
+            Event::Waiting { duration, .. } => Some(*duration),
+            _ => None,
+        });
+        assert!(
+            left.is_some_and(
+                |left| left <= Duration::from_secs(600) && left > Duration::from_secs(590)
+            ),
+            "what is left of the rest: {left:?}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            sent,
+            "nothing was sent before the rest is over"
+        );
+        assert_eq!(budget.sitting().and_then(|s| s.rest_until), Some(until));
+
+        fn rest_over() -> EpochMs {
+            snob_core::clock::now_ms() + Duration::from_secs(601)
+        }
+        let after = client_with(&server, Pacer::new(budget.clone()));
+        let mut walker = ListWalker::new(&after).with_pace(pace);
+        walker.sleeps = true;
+        walker.wall = rest_over;
+        let one_page = ListRequest {
+            max_pages: Some(1),
+            ..request()
+        };
+        let mut events = Vec::new();
+        walker
+            .walk(one_page, |p, _| Ok(p.users.len()), |e| events.push(e))
+            .await
+            .unwrap();
+        assert_eq!(cadence(&events), ["P1"]);
+        assert_eq!(
+            budget.sitting().map(|s| (s.pages, s.rest_until)),
+            Some((1, None)),
+            "the rest is over, and the page begins a new sitting"
         );
     }
 

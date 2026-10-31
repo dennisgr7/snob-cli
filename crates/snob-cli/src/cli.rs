@@ -31,6 +31,49 @@ pub struct Cli {
     #[arg(long, global = true, display_order = 899, value_name = "USER")]
     pub account: Option<String>,
 
+    /// Stop rather than wait longer than this for the request budget
+    ///
+    /// A list stopped this way is kept and continues where it left off, a
+    /// follow is not sent, and the run exits 130 with the wait in the message.
+    /// The pace's own steps and the rest after a long stretch of pages are
+    /// never cut short.
+    // For callers that cannot sit for hours: a script with a deadline, an
+    // agent's tool call (`snob mcp` passes it to every command it runs).
+    #[arg(
+        long,
+        global = true,
+        display_order = 898,
+        value_name = "DURATION",
+        value_parser = duration
+    )]
+    pub max_wait: Option<std::time::Duration>,
+
+    /// Stop, as Ctrl+C stops, when standard input reaches its end
+    // Hidden: plumbing for a parent that runs snob and cannot send it a
+    // signal, which on Windows is every parent (`snob mcp`, a script's
+    // timeout). `interrupt::stop_when_stdin_closes` says the rest.
+    #[arg(long, global = true, hide = true)]
+    pub stop_when_stdin_closes: bool,
+
+    /// Refuse to send anything for the account while another run given this
+    /// flag does
+    // Hidden: plumbing for `snob mcp`, which gives it to every child that
+    // may reach Instagram, so an agent's parallel calls cannot walk one
+    // account from two processes at once. Not for people in this release:
+    // a command typed by hand does not take the lock, and nothing that is
+    // not an agent's should be refused as busy (`app::spend_alone`).
+    #[arg(long, global = true, hide = true)]
+    pub spend_alone: bool,
+
+    /// Say how a walk goes as one JSON line on standard error per page and
+    /// per wait, instead of drawing a bar
+    // Hidden: plumbing for a job's supervisor (`jobs/supervise.rs`), which
+    // reads the walk's progress back from its log (`jobs::show`). Wins over
+    // `--no-progress`, which the walk's command line may carry
+    // (`progress::progress_json`).
+    #[arg(long, global = true, hide = true)]
+    pub progress_json: bool,
+
     /// Store the session in a protected file instead of the system keyring.
     /// For environments without a desktop session.
     // Ordered last, with `verbose`. Both are global, so without this they are
@@ -203,6 +246,24 @@ pub(crate) fn signing_secret(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+/// The line of [`EXAMPLES`] that announces `SNOB_MCP_KEY`, in a build that
+/// reads it (`commands::mcp::key`, feature `mcp-http`) and in no other: a
+/// build without the HTTP half has no key to read.
+#[cfg(feature = "mcp-http")]
+macro_rules! mcp_key_variable {
+    () => {
+        "
+  SNOB_MCP_KEY      the key of snob mcp served over the network, instead of
+                    the keyring's; see \"snob mcp key --help\""
+    };
+}
+#[cfg(not(feature = "mcp-http"))]
+macro_rules! mcp_key_variable {
+    () => {
+        ""
+    };
+}
+
 /// Shown under the option list.
 ///
 /// The note about quoting is not decoration. On PowerShell `@` is the splatting
@@ -210,7 +271,8 @@ pub(crate) fn signing_secret(value: &str) -> Result<String, String> {
 /// this program, which then answers about the user's own account instead. It
 /// cannot be detected from here, so the only place to say it is the help, and
 /// none of the examples above it are written that way.
-const EXAMPLES: &str = "\
+const EXAMPLES: &str = concat!(
+    "\
 Examples:
   snob login                          store your session, once
   snob status --budget                what you can still send today, for no request
@@ -255,7 +317,74 @@ Environment:
                     one background process, e.g. from a systemd timer
   SNOB_CSRFTOKEN, SNOB_SIGNING_KEY
                     the two secrets a command line would otherwise carry;
-                    see \"snob login --help\" and \"snob watch --help\"";
+                    see \"snob login --help\" and \"snob watch --help\"",
+    mcp_key_variable!()
+);
+
+/// What `snob mcp --help` says under its options, in every build that has
+/// the server; `mcp_listen_help` follows it where the HTTP half is built.
+#[cfg(feature = "mcp")]
+macro_rules! mcp_after_help {
+    () => {
+        "Started by the agent's client, not typed: \"snob mcp config <client>\" \
+                      prints what to add to its configuration. Each tool call runs one snob \
+                      command, so the budget, the cooldown and consent hold exactly as they do \
+                      in a terminal. It offers the status, the lists and profiles; with \
+                      --allow-writes, follow and unfollow too. Each of those, and walking \
+                      another account's lists, runs only after a yes for that one call, \
+                      asked in the client when it can show a form, or else put to you by the \
+                      agent in the chat (--confirm-in-chat narrows what that may cover). \
+                      snob cannot tell who gave the yes, so keep the writes on \"ask\" in the \
+                      client's permissions. Never login, purge, the monitor or a \
+                      download.\n\n\
+                      A call waits at most --max-wait for the request budget (five minutes \
+                      when it is not given) and is refused past it; a list stopped that way \
+                      continues next time. Calls that may reach Instagram run one at a time; \
+                      another is refused as busy, never queued. A long list is handed back \
+                      a page at a time, up to 200 accounts; the later pages come from what \
+                      was already read and send nothing.\n\n\
+                      A list that has to be walked runs as a job (\"snob jobs\"): the call \
+                      answers with the result when the walk ends within its wait_seconds, \
+                      and otherwise with the job, which the agent asks about, lists and \
+                      stops with snob_job, snob_jobs and snob_job_cancel, and which goes on \
+                      after the call, the client and the server. A client that supports MCP \
+                      Tasks gets the job as a task instead, which it polls and cancels on \
+                      its own. A job's walk waits at most an hour for the request budget, or \
+                      --max-wait when it is given.\n\n\
+                      What runs on a yes is recorded in the account's database before its \
+                      first request, and \"snob status --agents\" lists the last 24 hours. \
+                      Agents may make --max-writes-per-day follows and unfollows on the \
+                      account in any 24 hours (ten when not given, at most 99), attempts \
+                      counted; past that the call is refused and nothing is sent. What you \
+                      type in a terminal is neither recorded nor counted.\n\n\
+                      After upgrading snob, restart the server (reconnect it in the client): \
+                      one whose binary changed under it refuses every call and runs nothing."
+    };
+}
+
+/// The paragraph of `snob mcp --help` about `--listen`, which exists only
+/// with the `mcp-http` feature.
+#[cfg(feature = "mcp-http")]
+macro_rules! mcp_listen_help {
+    () => {
+        "--listen 127.0.0.1:8750 serves the same over HTTP at /mcp on this \
+                      machine's loopback, for a tunnel of your own (ssh -L, cloudflared, a VPN) \
+                      to reach from elsewhere; any other address is refused. On Linux and \
+                      macOS, --listen socket serves on a socket in snob's data directory that \
+                      only you can reach, which no other user can take while snob is not \
+                      running (ssh -L 8750:<its path>, or cloudflared's unix:<its path>); on a \
+                      port, whoever listens there while snob does not is handed the key. Every \
+                      request \
+                      carries the key \"snob mcp key new\" makes, as Authorization: Bearer, \
+                      and the server does not start without one. A yes in the chat covers \
+                      reading lists there and not the writes, unless --confirm-in-chat all. \
+                      --public-url names the https address the tunnel serves it at. TLS ends \
+                      at the tunnel, whose provider sees the key and every answer; put an \
+                      access layer in front where it offers one. \"snob mcp config <client> \
+                      --remote <URL>\" prints what a client needs to reach it there; the \
+                      client reads the key from SNOB_MCP_TOKEN."
+    };
+}
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
@@ -266,13 +395,17 @@ pub enum Command {
     /// Show which account you are authenticated as
     Whoami(WhoamiArgs),
 
-    /// Where the account stands: session, request budget, cooldown, lists, monitor
+    /// Where the account stands: session, budget, cooldown, lists, monitor, agents, jobs
     #[command(
         after_help = "Read from what is stored here; nothing is sent and nothing stored is \
                       changed, not even a database an older snob left, which is read as the \
                       current one without being migrated. With no section named, all of \
-                      them; --budget, --cooldown, --session, --lists and --watch narrow it \
-                      to those.\n\n\
+                      them; --budget, --cooldown, --session, --lists, --watch, --agents and \
+                      --jobs narrow it to those. --agents is what agents were told yes to \
+                      through \"snob mcp\" in the last 24 hours: each follow, unfollow and walk \
+                      of another account's lists, how the yes was given and through which \
+                      client. --jobs is the walks an agent left running as jobs (\"snob \
+                      jobs\").\n\n\
                       It exits 5 while the account is in cooldown, whatever sections were \
                       asked for, so \"snob status --budget && snob scan\" runs the scan only \
                       when it may send; 3 with no session; 0 otherwise.\n\n\
@@ -317,15 +450,19 @@ pub enum Command {
 
     /// An account as its page shows it: counts, bio, who you both know, highlights
     #[command(
-        after_help = "What you would see opening the profile, for three or four requests: the \
-                      counters, the bio, whether you follow each other, the accounts you follow \
-                      that follow them, the highlights and whether anything is up right now. It \
-                      walks no list and stores nothing.\n\n\
+        after_help = "What you would see opening the profile: the counters, the bio, whether \
+                      you follow each other, the accounts you follow that follow them, the \
+                      highlights and whether anything is up right now. A few requests for the \
+                      page, and up to ten pages of the accounts you follow that follow them, \
+                      which count toward the account's sitting as a list's pages do, so it may \
+                      wait out one rest between sittings, up to 15 minutes, before or between \
+                      those pages (one an earlier walk left owed, or one its own pages draw). \
+                      It walks neither of its lists and stores nothing.\n\n\
                       From the browser, finding another account's id costs one more until snob \
                       has walked its lists or a list that names it; your own is the session's. A \
                       name that cannot be an Instagram username is not found, for no request. \
-                      With SNOB_NO_BROWSER the name is asked about as typed, within the three or \
-                      four.\n\n\
+                      With SNOB_NO_BROWSER the name is asked about as typed, for no extra \
+                      request.\n\n\
                       \"snob scan\" is the crossing, and costs both lists."
     )]
     Profile(ProfileArgs),
@@ -444,6 +581,21 @@ pub enum Command {
     )]
     Watch(WatchArgs),
 
+    /// The walks running as jobs for an agent: list them, see one, stop one
+    #[command(
+        args_conflicts_with_subcommands = true,
+        after_help = "A walk an agent starts through \"snob mcp\" may run as a job, which goes \
+                      on after the agent's call has answered and is asked about by its id. One \
+                      runs at a time per account. Each is kept with its result for a day, \
+                      and its record for a week.\n\n\
+                      With no subcommand, the jobs not finished yet; --all, every one kept. \
+                      \"snob jobs cancel <id>\" stops a walk as Ctrl+C stops it: what it read is \
+                      kept, and the next walk of the list continues from there. Nothing here \
+                      sends anything; \"snob logout\" and \"snob purge\" stop the account's jobs \
+                      first."
+    )]
+    Jobs(JobsArgs),
+
     /// Read Instagram's own data export, with no session and no request
     #[command(
         subcommand,
@@ -456,10 +608,138 @@ pub enum Command {
     )]
     Import(crate::commands::import::ImportCommand),
 
+    /// Offer snob to an AI agent as an MCP server, on standard input and output
+    /// or over HTTP on loopback
+    #[cfg(feature = "mcp")]
+    #[cfg_attr(
+        feature = "mcp-http",
+        command(after_help = concat!(mcp_after_help!(), "\n\n", mcp_listen_help!()))
+    )]
+    // A build without the HTTP half (`mcp-http`) has no --listen, no key and
+    // no remote server of its own to tell of.
+    #[cfg_attr(
+        not(feature = "mcp-http"),
+        command(
+            about = "Offer snob to an AI agent as an MCP server, on standard input and output",
+            after_help = mcp_after_help!()
+        )
+    )]
+    Mcp(McpArgs),
+
     /// The process that runs the browsers for every command (`owner`).
     /// Started by the commands themselves; nobody types it.
     #[command(name = crate::owner::COMMAND, hide = true)]
     BrowserOwner,
+
+    /// A job's own processes (`jobs`): started by the commands and by
+    /// `snob mcp`; nobody types them.
+    #[command(name = crate::jobs::start::COMMAND, hide = true, subcommand)]
+    Job(JobCommand),
+}
+
+/// `snob __job`: what starts, runs and reads a job (`jobs`).
+#[derive(Subcommand, Debug)]
+pub enum JobCommand {
+    /// Start a list walk as a job, and answer with one JSON document
+    Start(JobStartArgs),
+    /// Run a job: the supervisor, started detached by `start`
+    Run(JobRunArgs),
+    /// One job, and its result once it has one
+    Show(JobShowArgs),
+    /// The jobs not finished yet
+    List(JobListArgs),
+    /// Ask a job to stop
+    Cancel(JobCancelArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct JobStartArgs {
+    /// Answer with the result if the walk ends within this long
+    #[arg(long, value_name = "DURATION", default_value = "0s", value_parser = duration)]
+    pub wait: std::time::Duration,
+
+    /// The tool call the job is for, recorded with it
+    #[arg(long, value_name = "NAME")]
+    pub tool: Option<String>,
+
+    /// The call's arguments, as a JSON object, recorded with it
+    #[arg(long, value_name = "JSON")]
+    pub arguments: Option<String>,
+
+    /// The client that started it, by name and version
+    #[arg(long, value_name = "CLIENT")]
+    pub started_by: Option<String>,
+
+    /// Make nothing: say whether the walk would start now, or be the job
+    /// already running it, or what would refuse it
+    #[arg(long)]
+    pub check: bool,
+
+    /// The walk, after `--`: one of the list commands and its flags
+    #[arg(last = true, required = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct JobRunArgs {
+    pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct JobsArgs {
+    #[command(subcommand)]
+    pub command: Option<JobsCommand>,
+
+    #[command(flatten)]
+    pub list: JobListArgs,
+}
+
+/// `snob jobs`: reading and stopping only. A job is started by an agent's
+/// call, never typed.
+#[derive(Subcommand, Debug)]
+pub enum JobsCommand {
+    /// The jobs not finished yet, or every one kept
+    List(JobListArgs),
+    /// One job: what it walks, how far it is, and how it ended
+    Show(JobShowArgs),
+    /// Stop a job as Ctrl+C stops a walk, keeping what it read
+    Cancel(JobCancelArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct JobShowArgs {
+    /// The job's id, as "snob jobs" lists it
+    pub id: String,
+
+    /// Wait up to this long for it to finish
+    #[arg(long, value_name = "DURATION", default_value = "0s", value_parser = duration)]
+    pub wait: std::time::Duration,
+
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct JobListArgs {
+    /// Every job kept, the finished ones too
+    #[arg(long)]
+    pub all: bool,
+
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct JobCancelArgs {
+    /// The job's id, as "snob jobs" lists it
+    pub id: String,
+
+    /// Wait up to this long for it to have stopped
+    #[arg(long, value_name = "DURATION", default_value = "0s", value_parser = duration)]
+    pub wait: std::time::Duration,
+
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 }
 
 #[derive(Args, Debug)]
@@ -472,6 +752,18 @@ pub struct LoginArgs {
     /// Open a browser, wait for you to log in, and capture the session
     #[arg(long, group = "method")]
     pub browser: bool,
+
+    /// Log in from the browser of the computer you are at, through an SSH tunnel
+    ///
+    /// For a machine reached over SSH, where a browser window would open
+    /// nowhere you can see: snob's browser runs here without one, and prints
+    /// an ssh command that opens a tunnel from your computer and a link to
+    /// open there. You log in on the page that link shows, which is snob's
+    /// browser seen from afar, and the session stays on this machine as with
+    /// --browser. The link works once; the tunnel carries pictures and input,
+    /// never the session.
+    #[arg(long, group = "method")]
+    pub remote: bool,
 
     /// User-Agent of the session, for requests sent without the browser
     ///
@@ -561,6 +853,14 @@ pub struct StatusArgs {
     #[arg(long)]
     pub watch: bool,
 
+    /// What agents were told yes to through snob mcp in the last 24 hours
+    #[arg(long)]
+    pub agents: bool,
+
+    /// The walks running as jobs, what they walk, since when and for whom
+    #[arg(long)]
+    pub jobs: bool,
+
     #[command(flatten)]
     pub output: StatusOutputArgs,
 }
@@ -573,6 +873,8 @@ pub struct StatusSections {
     pub cooldown: bool,
     pub lists: bool,
     pub watch: bool,
+    pub agents: bool,
+    pub jobs: bool,
 }
 
 impl StatusSections {
@@ -585,6 +887,8 @@ impl StatusSections {
             (self.cooldown, "cooldown"),
             (self.lists, "lists"),
             (self.watch, "watch"),
+            (self.agents, "agents"),
+            (self.jobs, "jobs"),
         ]
         .into_iter()
         .filter_map(|(shown, name)| shown.then_some(name))
@@ -601,8 +905,17 @@ impl StatusArgs {
             cooldown: self.cooldown,
             lists: self.lists,
             watch: self.watch,
+            agents: self.agents,
+            jobs: self.jobs,
         };
-        if named.session || named.budget || named.cooldown || named.lists || named.watch {
+        if named.session
+            || named.budget
+            || named.cooldown
+            || named.lists
+            || named.watch
+            || named.agents
+            || named.jobs
+        {
             named
         } else {
             StatusSections {
@@ -611,6 +924,8 @@ impl StatusArgs {
                 cooldown: true,
                 lists: true,
                 watch: true,
+                agents: true,
+                jobs: true,
             }
         }
     }
@@ -693,6 +1008,9 @@ pub struct ListArgs {
 
     #[command(flatten)]
     pub walk: WalkArgs,
+
+    #[command(flatten)]
+    pub agent: AgentArgs,
 }
 
 /// `snob scan`: [`ListArgs`] without `--limit`, because a summary of five
@@ -1508,12 +1826,304 @@ pub struct PostArgs {
 }
 
 #[derive(Args, Debug)]
+// What `--mcp-write-cap` needs beside it: a run on an agent's yes, which the
+// cap counts toward, or the check made before that yes is asked for.
+#[command(group(
+    clap::ArgGroup::new("vouched")
+        .args(["confirmed_via", "check_ahead"])
+        .multiple(true)
+))]
 pub struct FollowArgs {
     /// The one account to follow or unfollow
     pub target: String,
 
     #[command(flatten)]
     pub consent: ConsentArgs,
+
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
+
+    #[command(flatten)]
+    pub agent: AgentArgs,
+
+    /// Refuse when this many writes confirmed through snob mcp were made
+    /// in the last 24 hours [default: 10]
+    // Hidden: plumbing for `snob mcp`, which passes its
+    // `--max-writes-per-day` here. Bounded by what the write bucket lets
+    // through in a day anyway, so no number given can promise more.
+    #[arg(
+        long,
+        hide = true,
+        requires = "vouched",
+        value_name = "N",
+        value_parser = clap::value_parser!(u32)
+            .range(1..=i64::from(snob_store::store::mcp_acts::MOST_WRITES_A_DAY))
+    )]
+    pub mcp_write_cap: Option<u32>,
+
+    /// Send nothing and ask nothing: say what would refuse this write now if
+    /// an agent made it, or that nothing would
+    // Hidden: what `snob mcp` runs before it asks the person for a yes to a
+    // write, so nobody says yes to one that is then refused
+    // (`follow::check_ahead`). With `--mcp-write-cap`, the cap it counts.
+    #[arg(long, hide = true, conflicts_with = "confirmed_via")]
+    pub check_ahead: bool,
+}
+
+/// What a run of a command an agent was told yes to through `snob mcp`
+/// records about that yes (`snob_store::store::mcp_acts`), so that the person
+/// can see in `snob status` what was done in their name, and an agent's
+/// writes stay a few a day.
+///
+/// **Hidden: plumbing for `snob mcp`**, which adds them to a child's command
+/// line after the yes it obtained, and after what the yes is bound to was
+/// taken (`commands::mcp::tools::Plan::command_line`). A command a person
+/// types records nothing and counts toward no cap.
+#[derive(Args, Debug, Clone, Default)]
+pub struct AgentArgs {
+    /// How the yes this run is made on was given, through snob mcp
+    // Only with `-y`: the yes the server obtained is the one `-y` gives in
+    // advance, and a run that would still ask has nothing to record yet.
+    #[arg(long, value_enum, hide = true, requires = "yes", value_name = "HOW")]
+    pub confirmed_via: Option<ConfirmedVia>,
+
+    /// The client the yes came through, by its name and version
+    #[arg(long, hide = true, requires = "confirmed_via", value_name = "CLIENT")]
+    pub confirmed_for: Option<String>,
+}
+
+/// How `snob mcp` obtained a yes (`commands::mcp`, `consent`).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmedVia {
+    /// A form the client showed, answered in the call (2026-07-28 and later).
+    Form,
+    /// A form the client showed, asked with `elicitation/create` while the
+    /// call waited (the older revisions).
+    Elicitation,
+    /// A token the agent handed back after asking in the chat.
+    Chat,
+}
+
+impl ConfirmedVia {
+    /// The token stored and printed, which is also the flag's value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Form => "form",
+            Self::Elicitation => "elicitation",
+            Self::Chat => "chat",
+        }
+    }
+}
+
+/// `snob mcp`: serve, or print what a client needs to start it.
+#[cfg(feature = "mcp")]
+#[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct McpArgs {
+    #[command(subcommand)]
+    pub command: Option<McpCommand>,
+
+    /// Offer follow and unfollow as well, each only after a yes for that call,
+    /// asked in the client or by the agent in the chat
+    #[arg(long)]
+    pub allow_writes: bool,
+
+    /// What a yes the agent relays from the chat may confirm, for a client
+    /// that cannot show a form: none, reading other accounts' lists, or that
+    #[cfg_attr(
+        feature = "mcp-http",
+        doc = " and the writes too [default: all; lists with --listen]"
+    )]
+    #[cfg_attr(not(feature = "mcp-http"), doc = " and the writes too [default: all]")]
+    //
+    // An `Option` rather than a default value, so that whoever reads it can
+    // tell "not given" from "all": over HTTP the default is narrower
+    // (`commands::mcp::http`), and one value for both would hide that the
+    // choice was never made.
+    #[arg(long, value_enum, value_name = "WHAT")]
+    pub confirm_in_chat: Option<ConfirmInChat>,
+
+    /// Serve over HTTP on this address of this machine's loopback, such as
+    /// 127.0.0.1:8750, or on Linux and macOS on "socket", a socket in snob's
+    /// data directory only you can reach, for a tunnel of your own; clients
+    /// present the key "snob mcp key new" makes
+    #[cfg(feature = "mcp-http")]
+    #[arg(
+        long,
+        value_name = "ADDRESS",
+        value_parser = crate::commands::mcp::http::listen_at
+    )]
+    pub listen: Option<crate::commands::mcp::http::ListenAt>,
+
+    /// With --listen, the https address the tunnel serves this at, so that
+    /// requests addressed to it are taken
+    #[cfg(feature = "mcp-http")]
+    #[arg(
+        long,
+        requires = "listen",
+        value_name = "URL",
+        value_parser = crate::commands::mcp::http::public_url
+    )]
+    pub public_url: Option<url::Url>,
+
+    /// The follows and unfollows agents may make in any 24 hours on the
+    /// account, with --allow-writes [default: 10; at most 99, what the write
+    /// budget allows in a day anyway]
+    #[arg(
+        long,
+        requires = "allow_writes",
+        value_name = "N",
+        value_parser = clap::value_parser!(u32)
+            .range(1..=i64::from(snob_store::store::mcp_acts::MOST_WRITES_A_DAY))
+    )]
+    pub max_writes_per_day: Option<u32>,
+}
+
+/// What `snob mcp` takes a yes in the chat for (`commands::mcp`, `consent`).
+#[cfg(feature = "mcp")]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmInChat {
+    /// Nothing: a call that needs a yes needs a client that can show a form.
+    None,
+    /// Walking another account's lists, and not the writes.
+    Lists,
+    /// The walks and the writes.
+    All,
+}
+
+#[cfg(feature = "mcp")]
+#[derive(Subcommand, Debug)]
+pub enum McpCommand {
+    /// Print what to add to a client's configuration to start this server,
+    /// or to reach one already serving over HTTP
+    #[command(
+        after_help = "Printed, never written: the snippet goes to standard output, and \
+                      where it goes to standard error.\n\n\
+                      --remote <URL> configures the client to reach a \"snob mcp --listen\" \
+                      already running, at the https address your tunnel serves it at (or \
+                      http on this machine's loopback, for ssh -L), instead of starting one. \
+                      The snippet holds no key and starts nothing: the client sends the key \
+                      from SNOB_MCP_TOKEN in its own environment, which you set to what \
+                      \"snob mcp key show --reveal\" prints on the server's machine. Never \
+                      set SNOB_MCP_KEY for a client: that is the server's, and it replaces \
+                      the key of any snob started where it is set. The server's flags \
+                      (--allow-writes, --confirm-in-chat, --max-writes-per-day) go on its own \
+                      command line, and are refused here with --remote. Claude Desktop and \
+                      claude.ai take a remote server as a custom connector in their \
+                      settings, so for them only the address is printed."
+    )]
+    Config(McpConfigArgs),
+
+    /// Keep the key a client presents to reach this server over the
+    /// network, in the system keyring
+    #[command(
+        subcommand,
+        after_help = "One key, kept in the system keyring under its own entry, whatever \
+                      --no-keyring says: there is no file form. On a machine with no keyring \
+                      (a server, a container), set SNOB_MCP_KEY in the server's environment \
+                      instead, to a key \"snob mcp key new\" printed; it wins over the \
+                      keyring wherever it is set, so set it only where the server runs. \
+                      Only a key in snob's own form is taken: snob_mcp_ and 43 characters, \
+                      256 random bits.\n\n\
+                      The key is printed only to a terminal, unless --print says otherwise, \
+                      so that a program running this does not keep it in what it reads. \
+                      \"snob mcp key new --force\" replaces it, and every client given the \
+                      old one stops working; \"snob mcp key revoke\" removes it. A server \
+                      already running keeps the key it started with until it is restarted. \
+                      \"snob purge\" removes it too."
+    )]
+    #[cfg(feature = "mcp-http")]
+    Key(McpKeyCommand),
+}
+
+/// `snob mcp key` (`commands::mcp::key`).
+#[cfg(feature = "mcp-http")]
+#[derive(Subcommand, Debug)]
+pub enum McpKeyCommand {
+    /// Make a key, keep it in the system keyring, and print it this once
+    New(McpKeyNewArgs),
+    /// Say where the key is read from, and its fingerprint
+    Show(McpKeyShowArgs),
+    /// Remove the key from the system keyring
+    Revoke,
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Args, Debug)]
+pub struct McpKeyNewArgs {
+    /// Replace the key there is; every client given it stops working
+    #[arg(long)]
+    pub force: bool,
+
+    /// Print the key even when standard output is not a terminal
+    #[arg(long)]
+    pub print: bool,
+
+    /// Make a key for SNOB_MCP_KEY: printed, kept nowhere, and the system
+    /// keyring left as it is
+    #[arg(long, conflicts_with = "force")]
+    pub env: bool,
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Args, Debug)]
+pub struct McpKeyShowArgs {
+    /// Print the key itself, on a terminal
+    #[arg(long)]
+    pub reveal: bool,
+
+    /// With --reveal, print it even when standard output is not a terminal
+    #[arg(long, requires = "reveal")]
+    pub print: bool,
+}
+
+#[cfg(feature = "mcp")]
+#[derive(Args, Debug)]
+pub struct McpConfigArgs {
+    /// The client that will start it
+    #[arg(value_enum)]
+    pub client: McpClient,
+
+    /// Start it with --allow-writes
+    #[arg(long)]
+    pub allow_writes: bool,
+
+    /// Start it with --confirm-in-chat
+    #[arg(long, value_enum, value_name = "WHAT")]
+    pub confirm_in_chat: Option<ConfirmInChat>,
+
+    /// Reach a server already serving over HTTP at this address rather
+    /// than start one; the client sends the key from SNOB_MCP_TOKEN
+    //
+    // The server's flags describe a process this does not start, so they
+    // are refused rather than printed somewhere they do nothing.
+    #[arg(
+        long,
+        value_name = "URL",
+        value_parser = crate::commands::mcp::config::RemoteUrl,
+        conflicts_with_all = ["allow_writes", "confirm_in_chat", "max_writes_per_day"]
+    )]
+    pub remote: Option<url::Url>,
+
+    /// Start it with --max-writes-per-day
+    #[arg(
+        long,
+        requires = "allow_writes",
+        value_name = "N",
+        value_parser = clap::value_parser!(u32)
+            .range(1..=i64::from(snob_store::store::mcp_acts::MOST_WRITES_A_DAY))
+    )]
+    pub max_writes_per_day: Option<u32>,
+}
+
+#[cfg(feature = "mcp")]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpClient {
+    ClaudeCode,
+    ClaudeDesktop,
+    Codex,
+    Cursor,
+    Vscode,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -1700,6 +2310,22 @@ mod tests {
             std::time::Duration::from_secs(21_600)
         );
         assert!(duration("six hours").is_err());
+    }
+
+    /// The cap on an agent's writes means something only on a run an agent
+    /// was told yes to, or on the check made before that yes is asked for,
+    /// and the check is never a run on a yes.
+    #[test]
+    fn the_write_cap_needs_an_agents_yes_or_the_check_ahead() {
+        let parses = |extra: &[&str]| {
+            let line = ["snob", "follow", "someone", "-y", "--json"];
+            Cli::try_parse_from(line.iter().chain(extra)).is_ok()
+        };
+        assert!(parses(&["--confirmed-via=chat", "--mcp-write-cap=3"]));
+        assert!(parses(&["--check-ahead", "--mcp-write-cap=3"]));
+        assert!(parses(&["--check-ahead"]));
+        assert!(!parses(&["--mcp-write-cap=3"]));
+        assert!(!parses(&["--check-ahead", "--confirmed-via=chat"]));
     }
 
     #[test]
@@ -1936,6 +2562,34 @@ mod tests {
         assert!(args.walk.offline && args.walk.consent.yes);
     }
 
+    /// `snob mcp --help` tells of `--listen` and the key only in a build that
+    /// has them, and `snob profile --help` of the rest it may wait first.
+    #[test]
+    fn the_help_tells_only_of_what_the_build_has() {
+        let mut cli = Cli::command();
+        cli.build();
+        #[cfg(feature = "mcp")]
+        {
+            let mcp = cli.find_subcommand_mut("mcp").unwrap();
+            let help = mcp.render_long_help().to_string();
+            assert_eq!(
+                help.contains("--listen"),
+                cfg!(feature = "mcp-http"),
+                "{help}"
+            );
+            assert_eq!(
+                help.contains("snob mcp key new"),
+                cfg!(feature = "mcp-http"),
+                "{help}"
+            );
+            assert!(help.contains("Started by the agent's client"), "{help}");
+        }
+        let profile = cli.find_subcommand_mut("profile").unwrap();
+        let help = profile.render_long_help().to_string();
+        assert!(help.contains("up to 15 minutes"), "{help}");
+        assert!(!help.contains("three or four"), "{help}");
+    }
+
     /// The environment variables the program answers to are announced in one
     /// place, under the examples, where exit codes already live.
     ///
@@ -1957,9 +2611,18 @@ mod tests {
             "SNOB_NO_OWNER",
             "SNOB_CSRFTOKEN",
             "SNOB_SIGNING_KEY",
+            #[cfg(feature = "mcp-http")]
+            "SNOB_MCP_KEY",
         ] {
             assert!(EXAMPLES.contains(name), "{name} is read but not announced");
         }
+        // And the other way: a build that does not read the MCP key does not
+        // announce it.
+        assert_eq!(
+            EXAMPLES.contains("SNOB_MCP_KEY"),
+            cfg!(feature = "mcp-http"),
+            "SNOB_MCP_KEY is announced only where it is read"
+        );
         assert!(
             !EXAMPLES.contains("SNOB_IGNORE_COOLDOWN"),
             "the escape hatch is deliberately not advertised"

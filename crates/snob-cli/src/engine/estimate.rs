@@ -10,10 +10,13 @@
 //!
 //! **The time is the pacer's, run forward on paper.** Every request pays the
 //! pace and the day buckets of `rate_budget.rs`, from where they stand now; a
-//! sitting of [`PAGES_PER_SITTING`] pages rests, counted across the walks of
-//! the one process as `Pacer::page_walked` counts it; the steps and dwells are
-//! `pace.rs`'s, the shortest for the least time and the longest for the most.
-//! Nothing is a copy of those numbers, so a change to one moves this with it.
+//! sitting of [`PAGES_PER_SITTING`] pages owes a rest, counted across walks
+//! and runs as `Pacer::page_walked` counts it in the account's database, and
+//! starting from the sitting stored there: the pages already in it, and what
+//! is left of a rest already owed, which comes before the first page. The
+//! steps and dwells are `pace.rs`'s, the shortest for the least time and the
+//! longest for the most. Nothing is a copy of those numbers, so a change to
+//! one moves this with it.
 //!
 //! [`compute`] is the arithmetic, over plain numbers, so every case is a unit
 //! test; [`gather`] reads those numbers out of the store and the budget.
@@ -105,6 +108,11 @@ pub struct Inputs {
     pub daily: Bucket,
     pub accounts_left: u64,
     pub held: Option<EpochMs>,
+    /// Pages already in the account's sitting, which fill it sooner.
+    pub into_sitting: u64,
+    /// Milliseconds left of a rest the sitting already owes, paid before the
+    /// first page; 0 when none is.
+    pub rest_owed_ms: u64,
 }
 
 /// What would happen to one list.
@@ -163,6 +171,9 @@ pub struct Estimate {
     pub pauses: bool,
     pub same_day: bool,
     pub held: Option<EpochMs>,
+    /// Seconds left of a rest the sitting already owes, which the time
+    /// counts when a page is walked; 0 when none is.
+    pub rest_owed: u64,
 }
 
 impl Estimate {
@@ -238,7 +249,36 @@ pub fn compute(inputs: &Inputs) -> Estimate {
         pauses: !inputs.same_day && most.accounts > inputs.accounts_left,
         same_day: inputs.same_day,
         held: inputs.held,
+        rest_owed: inputs.rest_owed_ms.div_ceil(1000),
     }
+}
+
+/// The time the pace alone gives one walk of `pages`, the fewest and the
+/// most, in seconds: its dwell, its steps and the rests its sitting owes,
+/// from `into_sitting` pages already in the sitting and `rest_owed_ms` left
+/// of a rest already owed. The request budget's waits are not in it.
+///
+/// For what has to say how long a walk under way has left, which knows its
+/// pages and not the buckets' standing at every one of them.
+pub fn walk_seconds(pages: (u64, u64), into_sitting: u64, rest_owed_ms: u64) -> (u64, u64) {
+    walks_seconds(&[pages], into_sitting, rest_owed_ms)
+}
+
+/// [`walk_seconds`] for walks one after the other, as a crossing reads its
+/// two lists: each its dwell, and the sitting carried from one to the next,
+/// since it is the account's.
+pub fn walks_seconds(walks: &[(u64, u64)], into_sitting: u64, rest_owed_ms: u64) -> (u64, u64) {
+    let time = |scenario, pick: fn(&(u64, u64)) -> u64| {
+        let mut run = Run::unpaced(scenario, into_sitting, rest_owed_ms);
+        for walk in walks {
+            run.walk(pick(walk), false);
+        }
+        run.ms
+    };
+    (
+        time(Scenario::Least, |walk| walk.0) / 1000,
+        time(Scenario::Most, |walk| walk.1).div_ceil(1000),
+    )
 }
 
 /// What each list would be, before anything is timed.
@@ -350,6 +390,13 @@ impl Gcra {
     fn pay(&mut self, at: i64) {
         self.tat = self.tat.max(at) + self.emission;
     }
+
+    /// A bucket that never makes a request wait, for the pace alone.
+    const FREE: Self = Self {
+        tat: 0,
+        emission: 0,
+        burst: 0,
+    };
 }
 
 /// The command, run on paper: the requests it sends, in order, each paid
@@ -359,8 +406,12 @@ struct Run {
     ms: u64,
     pace: Gcra,
     daily: Gcra,
-    /// Pages walked since the last rest, across walks, as the pacer counts.
-    sitting: u32,
+    /// Pages walked since the last rest, across walks and runs, as the
+    /// pacer counts.
+    sitting: u64,
+    /// Milliseconds of a rest owed and not yet paid, which the next page
+    /// pays first.
+    owed: Option<u64>,
     requests: u64,
     accounts: u64,
     per_list: Vec<u64>,
@@ -373,7 +424,8 @@ impl Run {
             ms: 0,
             pace: Gcra::starting(inputs.pace, PACE_EMISSION_MS, PACE_BURST_MS),
             daily: Gcra::starting(inputs.daily, DAILY_EMISSION_MS, DAILY_BURST_MS),
-            sitting: 0,
+            sitting: inputs.into_sitting,
+            owed: (inputs.rest_owed_ms > 0).then_some(inputs.rest_owed_ms),
             requests: 0,
             accounts: 0,
             per_list: Vec::new(),
@@ -415,6 +467,21 @@ impl Run {
         run
     }
 
+    /// A run of nothing but walks, whose requests no bucket holds up.
+    fn unpaced(scenario: Scenario, into_sitting: u64, rest_owed_ms: u64) -> Self {
+        Self {
+            scenario,
+            ms: 0,
+            pace: Gcra::FREE,
+            daily: Gcra::FREE,
+            sitting: into_sitting,
+            owed: (rest_owed_ms > 0).then_some(rest_owed_ms),
+            requests: 0,
+            accounts: 0,
+            per_list: Vec::new(),
+        }
+    }
+
     /// One of the two ends of a pace range.
     fn pick(&self, (least, most): (u64, u64)) -> u64 {
         match self.scenario {
@@ -437,19 +504,23 @@ impl Run {
         self.requests += 1;
     }
 
-    /// A walk of `pages`, as the pager makes it: the dwell, the navigation
-    /// from the browser, then each page (and its `show_many`) a step apart,
-    /// resting after a full sitting unless the walk ends there.
+    /// A walk of `pages`, as the pager makes it: a rest owed paid first, the
+    /// dwell, the navigation from the browser, then each page (and its
+    /// `show_many`) a step apart, with the rest a full sitting owes paid
+    /// before the page after it. A walk that ends on a full sitting leaves
+    /// the rest owed to the next one, as the pager does.
     fn walk(&mut self, pages: u64, browser: bool) {
         if pages == 0 {
             return;
         }
+        self.pay_rest();
         self.wait(self.pick(DWELL_MS));
         if browser {
             self.send();
         }
         for page in 0..pages {
             if page > 0 {
+                self.pay_rest();
                 self.wait(self.pick(STEP_MS));
             }
             self.send();
@@ -457,10 +528,17 @@ impl Run {
                 self.send();
             }
             self.sitting += 1;
-            if self.sitting >= PAGES_PER_SITTING && page + 1 < pages {
-                self.wait(self.pick(SITTING_PAUSE_MS));
-                self.sitting = 0;
+            if self.sitting >= u64::from(PAGES_PER_SITTING) && self.owed.is_none() {
+                self.owed = Some(self.pick(SITTING_PAUSE_MS));
             }
+        }
+    }
+
+    /// The rest owed, if one is, and a new sitting after it.
+    fn pay_rest(&mut self) {
+        if let Some(ms) = self.owed.take() {
+            self.wait(ms);
+            self.sitting = 0;
         }
     }
 }
@@ -517,6 +595,17 @@ pub fn gather(standing: &Standing<'_>, query: &ListQuery, kinds: &[ListKind]) ->
         });
     }
     let budget = standing.budget;
+    let longest_rest = Duration::from_millis(SITTING_PAUSE_MS.1);
+    let (into_sitting, rest_owed_ms) = match budget.sitting {
+        Some(sitting) => (
+            u64::from(sitting.pages_at(standing.now, longest_rest)),
+            sitting
+                .rest_owed(standing.now)
+                .map_or(0, |until| u64::try_from(until - standing.now).unwrap_or(0))
+                .min(SITTING_PAUSE_MS.1),
+        ),
+        None => (0, 0),
+    };
     Ok(Inputs {
         typed: query.target.is_some(),
         pk_known: pk.is_some(),
@@ -532,6 +621,8 @@ pub fn gather(standing: &Standing<'_>, query: &ListQuery, kinds: &[ListKind]) ->
         daily: Bucket::of(&budget.daily, standing.now),
         accounts_left: budget.accounts_left(),
         held: standing.held,
+        into_sitting,
+        rest_owed_ms,
     })
 }
 
@@ -580,6 +671,8 @@ mod tests {
             daily,
             accounts_left: 2_000,
             held: None,
+            into_sitting: 0,
+            rest_owed_ms: 0,
         }
     }
 
@@ -750,7 +843,7 @@ mod tests {
     }
 
     /// A sitting rests between sittings and not after the last, and the
-    /// sitting is the process's: a second walk carries on the first one's.
+    /// sitting is the account's: a second walk carries on the first one's.
     #[test]
     fn a_rest_falls_where_the_pacer_puts_it() {
         let seconds = |lists: Vec<Stored>| compute(&inputs(false, false, lists)).seconds;
@@ -773,6 +866,56 @@ mod tests {
             crossing.0 >= 300,
             "sixty pages across two walks rest once: {crossing:?}"
         );
+    }
+
+    /// The sitting stored for the account is where the run starts: a rest
+    /// it already owes comes before the first page, even of a walk of one
+    /// page, and pages already in it fill it sooner.
+    #[test]
+    fn the_estimate_counts_a_rest_already_owed() {
+        let one_page = || vec![stored(ListKind::Followers, Some(12), Some(48 * HOUR))];
+        let fresh = compute(&inputs(false, false, one_page()));
+        assert_eq!(fresh.rest_owed, 0);
+
+        let mut owing = inputs(false, false, one_page());
+        owing.rest_owed_ms = 600_000;
+        let owing = compute(&owing);
+        assert_eq!(owing.rest_owed, 600);
+        assert!(
+            owing.seconds.0 >= fresh.seconds.0 + 600 && owing.seconds.1 >= fresh.seconds.1 + 600,
+            "{owing:?} against {fresh:?}"
+        );
+
+        // Thirty-nine pages in, the fortieth fills the sitting, and the
+        // forty-first waits for its rest.
+        let two_pages = || vec![stored(ListKind::Followers, Some(24), Some(48 * HOUR))];
+        let mut far_in = inputs(false, false, two_pages());
+        far_in.into_sitting = 39;
+        let far_in = compute(&far_in).seconds;
+        let near = compute(&inputs(false, false, two_pages())).seconds;
+        assert!(far_in.0 >= near.0 + 300, "{far_in:?} against {near:?}");
+    }
+
+    /// The pace alone, for a walk under way: its dwell and steps, a rest
+    /// owed paid first, and one for every sitting it fills before its last
+    /// page.
+    #[test]
+    fn a_walk_is_timed_from_the_sitting_it_starts_in() {
+        let (least, most) = walk_seconds((3, 3), 0, 0);
+        assert_eq!((least, most), (1 + 2, 4 + 2 * 3), "a dwell and two steps");
+
+        assert_eq!(walk_seconds((3, 3), 0, 60_000), (60 + 3, 60 + 10));
+        assert_eq!(
+            walk_seconds((2, 2), 39, 0),
+            (1 + 300 + 1, 4 + 900 + 3),
+            "the first page fills the sitting, the second waits for the rest"
+        );
+        assert_eq!(
+            walk_seconds((1, 1), 39, 0),
+            (1, 4),
+            "a walk that ends on a full sitting leaves the rest owed"
+        );
+        assert_eq!(walk_seconds((0, 0), 0, 60_000), (0, 0), "no walk, no rest");
     }
 
     /// The day's bucket moves the time once it runs out.

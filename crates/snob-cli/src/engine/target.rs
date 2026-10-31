@@ -204,7 +204,7 @@ pub fn from_store(app: &App, typed: Option<&str>, kind: ListKind) -> Result<Targ
 
     let typed = clean(typed);
     let Some(pk) = accounts::find_pk_by_username(app.db().conn(), typed)? else {
-        return Err(crate::report::refuse_nothing_stored(kind));
+        return Err(crate::report::refuse_nothing_stored(kind, Some(typed)));
     };
 
     Ok(Target {

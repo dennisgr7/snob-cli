@@ -145,6 +145,9 @@ impl Stored {
 /// deleted by `snob purge` without anybody having to remember to add it there
 /// too. A test walks the variants for the same reason.
 ///
+/// **No feature gate on any variant**, the MCP key's included: a build
+/// without `snob mcp` still purges a key an earlier build stored.
+///
 /// The probe entry is deliberately not here. It is written and removed by the
 /// write check itself and never holds anything, so listing it would only mean
 /// `delete_all` reporting a failure about a value nobody stored.
@@ -154,10 +157,14 @@ pub enum Kind {
     WatchToken,
     /// The key the monitor signs the webhook body with.
     WatchSigningKey,
+    /// The key a client presents to reach `snob mcp` over the network
+    /// (`snob mcp key`). Not an account's: one server serves whichever
+    /// account it is told to.
+    McpKey,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 2] = [Kind::WatchToken, Kind::WatchSigningKey];
+    pub const ALL: [Kind; 3] = [Kind::WatchToken, Kind::WatchSigningKey, Kind::McpKey];
 
     /// The keyring entry's user name. Stable: changing one of these strands
     /// whatever is already stored under the old one, where `purge` will no
@@ -166,6 +173,7 @@ impl Kind {
         match self {
             Self::WatchToken => "watch-token",
             Self::WatchSigningKey => "watch-signing-key",
+            Self::McpKey => "mcp-key",
         }
     }
 }
@@ -366,7 +374,7 @@ impl SecretStore {
         }
     }
 
-    /// Stores one of the monitor's secrets.
+    /// Stores one of the secrets in [`Kind`].
     ///
     /// Keyring only, unlike the session — and that is a deliberate difference
     /// rather than an omission. The session has a fallback because without one
@@ -376,7 +384,9 @@ impl SecretStore {
     /// reports, and still writes to standard output. So rather than invent a
     /// second protected file, this says it cannot keep the secret and the user
     /// passes `--sign-with` or `--header` on the command line, where a systemd
-    /// unit can supply it from an environment file.
+    /// unit can supply it from an environment file. The MCP key is in the same
+    /// position, and its way past a machine with no keyring is the same:
+    /// `SNOB_MCP_KEY` in the server's environment.
     pub fn save_secret(&self, kind: Kind, value: &Secret) -> Result<(), SecretsError> {
         self.entry_for(kind.entry_name())?
             .set_password(value.expose())
@@ -412,7 +422,8 @@ impl SecretStore {
         }
     }
 
-    /// Which of the monitor's secrets are on this machine.
+    /// Which of the secrets in [`Kind`] are on this machine: the monitor's
+    /// and the MCP key.
     ///
     /// The session is not among them: [`SessionStore::something_is_stored`]
     /// answers for that one, and it has to, because a session too corrupt to
@@ -423,9 +434,9 @@ impl SecretStore {
     /// answer being complete — a keyring that refuses to be read leaves the
     /// listing short and the deletion whole, which is the right way round.
     ///
-    /// Walking `Kind::ALL` rather than naming the two, so a secret added later
+    /// Walking `Kind::ALL` rather than naming them, so a secret added later
     /// appears here without anybody remembering to come back.
-    pub fn monitor_secrets_stored(&self) -> Vec<Kind> {
+    pub fn secrets_stored(&self) -> Vec<Kind> {
         Kind::ALL
             .into_iter()
             .filter(|kind| matches!(self.load_secret(*kind), Ok(Stored::Found(_))))
@@ -444,8 +455,8 @@ impl SecretStore {
     }
 
     /// Removes every secret this tool has ever written — the monitor's, the
-    /// session of every account in `accounts`, and the single-account layout's
-    /// — and says so only if they all went.
+    /// MCP key, the session of every account in `accounts`, and the
+    /// single-account layout's — and says so only if they all went.
     ///
     /// `Kind::ALL` is the one list of what is not an account's, for the same
     /// reason `owned_dirs` is one list: a secret added later must not be
@@ -1131,13 +1142,13 @@ mod tests {
         // `ALL` while the type keeps it.
         fn is_a_kind(kind: Kind) -> bool {
             match kind {
-                Kind::WatchToken | Kind::WatchSigningKey => true,
+                Kind::WatchToken | Kind::WatchSigningKey | Kind::McpKey => true,
             }
         }
         assert!(Kind::ALL.into_iter().all(is_a_kind));
         assert_eq!(
             Kind::ALL.len(),
-            2,
+            3,
             "a kind left `ALL`, so `purge` no longer removes it"
         );
 
@@ -1274,6 +1285,45 @@ mod tests {
         // Forgetting one that is not there is not an error: `setup` run again
         // with no token has to be able to clear whatever was there before.
         store.forget_secret(Kind::WatchToken).unwrap();
+    }
+
+    /// The MCP key is kept where the monitor's secrets are, under an entry
+    /// of its own, and `snob mcp key revoke` takes it out again. On the
+    /// file backend too, since it has no file form: `--no-keyring` is about
+    /// where the session goes.
+    #[test]
+    fn the_mcp_key_is_saved_read_and_forgotten() {
+        let (_tmp, store, _keyring) = file_store();
+        let key = "snob_mcp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        if store.save_secret(Kind::McpKey, &Secret::new(key)).is_err() {
+            return; // no keyring on this machine; see `save_secret`
+        }
+
+        assert_eq!(
+            store
+                .load_secret(Kind::McpKey)
+                .unwrap()
+                .found()
+                .unwrap()
+                .expose(),
+            key
+        );
+        assert_eq!(store.secrets_stored(), vec![Kind::McpKey]);
+        assert!(
+            store
+                .load_secret(Kind::WatchToken)
+                .unwrap()
+                .found()
+                .is_none(),
+            "the key is under its own entry, not the monitor's"
+        );
+
+        store.forget_secret(Kind::McpKey).unwrap();
+        assert!(matches!(
+            store.load_secret(Kind::McpKey).unwrap(),
+            Stored::Nothing
+        ));
+        assert!(store.secrets_stored().is_empty());
     }
 
     /// A session is reported with the backend it was found in, so that it

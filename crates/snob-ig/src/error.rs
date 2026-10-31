@@ -162,6 +162,25 @@ pub enum IgError {
     #[error("canceled")]
     Canceled,
 
+    /// The request budget would have made this wait longer than the caller
+    /// allowed (`Pacer::waiting_at_most`), so nothing was sent and nothing was
+    /// charged for it.
+    ///
+    /// **Stopping, not throttling.** Instagram said nothing; the run stopped
+    /// at a limit its caller set, the way Ctrl+C stops it, and a walk it
+    /// stops ends `Canceled` and continues where it left off. It carries
+    /// durations and no wording, for the reason [`IgError::InCooldown`]
+    /// carries an epoch.
+    #[error(
+        "the request budget would wait {}, longer than the {} allowed, so nothing was sent",
+        snob_core::duration::format(*.wait),
+        snob_core::duration::format(*.limit)
+    )]
+    WaitTooLong {
+        wait: std::time::Duration,
+        limit: std::time::Duration,
+    },
+
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
 

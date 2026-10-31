@@ -14,10 +14,15 @@ pub mod browser;
 pub mod cdp;
 pub mod cli;
 pub mod commands;
+/// Starting a process that outlives the command that started it, with
+/// nothing of the command's: its output, its terminal, its job.
+pub(crate) mod detach;
 pub mod engine;
 pub mod exit;
 pub mod headless;
 pub(crate) mod interrupt;
+/// A list walk that outlives the call that started it, and `snob jobs`.
+pub mod jobs;
 pub mod media;
 pub mod output;
 /// The one process that runs the browsers for every command of this user's.
@@ -28,6 +33,8 @@ pub(crate) mod pipe;
 pub mod posts;
 pub(crate) mod power;
 pub(crate) mod progress;
+pub(crate) mod relay;
 pub mod report;
+pub mod seat;
 pub mod ui;
 pub mod watch;

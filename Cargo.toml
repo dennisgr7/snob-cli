@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/snob-ig", "crates/snob-core", "crates/snob-store", "crates/snob-cli"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 # The oldest compiler every locked dependency accepts: rusqlite_migration 2.6
 # declares 1.95, so a `cargo install --git` on anything older fails in the
@@ -120,6 +120,22 @@ indicatif = "0.18"
 supports-hyperlinks = "3"
 csv = "1"
 rust_xlsxwriter = "0.97"
+# The Model Context Protocol SDK behind `snob mcp`. Pinned to the exact
+# version: it moves fast (eight releases in the two months before this one),
+# the protocol revision it speaks is part of what `snob mcp` promises a
+# client, and a minor bump is a change to read before taking. No default
+# features: those add the tool macros, which this crate does without.
+rmcp = { version = "=3.8.0", default-features = false }
+# What `snob mcp --listen` serves HTTP with (`commands::mcp::http`), and
+# nothing else: **every one of these was already in the tree** through
+# reqwest, which builds hyper's client and `http1` on every target. What is
+# new is hyper's `server` half; the features are named where they are used,
+# in crates/snob-cli/Cargo.toml.
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
 # Only to read Instagram's export. Deflate is what a zip holding JSON uses;
 # rust_xlsxwriter already pulls this crate in, so the features are kept narrow
 # rather than adding a second copy of the compression code.

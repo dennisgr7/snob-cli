@@ -1,0 +1,72 @@
+html, body {
+  margin: 0;
+  height: 100%;
+  background: #111;
+  color: #eee;
+  font: 14px system-ui, sans-serif;
+}
+body {
+  display: flex;
+  flex-direction: column;
+}
+header {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 6px;
+  background: #222;
+}
+header button {
+  background: #333;
+  color: #eee;
+  border: 0;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 16px;
+  cursor: pointer;
+}
+#address {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, monospace;
+}
+#stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+}
+#screen {
+  max-width: 100%;
+  max-height: 100%;
+  touch-action: pinch-zoom;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+#keys {
+  position: fixed;
+  left: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  border: 0;
+  padding: 0;
+  resize: none;
+}
+#done {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.85);
+  font-size: 20px;
+}
+#done[hidden] {
+  display: none;
+}

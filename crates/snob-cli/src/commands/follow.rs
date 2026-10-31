@@ -17,6 +17,14 @@
 //! is a growth-hacking trick rather than the housekeeping this tool is for. So
 //! the question is asked before the request, and `-y` is how a script answers it
 //! in advance.
+//!
+//! A run an agent was told yes to through `snob mcp` (`--confirmed-via`) is
+//! recorded before its first request, and refused with nothing sent once the
+//! day's writes made that way reach the cap (`common::record_agent_act`).
+//!
+//! `--json` prints one object on standard output for every way the run ends
+//! (done, already so, declined), so a program never has to read the sentence;
+//! the failures are the JSON error `main` prints when `--json` was asked for.
 
 use anyhow::{Result, anyhow};
 use snob_core::model::printable;
@@ -61,7 +69,10 @@ pub async fn run(
     // budget for a quarter of an hour (from the browser, before the profile
     // is loaded), which is a wait to be told about in a sentence rather than
     // animated.
-    let app = common::app(&secrets, paths, false)?;
+    if args.check_ahead {
+        return check_ahead(&args, verb, &secrets, paths);
+    }
+    let mut app = common::app(&secrets, paths, false)?;
 
     // **Before anything is spent.** A session cannot write only when requests
     // are sent directly (SNOB_NO_BROWSER) and it was pasted without
@@ -69,21 +80,10 @@ pub async fn run(
     // request, a slot of write budget, and a message telling the user their
     // session had expired when it had not.
     if !app.client().can_write() {
-        return Err(ExitError::new(
-            ExitCode::NoSession,
-            format!(
-                "this session can read but not {}: it has no CSRF token",
-                verb.present()
-            ),
-        )
-        .with_hint(
-            "run \"snob login --browser\", which captures it, or \
-             \"snob login --paste --csrftoken <token>\"",
-        )
-        .into());
+        return Err(cannot_write(verb));
     }
 
-    common::refuse_during_cooldown(&app, "nothing can be sent")?;
+    common::refuse_during_cooldown(&app, NOTHING_SENT)?;
 
     // **Also before anything is spent.** Whether anybody can answer is a
     // property of this process's streams, not of the account, so it is known
@@ -104,11 +104,29 @@ pub async fn run(
         ));
     }
 
+    // **Before the first request**, for a run an agent was told yes to
+    // through `snob mcp`: recorded where the person sees it, and refused with
+    // nothing sent past the day's cap on an agent's writes. An attempt that
+    // then finds nothing to do, or is refused by Instagram, still counts.
+    let act = common::record_agent_act(
+        &mut app,
+        &args.agent,
+        verb.present(),
+        Some(&args.target),
+        args.mcp_write_cap,
+    )?;
+
     let known = target::known_pk(&app, &args.target)?;
     let profile = app
         .client()
         .profile_named(target::clean(&args.target), known)
         .await?;
+    if let Some(id) = act
+        && let Err(e) = snob_store::store::mcp_acts::resolved(app.db().conn(), id, profile.id)
+    {
+        // The act stays recorded by the name it was asked about.
+        tracing::debug!(error = %e, "the account an act was about could not be stored");
+    }
 
     // Instagram spells the name; the user typed a spelling of it. Everything
     // from here on uses Instagram's, filtered, because it is going to a
@@ -125,9 +143,8 @@ pub async fn run(
     // Nothing to do is worth saying rather than doing. It also saves the write
     // budget for a write that changes something, which matters when a slot is
     // fifteen minutes.
-    if let Some(settled) = already_done(verb, &profile, &name) {
-        ui::info(&settled);
-        return Ok(ExitCode::Ok);
+    if let Some(settled) = already_done(verb, &profile) {
+        return tell(&args, verb, &profile, &name, settled, None);
     }
 
     let question = match verb {
@@ -143,6 +160,7 @@ pub async fn run(
     // events. The guard above is what keeps that unreachable here, so this
     // branch only ever runs with somebody at the keyboard.
     if !args.consent.yes && !ui::confirm(&question, false)? {
+        tell(&args, verb, &profile, &name, Outcome::Declined, None)?;
         return Ok(ExitCode::Interrupted);
     }
 
@@ -152,7 +170,226 @@ pub async fn run(
         Verb::Follow => client.follow(pk, username, &ids).await?,
         Verb::Unfollow => client.unfollow(pk, username, &ids).await?,
     };
-    ui::info(&outcome(verb, &status, &name));
+    tell(
+        &args,
+        verb,
+        &profile,
+        &name,
+        outcome(verb, &status),
+        Some(&status),
+    )
+}
+
+/// What a write refused in a cooldown says it did not do.
+const NOTHING_SENT: &str = "nothing can be sent";
+
+/// The refusal of a session that has no CSRF token to write with.
+fn cannot_write(verb: Verb) -> anyhow::Error {
+    ExitError::new(
+        ExitCode::NoSession,
+        format!(
+            "this session can read but not {}: it has no CSRF token",
+            verb.present()
+        ),
+    )
+    .with_hint(
+        "run \"snob login --browser\", which captures it, or \
+         \"snob login --paste --csrftoken <token>\"",
+    )
+    .into()
+}
+
+/// `--check-ahead`: what would refuse this write now if an agent made it,
+/// **sending nothing, asking nothing and writing nothing**, or `{"would":
+/// "send"}` on standard output when nothing would. `snob mcp` runs it before
+/// it asks the person for a yes to a follow or an unfollow, so nobody says
+/// yes to one that is then refused, and no ticket is spent on one
+/// (AGENTS.md, "The MCP server").
+///
+/// The refusals of [`run`] that cost nothing to know, in its order, each the
+/// same error a run would give: another run started by an agent holding the
+/// account (a job's walk, or anything under `--spend-alone`), no CSRF token,
+/// the cooldown, the day's cap on an agent's writes (`--mcp-write-cap`, or
+/// its default), and a wait for the budget past `--max-wait`. Read from the
+/// budget's state and the account's database as `--dry-run` reads them
+/// (`common::standing`). **Not known ahead**: what the profile says (already
+/// so, the viewer's own account, a name that resolves to nothing), and
+/// whatever changes between this and the yes.
+fn check_ahead(
+    args: &FollowArgs,
+    verb: Verb,
+    secrets: &SessionStore,
+    paths: &AccountPaths,
+) -> Result<ExitCode> {
+    let Some(session) = secrets.load()? else {
+        return Err(common::no_session());
+    };
+    if session.ds_user_id != paths.pk() {
+        anyhow::bail!(
+            "the session stored for account {} is account {}'s; log in again with \
+             \"snob login\"",
+            paths.pk(),
+            session.ds_user_id
+        );
+    }
+    let now = snob_core::clock::now_ms();
+    // A job's walk holds the account for as long as it walks, from before
+    // its walk takes `spend.lock` (queued) to its end.
+    if let Some(going) = crate::jobs::all(paths, now.get())?
+        .into_iter()
+        .find(|seen| !seen.status.is_over())
+    {
+        return Err(ExitError::new(
+            ExitCode::Error,
+            format!(
+                "{} of this account is walking a list, and only one run started by an agent \
+                 may use the account on Instagram at a time; nothing was sent",
+                going.id
+            ),
+        )
+        .with_reason("busy")
+        .with_hint(format!(
+            "ask again once it has ended, which \"snob jobs show {id}\" tells, or stop it \
+             with \"snob jobs cancel {id}\"",
+            id = going.id
+        ))
+        .into());
+    }
+    if snob_store::paths::lock_is_held(&paths.spend_lock())?.unwrap_or(false) {
+        return Err(crate::app::held_elsewhere());
+    }
+    if session.csrftoken.is_none() && !snob_ig::client::page::a_client_would_use_a_page() {
+        return Err(cannot_write(verb));
+    }
+    let (store, budget) = common::standing(paths, now)?;
+    if let Some(held) = common::held_in(&budget, paths, now) {
+        return Err(common::in_cooldown(&held, NOTHING_SENT));
+    }
+    let cap = args
+        .mcp_write_cap
+        .unwrap_or(snob_store::store::mcp_acts::WRITES_A_DAY);
+    if let Some(snob_store::store::mcp_acts::Recorded::Capped { writes, free_at }) =
+        snob_store::store::mcp_acts::over_the_cap(store.conn(), cap, now)?
+    {
+        return Err(common::write_cap_reached(writes, free_at));
+    }
+    // The write pays the pace and the day as the profile before it does, and
+    // the write bucket on top, so its wait is the longest of the run's.
+    let owed = budget.next_write_at.get().saturating_sub(now.get());
+    let wait = std::time::Duration::from_millis(u64::try_from(owed).unwrap_or(0));
+    if let Some(limit) = crate::app::max_wait()
+        && wait > limit
+    {
+        return Err(snob_ig::error::IgError::WaitTooLong { wait, limit }.into());
+    }
+    crate::ui::say!("{}", serde_json::json!({ "would": "send" }));
+    Ok(ExitCode::Ok)
+}
+
+/// How a run ended, as a word a program can match on and a sentence a person
+/// can read. One list, so `--json` and the sentence cannot describe two
+/// different runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    AlreadyFollowing,
+    AlreadyRequested,
+    NotFollowing,
+    /// The question was asked and answered no; nothing was sent.
+    Declined,
+    Followed,
+    /// A private account: following it asks, and they have to accept.
+    Requested,
+    Unfollowed,
+    /// Instagram took the write and reported the relationship as it was.
+    Unchanged,
+}
+
+impl Outcome {
+    /// The `outcome` field of `--json`. Part of the JSON contract.
+    fn token(self) -> &'static str {
+        match self {
+            Self::AlreadyFollowing => "already_following",
+            Self::AlreadyRequested => "already_requested",
+            Self::NotFollowing => "not_following",
+            Self::Declined => "declined",
+            Self::Followed => "followed",
+            Self::Requested => "requested",
+            Self::Unfollowed => "unfollowed",
+            Self::Unchanged => "unchanged",
+        }
+    }
+
+    /// Whether this run changed anything on Instagram.
+    fn changed(self) -> bool {
+        matches!(self, Self::Followed | Self::Requested | Self::Unfollowed)
+    }
+
+    /// The sentence a person is told. `None` for a refusal they gave
+    /// themselves, which needs no telling back.
+    fn sentence(self, verb: Verb, name: &str) -> Option<String> {
+        Some(match self {
+            Self::AlreadyFollowing => format!("You already follow @{name}."),
+            Self::AlreadyRequested => {
+                format!("You have already asked to follow @{name}, and they have not answered yet.")
+            }
+            Self::NotFollowing => format!("You do not follow @{name}."),
+            Self::Declined => return None,
+            Self::Followed => format!("Now following @{name}."),
+            Self::Requested => format!("Asked to follow @{name}. They have to accept it."),
+            Self::Unfollowed => format!("No longer following @{name}."),
+            // Instagram answered, and answered that nothing is different.
+            // Better said plainly than dressed up as success.
+            Self::Unchanged => match verb {
+                Verb::Follow => {
+                    format!("Instagram accepted the request, but @{name} is still not followed.")
+                }
+                Verb::Unfollow => {
+                    format!("Instagram accepted the request, but @{name} is still followed.")
+                }
+            },
+        })
+    }
+}
+
+/// Says how the run ended, as a sentence on standard error or, with `--json`,
+/// as one object on standard output. Exit 0 for everything but `Declined`,
+/// whose 130 the caller returns.
+fn tell(
+    args: &FollowArgs,
+    verb: Verb,
+    profile: &snob_ig::model::WebProfileInfo,
+    name: &str,
+    outcome: Outcome,
+    status: Option<&FriendshipStatus>,
+) -> Result<ExitCode> {
+    if args.output.json {
+        // What the relationship is now: Instagram's answer to the write when
+        // there was one, and the profile's own fields when there was not
+        // (`null` where the profile left them out, as `already_done` reads
+        // them).
+        let (following, requested) = match status {
+            Some(status) => (Some(status.following), Some(status.outgoing_request)),
+            None => (profile.followed_by_viewer, profile.requested_by_viewer),
+        };
+        ui::say!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "action": verb.present(),
+                "target": {
+                    "pk": profile.id,
+                    "username": name,
+                    "is_private": profile.is_private,
+                },
+                "outcome": outcome.token(),
+                "changed": outcome.changed(),
+                "following": following,
+                "requested": requested,
+                "viewer": crate::report::acting_as().map(|viewer| viewer.json()),
+            }))?
+        );
+    } else if let Some(sentence) = outcome.sentence(verb, name) {
+        ui::info(&sentence);
+    }
     Ok(ExitCode::Ok)
 }
 
@@ -163,18 +400,12 @@ pub async fn run(
 /// endpoint omits them on some answers, and `None` means unknown. Unknown must
 /// send the request rather than assume: refusing on a missing field would make
 /// the command stop working the day Instagram drops it from the response.
-fn already_done(
-    verb: Verb,
-    profile: &snob_ig::model::WebProfileInfo,
-    name: &str,
-) -> Option<String> {
+fn already_done(verb: Verb, profile: &snob_ig::model::WebProfileInfo) -> Option<Outcome> {
     match verb {
-        Verb::Follow if profile.followed_by_viewer == Some(true) => {
-            Some(format!("You already follow @{name}."))
+        Verb::Follow if profile.followed_by_viewer == Some(true) => Some(Outcome::AlreadyFollowing),
+        Verb::Follow if profile.requested_by_viewer == Some(true) => {
+            Some(Outcome::AlreadyRequested)
         }
-        Verb::Follow if profile.requested_by_viewer == Some(true) => Some(format!(
-            "You have already asked to follow @{name}, and they have not answered yet."
-        )),
         // Both facts have to be *known*: an absent `requested_by_viewer` is not
         // "no pending request", which is the assumption the doc-comment above
         // forbids -- an unfollow that would withdraw a pending request must
@@ -183,7 +414,7 @@ fn already_done(
             if profile.followed_by_viewer == Some(false)
                 && profile.requested_by_viewer == Some(false) =>
         {
-            Some(format!("You do not follow @{name}."))
+            Some(Outcome::NotFollowing)
         }
         _ => None,
     }
@@ -229,21 +460,12 @@ fn key(friendly_name: &str) -> String {
 /// **Following a private account does not follow it — it asks.** Saying
 /// "Followed" there would be the command lying about the one thing it was run
 /// to do, and the user would go looking for stories that will not be there.
-fn outcome(verb: Verb, status: &FriendshipStatus, name: &str) -> String {
+fn outcome(verb: Verb, status: &FriendshipStatus) -> Outcome {
     match verb {
-        Verb::Follow if status.following => format!("Now following @{name}."),
-        Verb::Follow if status.outgoing_request => {
-            format!("Asked to follow @{name}. They have to accept it.")
-        }
-        // Instagram answered, and answered that nothing is different. Better
-        // said plainly than dressed up as success.
-        Verb::Follow => {
-            format!("Instagram accepted the request, but @{name} is still not followed.")
-        }
-        Verb::Unfollow if !status.following && !status.outgoing_request => {
-            format!("No longer following @{name}.")
-        }
-        Verb::Unfollow => format!("Instagram accepted the request, but @{name} is still followed."),
+        Verb::Follow if status.following => Outcome::Followed,
+        Verb::Follow if status.outgoing_request => Outcome::Requested,
+        Verb::Unfollow if !status.following && !status.outgoing_request => Outcome::Unfollowed,
+        _ => Outcome::Unchanged,
     }
 }
 
@@ -286,9 +508,9 @@ mod tests {
 
     #[test]
     fn a_relationship_that_already_holds_costs_no_request() {
-        assert!(already_done(Verb::Follow, &profile(Some(true), None), "x").is_some());
-        assert!(already_done(Verb::Unfollow, &profile(Some(false), Some(false)), "x").is_some());
-        assert!(already_done(Verb::Follow, &profile(Some(false), Some(true)), "x").is_some());
+        assert!(already_done(Verb::Follow, &profile(Some(true), None)).is_some());
+        assert!(already_done(Verb::Unfollow, &profile(Some(false), Some(false))).is_some());
+        assert!(already_done(Verb::Follow, &profile(Some(false), Some(true))).is_some());
     }
 
     /// The endpoint omits these fields on some answers. Unknown has to mean
@@ -296,18 +518,18 @@ mod tests {
     /// drops the field.
     #[test]
     fn an_unknown_relationship_is_not_treated_as_settled() {
-        assert!(already_done(Verb::Follow, &profile(None, None), "x").is_none());
-        assert!(already_done(Verb::Unfollow, &profile(None, None), "x").is_none());
+        assert!(already_done(Verb::Follow, &profile(None, None)).is_none());
+        assert!(already_done(Verb::Unfollow, &profile(None, None)).is_none());
         // Half-known is still unknown: not following, but with the pending
         // request unreported, unfollow may still have a request to withdraw.
-        assert!(already_done(Verb::Unfollow, &profile(Some(false), None), "x").is_none());
+        assert!(already_done(Verb::Unfollow, &profile(Some(false), None)).is_none());
     }
 
     /// A pending request is not a follow, and unfollow has something to do
     /// about it: withdrawing the request.
     #[test]
     fn a_pending_request_is_still_something_to_withdraw() {
-        assert!(already_done(Verb::Unfollow, &profile(Some(false), Some(true)), "x").is_none());
+        assert!(already_done(Verb::Unfollow, &profile(Some(false), Some(true))).is_none());
     }
 
     #[test]
@@ -317,7 +539,9 @@ mod tests {
             outgoing_request: true,
             ..Default::default()
         };
-        let said = outcome(Verb::Follow, &asked, "someone");
+        let told = outcome(Verb::Follow, &asked);
+        assert_eq!(told, Outcome::Requested);
+        let said = told.sentence(Verb::Follow, "someone").unwrap();
         assert!(said.contains("Asked to follow"), "{said}");
         assert!(!said.contains("Now following"), "{said}");
     }
@@ -325,7 +549,9 @@ mod tests {
     #[test]
     fn a_write_instagram_accepted_but_did_not_apply_is_not_called_a_success() {
         let unchanged = FriendshipStatus::default();
-        let said = outcome(Verb::Follow, &unchanged, "someone");
+        let told = outcome(Verb::Follow, &unchanged);
+        assert!(!told.changed());
+        let said = told.sentence(Verb::Follow, "someone").unwrap();
         assert!(said.contains("still not followed"), "{said}");
     }
 }

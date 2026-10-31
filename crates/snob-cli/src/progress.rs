@@ -32,6 +32,37 @@ use snob_ig::pager::{Event, WaitKind};
 /// whole seconds has nothing new to say any faster.
 type Deadline = Arc<Mutex<Option<Instant>>>;
 
+/// `--progress-json`, set once by `main` before any command runs.
+static PROGRESS_JSON: AtomicBool = AtomicBool::new(false);
+
+/// Makes every stack this run builds say how its walks go as JSON lines on
+/// standard error, one per page and per wait, and draw nothing.
+///
+/// For a job's walk (`jobs/supervise.rs`), whose standard error is a file the
+/// job is read back from (`jobs::show`): a bar there would be escape codes
+/// nobody reads. **It wins over `--no-progress`**, which the walk's command
+/// line may carry from the call that started it, and which would otherwise
+/// leave the job with nothing to say for how far it is.
+pub fn progress_json() {
+    PROGRESS_JSON.store(true, Ordering::SeqCst);
+}
+
+/// Where a walk is, as its JSON lines say it.
+#[derive(Default)]
+struct Told {
+    page: u32,
+    accounts: usize,
+    of: Option<u64>,
+    /// The list being walked (`Progress::walking`), and the account's
+    /// sitting as the last page left it: its pages and when the rest it owes
+    /// ends. **Kept from one walk to the next**, as the sitting is the
+    /// account's and a crossing walks two lists in a row; `jobs::show::eta`
+    /// counts the rests to come from them.
+    list: Option<&'static str>,
+    sitting: Option<u32>,
+    rest_until: Option<i64>,
+}
+
 /// Cloning shares the same stack rather than making a second one: the pacer
 /// announces its waits from inside the client and has to reach the bar the walk
 /// is already drawing.
@@ -65,6 +96,9 @@ pub struct Progress {
     /// once: it cannot change while the process runs, and it is read on every
     /// style rebuild.
     rich: bool,
+    /// Under `--progress-json`, where the walk is, for the lines
+    /// ([`progress_json`]); `None` otherwise.
+    told: Option<Arc<Mutex<Told>>>,
 }
 
 /// How often a bar redraws itself while pages are arriving: what the spinner
@@ -83,6 +117,13 @@ const WAITING_TICK: Duration = Duration::from_secs(1);
 
 impl Progress {
     pub fn new(enabled: bool) -> Self {
+        Self::built(enabled, PROGRESS_JSON.load(Ordering::SeqCst))
+    }
+
+    /// [`Progress::new`], told whether this run is under `--progress-json`
+    /// rather than reading it, so a test can say.
+    fn built(enabled: bool, json: bool) -> Self {
+        let enabled = enabled && !json;
         let stack = if enabled {
             MultiProgress::with_draw_target(ProgressDrawTarget::stderr())
         } else {
@@ -108,9 +149,44 @@ impl Progress {
             ticking: Arc::new(Mutex::new(None)),
             since: Arc::new(Mutex::new(None)),
             rich,
+            told: json.then(|| Arc::new(Mutex::new(Told::default()))),
         };
         *progress.lock() = progress.fresh();
         progress
+    }
+
+    /// Under `--progress-json`, one line on standard error: `{"progress":
+    /// {...}}`, with the moment, the event, where the walk is and `more`.
+    fn tell(&self, event: &str, update: impl FnOnce(&mut Told), more: serde_json::Value) {
+        if let Some(line) = self.line(event, update, more) {
+            eprintln!("{line}");
+        }
+    }
+
+    /// The line [`Progress::tell`] says, when it says one.
+    fn line(
+        &self,
+        event: &str,
+        update: impl FnOnce(&mut Told),
+        more: serde_json::Value,
+    ) -> Option<String> {
+        let told = self.told.as_ref()?;
+        let mut told = told.lock().unwrap_or_else(|e| e.into_inner());
+        update(&mut told);
+        let mut line = serde_json::json!({
+            "at": snob_core::clock::now_ms().get(),
+            "event": event,
+            "page": told.page,
+            "accounts": told.accounts,
+            "of": told.of,
+            "list": told.list,
+            "sitting": told.sitting,
+            "rest_until": told.rest_until,
+        });
+        if let (Some(line), serde_json::Value::Object(more)) = (line.as_object_mut(), more) {
+            line.extend(more);
+        }
+        Some(serde_json::json!({ "progress": line }).to_string())
     }
 
     /// A stack that draws nowhere but still behaves as though it draws.
@@ -213,6 +289,17 @@ impl Progress {
     /// there is nothing to animate and a line per second down a pipe would be
     /// noise.
     pub fn waiting(&self, reason: &str, duration: Duration) {
+        self.wait_for("budget", reason, duration);
+    }
+
+    /// [`Progress::waiting`], with what the wait is for as `--progress-json`
+    /// names it: `budget`, `sitting`, `day`, `reconnect` or `retry`.
+    fn wait_for(&self, kind: &str, reason: &str, duration: Duration) {
+        self.tell(
+            "waiting",
+            |_| {},
+            serde_json::json!({ "kind": kind, "seconds": duration.as_secs() }),
+        );
         self.set_deadline(Some(Instant::now() + duration));
         if self.quiet {
             eprintln!("{reason} ({} s)", seconds_left(duration));
@@ -242,6 +329,19 @@ impl Progress {
     pub fn event(&self, e: &Event) {
         match e {
             Event::Started { estimated, resumed } => {
+                self.tell(
+                    "started",
+                    |told| {
+                        *told = Told {
+                            of: *estimated,
+                            list: told.list,
+                            sitting: told.sitting,
+                            rest_until: told.rest_until,
+                            ..Told::default()
+                        }
+                    },
+                    serde_json::json!({ "resumed": resumed }),
+                );
                 // A finished walk's bar stays where it is; this walk gets its
                 // own. `begin` has usually renewed already — it runs first and
                 // names the walk — so this is for the caller that never named
@@ -284,7 +384,22 @@ impl Progress {
                     self.warn("continuing an interrupted walk");
                 }
             }
-            Event::Page { running_total, .. } => {
+            Event::Page {
+                number,
+                running_total,
+                sitting,
+                ..
+            } => {
+                self.tell(
+                    "page",
+                    |told| {
+                        told.page = *number;
+                        told.accounts = *running_total;
+                        told.sitting = Some(sitting.pages);
+                        told.rest_until = sitting.rest_until.map(|until| until.get());
+                    },
+                    serde_json::Value::Null,
+                );
                 let running_total = *running_total as u64;
                 let bar = self.current();
                 // Instagram's counter sometimes undercounts. If we overshoot,
@@ -324,16 +439,16 @@ impl Progress {
                 // list's first page is a few seconds once, likewise.
                 match kind {
                     WaitKind::Sitting => {
-                        self.waiting("resting between sittings", *duration);
+                        self.wait_for("sitting", "resting between sittings", *duration);
                     }
                     // Kept on screen above the bar: a wait of hours is worth a
                     // line that says why, and that Ctrl+C loses nothing.
                     WaitKind::Day => {
                         self.warn(&crate::report::paused_for_the_day(*duration));
-                        self.waiting("waiting for the day's accounts", *duration);
+                        self.wait_for("day", "waiting for the day's accounts", *duration);
                     }
                     WaitKind::Reconnect => {
-                        self.waiting("waiting for the network", *duration);
+                        self.wait_for("reconnect", "waiting for the network", *duration);
                     }
                     WaitKind::Step | WaitKind::Dwell => {}
                 }
@@ -347,7 +462,7 @@ impl Progress {
                 // keeping; the countdown runs on the bar itself, where it can
                 // move.
                 self.warn(&format!("retry {attempt} after a failure: {error}"));
-                self.waiting(&format!("waiting before retry {attempt}"), *after);
+                self.wait_for("retry", &format!("waiting before retry {attempt}"), *after);
             }
             // The pager says what it saw; `report` says it in English.
             Event::Warning(warning) => self.warn(&crate::report::pager_warning(*warning)),
@@ -356,7 +471,19 @@ impl Progress {
             Event::Resumed { slept } => {
                 self.warn(&crate::report::slept_during_the_walk(*slept));
             }
-            Event::Finished { users, reason, .. } => {
+            Event::Finished {
+                pages,
+                users,
+                reason,
+            } => {
+                self.tell(
+                    "finished",
+                    |told| {
+                        told.page = *pages;
+                        told.accounts = *users;
+                    },
+                    serde_json::json!({ "reason": reason.as_str() }),
+                );
                 self.set_deadline(None);
                 self.freeze(*users, *reason);
             }
@@ -446,6 +573,49 @@ impl Progress {
         } else {
             self.stack.suspend(f)
         }
+    }
+
+    /// Under `--progress-json`, the list the walk about to start reads, said
+    /// on every line from then on (`list`); nothing is drawn for it.
+    pub fn walking(&self, list: snob_core::model::ListKind) {
+        if let Some(told) = &self.told {
+            told.lock().unwrap_or_else(|e| e.into_inner()).list = Some(list.as_str());
+        }
+    }
+
+    /// Under `--progress-json`, where a list came from once the engine has
+    /// answered for it: `{"progress": {"event": "served", "list", "from",
+    /// "taken_at", "cooldown_until", "reason"}}`. `from` is the provenance's
+    /// word (`engine::Provenance::as_str`), `taken_at` when the list was
+    /// read, in seconds, `cooldown_until` when a cooldown that had it served
+    /// from storage lifts, and `reason` how the walk that read it ended
+    /// (`StopReason::as_str`; `completed` for a stored list): a list cut
+    /// short by `--max-pages` is answered as a success, and only this says
+    /// it is not the whole list, with `accounts` and `of` (the walk's, as on
+    /// every line) saying how much of it was read. A job's reader hands it
+    /// on (`jobs::show::finished`), and so does `snob mcp` for a call it ran
+    /// with this flag, so an agent is told a stored list is one, and how old,
+    /// and a short one is short, as a person is told in the warning and the
+    /// summary; nothing is drawn for it.
+    pub fn served(
+        &self,
+        list: snob_core::model::ListKind,
+        from: &str,
+        taken_at: snob_core::Epoch,
+        cooldown_until: Option<snob_core::Epoch>,
+        reason: snob_core::model::StopReason,
+    ) {
+        self.tell(
+            "served",
+            |_| {},
+            serde_json::json!({
+                "list": list.as_str(),
+                "from": from,
+                "taken_at": taken_at,
+                "cooldown_until": cooldown_until,
+                "reason": reason.as_str(),
+            }),
+        );
     }
 
     /// Ends the stack, frozen lines included, and leaves it ready for the
@@ -632,6 +802,46 @@ fn seconds_left(left: Duration) -> u128 {
 mod tests {
     use super::*;
 
+    /// A job's walk is read by its lines: under `--progress-json` they come
+    /// even when the command line said `--no-progress`, no bar draws, and each
+    /// says where the walk is.
+    #[test]
+    fn progress_json_wins_over_no_progress() {
+        let silent = Progress::built(false, false);
+        assert_eq!(silent.line("page", |_| {}, serde_json::Value::Null), None);
+
+        let p = Progress::built(false, true);
+        assert!(p.quiet && p.stack.is_hidden());
+        let started = p
+            .line(
+                "started",
+                |told| told.of = Some(120),
+                serde_json::json!({ "resumed": false }),
+            )
+            .unwrap();
+        let page = p
+            .line(
+                "page",
+                |told| {
+                    told.page = 3;
+                    told.accounts = 36;
+                },
+                serde_json::Value::Null,
+            )
+            .unwrap();
+        let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+        let page: serde_json::Value = serde_json::from_str(&page).unwrap();
+        assert_eq!(started["progress"]["event"], "started");
+        assert_eq!(page["progress"]["event"], "page");
+        assert_eq!(page["progress"]["page"], 3);
+        assert_eq!(page["progress"]["accounts"], 36);
+        assert_eq!(page["progress"]["of"], 120, "the total is carried on");
+        assert!(page["progress"]["at"].as_i64().is_some());
+        // And the events themselves keep them coming: a drawing flag of
+        // `true` changes nothing under the JSON.
+        assert!(Progress::built(true, true).stack.is_hidden());
+    }
+
     const EVERY_TEMPLATE: [&str; 5] = [
         TEMPLATE_WITHOUT_TOTAL,
         TEMPLATE_WITH_TOTAL,
@@ -701,6 +911,11 @@ mod tests {
             running_total,
             added: 50,
             received: 50,
+            sitting: snob_core::budget::Sitting {
+                pages: number % 40,
+                last_page_at: snob_core::EpochMs::new(0),
+                rest_until: None,
+            },
         }
     }
 

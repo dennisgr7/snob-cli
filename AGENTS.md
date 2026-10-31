@@ -1,779 +1,978 @@
 # AGENTS.md
 
-Context for working on this project. `CLAUDE.md` points here; this is the only
-instruction document. It describes the current state of the tree; history and
-the reasoning behind individual changes live in the commit messages.
+Instructions for anyone, human or agent, changing this repository. `CLAUDE.md`
+points here. Code comments cite this file by section name ("Known walls",
+"Costs worth knowing", "Stories are handed to the system viewer", the write
+regime, the rules below), so rename a section only together with the comments
+that cite it (`grep -rn AGENTS.md crates`).
 
-**Detailed reasoning lives in the doc-comment above the code it governs, not
-here.** Read it before changing anything it names, because it explains what a
-number is for, which is what stops it being changed into something that no longer
-does its job:
+The code documents itself heavily: every module opens with a `//!` header that
+says what it is for and which rule it keeps, and every dependency, feature,
+workflow step and magic number has its reason written beside it. **Read the
+header of a file before changing it.** This document is the map and the rules
+that span files; it does not repeat what a header already says.
 
-| Subject | Where |
-|---|---|
-| Request pacing, the numbers and where they come from | `crates/snob-ig/src/pace.rs` |
-| The calls snob may send, and the check that refuses the rest | `crates/snob-ig/src/allowlist.rs` |
-| How each call is built, in the app's own families | `crates/snob-ig/src/web.rs` |
-| The values read from the page and sent back | `crates/snob-ig/src/page_values.rs` |
-| Stop conditions of a walk | `crates/snob-ig/src/pager.rs` |
-| The browser, what a headless one gives away, the tab | `crates/snob-cli/src/headless/mod.rs`, `tab.rs`, `identity.rs` |
-| What the browser listens for (push-back) | `headless/listen.rs` |
-| What the tab lets out (the guard) | `headless/guard.rs` |
-| The one process that runs the browsers | `crates/snob-cli/src/owner/` |
-| The cookie boundary and the protocol client | `cdp/mod.rs`, `cdp/connection.rs`, `pipe.rs` |
-| Request budget, cooldowns, the common brake | `snob-core/src/budget.rs`, `snob-store/src/store/rate_budget.rs` |
-| The schema | `crates/snob-store/src/store/sql/` |
-| Telling that the machine slept in the middle of a walk | `crates/snob-ig/src/awake.rs` |
-| What snob asks of the system's power management: keeping it awake, the battery | `crates/snob-cli/src/power/` |
+## What snob is, and the lines it does not cross
 
-## What this is
+`snob` is an Instagram CLI (binary `snob`, crate `snob-cli`, version in
+`[workspace.package]` of `Cargo.toml`). It walks followers and following lists
+and crosses them (`unfollowers`, `fans`, `friends`, `scan`), shows profiles,
+stories, highlights, posts and reels and downloads their media, imports
+Instagram's own data export (`import dyi`, no network at all), and monitors
+accounts over time (`watch`, with webhooks). It signs in as the user, through
+Instagram's own **web** API (`www.instagram.com`, never the mobile API), and by
+default sends every request from a Chromium-based browser installed on the
+machine (Chrome, Edge, Brave, Chromium), headless, on a profile of snob's own.
 
-`snob` (Snob CLI) is an Instagram client for the terminal. It tells you who does
-not follow you back and tracks changes to your followers and following over
-time; follows and unfollows one account at a time; shows an account's page the
-way Instagram does; shows and downloads stories, highlights, posts and reels;
-and prints everything in stable forms that scripts and AI agents can read. A
-single Rust binary that drives a Chromium-based
-browser installed on the machine. Windows and Linux on x86_64 and ARM64, macOS
-on Apple Silicon.
+Hard lines, each enforced by code or a test, never by convention alone:
 
-It is a convenience tool for a person's own accounts, signed in as themselves.
-Everything it shows is what the app already shows the same person, read faster
-and in a form they can keep. That gap is the reason the project exists, and it
-bounds the scope: one person's accounts, at human scale, doing by command what
-the person could do by scrolling.
+- **Two writes, ever: follow and unfollow.** No block, remove-follower, like,
+  comment, message, share. `snob_ig::graphql::Mutation` has exactly two
+  variants and its matches have no wildcard arm, so a third write is a compile
+  error; a test in `graphql.rs` pins the operation names. `IgClient::post`
+  (in `crates/snob-ig/src/client/write.rs`, the only file that writes) takes a
+  `Mutation`, never a path.
+- **Nothing ever marks anything as seen**: stories, reels, posts, the activity
+  feed, threads, search history, time spent, view counts.
+  `crates/snob-core/tests/no_seen.rs` fails on any known spelling of such a
+  call in any `.rs` file (it is the only file allowed to name them), and
+  `snob_ig::allowlist` refuses every call it does not name. Reading a reel
+  does not register a view; sending the seen call would.
+- **The user's own browser is never touched.** No reading of its cookie store
+  (on Windows that would mean defeating App-Bound Encryption). snob logs in
+  in a window it opens on its own profile, or takes a pasted `sessionid`, or
+  relays its own headless browser to the user's (`login --remote`). The
+  password is never seen by snob except as keystrokes relayed over `--remote`,
+  which are passed to its browser and kept nowhere.
+- **A human pace, a hard stop on the first push-back.** See "Talking to
+  Instagram" below. Slower is always acceptable; faster has to be argued for
+  in the code, next to the number.
+- **Consent before enumerating someone else's lists**, asked before the
+  account is even resolved (resolving is already a request).
 
-There is no official API for listing followers, so snob asks the same web API
-instagram.com asks, with the user's own session, **from a real browser**: every
-request leaves from a Chrome, Edge, Brave or Chromium that snob runs without a
-window against its own profile, sent with `fetch()` from an instagram.com tab.
-Automating that is outside Instagram's Terms of Use, and the realistic outcome is
-that Instagram asks the account to verify itself. **Most of the design goes into
-being a light, well-behaved client**: modest volume, the app's own requests, and
-an immediate stop when the service pushes back.
+## Workspace map
 
-Commands (`crates/snob-cli/src/cli.rs` is the source of truth; `snob --help` and
-`snob <command> --help` print it):
+Rust 2024 edition, resolver 3. Dependency direction is one-way:
+`snob-cli -> snob-store, snob-ig -> snob-core`; `snob-ig` never depends on
+`snob-store`.
 
-- Session and accounts: `login` (`--paste`, `--browser`, `--add`), `whoami`,
-  `status` (`--session`, `--budget`, `--cooldown`, `--lists`, `--watch`),
-  `account list`, `account use`, `logout` (`--all`), `purge` (`--account`,
-  `--dry-run`).
-- Lists: `unfollowers`, `fans`, `friends`, `followers`, `following`, `scan`.
-  `--dry-run` on any of them estimates the walks out of what is stored
-  (`engine::estimate`, the pacer run forward on paper) and sends nothing and
-  writes nothing: no resolution, no consent asked, and every flag it would
-  ignore refused.
-- One account: `profile`, `pfp`, `stories`, `highlights`, `posts`.
-- `-o -` is standard output everywhere: a listing or a document goes there as
-  with no `-o` (never to a file named `-`), and a download (`pfp`, `-d`) writes
-  its one file there, refused before any request when the command line already
-  names several or standard output is a terminal.
-- One file of the CDN by its address, with no account: `fetch`.
-- One post: `post` (alias `reel`), by its link or its code.
-- The only two writes: `follow`, `unfollow`.
-- The monitor: `watch` (the scheduled loop), `watch once`, `watch diff`,
-  `watch check`, `watch setup`, `watch status`.
-- `import dyi`, which reads Instagram's own export and sends nothing.
-- Hidden: `__browser-owner` (the process that runs the browsers); with the
-  `testing` feature, `--sandbox-root`, `--ig-base-url`, `--through-the-browser`.
+| Crate | What lives there | What must not |
+|---|---|---|
+| `crates/snob-core` | Domain: `Pk`, models (the JSON contract), set arithmetic, `watch` diff, schedule (cron and `--on/--at/--every`), webhook signing (HMAC-SHA256) and the one constant-time comparison (`watch::sign::same`), `Secret`, `Session`, the `RateBudget` trait and cooldown policy, `clock` | **No I/O.** No file, database, network or directory; `clock` is the single exception |
+| `crates/snob-ig` | Instagram web client: `client/` (`read.rs`, `write.rs`, `transport.rs`, `headers.rs`, `cdn.rs`, `media.rs`, `page.rs`, `ask.rs`, `posts.rs`), `web.rs` (calls built as the web app builds them), `allowlist.rs`, `pager.rs` (list walks), `pace.rs`, `graphql.rs`, `error.rs` (classifying answers), `http.rs` (the only place `reqwest` is configured; re-exported) | No SQLite, no keyring, no browser driving (it defines the page request shape only) |
+| `crates/snob-store` | SQLite (`store/`, migrations in `store/sql/`), platform paths, keyring/file secret store, account registry (`accounts.toml`), the monitor's `watch.toml`, layout migration | Domain logic that belongs in `snob-core` |
+| `crates/snob-cli` | `cli.rs` (clap), `main.rs`, `app.rs` (wires everything), `commands/`, `engine/` (rules: cache, consent, cooldown, walks, estimates, monitor), `output/`, `report.rs` (shared sentences), `ui/` (ratatui views), `headless/` + `cdp/` + `pipe.rs` (the browser), `owner/` (one background process that owns the browsers), `detach.rs` (starting a process that outlives its command, with nothing of the command's), `jobs/` (a list walk run as a job that outlives the call that started it: the hidden `__job start|run|show|list|cancel`, and `snob jobs`), `relay/` (`login --remote`), `power/`, `watch/webhook.rs`, `commands/mcp/` (the MCP server, feature `mcp`; over HTTP, `mcp-http`) | |
 
-Several accounts can be signed in; each command acts as one of them, chosen by the
-global `--account`, then `SNOB_ACCOUNT`, then the active account, then the only
-one (`account::resolve`). JSON answers and failures name it in `viewer`.
+Layering rules inside `snob-cli`:
 
-## Rules
+- **Commands take an `App`** and orchestrate; they never build a client or
+  open a database themselves. The exceptions say so in their header
+  (`status`, `--dry-run`, `fetch`).
+- **`engine` returns data and where it came from; it never decides how
+  anything looks.** Wording and exit codes for those outcomes live in
+  `commands` and `report.rs`. `engine::list` is the one place every list comes
+  out of, in a fixed order: cooldown, consent, counter poll, freshness, walk.
+  It knows nothing about delivery (`WatchConfig` stays out of it).
+- In `commands/watch/`, `say.rs` is prose (rewording is free) and `wire.rs` is
+  protocol (`SENT_SCHEMA = 1`, `PRINTED_SCHEMA = 2`; what is signed, stored
+  and deduplicated on `run_id`). An edit to `wire.rs` is an integration change.
 
-Standing instructions from the maintainer. They are not up for re-litigation in
-a normal change.
+## Build, lint, test: what CI runs
 
-- **Branches**: `main` is stable and only good versions land there; `dev` is
-  day-to-day work. Changes come in through pull requests.
-- **Everything is written in English**: code, identifiers, comments, user-facing
-  strings and documentation. US spelling. `crates/snob-core/tests/language.rs`
-  enforces it on every file git would commit, Markdown and config files too, this
-  one and `README.md` included. What `.gitignore` declares scratch (`/docs/`) is
-  not read. On a false positive fix the test's word list rather than disabling it.
-- **`cargo fmt` and `cargo clippy --workspace --all-targets --all-features
-  --locked -- -D warnings` before every commit**, and the same without default
-  features (see below). Commit messages are in English, imperative, with no
-  conventional-commit prefixes.
-- **`README.md` is short and read by people first**: what the tool is, how to
-  install it, the main commands, the flags for automation. Details belong in
-  `--help`. If it ever shows the webhook body as a ```` ```json ```` block,
-  `the_readme_publishes_the_body_that_goes_out` (`commands/watch/wire.rs`) checks
-  that block against the real payload.
-- Prefer the compiled, dependency-free option. Native binary, instant start, broad
-  platform support is the point of the project. A new dependency has to argue for
-  itself; the trades already weighed and declined are in the comments of the
-  workspace `Cargo.toml`, next to the tables they concern.
-- **The command line keeps three conventions**:
-  - **One question per command, and `-y` answers it in advance.** The flag groups
-    in `cli.rs` (`ConsentArgs`, `ProgressArgs`, `StatusOutputArgs`, `FilterArgs`,
-    `OutputArgs`, `WalkArgs`) hold this structurally: a flag a command would
-    ignore is refused by clap rather than warned about.
-  - **`--json` is for a status object; `--format` is for a document.** `whoami`,
-    `status`, `account list` and the `watch` subcommands take `--json`; everything that
-    prints a thing a person reads takes `--format`, with an enum narrowed to the
-    forms it has.
-  - **Interactivity is detected, and said beats detected.** The full-screen
-    browsers are the default exactly when all three standard streams are a
-    human's terminal and no flag asked for the printed or downloaded form. `-i`
-    forces a browser; `--no-interactive` prints. The one copy of the ordering is
-    `cli::browse_decision`; the three-stream predicate is
-    `ui::a_human_would_watch_the_listing_scroll_by`. The two wizards (`login` with
-    no method flag, `watch setup`) are the written exception, and each has a
-    non-interactive route beside it (`login --paste`; `watch.toml` by hand).
-  - `--offline` is the one word for "spend no network". The short-flag space is
-    deliberately almost empty (`-y -o -d -i`) and a new short flag has to argue for
-    itself first. There is no REPL and no global interactive mode.
-- **Instagram commands never carry an at sign in examples**: on PowerShell `@` is
-  the splatting operator and the argument vanishes. `language.rs` fails the build
-  on one in a command to type back. Names are accepted without the sign.
+The toolchain is pinned in `rust-toolchain.toml` (`1.97.1`, with rustfmt and
+clippy); `rust-version = "1.95"` is the floor for `cargo install --git`. Bump
+the toolchain together with `tools/ci/Dockerfile` (`FROM rust:1.97.1-...`).
+Every command that resolves dependencies takes `--locked`.
 
-And the domain rules, which exist because breaking them puts a real account at
-risk:
-
-- **Two write operations exist, and no third one may be added.** Follow and
-  unfollow, one account per invocation, no bulk mode and no flag that makes one.
-  Each is paid out of its own, far slower budget (one write per fifteen minutes,
-  three in a row), confirmed before it is sent, and a `feedback_required` on one
-  is an action block with a twelve-hour cooldown. **Nothing may mark a story as
-  seen**, which is a write dressed as a read. Enforcement is structural: a write
-  leaves only through `IgClient::post` or as a `web::Ask::Write`, both take a
-  `graphql::Mutation`, and neither can be reached without paying the write budget,
-  which the variant chooses, so a new write is a build error until somebody has
-  written the variant. `crates/snob-core/tests/no_seen.rs` is the backstop: a
-  denylist of the seen signals, and the only file that may name them.
-- **Never read or decrypt the user's browser cookie store.** The allowed route is a
-  browser *we launched* against *our own* profile, which the user logs into
-  themselves and which hands the cookies over through its debugging protocol. A
-  pasted session is written into that profile, never taken out of anybody else's.
-- **On the first 429, `spam:true`, `feedback_required` or `challenge_required`:
-  hard stop.** No retry in that run, and the account goes into cooldown. When the
-  service says no, the answer is to stop asking. A refusal is never worked around
-  by asking somewhere else (`IgError::worth_a_second_route`).
-- **Request pacing is not changed without a documented reason.** Slower is always
-  acceptable; faster has to be argued for in `pace.rs`. See "Pacing" below.
-- **Never walk a real account's lists without the limiter.** Live-API testing is
-  done with single, counted requests, by the owner, with the log open.
-- **No test may touch the real keyring.** Tests use their own service name through
-  `SecretStore::with_service`, and `crates/snob-core/tests/keyring.rs` reads the
-  source of every crate to check that they do.
-
-### Real accounts: what an agent must not do
-
-- **Do not run `snob` against real Instagram on your own initiative.** No `login`,
-  no list, `profile`, `stories`, `follow`, `watch` or `import` of a live session on
-  the maintainer's machine, and nothing that starts a browser on a real profile.
-  The environment's keyring and data directory hold real sessions. Every test and
-  experiment goes through the sandbox (`--sandbox-root`, the fake in
-  `tests/common/ig.rs`).
-- A live check is a handful of counted requests, made by the account's owner
-  with `--verbose` and `browser-owner.log` open, each step read before the next
-  and stopped at the first push-back. Never unattended.
-- Never use `SNOB_IGNORE_COOLDOWN` (the undocumented escape hatch in
-  `rate_budget.rs`) against a real account, and never lower a number in `pace.rs`
-  or `rate_budget.rs` to make a test or a run faster.
-- A capture of the real app (`tools/capture/record.js`, its `out/`, and any
-  recording kept elsewhere) carries real names and messages even after redaction.
-  `out/` is gitignored; never commit one, and delete what it showed once it is
-  written down.
-- Do not delete or reset the user's data directory, browser profiles or keyring
-  entries to "clean up". `snob purge` is the sanctioned route and it is the
-  owner's decision.
-
-## Working on it
+`.github/workflows/ci.yml`, job **lint** (Ubuntu):
 
 ```bash
-cargo build --locked                       # debug binary: target/debug/snob
-cargo test --workspace --locked            # everything
-cargo test -p snob-ig pager                # one module
-cargo test -p snob-cli --test cache        # one integration file
-cargo test the_first_run_walks_the_list    # one test by name
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo clippy -p snob-cli --all-targets --no-default-features --locked -- -D warnings
-cargo test -p snob-cli --features testing --locked   # the binary itself, on the fake
-cargo run -p snob-cli -- --help            # mind the double dash
 ```
 
-`rust-toolchain.toml` pins an exact compiler (1.97.1); the manifest's
-`rust-version` is 1.95, the oldest every locked dependency accepts. The lint
-policy lives in the workspace manifest (`undocumented_unsafe_blocks`,
-`return_self_not_must_use`), so plain `cargo clippy` gives CI's answer. Every
-`unsafe` block carries a `// SAFETY:` comment.
+plus a check that `bash packaging/render.sh <version> SHA256SUMS` reproduces
+the committed `Formula/`, `bucket/` and `packaging/winget/` (skipped while the
+version is unreleased). Never hand-edit those files.
 
-**The `testing` feature is what lets a test drive the program**; everything else in
-the suite drives a library. It adds three hidden flags a released binary contains
-none of. `--sandbox-root` puts every file a run touches under one directory,
-forces the file secret backend, and derives a keyring service name from that root,
-which is what actually separates a sandbox from the real credentials.
-`--ig-base-url` **requires** `--sandbox-root`; that pairing is the whole safety
-argument (`main::wiring`). `--through-the-browser` requires `--ig-base-url` and
-sends the redirected requests from the headless browser too, which is how
-`tests/headless.rs` drives the path users take; without it a sandbox reaches its
-mock server with `reqwest`, so the rest of the suite needs no browser.
-`crates/snob-core/tests/sandbox.rs` reads the source to keep all of this out of a
-release. Plain `cargo test --workspace` compiles none of it, so run the `testing`
-suite too before pushing; CI runs it as its own step on every platform.
+Job **test**, on `ubuntu-latest`, `ubuntu-24.04-arm`, `windows-latest`,
+`windows-11-arm`, `macos-latest`:
 
-**`tests/web.rs` runs the browser path without a browser.** Its tab
-(`common::tab::TestTab`) builds each intent with the same `web::build_call` the
-headless tab runs and sends it with `reqwest`, against `common::ig::World`: one
-invented Instagram that serves both the web app's shapes (`serve_web`) and the
-REST path's (`serve_rest`). `World::audit` replays what reached the fake through
-`allowlist::refused`, so a test can end by checking that snob sent nothing it may
-not.
+```bash
+# Windows and macOS: clippy again (Linux never compiles cfg(windows)/macOS code)
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+SNOB_TEST_REQUIRE_BROWSER=1 cargo test --workspace --locked
+SNOB_TEST_REQUIRE_BROWSER=1 cargo test -p snob-cli --features testing --locked -- --test-threads=1
 
-**`tests/headless.rs` skips where no browser will start**: the Linux runners (no
-Chrome on ARM64, no user namespaces for its sandbox on x86_64) and anything
-running as root. It runs for real on the Windows and macOS runners, where CI sets
-`SNOB_TEST_REQUIRE_BROWSER` so a browser that will not start fails it (and
-`tests/browser_pipe.rs`) instead of skipping. Locally on Linux run it as an
-ordinary user with a `chromium` on `PATH`. Its tests take turns with the browser,
-one at a time, since browsers started together on a loaded machine hold their
-profiles past the patience the tests give them; on Windows it is only reliable
-single-threaded.
-
-**The two routes show the same thing**: `the_two_paths_show_the_same` in
-`tests/headless.rs` runs each command through the browser and through REST on
-the same fake and compares the output; the differences allowed are listed in
-`EXPECTED_DIFFERENCES`, each with its reason. `tools/parity/tui.sh` does the same
-for the full-screen views, between any two binaries.
-
-**The Linux CI job runs on this machine too**, in a container: `bash
-tools/ci/run.sh` (from Git Bash on Windows). It is the job that differs most from a
-developer's host: musl, a real Secret Service keyring behind a session bus, a
-static link. `tools/ci/ci.sh` mirrors `.github/workflows/ci.yml` and has to be kept
-in step with it; the image names the compiler again in `tools/ci/Dockerfile`, so
-bump it together with `rust-toolchain.toml`.
-
-Remote CI (`.github/workflows/ci.yml`) runs fmt, clippy with `--all-features` and
-again without default features, and the suite on Linux x86_64 and ARM64 (musl),
-Windows x86_64 and ARM64 (the one on schannel) and macOS, then builds the five
-release targets and a `.deb`. Clippy runs once more on Windows and macOS, since the
-Linux job never compiles their `cfg` code. `supply-chain.yml` runs `cargo deny`
-(advisories, sources, licenses; `deny.toml`) on a weekly timer and on pushes.
-
-**The browser recorder is `node tools/capture/record.js`** (needs `playwright`): it
-launches Chrome with a throwaway profile, the person browses by hand, and every
-API call, click, console line and socket frame lands redacted in
-`tools/capture/out/<timestamp>/events.jsonl`. `summarize.js` reads it back and
-`sanitize.js` cleans an older recording. It is how a change in the web app is
-studied before snob follows it.
-
-Releases are tag-driven (`.github/workflows/release.yml`) and reproducible: the
-tag must be on a commit that reached `main` and agree with the manifest version;
-the notes are generated from the commits since the last tag. `rust-toolchain.toml` pins the
-compiler, `/Brepro` is in both Windows tables of `.cargo/config.toml`, and the
-archives get a deterministic mtime. Two builds of one tag produce the same bytes;
-keep it that way. Packaging lives under `packaging/` (`render.sh` writes the
-Homebrew formula in `Formula/`, the Scoop manifest in `bucket/` and the winget
-manifests from a release's `SHA256SUMS`; `install.sh` and `install.ps1`), and the
-`.deb` is described in `crates/snob-cli/Cargo.toml` and packages the README.
-
-## The website
-
-`web/` is the project's site, `snob.dennisgr7.dev`: Astro 7, fully static,
-served by Cloudflare as a Worker with static assets and no Worker code
-(`web/wrangler.jsonc`). Workers Builds is connected to the repository with `web/`
-as its root: a push to `main` deploys, any other branch uploads a version with a
-preview URL. It shares nothing with the Rust workspace but the repository and the
-rules above (English, US spelling; `language.rs` reads its `.md`, `.json` and
-`.yaml` too, and skips `pnpm-lock.yaml` by name as a generated file).
-
-- **The look is decided in `web/DESIGN.md`**: who the page is for, the mark, the
-  tokens, the sections and the limits on scripts. Read it before changing anything
-  visual; `/design-system` on the dev server shows every token and component.
-- **The Workers Builds connection** (Workers & Pages, Create, Continue with
-  GitHub, access to this repository only): Worker name `snob-web` (it must match
-  `wrangler.jsonc`), root directory `web`, production branch `main`, build
-  command `pnpm build`, deploy command `pnpm exec wrangler deploy`, non-production
-  branches `pnpm exec wrangler versions upload`. No build variables: Node comes
-  from `web/.node-version`, and the image's older pnpm switches itself to the one
-  `packageManager` names. The custom domain is created by the first deploy, not
-  by hand in DNS; the `dennisgr7.dev` zone has to be in the same Cloudflare
-  account as the Worker.
-- **pnpm only**, run from `web/` (`pnpm install`, `pnpm dev`, `pnpm check`,
-  `pnpm build`; `pnpm preview` serves `dist/` through Wrangler, with the
-  production headers and 404). Wrangler is a pinned dev dependency, so a deploy
-  never runs whatever version `npx` finds that day. The supply-chain policy is `web/pnpm-workspace.yaml`: a 24-hour
-  quarantine on fresh versions, no exotic transitive sources, install scripts
-  blocked except the ones listed in `allowBuilds`, exact versions. A new
-  dependency has to argue for itself, as in the workspace. Node is pinned in
-  `web/.node-version`.
-- **`pnpm check` with 0 errors, 0 warnings, 0 hints, a clean `pnpm build` and a
-  green `pnpm test`** before every commit that touches `web/`. The tests are
-  Playwright's, against the build served by Wrangler as production serves it
-  (headers, 404 status); they need a build first and Chromium, installed on
-  purpose with `pnpm exec playwright install chromium`, never by a postinstall.
-  `.github/workflows/web.yml` runs the same steps on every change under `web/`.
-- **One source for the site's identity**, `web/src/lib/site.ts`: the domain
-  (`site`), the name and the description. The canonical URL, the sitemap, Open
-  Graph, the JSON-LD and the generated `robots.txt` and `llms.txt` all read it.
-  The domain must be the root of a host; under a path, crawlers never find
-  `robots.txt` or `llms.txt`.
-- **The Content Security Policy is the `<meta>` Astro writes** from `security.csp`
-  in `web/astro.config.mjs`, with the hash of every script and style each page
-  runs. No `'unsafe-inline'`, no third-party origins, no inline `style`
-  attributes, and Shiki stays off (it styles inline). `web/public/_headers` adds
-  what a `<meta>` cannot carry (`frame-ancestors`, which lets only dennisgr7.dev
-  frame the page for its live preview, HSTS, `nosniff`, the referrer
-  and permissions policies, the `llms.txt` link) and keeps version URLs out of
-  search. A response with both policies must satisfy both.
-- **Every page goes through `BaseLayout`**: title, description, canonical, robots,
-  Open Graph, Twitter card and the JSON-LD `@graph` (`web/src/lib/jsonld.ts`,
-  `<` escaped). A new page also gets a line in `llms.txt` and a Markdown twin
-  (`index.md.ts`, `web/src/lib/markdown.ts`); a `noindex` page is kept out of the
-  sitemap in `astro.config.mjs`.
-- **Every word on the page is in `web/src/lib/content.ts`**, which the HTML, the
-  twin and `llms.txt` all read, so `tests/agents.spec.ts` can hold them to each
-  other. Output shown there is what snob prints, with invented accounts; it is
-  checked against the code, not imagined. The release version comes from the
-  workspace `Cargo.toml` at build time. `content.ts` imports with relative `.ts`
-  paths, not `@/`, because `scripts/brand.mjs` loads it under plain Node.
-- **`pnpm brand`** redraws `og.png` and the icons in `web/public/` with
-  Playwright's Chromium and the built Plex files (build first); the images are
-  committed. Run it when the mark, the headline or the domain changes.
-- **`web/public/googledbdae8cd579cba2e.html` proves ownership to Google Search
-  Console** (the `https://snob.dennisgr7.dev/` property). Google checks it again
-  from time to time: deleting or renaming it loses the property.
-- No client JavaScript unless a feature cannot work without it. Tailwind v4 runs
-  as a Vite plugin with its entry in `web/src/styles/global.css`; there is no
-  `tailwind.config.js`. TypeScript strict, `@/` is `web/src/`.
-
-## Architecture
-
-Four crates, and the line between the first two is the one worth knowing:
-
-| Crate | Responsibility |
-|---|---|
-| `snob-core` | Domain: models (`Pk`, `Epoch`, `User`), sets, filters, the diff, the schedule, the webhook signature, the request-budget **interface** (`budget`), the session and secret types, the clock. **No I/O** |
-| `snob-store` | Everything kept on the machine: the SQLite databases and migrations, the platform directories (`paths`), the keyring (`secrets`), the account registry, `layout` (migration from the single-account layout), `watch.toml` (`config`) |
-| `snob-ig` | Instagram's web API: the allowlist, the call builders, the page values, the client, pagination, pacing, error classification, the browser seam (`client::page`) |
-| `snob-cli` | The `snob` binary, plus a library so commands can be tested: `cli`, `app`, `engine`, `commands`, `output`, `report`, `ui`, `headless`, `cdp`, `owner`, `pipe` |
-
-**`snob-ig` depends on `snob-core` and on nothing under it**: the Instagram client
-compiles no SQLite, no keyring and no TOML parser, and no browser code.
-
-The tool is a session, a database and a request budget, and a browser the requests
-leave from. Everything else is a way of asking those something:
-
-```
-                         app::App
-             the only place they are assembled:
-        client · store · progress · cancellation · viewer
-                            │
-  engine::  target · freshness · cooldown · walk · people · check · watch
-                            │
-                       commands::*
-              orchestration and presentation only
-                            │
-              output::* · report::* · exit::*
+# Linux: against musl, inside a session bus with gnome-keyring unlocked
+dbus-run-session -- bash -c '
+  echo "" | gnome-keyring-daemon --unlock --components=secrets
+  cargo test --workspace --locked --target "$(uname -m)-unknown-linux-musl"
+  cargo test -p snob-cli --features testing --locked --target "$(uname -m)-unknown-linux-musl"'
 ```
 
-Two rules keep it that way:
+Job **build** (pushes only, not pull requests): `cargo build --release --locked
+--target <triple> -p snob-cli` for the five release targets, runs `--version`,
+checks the musl binaries are static, and builds the `.deb` with
+`cargo-deb@3.7.0`.
 
-- **`engine` returns data and where the data came from. It never decides how
-  anything looks.** Wording, formats and exit codes live in `commands`, `report`,
-  `output` and `exit`; the one exception is the code an outcome exits with, which
-  the outcome names (`ListOutcome::exit_code`, `check::Verdict::exit_code`). Every
-  list, crossing and summary comes out of `engine::list`.
-- **`commands` never builds a client or opens a database. It takes an `App`.** A
-  command that assembles its own dependencies can be handed a different budget
-  than the rest, which is how rate control gets bypassed by accident. The listed
-  exceptions each say why at the line that does it: `whoami` builds an `IgClient`
-  directly (it reports on a session that may be dead) but still takes its budget
-  through `app::pacer_saying_a_line`; the monitor's run, scheduled loop and
-  `status` call `Store::open_existing` directly (a connection is not held across
-  a day-long sleep); `purge --account` and the scheduled loop open `shared.db`;
-  `snob status` and `--dry-run` read the account's database and `shared.db`
-  with `read_existing` (`store::read_only`: no migration in place, no
-  checkpoint, `query_only`) and the budget with `rate_budget::state`, which
-  charges nothing (an `App` would create the database, migrate it, settle the
-  day's retention and refresh the session, and a report must not write);
-  `snob fetch` builds a `CdnClient` and nothing else (a known CDN address
-  needs no account, so it sends no session, pays no budget and starts no
-  browser, and works with nobody signed in; the stored session is read only
-  for its User-Agent, when `--user-agent` does not give one).
+`.github/workflows/supply-chain.yml` (also weekly): `cargo deny check
+advisories sources licenses`. Not a bare `cargo deny check`: `bans` is off on
+purpose and fails. Every `ignore` entry in `deny.toml` needs a reason and the
+condition under which it goes; a new release target must be added to
+`[graph] targets`.
 
-**Everything that acts as an account goes through `account::resolve`, and no query
-opens another account's database.** An account's database and session file are
-reachable only from its `AccountPaths` (`AppPaths::account(pk)`), and its session
-only from its `SessionStore` (`SecretStore::session_of`), so a function that acts
-as an account says which in its signature. `App::open` refuses a session whose
-`ds_user_id` is not the account's. The places that look past the account in use are
-few and each says why: the layout migration (`snob_store::layout::settle`), `login`,
-`purge`, `logout --all`, `account list`, the account picker of the full-screen
-views (`ui::accounts`), the monitor's run over every viewer
-(`commands::watch::run::run_viewers`) and `watch status`, and the browser's
-write-back and listener, which write to the account whose browser it was.
+Locally:
 
-### Storage
+- On the maintainer's Windows machine, the CI lint and test commands above run
+  as written (with `SNOB_TEST_REQUIRE_BROWSER` optional). Remember they do not
+  compile `cfg(unix)`/Linux code.
+- `bash tools/ci/run.sh` runs the Linux job (musl, real Secret Service keyring)
+  in Docker; `tools/ci/ci.sh` is what the container runs and must stay in step
+  with `ci.yml`.
+- **Never export `RUSTFLAGS`**: it replaces `.cargo/config.toml` rather than
+  merging, silently dropping `+crt-static` and `/Brepro` on Windows (the
+  binaries would then need the VC++ redistributable). Add flags to a table in
+  `.cargo/config.toml` or to a second config file, as `release.yml` does.
 
-SQLite in the platform's **local** data directory (WAL on a synced directory is a
-documented corruption cause), one database per account at `accounts/<pk>/snob.db`:
-its lists, walks, monitor history, request budget and cooldowns. Migrations are
-`crates/snob-store/src/store/sql/001..012`, and a released migration is left as it
-shipped. `accounts.toml` beside them lists the accounts and the active one and is
-written only through `Registry::update` (under a lock). `shared.db` holds the
-push-backs every account received, which each account's budget reads to stop with
-the others (`budget::common_brake`), and the monitor's interval seed. Every table
-is `STRICT`; comparison code reads the `usable_snapshots` view, which cannot return
-an incomplete capture. A walk in progress holds a soft lease
-(`snapshots.claimed_by`/`claimed_at`); the invariants are at `store/snapshots.rs`.
-Captures are kept 30 days. `watch.toml` is in the configuration directory (the
-roaming one on Windows), schema 2, one for every account, each `[[account]]` naming
-its `viewer`; **no secret is in it**: the webhook token and signing key go to the
-keyring. The data directory is private (0700, or a protected DACL on Windows,
-`paths::create_private_dir`). An account is named by its id everywhere snob files
-it, never by its username.
+## Tests
 
-## The web-client engine
+- Unit tests sit in `#[cfg(test)] mod tests` at the bottom of each file;
+  integration tests in `crates/<crate>/tests/`, with shared fixtures in
+  `tests/common/`. Test names are sentences stating the property
+  (`only_a_walk_against_a_test_server_skips_the_waits`).
+- **No test reaches Instagram.** HTTP is mocked with `wiremock`, or with the
+  fake Instagram in `crates/snob-cli/tests/common/ig.rs` (a `World` served in
+  the web app's shapes, whose Relay endpoints are an independent oracle that
+  answers 400 to a malformed form). `IgClient::is_live` decides by address, so
+  every wait and pace is off against a local server and on against
+  instagram.com, and no caller can choose otherwise.
+- **Jobs in tests** (`tests/sandbox.rs`): a walk still going when it is asked
+  about is a followers mock with `set_delay` at a higher priority
+  (`fake_instagram_slow`), answered at once after its first `n` times.
+  **Every job test stops its jobs and waits for their locks before its
+  `TempDir` drops** (`Jobs`, on drop, a panic included): a job is a detached
+  process, and one left running writes into a directory being removed, and on
+  Windows keeps it from being removed.
+- **The `testing` feature** (`snob-cli/testing` -> `snob-ig/testing`) adds the
+  hidden seam: `--sandbox-root`, `--ig-base-url` (requires `--sandbox-root`),
+  `--through-the-browser` (requires `--ig-base-url`), `point_every_client_at`,
+  `SANDBOX_BASE`, `with_page`. A release binary contains none of it, and
+  `crates/snob-core/tests/sandbox.rs` fails if any of those names appears
+  without `#[cfg(feature = "testing")]` directly above it. `tests/sandbox.rs`,
+  `tests/headless.rs` and `tests/web.rs` in `snob-cli` need the feature;
+  `--workspace` alone runs none of them. Do not narrow the CI line with
+  `--test`: it would skip the bin's own unit tests.
+- **Tests that need a browser** (`browser_pipe.rs`, `headless.rs`, some
+  `owner`/`headless` unit tests) skip when none will start, and fail instead
+  when `SNOB_TEST_REQUIRE_BROWSER=1`. Run them with `--test-threads=1`.
+  Chromium refuses to run as root.
+- **No test may touch the real keyring** (service `snob-ig`). Every
+  `SecretStore::new(` in test code is followed by `.with_service(` in the same
+  statement; `crates/snob-core/tests/keyring.rs` reads the source to enforce
+  it. Binary-level tests use `--sandbox-root`, which forces the file backend
+  and a keyring namespace of its own.
+- **Source-reading guards** in `crates/snob-core/tests/` (shared walk in
+  `common/mod.rs`, over tracked and untracked-but-not-ignored files):
+  `no_seen.rs`, `keyring.rs`, `sandbox.rs`, and `language.rs`, which scans
+  `rs sql md toml yml yaml sh ps1 rb json` (this file included) for Spanish
+  (escape: `i18n-allow`), British spellings (escape: `spelling-allow`), runs of
+  spaces inside a sentence in `.rs` (escape: `layout-allow`), and a
+  `snob ...` command to be typed back that contains an at sign (no escape).
+  `.agents/` (vendored skills) and `pnpm-lock.yaml` are skipped.
+- Hand-run only: `cargo test -p snob-cli --features testing --test headless
+  serve_the_fake_world -- --ignored --nocapture` serves the fake Instagram for
+  `SNOB_TEST_SERVE_SECS`; `tools/parity/tui.sh` diffs the full-screen views of
+  two `testing` builds frame by frame in tmux.
+- Migrations: the `validate()` test runs the whole chain; it is mandatory.
 
-From the browser, every read and both writes go out the way instagram.com's web app
-sends them. The command asks an *intent*, and the tab builds the call from what the
-page shows. `snob-ig` defines what a page is asked (`client::page`, `web::Ask`) and
-compiles no browser code; `snob-cli` (`headless/`) is the one implementation.
+## Talking to Instagram
 
-A read travels like this:
+All numbers below are in code with their source next to them; change one only
+with a documented reason in the same place.
 
-```
-command ── IgClient::ask_page: allowlist::refused_ask, then paid by the Ask's kind
-        ── client::page Allowlisted: refused_ask again
-        ── owner/ (ToOwner::Ask): one process per user, a browser per account
-        ── Headless::ask_as: refused_ask once more, in the process that sends
-        ── Live::build → web::build_call, from the current document's page
-           values and its app's calls, waited for up to APP_CALLS_PATIENCE (8 s)
-        ── allowlist::refused on the built request (headless::refuse)
-        ── headless::guard: every API call the tab sends is paused and judged
-        ── fetch() from the tab's isolated world
-```
+- **Transport.** By default every request leaves from a tab on instagram.com
+  in a headless installed browser, sent with `fetch()`, so handshake, HTTP/2,
+  cookie jar, client hints and `Referer` are the browser's own
+  (`headless/`, `snob_ig::client::page`). `SNOB_NO_BROWSER=1` sends with
+  `reqwest` instead, and Instagram can tell. One browser per account, run by
+  the **owner** process (`owner/`, the hidden `__browser-owner` command), closed
+  `headless::IDLE` (5 min) after its last request; `SNOB_NO_OWNER=1` makes a
+  command run its own. Nothing that spends no network starts a browser.
+- **Allowlist.** Every call snob may send is a value in `snob_ig::allowlist`
+  (call sites pass those values, never a path or a name). The tab's guard
+  (`headless::guard`) pauses every API call the page makes, the app's own
+  included: GETs go on, a POST only if `allowlist::refused` lets it.
+  `doc_id`s are discovered from the page's JavaScript, never hard-coded.
+- **Headers.** Every value is the page's, or computed from the User-Agent of
+  the browser actually installed; what cannot be computed is left out. An
+  absent header is honest, an invented one is not, and no header is a
+  disguise (`client_hints.rs`, `headers.rs`). TLS handshake, HTTP/2 settings
+  and header order are never imitated.
+- **Pace** (`snob_ig::pace`): web app's page size (12), 1 to 3 s between pages
+  of an action (`STEP_MS`), 1.5 to 4 s dwell before a list (`DWELL_MS`), a
+  5 to 15 min rest after 40 pages (`PAGES_PER_SITTING`, `SITTING_PAUSE_MS`),
+  `HARD_PAGE_CAP = 2000`. Under it, the persistent GCRA buckets of
+  `snob-store/src/store/rate_budget.rs`: pace (3.83 s emission, burst 20),
+  daily (about 2,000 requests), and writes (burst of 3, then one every 15 min).
+  Lists read at most 2,000 accounts in any 24 h, 1,000 for a week after a
+  push-back (`budget::accounts_per_day`); `--same-day` reads past it on
+  purpose. The budget outlives the process. **The sitting and the rest it
+  owes are kept in the account's database and outlive the process** (table
+  `sitting`, `snob_core::budget::Sitting`): the page that fills a sitting
+  draws its rest and writes down when it ends, whether or not its walk goes
+  on, and the next page any walk of that account reads (the pager, a
+  profile's mutual followers), in this process or another, waits for it
+  first. So a walk ending on its cap, a run stopped during its rest and a
+  list read a page at a time all still rest after 40 pages; a sitting not
+  full that is left alone for the longest rest (15 min) ends. `--max-wait`
+  refuses a wait for the budget (asked with `read_wait`/`write_wait` before
+  the charge, so the refusal costs nothing) and never cuts a sitting's rest,
+  which would only be owed again by the next run.
+- **Push-back is a hard stop.** The first refusal stops the run and starts a
+  cooldown: 2 h for a throttle, 12 h for an action block, 30 min for a
+  challenge (`snob_core::budget`, pinned by
+  `the_cooldowns_are_the_documented_ones`). A push-back on one account brakes
+  every account on the machine for an hour (`shared.db`, `common_brake`). The
+  app's own calls in the tab are listened to for push-back too
+  (`headless::listen`). Never write a retry loop against Instagram (the
+  project this was inspired by did `catch { continue }`). During a cooldown
+  nothing is sent, not even the counter poll; stored lists are served with a
+  dated warning. `SNOB_IGNORE_COOLDOWN` exists only so a bug of ours cannot
+  lock anyone out; it stays out of the help.
+- **Cache.** A list's counter is polled before any walk (one request instead
+  of a walk when nothing moved, `engine::freshness`). Each walked page commits
+  in its own transaction, so stopping is saving.
+- **The write regime** (`commands/follow.rs`, `client/write.rs`): one account
+  per invocation and no flag that batches; the question is asked before the
+  request (`-y` answers it in advance); the write pays the write bucket on
+  top of the read buckets; it needs a CSRF token and refuses without one; it
+  sends `Origin`; it follows no redirect; and once in flight it is **not**
+  abandoned on Ctrl+C (the only exception to "Ctrl+C cancels at once"; every
+  read races the cancel token).
+- **Consent.** Walking another account's lists asks first, before resolving
+  it; no terminal and no `-y` is a refusal with exit 130 and nothing spent.
+  `watch once` has no `-y`: the monitor takes consent from its configuration.
+  `stories`, `highlights` and `profile` do not ask: consent covers walking
+  somebody's followers or following, and the only list `profile` reads is the
+  viewer's own following.
+- **Identity is the numeric `pk`, never the username.** `snob_core::Pk` is a
+  newtype with no `Deref`, no arithmetic and no `ToSql`/`FromSql`; SQLite goes
+  through `snob_store::store::pk_to_sql`/`pk_from_sql`. Crossings are by pk.
+  Their arithmetic is tested: unfollowers + friends = following, fans +
+  friends = followers.
 
-The page's tokens never leave the process holding the browser, and the answer comes
-back decoded by `model::web` into the same types the REST route fills.
+## Secrets, network and local data
 
-### Intents (`web::Ask`)
+- **Session storage**: system keyring (Credential Manager with
+  `CRED_PERSIST_LOCAL_MACHINE`, Keychain, Secret Service), or with
+  `--no-keyring` a `0600` file in a `0700` directory (DPAPI-sealed on
+  Windows). One session per account. Credential fields are `Secret`: `Debug`
+  prints `<hidden>`, zeroized on drop, read only through `expose()` (keep it
+  greppable). Never log or print a token.
+- **The MCP key** (`snob mcp key`, `commands/mcp/key.rs`): one key for
+  `snob mcp` served over the network, `snob_mcp_` plus 43 base64url
+  characters of 256 random bits; any other text is refused, from the
+  keyring and from `SNOB_MCP_KEY` alike. **Keyring only** (`Kind::McpKey`,
+  like the monitor's secrets; `--no-keyring` does not change it): on a
+  machine without one, `SNOB_MCP_KEY` in the server's environment is the
+  way, and it wins over the keyring wherever it is set, which `show` and
+  `revoke` warn about; `new --env` makes one for it, printed and kept
+  nowhere, the keyring not even read. A client reads its copy from `SNOB_MCP_TOKEN`, never
+  the server's name. The key is printed only to a terminal unless `--print`
+  (an agent with a shell would keep it in its transcript), and is named
+  everywhere else by a 12-digit fingerprint. Neither variable reaches a
+  child of a tool call or a job (`jobs::NEVER_INHERITED`). **`snob mcp
+  --listen` does not start without it**: a TCP port on loopback is open to
+  every local user, unlike the owner's pipe, and the key is what tells the
+  person's client from anything else that connects (on Unix, `--listen
+  socket` serves where nobody else can connect, and the key is required
+  there too, since a tunnel lets in whoever reaches its far end). `snob
+  mcp key` is behind the `mcp-http` feature; `Kind` has no feature gate, so every build
+  purges the key; no test writes it to the
+  keyring outside `SecretStore::with_service`, and the sandbox tests reach
+  it through `SNOB_MCP_KEY` only.
+- **No cookie jar in `reqwest`**: the `cookies` feature is off workspace-wide
+  so `.cookie_store(true)` does not compile; the session travels as an
+  explicit header on the one client meant to carry it. `reqwest` is
+  configured only in `snob_ig::http` and re-exported from there.
+- **Clients that can never carry the session**: the CDN client
+  (`client/cdn.rs`: HTTPS, CDN hosts only, never instagram.com) and the
+  webhook client (`watch/webhook.rs`), both built by `http::plain`, which has
+  no argument for a credential. The webhook follows no redirect, says
+  `User-Agent: snob`, refuses `http://` outside private networks, signs with
+  `X-Snob-Signature: sha256=<hex>`, and its token and key live in the
+  keyring, never in `watch.toml`. Retries are allowed there (it is the user's
+  server), never against Instagram.
+- **API redirects**: the API client's policy is `none()`; the transport
+  follows redirects itself, pays for every hop, and never leaves
+  instagram.com.
+- **TLS**: rustls (with `prefer-post-quantum`) on four targets, native-tls
+  (schannel) on Windows ARM64 only, because neither rustls provider builds
+  there without LLVM. HTTP/2 is required (HTTP/1.1 draws 429s). Default trust
+  is the platform store; `--strict-roots` narrows to Mozilla's roots (refused
+  on Windows ARM64, where it cannot work) and `--tls-extra-root` adds PEM
+  files to that. Neither applies to the webhook. No C crypto library is
+  linked (RustCrypto `hmac`/`sha2` for signing).
+- **The browser's DevTools protocol is on a pipe** (`--remote-debugging-pipe`,
+  `pipe.rs`), never a port: a port hands the session to any local process. The
+  owner's socket is reachable only by the same user (Unix: `0600` socket,
+  `peer_cred` checks; Windows: named pipe with a DACL for this user, owner
+  verified on both ends). The relay page for `--remote` gets JPEG frames and
+  posts input only, behind a one-visit token and a key in the URL fragment;
+  the protocol never crosses the tunnel. It listens on a `0600` Unix socket in
+  the data directory, and falls back to a TCP port on `127.0.0.1` only on
+  Windows or where the socket path cannot be forwarded by `ssh -L`
+  (`relay::can_be_forwarded`).
+- **Rotated cookies are written back** from the browser to the store when a
+  command leaves it (`headless/write_back.rs`); a login is authoritative.
+- **Local data is per user, never per directory** (`snob-store/src/paths.rs`,
+  app name `snob-ig`): on Windows the Local, not Roaming, directory (WAL on a
+  synced folder corrupts SQLite), created with a user-only DACL and
+  `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED`. Per account under `accounts/<pk>/`;
+  `shared.db` for what accounts share; the account's database also keeps
+  what agents were told yes to through `snob mcp` (`mcp_acts`, a week of
+  rows, the last day shown by `snob status`); its jobs under
+  `accounts/<pk>/jobs/<id>/` (`job.json`, `state.json`, the walk's output and
+  log, `0600` on Unix; a finished job's result kept a day, the job a week, at
+  most 50, swept by a start and by `snob jobs` and the `__job` reads when
+  the jobs lock is free, and a result past its day is not handed back,
+  swept or not), which `snob logout` stops and `snob purge` stops and
+  removes, both before the owner of the browsers is released, so no walk
+  starts it again into what is going, and **both holding the account's jobs
+  lock until its session is gone** (an account that never ran a job
+  included), since a start checks the session again under that lock and
+  makes nothing without one; `accounts.toml` changed only
+  through `Registry::update` (file lock). `watch.toml` and `accounts.toml`
+  are read with serde and written from a hand-written template, tested to
+  round-trip. `snob status` and `--dry-run` write nothing. `snob purge`
+  removes everything but the binary.
+- **Migrations** (`snob-store/src/store/migrations.rs`): a published migration
+  is never edited; add the next numbered file in `store/sql/` (and
+  `store/sql/shared/` for `shared.db`). No `PRAGMA foreign_keys` inside a
+  migration; rebuild a table by create, copy, drop, rename
+  (`SQLITE_DBCONFIG_DEFENSIVE` forbids `writable_schema`). Counts are not
+  `u64` columns (`fallible_uint` is off on purpose).
 
-`Viewer` (who the document was served to, nothing sent), `Tray` (the stories tray
-the home document preloads, nothing sent), `Pk { name }` (a name to a pk, through
-the route definitions or the profile document), `Document { path }` (load the home
-page or a profile, answered with its bundles and never its HTML), `Query` (a Relay
-read of the registry's), `Rest` (a friendship list of the registry's),
-`Navigation { route }` (the app's router moving to a profile or its mutual tab;
-the tab itself does not move), `Statuses { pks }` (`friendships/show_many` about
-a list page's accounts), `Asset` (a file from the CDN, which the tab fetches)
-and `Write` (one of the two mutations, built only on the profile document it is
-made from).
-What the tab answers from its document costs nothing, though a cooldown and Ctrl+C
-still stop it. A write is two asks, `Document` and then `Write`, paid from the
-write budget; the budget's wait comes before the document is loaded, never between
-the two.
+## The MCP server (`snob mcp`)
 
-### Page values (`page_values.rs`)
+Feature `mcp` (on by default; `rmcp` pinned exactly in the workspace
+`Cargo.toml`). A stdio server an agent's client starts, or with `--listen`
+(feature `mcp-http`, on by default) the same server over HTTP on loopback,
+behind the MCP key; `snob mcp config <client>` prints the snippet for that
+client's configuration and never writes it (with `--remote <url>`, one that
+reaches a server already listening: no command, no key, see "Over HTTP").
 
-A logged-in document defines modules, `["Name",[],{...},id]`, inside the JSON it
-bootstraps from. snob reads six, from the first definition of each: `PolarisViewer`
-(pk, username, `fbid`; `{data: null, id: null}` is the logged-out marker),
-`SiteData` (revision, `hsi`, haste session, `__spin_*`; a document defines it twice
-and the app sends the first), `LSD`, `DTSGInitialData` (the per-load Relay token),
-`DTSGInitData` (never used to build a call) and `WebBloksVersioningID`. The web
-session id (`X-Web-Session-ID` / `__s`), the Relay bitmaps (`__dyn`, `__csr` ...),
-the route envelope, the variables of the app's queries and the `__req` counter are
-copied from the app's *own* calls on the document (`web::AppCalls`, kept per
-document by `headless::listen::Documents`). **A value is read from the page or
-copied from the app, never invented.** One not shown yet is `web::Missing` and the
-call is not built: nothing is sent, no cooldown is written, the command ends with
-exit 1 ("the page has not shown ... yet") and the browser stays open. The values
-change with every load, so they are read again on each document; a call is built
-only from the current document's.
+- **Every tool call is a child `snob`** with the arguments a person would
+  type (`commands/mcp/tools.rs` builds them, `child.rs` runs them), never a
+  function call into the commands: their confirmations read standard input,
+  which here carries the protocol, the cancellation token is per process, and
+  a stray line on standard output would corrupt a frame. So every rule above
+  (the budget, the cooldown, consent, the write regime) holds for an agent
+  through the same code path it holds for a person. **The server process
+  itself never builds an Instagram client or opens a database**; the one
+  thing it reads is the MCP key, to serve over HTTP.
+- Children get the server's global flags, `--max-wait` (`mcp::Waits`: the
+  server's own when given, else 5 min, and an hour, `mcp::JOB_MAX_WAIT`, for
+  a job's walk, which nobody waits on) and `--stop-when-stdin-closes`; the
+  server's globals carry no `--max-wait` of their own, since clap refuses it
+  twice. A canceled call closes the child's standard
+  input and kills it only after a grace period, so a walk saves its page and
+  gives back its claim. **A child runs in a process group of its own**
+  (`child::Launch`), so closing its input is the only stop it gets: the
+  Ctrl+C that stops the server would otherwise reach it too, and the input
+  closing after it would be a second stop, which exits at once.
+  `SNOB_IGNORE_COOLDOWN` is removed from a child's environment.
+- **Reads only, unless `--allow-writes`**: status, lists, profiles. One tool
+  list for every client, from the server's flags alone. Walking another
+  account's lists, and every follow or unfollow, needs a yes for that one
+  call, asked in this order (`mod.rs`, `Server::consent`): a form the client
+  shows (elicitation, either revision); else, for a client that declared no
+  form or answers `elicitation/create` with method-not-found, the chat: the
+  call answers, not as an error, with `status: "confirmation_required"`, the
+  question and a `confirmation` token, which the agent puts to the person
+  word for word and hands back on the same call only on a yes. A decline, a
+  dismissal or a timeout in a form is a no, never a reason to ask in the
+  chat. `--confirm-in-chat none|lists|all` (`all` when not given on stdio,
+  `lists` with `--listen`) says what the chat may cover; past it the call is `cannot_confirm`. Not
+  offered, ever: `login`, `logout`, `purge`, the monitor, `--same-day`,
+  downloads (outside the request budget), any flag that writes a file.
+- **The yes comes from the client, not provably from the person.** The
+  client declares what it can show, and an agent can type a yes in the chat
+  itself (or be steered to by a bio it read). The tickets keep a yes to the
+  call it was asked about, once; the real gate on a write is the client's
+  own permission prompt, so keep `snob_follow` and `snob_unfollow` on "ask"
+  (`snob mcp config --allow-writes` says so). The question is composed of
+  snob's words and the validated username only (`tools::Question`), never a
+  display name, a bio or any other string another person wrote, since it is
+  read out to the person in snob's voice.
+- **A yes counts once, for the command it was given for** (`seal.rs`). On
+  the stateless revision the question goes out with a ticket: a random
+  nonce, a deadline ten minutes on in seconds of the process's monotonic
+  clock, and an HMAC under a key drawn at start over its kind, the nonce,
+  the deadline and the command line (`tools::Plan::binding`, the tool and
+  `Plan.args`, which hold nothing about how a call is delivered). Redeeming
+  puts the nonce in a set of spent ones, kept until it would have expired
+  and at most 4096 (full is refused, never forgotten): the same answered
+  call sent twice runs once and then answers `confirmation_used`; a ticket
+  for another command, kind or server spends nothing. A call back with the
+  ticket and no answer retires it and is asked again. A chat token is a
+  ticket of the other kind, carried in the `confirmation` argument, which
+  stays out of `Plan.args`; brought to a call that asks nothing it is
+  `invalid_arguments`, and one for another call or past its time is no yes
+  (the call is asked again, with `previous` saying why). Where a request
+  carries a session, the chat ticket is bound to it too (over HTTP, the
+  `Mcp-Session-Id` of the 2025-11-25 revision, read from the parts rmcp
+  hands the handler). **A stateless call over HTTP carries none, as stdio
+  does**, so there the ticket is bound to the command alone, and any
+  conversation that holds the key may redeem it, once, before it expires.
+  No ticket outlives the process.
+- **Signing in is the person's.** The server's instructions say so, and
+  every answer that comes of having no session carries a hint that the
+  person runs `snob login` in their own terminal, in place of the command's
+  own (`answer::SIGN_IN`). `snob_status` with no session is an answer, not a
+  failure: exit 3 is what it was asked, as exit 5 is in a cooldown. **Every
+  hint that is advice to the person at a terminal is replaced the same
+  way**, by the failure's `reason` (`answer::agent_hint`: `too_many_jobs`,
+  `no_such_job`, `job_stopping`, `nothing_stored`, `stored_moments`,
+  `budget_wait`, `busy`, `mcp_write_cap`, `walked_elsewhere`), with the
+  tools that do it instead,
+  and a push-back the call met itself, whose cooldown the failure does not
+  date, by `answer::PUSHED_BACK` (ask `snob_status` when it lifts); so
+  every refusal a cooldown already held is behind carries
+  `cooldown_until`, a crossing's of two stored lists too far apart
+  included (`engine::cooldown::check_same_moment_dated`); a failure's
+  message is its sentences, the records of the log and the progress lines
+  left out (`jobs::show::sentences`).
+- **`snob_profile` stays inline, not a job**: its walk of the mutual
+  followers is at most `MUTUAL_PAGE_CAP` (10) pages, which count toward the
+  account's sitting as a list's do, so it may wait out one rest between
+  sittings, up to 15 minutes, before or between those pages (one an
+  earlier walk left owed, or one its own pages draw; a rest paid first
+  leaves a sitting ten pages cannot fill), which its description says and
+  `mcp::longest_call` counts.
+  `openWorldHint` is per tool (`tools::Spec::open_world`): false for the
+  tools whose every plan spends nothing (`snob_status` and the three job
+  tools).
+- Arguments are checked, not passed through: an `account` must be a possible
+  username, so it can never be read as a flag, and an unknown argument is
+  refused rather than ignored. A tool that is not listed (the writes without
+  `--allow-writes` included) is a JSON-RPC error, -32602, as the protocol
+  asks, not an `isError` result.
+- Everything a child prints is passed through `printable` string by string
+  before it reaches the client; tool descriptions tell the model that names
+  and bios are data, never instructions. What a child printed is read
+  without assuming its shape (`answer.rs`): under `panic = "abort"` one
+  indexing panic is the server gone, with every call in flight.
+- **A few calls at a time, and one that spends** (`commands/mcp/limits.rs`):
+  at most 4 calls at once, 1 of them a call that may reach Instagram
+  (`snob_list` that polls or walks, `snob_profile`, the writes; not
+  `snob_status`, a stored list or a dry run, `tools::Spends`), 1 write, and
+  60 calls a minute, which also keeps the tickets alive under `seal.rs`'s
+  4096. Taken before anything is asked, so nobody says yes to a call that is
+  then refused; past a limit the call answers `busy` at once and is never
+  queued; held until the child has exited. **Every refusal that costs
+  nothing to know is asked before anything is asked too**
+  (`Server::refused_ahead`), through a child that sends and writes nothing,
+  with the refusal the call's own child would give: a walk run as a job
+  through `__job start --check` (the account's jobs, since a job's walk
+  holds no permit once its call answered: `too_many_jobs`, `job_stopping`,
+  `walked_elsewhere`; and in a cooldown a refresh, or a list with nothing
+  stored to serve), and a write through `follow --check-ahead` (a job
+  walking or `spend.lock` held, `busy`; no CSRF token; the cooldown, with
+  `cooldown_until`; `mcp_write_cap`; a wait for the write bucket past
+  `--max-wait`, `budget_wait`). In a cooldown a stored list is still asked
+  about: the command carries `-y`, which a question skipped would hand a
+  walk with no yes once the cooldown lifts. What can still refuse after the
+  yes: what changes between the check and the yes (another process taking
+  `spend.lock`, a cooldown starting, the budget or the cap taken by another
+  call), what only a request tells (a write already so, a name that is
+  nobody's), and a crossing whose stored lists a cooldown serves were walked
+  too far apart. Across
+  processes, every child that may reach Instagram is run with the hidden
+  `--spend-alone` (`tools::Plan::command_line`, outside the binding) and takes
+  `accounts/<pk>/spend.lock` in `App::open`, before any request; held
+  elsewhere, it exits 1 with `reason: "busy"` in its JSON failure, which the
+  server hands the agent as code `busy`. Why: the persistent budget bounds
+  the average across processes, but `STEP_MS` and `DWELL_MS` are waited per
+  process, so two walks of one account interleave their requests and drain
+  the burst at once. A command a person types takes no lock, for now.
+- **A record of every yes, and a cap on an agent's writes**
+  (`snob_store::store::mcp_acts`). Since nobody can prove who said yes, the
+  person sees what was done in their name and the volume stays human. A call
+  run on a yes gets the hidden `--confirmed-via form|elicitation|chat` and
+  `--confirmed-for=<client>` (the client's `name version`, from the request's
+  `_meta` or the handshake, through `printable`, cut to `[A-Za-z0-9 ._/-]`
+  and 64 characters; `commands::common::client_label`), and a write also
+  `--mcp-write-cap=<N>`, all after the binding is taken
+  (`tools::Plan::command_line`). The child records the act in the account's
+  `mcp_acts` table before its first request, in a transaction of its own
+  (`commands::common::record_agent_act`); a follow or unfollow is refused
+  with nothing sent and nothing recorded when the writes recorded in the
+  last 24 hours reach the cap: exit 1, `reason: "mcp_write_cap"`, and
+  `retry_at`, when the next frees. Attempts count (one Instagram refused, or
+  that found nothing to do, still did). Only follow and unfollow are
+  writes, only acts recorded this way are counted, on the account whichever
+  server made them; a command the person types records nothing, and nor
+  does a walk in a cooldown, which reads nothing. `--max-writes-per-day`
+  (10 by default, `mcp_acts::WRITES_A_DAY`) is bounded by what the write
+  bucket allows in a day anyway (99, `rate_budget::WRITES_IN_A_DAY`).
+  `snob status` (section `--agents`, `agents` in `--json`) lists the last
+  day's acts: when, what, how the yes was given and through which client.
+- **A long list comes back a page at a time** (`answer::page`): at most 200
+  accounts (`answer::PAGE`) and 30,000 bytes of compact JSON
+  (`answer::PAGE_BYTES`), since the result goes into the model's context
+  twice (structured and as text) and clients cut long ones (Claude Code at
+  25,000 tokens, as quoted). **An account goes without its picture's
+  address** (`answer::LEFT_OUT`, `pfp_url`): a signed URL of 300 to 500
+  bytes that answers nothing an agent is asked, and with it a page held
+  some 65 accounts. `{total, count, offset, items, next_offset}`: `total`
+  the list's, `count` what the call hands back across its pages, at most
+  `limit`. **The server applies `limit`** (`tools::Page::limit`), never the
+  command's `--limit`, so a call given one still says the whole list's
+  `total`, and one it cut to a single page says so in a sentence
+  (`answer::limited`); the limit stays out of `Plan.args`, so a yes is to
+  the walk whatever it trims, and every limit pages from the same list held.
+  A failure's `partial` is one page with no `next_offset`, since what a walk
+  stopped short read is not stored as a whole list. **A list is never
+  handed back as more than it is**: where it came from is the walk's
+  `served` progress line (`Progress::served`, read from a job's log, or
+  from a stored read's own standard error, which `mode: "stored"` and a
+  later page get `--progress-json` for), with its date, a sentence beside
+  it when it was not read now (`answer::not_read_now`), and `complete:
+  false` with what was read of how many and a sentence
+  (`answer::incomplete`; for a crossing, that results are missing and the
+  ones given are right) when a walk cut short by `max_pages` exited 0. The
+  client's `offset` is sliced with `get`, never indexed. **A page past the
+  first never walks**: `offset` stays out of `Plan.args` (and the binding),
+  and the call is planned as the same list read with `--offline`, which
+  asks nothing and spends nothing (`tools::Page`), whatever its mode;
+  `offset` with `dry_run` is `invalid_arguments`. It is handed back from the
+  whole list the server holds from the call that read it
+  (`commands/mcp/pages.rs`: in memory, 4 lists, 30 min, 16 MiB), under the
+  call's binding without `--refresh`, so a refresh and a later page of it
+  meet, and with what the first page said of the whole list (`served`,
+  `cooldown_until`, `complete`), since the store would not always serve
+  the same list: a walk cut by `max_pages` is not a whole one, and a
+  crossing checked against Instagram on the first page is refused offline
+  when its lists were walked far apart. Not held, the page is read from the
+  store; for a call given `max_pages`, it is refused as `page_unavailable`.
+- **A walk can outlive the call that started it, as a job** (`jobs/`, in
+  every build: `std` processes and threads, no `mcp` feature). `snob __job
+  start` checks the walk, makes the job under the account's `jobs/.lock`
+  (one running per account: the same command again is `reused`, the
+  `--confirmed-*` aside, another is `too_many_jobs`, and one asked to stop
+  that has not yet is `job_stopping`, never reused; a list a lost job may
+  still hold is `walked_elsewhere`, with until when, `retry_at` for a
+  program, and one that never started its walk, with no walk's pid in its
+  state, holds none, `jobs::Seen::claim_frees_at`), starts its supervisor
+  detached (`detach.rs`) and answers with **one** compact JSON document:
+  the record, and the walk's answer under
+  `finished` when it ended within `--wait`. Asked to stop before it answered
+  (its standard input closing), it stops the job it made, since nobody would
+  ever be told the id. The supervisor, `__job run <id>`, holds the job's
+  `lock` all its life (a held lock is a running job, `jobs::derive`; asking
+  writes nothing, `paths::lock_is_held`), **runs itself** (`current_exe`,
+  never a path from disk) with its own global flags (`argv::globals`), and
+  **checks the stored command line again** (`argv::check`: the five list
+  commands, judged by clap, and an allowlist of flags; anything else ends
+  `failed`, `refused_argv`, nothing run). Its walk gets `--spend-alone`,
+  `--stop-when-stdin-closes` on a pipe it holds, and `--progress-json`, which
+  wins over `--no-progress` and is what `show` reads progress and the time
+  left from. Stopping is a `stop` file, read every second; the supervisor
+  closes the walk's input and kills it through its own handle only after
+  the grace. No pid read from a file is ever signaled. `show`, `list` and
+  `cancel` look only in the jobs of the account the run acts as: another
+  account's id is `no_such_job`. A Windows job object that refuses breakaway
+  takes the job with its client: `detached: "in_client_job"`. On Windows
+  the detached supervisor hears no end of session, so a job running at
+  sign-out or shutdown is read as `lost`; and a supervisor that comes to a
+  job every reader already takes as lost leaves it so (`started_late`)
+  rather than run it.
+- **To an agent, a list that may be walked is a job** (`tools::Run::Job`):
+  `snob_list` in mode `auto` or `refresh` (not `stored`, a dry run or a later
+  page; the writes never) runs `__job start --wait=<wait_seconds>s --tool
+  --arguments --started-by -- <the command and its --confirmed-*>`, with no
+  `--spend-alone` (the supervisor gives the walk that). `wait_seconds` (20 by
+  default, at most 50, `tools::MOST_WAIT_SECONDS`, so a call answers inside a
+  minute) stays out of `Plan.args`, the binding and what the job records
+  (`tools::recorded`). Ended within it, the call answers as an inline walk
+  would, with `job_id` beside it and its pages held as any list's; otherwise
+  with `{status: "running", done: false, job_id, progress, eta_seconds,
+  detached, poll_with: "snob_job"}` and a sentence (`commands/mcp/job.rs`).
+  `snob_job` (`__job show <id> --wait`), `snob_jobs` (`__job list`) and
+  `snob_job_cancel` (`__job cancel <id>`) are offered always, spend nothing,
+  and take a `job_id` only as `JobId::parse` reads it. A finished job answers
+  through `answer::from` with the plan rebuilt from the tool and arguments it
+  recorded, its pages read again from the job's `out.json` (`offset`); a
+  result swept a day later is `result_gone`, a lost job `job_lost`. **All job
+  I/O goes through those `__job` children**, so the server still opens no
+  store and reads no job's file.
+- **A client that takes MCP Tasks gets a task for that job**
+  (`commands/mcp/tasks.rs`; SEP-2663 as rmcp 3.8.0 has it: `tasks/get`,
+  `tasks/update`, `tasks/cancel`, and no `tasks/result` or `tasks/list`, so
+  jobs are listed by `snob_jobs`). The server declares the extension. A
+  `snob_list` run as a job, for a client that declared it (at `initialize`,
+  or in a stateless request's `_meta`), waits at most `tasks::WAIT_SECONDS`
+  (5) whatever `wait_seconds` says, and answers with a task whose id is the
+  job's. `tasks/get` and `tasks/cancel` are the children `snob_job` (with no
+  wait) and `snob_job_cancel` run, under the same limits and the upgrade
+  check; an id that is not one of the account's jobs is `invalid_params`
+  "unknown task". Queued or running is `working`, with `pollIntervalMs` a
+  tenth of the least time left (5 to 60 s); a walk that ended is
+  `completed` with the result `snob_job` would give, an error result
+  included; a canceled job is the extension's canceled status, and a lost
+  one `failed` with `job_lost`. `ttlMs` is the week a job is kept. **Nothing
+  is asked inside a task**: the yes is settled before the job starts, so
+  `tasks/update` only checks the id. Not rmcp's `TaskManager`, which keeps
+  tasks in memory and aborts one after five minutes.
+- A heartbeat (`notifications/progress`) is sent from the call's own task
+  and awaited, never spawned, so none can reach the client after the result.
+- **Upgrades.** `snob mcp config` prints a path that outlives one
+  (`config::stable_exe`: Homebrew's link, Scoop's `current`, or the first
+  `snob` on `PATH`), each candidate taken only if it leads to the running
+  binary, and warns when what it prints is in a directory named after a
+  version. A running server whose binary was moved, removed or replaced
+  (size and modification time, `child::Launch::upgraded`) refuses every
+  call with `upgraded` and starts nothing; the client restarts it.
+- Codex's snippet carries `tool_timeout_sec` from `mcp::longest_call`: the
+  longer of a call that asks (the person's answer, `ANSWER_WITHIN`, then
+  the longer of `--max-wait`, `mcp::MAX_WAIT` when not given, and a list's
+  wait for its job, `MOST_WAIT_SECONDS` plus
+  `jobs::start::SUPERVISOR_WITHIN`) and a profile (`--max-wait` and the
+  longest rest between sittings), then the child's grace and a margin. A
+  list's walk is bounded by it however long it is: the call hands back the
+  job and the walk goes on.
+- **Over HTTP, for a tunnel of your own** (`snob mcp --listen <addr>`,
+  `commands/mcp/http.rs`). **Loopback only**: any other address is refused
+  with exit 2, and TLS is the tunnel's job (`--public-url`, `https` only,
+  adds the tunnel's host and origin to those taken). **On Unix, `--listen
+  socket`**
+  (`http/socket.rs`) serves on `mcp.sock` in the private data directory,
+  `0600`, each connection checked for this user or root (`peer_cred`): the
+  one way to close the gap below, since nobody else can connect to it or
+  take its name while snob is not running. One server holds the name at a
+  time (`mcp.sock.lock`, held for its life); holding it, a socket left at
+  the name by a killed server is replaced, and anything else there is left
+  alone and refused. Refused on Windows with exit 2. **The key is
+  mandatory** (no key, exit 1 and a hint), because loopback TCP is
+  reachable by every local user, unlike the owner's pipe; startup says its
+  source and fingerprint, never the key, and with `--allow-writes` warns
+  that whoever holds it can call the writes (and confirm them in the chat
+  under `--confirm-in-chat all`). **The reverse does not hold: the server
+  does not prove itself to its clients.** A client or tunnel sends the key
+  to whatever answers on the port, so another local user who binds it while
+  snob is not listening is handed the key; `--listen` is for a machine where
+  nobody else can run code, and startup says to replace the key if the
+  port could have been taken (revoking the keyring's, or replacing
+  `SNOB_MCP_KEY`, by where the key came from). Bound to `127.0.0.1` or
+  `[::1]`, it also holds the same port of the other family (`http::twin`),
+  since `localhost` may resolve to either, and, on a port the person
+  named, refuses to start, exit 1, when something else holds it (its
+  family's wildcard held with exclusive use included) or it cannot be held
+  for any reason but the family being absent; on a port the system picked
+  (`:0`) it goes on with one family. Each request, in order: the path (`/mcp`
+  only, `/.well-known/*` included is 404); the key (`Authorization:
+  Bearer`, the scheme in any case), checked **before any of the body is
+  read** by comparing HMACs of both sides under a key drawn at start, and
+  refused with 401, `WWW-Authenticate: Bearer realm="snob"` and
+  `Connection: close`; the body, read by snob, at most 256 KiB (413) within
+  30 s (408); at most 8 sessions, a new one past them closing the one left
+  idle longest with no call running, since a client gone without a `DELETE`
+  keeps its session for the idle time (503 for an `initialize` only when
+  every one has a call running; a stateless call opens none and passes);
+  then rmcp's own
+  checks and the same handler. **The `Host` and `Origin` checks guard
+  browsers (DNS rebinding) only; against any other caller the key is the
+  only control.** hyper serves HTTP/1.1 with a header (and idle) timeout of
+  10 s and a 16 KiB buffer; a connection's first request must arrive within
+  2 s. At most 32 connections, **counted against those that have shown the
+  key**: past it, the oldest connection that has not is closed for the new
+  one, so idle sockets held by another local process lock no client with
+  the key out (`http::Open`). `Host` takes the bound address too, so any of
+  127/8 works. Sessions idle for 30 min close. The limits, consent, jobs and
+  tasks are the stdio server's, shared by every session; a chat token from
+  a stateless call is bound to its command only (see "A yes counts once").
+  Ctrl+C (or the system, or `--stop-when-stdin-closes`) stops accepting,
+  stops every call's child as a canceled call's is stopped, answers a call
+  still waiting on a form as not confirmed (`Server::in_a_form` races the
+  question against `Server::stopped`), waits for the children
+  (`child::GRACE` and 5 s), **then for their answers to be written** (rmcp
+  drops an answer it has not handed over once its token is canceled), and
+  only then ends the streams and exits 130. **What the tunnel sees**: TLS
+  ends at its edge, so its provider sees the key and every answer, other
+  people's names and lists included, in plain text, and a connector's vendor
+  stores the key; put an access layer in front where the tunnel offers one
+  (Cloudflare Access service tokens, for example). **`snob mcp config
+  <client> --remote <url>`** (`config.rs`, `render_remote`) prints a
+  client's snippet for such a server: the address and how the client sends
+  the key, never a command and never the key, which it does not read. The
+  client takes it from `SNOB_MCP_TOKEN` in its own environment
+  (`config::TOKEN`; each client's spelling of a variable, Codex's
+  `bearer_token_env_var`), never from `SNOB_MCP_KEY`, which would replace
+  the keyring's key in every snob started where it is set; Claude Desktop
+  gets the address alone, for a connector, which Anthropic's side reaches,
+  so a loopback address is warned about. The address is `https`, or `http`
+  on loopback only (`ssh -L`), and holds no user, password, query, fragment
+  or key; clap is handed a parser of its own (`config::RemoteUrl`) so that a
+  refused address is not printed back. The server's flags (`--allow-writes`,
+  `--confirm-in-chat`, `--max-writes-per-day`) are refused with it, since
+  they describe a process this does not start.
 
-### Request families (`web.rs`)
+## Output contract
 
-The JS module that sends a call picks the header family, not the URL:
+- **Standard output carries data only**; progress bars, prompts, warnings and
+  every full-screen view are drawn on standard error. `snob stories someone
+  -i > out.txt` leaves the file empty.
+- `--format json|ndjson|csv|xlsx|md|table` and `-o <file>` for lists and
+  documents (narrower enums where a format makes no sense, e.g.
+  `StoryFormat`); `--json` for status commands; `-o -` is stdout. Not a
+  terminal means JSON by default and no interactive view; `--no-interactive`
+  forces printing.
+- When the result would have been JSON, a failure is also one JSON object on
+  the last line of standard error (`main::wording_for`); its `code` is the
+  exit's token, and `reason` a finer one when there is one
+  (`ExitError::with_reason`, e.g. `busy`, `mcp_write_cap`,
+  `walked_elsewhere`, `nothing_stored`, `stored_moments` for a crossing of
+  two stored lists too far apart under `--offline`, `budget_wait` for a
+  wait past `--max-wait`, and a job's `too_many_jobs`, `job_stopping`,
+  `no_such_job`, `refused_argv`).
+  `cooldown_until` is when a cooldown that refused the run lifts
+  (`ExitError::with_cooldown_until`), and `retry_at` when a refusal that is
+  no cooldown stops applying (`ExitError::with_retry_at`: `mcp_write_cap`,
+  and `walked_elsewhere`, when the lost job's claim on the list frees),
+  both in seconds since the epoch, since the sentence says them in the local
+  time of the machine that wrote it.
+- **Exit codes are stable** (`exit.rs`, `snob_core::watch::RunOutcome`, the
+  `watch_runs.outcome` column and the `--json` `outcome` field share one
+  vocabulary): 0 worked (a list cut short by `--limit`/`--max-pages` is still
+  0), 1 failed or result refused as incomplete, 2 bad command line (clap), 3 no
+  or dead session, 4 account needs verifying, 5 throttled or in cooldown, 130
+  stopped (Ctrl+C, a confirmation not given, a wait past `--max-wait`, or
+  standard input closing under the hidden `--stop-when-stdin-closes`, which
+  is how a parent on Windows stops a child in order). `snob status` exits 5 in
+  cooldown, whatever was asked. Errors that know their code carry it as
+  `ExitError` (with an optional `with_hint`, printed on its own `hint:` line).
+- The JSON shapes are the types in `snob-core` (`model.rs`), deliberately
+  separate from the wire models in `snob-ig`, which follow Instagram. A JSON
+  shape change is a contract change.
+- **Every string from another person goes through `snob_core::model::printable`**
+  before it reaches a terminal or a JSON list (`output::readable`; a JSON
+  reader may be a model, and `serde_json` writes `Cf` as it is): all of `Cc`
+  and all of `Cf` removed, plus the invisible letters such as Hangul fillers
+  and the marks that draw nothing (the whole of `Default_Ignorable_Code_Point`:
+  the combining grapheme joiner, the Mongolian and supplementary variation
+  selectors, U+FE00 to U+FE0D, and U+FE0E/U+FE0F anywhere but alone right
+  after a symbol in the ranges where Unicode puts the bases of presentation
+  sequences (a positive list, `takes_a_presentation`), or after a keycap
+  base with U+20E3 next; never after a letter, a digit, a combining mark
+  of any script or punctuation that is no emoji: one selector per letter or
+  mark hides four bits each, a run a byte each); whitespace controls become
+  a space.
+- **No `@` in a command handed over to be typed back** (PowerShell's splatting
+  eats an unquoted `@name`, and the command then answers about the user's own
+  account). Names are accepted with or without it; the help explains quoting.
 
-- **REST GET** `/api/v1/...`: the app's identifiers, the CSRF token, the
-  `X-IG-WWW-Claim` (0 until the server hands one out) and the web session id.
-  The one REST POST, `friendships/show_many`, adds `X-Instagram-AJAX` and a
-  form of the pks, `jazoest` and the REST token, which is not the Relay one and
-  is taken only from the app's own REST POSTs (`AppCalls::rest_token_sent`);
-  until the app has sent one, `show_many` is not built.
-- **Relay POST** `/api/graphql`: a form of about 29 fields with the page's values,
-  `X-FB-Friendly-Name` and `lsd`, its last five fields in the app's order
-  (`fb_api_caller_class`, `fb_api_req_friendly_name`, `server_timestamps`,
-  `variables`, `doc_id`); never the claim, `X-Requested-With` or the web
-  session id.
-- **Relay POST** `/graphql/query`: the same plus the answer's root field and the
-  Bloks version. An operation goes to one endpoint, never both.
-- **Comet** `POST /ajax/bulk-route-definitions/`, for a name's route, and
-  `POST /ajax/navigation/`, the app's router opening a profile or its mutual
-  tab before a list is read; both in the envelope copied from the app's own
-  route call.
+## Code conventions
 
-Only the headers the app's script sets are listed; the browser adds the rest
-(`Cookie`, `User-Agent`, client hints, `Origin`, `Sec-Fetch-*`). The page fills in
-`X-CSRFToken` and the claim only on a request that already carries them. The
-endpoint, `doc_id` and root field come from the registry, never the caller.
+- English everywhere, **US spelling**; the language guard enforces both.
+  Comments say why, in full sentences, and carry where a number came from
+  (a capture and its date, a measurement, a paper). Bold marks the claim a
+  reader must not miss. Prefer one home per rule over copies that drift, and
+  say in a comment where the other half of a rule lives.
+- Errors: `thiserror` enums in the libraries (`IgError`, `PathError`, ...),
+  `anyhow` in `snob-cli` with `ExitError` for anything with a specific exit
+  code; `exit::exit_code_for` digs the code out of the chain. Instagram's
+  answers are classified in `snob_ig::error` (status codes lie; the body says
+  why), and everything in `snob_ig::model` but `pk` is optional.
+- Lints (`[workspace.lints]`): `undocumented_unsafe_blocks` (every `unsafe`
+  block has a `// SAFETY:` comment; there is no `unsafe fn`) and
+  `return_self_not_must_use`. Lints are added one at a time, each for a
+  defect this codebase had; no `pedantic`/`nursery` groups.
+- Dependencies: every entry and feature in `Cargo.toml` is commented with why
+  it is there and why its features are what they are; keep it that way.
+  Features are narrowed to what is used (no `#[tracing::instrument]`, so no
+  `attributes`; no `env-filter`; `SNOB_LOG` is `target=level` pairs). Avoid
+  `ring`/`aws-lc-rs`/OpenSSL (Windows ARM64 cannot build the first two).
+- Release profile: `opt-level = "s"`, fat LTO, one codegen unit, stripped,
+  **`panic = "abort"`**: no destructor runs on a panic or `exit()`, so durable
+  state is committed as it is made, and code fed by a browser (the CDP
+  dispatcher) never panics.
+- The runtime is `tokio` multi-thread with exactly two workers (`main.rs`):
+  one worker would let a blocked task starve the Ctrl+C handler.
+- Terminal UI: `ratatui` for drawing, keys read through
+  `ui/browser/input.rs` (crossterm, bracketed paste) and never
+  `console::Term::read_key`; `ui::tui::Tui` is the one claim on the terminal
+  and restores it on drop; the 16 ANSI colors only, so the user's theme
+  decides. Full-screen views use the alternate screen and print receipts
+  after leaving it; the menu draws inline. From the profile card, never call
+  `ui::stories::browse` or `ui::highlights::browse` (a second `Tui` and a
+  second scratch directory on the same path).
+- **Stories are handed to the system viewer.** Media is never rendered in the
+  terminal: a view writes the file into the session's scratch directory
+  (`ui/browser/scratch.rs`, swept when abandoned) and opens it with `opener`
+  in whatever the user already uses for pictures and videos.
+- `stories` and `highlights` are separate commands because a highlight has a
+  tray level and an items level (`snob highlights someone 2`); `posts` has the
+  same two levels. Shared flags live in `cli::MediaActionArgs`.
+- The monitor: a run compares against what was last **reported**
+  (`watch_marks`), not against the newest capture; a report is queued before
+  its mark moves; the delivery queue is drained once per run, after every
+  account (`commands/watch/run.rs`); what a run reports as spent is what the
+  pacer was charged, measured around the tick. Schedules: `--every` is a floor
+  from the previous run and `--on/--at` or `--cron` a calendar; the next run
+  is on the calendar and past the floor, both (`--every 2w --on mon` is legal
+  and is what cron cannot say). Cron day-of-month and day-of-week combine with
+  OR when both are restricted.
 
-### The allowlist (`allowlist.rs`)
+## Platforms
 
-The registry is `Operation` (`ProfilePage`, `HoverCard`, `HighlightsTray`,
-`HighlightsPage`, `ReelGallery`, `ReelGalleryPage`, `StoriesTray`, `NoteBubble`,
-`SchoolPartnerBadge`, `ProfilePosts`, `ProfilePostsPage`, `Follow`, `Unfollow`,
-each with a friendly name, `doc_id`, endpoint and root field), `Rest` (followers,
-following, mutual followers of a pk, a post's info and its comments by the post's
-pk, each with its allowed query keys), the route definitions, the app's navigation
-and `show_many`. `refused` lets out only: a POST of the registry's on its own
-endpoint, announcing its name in `X-FB-Friendly-Name` and carrying its own
-`doc_id` (for the two writes, whose `doc_id` rotates, only the name and endpoint);
-the route definitions; a navigation POST whose one `route_url` is `/`, a profile
-or `/<name>/followers/mutualOnly` (`list_route`); a `show_many` whose form is the
-pks (one to fifty), `jazoest` and `fb_dtsg` and nothing else; a GET of a registry
-REST read by a numeric pk (`media/<pk>/info/` and `media/<pk>/comments/` and
-nothing else under a post: not its likers, not the link the app mints to share
-it); and a navigation with no query to
-`/` or to a profile, never to the app's screens (`stories explore direct reels
-accounts`), and never to a post's or a reel's page. `refused_ask` asks the same of an intent. **Anything else is refused
-before the browser sees it, as a defect of snob's, and ends the command.** The
-allowlist exists because the app's own writes cannot be listed: it sends seen
-signals, view counts and history on its own, under names that change.
+Releases: `x86_64-pc-windows-msvc` (built for `x86-64-v2`; Windows 11 only),
+`aarch64-pc-windows-msvc`, `x86_64-unknown-linux-musl`,
+`aarch64-unknown-linux-musl` (static, no glibc requirement),
+`aarch64-apple-darwin`. No Intel macOS build. The five triples appear in
+`ci.yml`, `release.yml`, `deny.toml` and `packaging/render.sh`; a new target
+touches all four.
 
-**The tab's guard** (`headless/guard.rs`) covers the app's own traffic: the app runs
-on every document the tab loads and sends calls of its own. The browser pauses each
-API call (`/api/graphql`, `/graphql/query`, `/ajax/`, `/api/v1/`), the view-count
-path, the event log and the Facebook sync, and judges it: a GET goes on, a POST only
-when `allowlist::refused_app` lets it (the registry's calls, plus the reads of the
-app's that `APP_READS` names with the reasons, a profile's posts and suggested
-accounts among them, the posts under any number the call vouches for since it
-rotates, plus the app's empty POST that
-hands out the claim, `CLAIM_HANDED_OUT`), anything else, the beacons included, is
-failed as a content blocker fails it and logged to `browser-owner.log`. No video reaches the
-page (a play counts). The app's realtime socket is not covered.
-`CLAIM_HANDED_OUT` is matched exactly and its `/web/` prefix is unconfirmed; if it
-is wrong every read carries claim `0`.
+Platform-specific code, all of it reached only by the CI job on that OS:
 
-### Pacing
-
-All numbers are in `pace.rs` and `rate_budget.rs`; the reasons are next to them.
-
-- **Per page**: twelve accounts (`ACCOUNTS_PER_PAGE`, the app's `count=12`, which
-  makes a list take two to four times the requests fifty a page would), one and a
-  half to four seconds before a list's first page (`DWELL_MS`, a person looking
-  at the profile), one to
-  three seconds between pages of an action (`STEP_MS`), **a sitting of forty pages
-  (about 480 accounts) and then a rest of five to fifteen minutes**
-  (`PAGES_PER_SITTING`, `SITTING_PAUSE_MS`), counted across walks. Somebody else's
-  lists use the same cadence with one fewer network retry.
-- **The daily ceiling on accounts read** is 2,000 in any 24 hours, 1,000 for seven
-  days after a push-back (`budget::accounts_per_day`). It is what binds, except
-  under `--same-day`, which reads past it and leaves the request budget as the
-  bound.
-- **The request budget** (GCRA, persisted per account): a pace bucket of one request
-  per 3.83 s with a twenty-request tolerance, a daily bucket of about 2,000
-  requests, and the write bucket of one write per fifteen minutes with a tolerance
-  of two (three in a row).
-- **Cooldowns** (`snob_core::budget`): 2 hours for a rate limit, 12 for an action
-  block, 30 minutes for a challenge, escalating on repeats and capped at 24 hours.
-  Push-backs on two different accounts less than an hour apart pause every account
-  (`common_brake`).
-- **What goes with them, each a read paid like any other**: a profile is opened
-  with the three reads the app sends beside its query (`IgClient::profile_burst`:
-  the highlights tray, kept for the command that shows it, the note bubble, the
-  school badge), a list with the app's navigation (`IgClient::open_list`), and
-  each list page is followed by its `show_many` before the next page
-  (`IgClient::statuses`), when the REST token is known. A failure of one of
-  these that is not a push-back is logged and passed over.
-- `Pacer::begin_action` advances the action count only where a stretch of time
-  begins that the account can move in (a walk, each sitting, a monitor tick); a
-  resolved target's counters are reused only within that action.
-- Not evidence, and not to be cited as it: Meta's "200 calls per user per hour" is
-  the Graph API's limit and has nothing to do with these endpoints.
-
-### Auth
-
-The credential is a session: `sessionid` (and `ds_user_id`, `csrftoken`, `mid`,
-`ig_did`, `datr`) as `snob_core::session::Session`, whose secrets are
-`secret::Secret` (cannot be printed, cleared on drop). It is stored per account in
-the system keyring (`session.<pk>`) or, with no keyring or `--no-keyring`, a file in
-the account's directory (DPAPI-sealed on Windows, 0600 elsewhere).
-
-- `login --browser` launches a browser against *our own profile*; the user logs in
-  and the cookies come back through `Storage.getCookies` over the pipe. `login
-  --paste` writes a pasted `sessionid` into that profile (`headless::profile`). A
-  login is authoritative; afterwards the browser's jar is, and the stored copy is
-  brought up to date from it at the end of each run and between monitor runs
-  (`headless::write_back`), never over a login made since and never another
-  account's.
-- **One browser profile per account**, `browser-profile/<pk>`, and two accounts
-  never share one (`AppPaths::browser_profile_for`). The profile is the device.
-- **The session is checked from the page**: `PolarisViewer` on the tab's document,
-  no request. A document that is logged out is an expired session (exit 3); a write
-  made on a page served to nobody or to another account is not sent.
-- The protocol travels on **an inherited pipe, never a port** (`pipe::spawn`,
-  `--remote-debugging-pipe`); the browser dies with its parent (a job object on
-  Windows). The protocol client is our own (`cdp/`).
-- The browser is a headless Chromium corrected only where headlessness changes what
-  a page can see (`headless/mod.rs` lists each: `navigator.webdriver`, the
-  `HeadlessChrome` token, client hints, the screen, pointer media queries, focus,
-  isolated world for snob's fetches). The browser's own User-Agent always goes out;
-  `login --user-agent` applies only with `SNOB_NO_BROWSER` and to media downloads.
-- A push-back heard on the page, on the app's own calls or snob's, stops the run and
-  is recorded once, by the process holding the browser, in that account's database
-  (`headless::listen`: `Latch`, `heard`). The tab is then sent to `about:blank`.
-- The owner (`owner/`) is one process per user; commands reach it over a `0600`
-  socket (a user-only named pipe on Windows) and can send only snob's own
-  intents and requests, never the protocol. Browsers close after five idle
-  minutes. `SNOB_NO_OWNER` or an unreachable owner means `headless::alone`: the
-  command runs its browser itself, and waits (`start_when_free`) while another
-  browser holds the profile.
-- `SNOB_NO_BROWSER=1` keeps `reqwest` as the last hop with the REST reads and the
-  write token scraping, and with every CDN download; from the browser the tab
-  fetches the files (`Ask::Asset`), except video and anything past 4 MiB, which stay
-  with `reqwest`. TLS is rustls with the
-  hybrid post-quantum group everywhere except Windows ARM64, which uses schannel
-  (`crates/snob-ig/Cargo.toml`); `--strict-roots` is refused there.
-
-## Rules the code enforces, and where
-
-Each lives in the one place that cannot be bypassed, rather than in something a
-caller has to remember. The reasoning is in the doc-comment at each location.
-
-| Rule | Where it lives |
-|---|---|
-| Every request is paid for, once per redirect hop; nothing is sent in a cooldown | `Pacer::clear_to_send` inside `IgClient::get_body`, and `IgClient::ask_page` by the Ask's kind; `Pacer::clear` |
-| Walking without rate control cannot be written | `ListWalker::new` takes only an `IgClient`, which cannot exist without a `Pacer` |
-| Only the registry's calls leave, and the app's POSTs are judged too | `allowlist::refused`, `refused_ask`; `headless::guard`; `headless::refuse`, `web::build_call` |
-| Nothing marks a story as seen | no `Mutation` variant; the allowlist; the guard; `snob-core/tests/no_seen.rs` |
-| A write's shape: not replayed by a redirect, no CSRF token no send, not resent after an ambiguous answer | `redirect::Policy::none()`; `IgError::NoCsrfToken`; `client::write::worth_rediscovering` |
-| A 429 or push-back puts the account in cooldown; a text 5xx from the edge proxy is not one | `IgClient::classify_and_record`; `headless::listen::heard`; `error::push_back` |
-| A push-back on two accounts within the hour pauses all | `budget::common_brake` over `shared.db` |
-| Only Instagram's CDN is downloaded from, never instagram.com itself | `allowlist::refused_asset` (through `CdnClient::check_downloadable` and the tab); `graphql::is_bundle` |
-| A name is filtered before anything draws it; a name in a URL is encoded, never filtered | `model::printable`, `report::filtered`; `model::in_a_path` |
-| An account id, a moment and a count cannot be confused | `snob_core::{Pk, Epoch, EpochMs}` newtypes; `Pk` implements neither `ToSql` nor `FromSql` |
-| The credential cannot be printed and clears itself | `secret::Secret` |
-| One account's database and session are reached only through its paths | `AccountPaths`, `SecretStore::session_of`; `App::open` checks `ds_user_id` |
-| Only a typed `--account` narrows a purge | no `env` on the flag in `cli.rs` |
-| Consent before enumerating someone else, before resolving; an unattended run reads a stranger's lists only on a recorded answer | `engine::ask_consent_with`; `Watched::may_run_unattended` |
-| Two stored lists are crossed only if nothing happened between the walks; an incomplete list is never crossed against (more than one row in twenty repeated is incomplete) | `engine::cooldown::check_same_moment`; `pager::WalkState::verify_completion`, `REPEAT_LIMIT_PERCENT` |
-| A walk in progress has exactly one writer | `snapshots::resumable`/`save_page`/`close` |
-| A change is reported once and only from a verified list; a report is never lost because delivery failed | `store::watch::Mark`; `store::watch::commit_report` (queue row and mark in one transaction) |
-| A queued report goes only to the address it was made for; credentials configured for one origin are not sent to another | `watch_deliveries.destination`; `delivery::plan` |
-| The session cannot reach the user's webhook | `WebhookClient::new` takes no `Session` |
-| The schedule reads no clock | `schedule::next_after` takes `now` |
-| A file named by a server is created, never written over; one the user named is replaced only by a whole file | `output::create_new`; `output::Replacing` |
-| The data directory is limited to this user; no deletion near the root | `paths::create_private_dir`; `paths::is_safe_to_remove`, `AppPaths::owned_dirs` |
-| No request is sent after the user asks to stop; a write in flight is the one thing Ctrl+C does not abandon | `Pacer::clear_to_send` reads the token first; `IgClient::post`, `ask_page` for `Ask::Write` |
-| The reader leaving is not an error | `ui::say!` (`println!` panics on a closed pipe) |
-| A failure is told in the language the answer was going to be in | `report::Wording`, `main::wording_for` |
-
-## Settled, so nobody re-opens them
-
-- **`friendships/show_many` is sent after every list page**, as the app sends it:
-  it is a read that happens to be a POST, a write is a `graphql::Mutation` and nothing else, and a list
-  read without it is not the app's. It is paid from the read budgets, never the
-  write bucket, and goes only with the REST token the app's own REST POSTs
-  carried; its answer is read for a push-back and discarded.
-- **The stories gallery is opened over the tray the home document preloads**
-  (`Ask::Tray`), not over the app's tray query, which the app does not send on the
-  home page. An account not in it opens the gallery over itself alone.
-- **A call is built in the process holding the browser**, right before it is sent,
-  from a typed intent: one `__req` counter per tab, and the page's tokens never
-  leave that process.
-- **The arithmetic holds**: `unfollowers + friends` is everyone you follow, `fans +
-  friends` everyone who follows you. A test asserts it.
-- **An incomplete list is never crossed against.** A short *starting* list only
-  warrants a warning.
-- **The full-size profile picture** comes from the profile query's
-  `hd_profile_pic_url_info` (no size beside it); `web_profile_info`'s
-  `profile_pic_url_hd` is not the full size.
-- **There is no useful logged-out mode.**
-- **No biometric verification**, on any platform: any prompt a local process of the
-  same user can trigger, that process can satisfy.
-- **A challenge's cooldown is not lifted by clearing the challenge.**
-- **The browser is talked to over a pipe; there is no debugging port.** A port hands
-  the session cookie to any local process.
-- **`snob purge` deletes the stored data and not the binary**, session first.
-  `snob logout` deletes the account's browser profile and session, keeps its data
-  and its registry entry.
-- **The trust store is narrowed only when asked** (`--strict-roots`,
-  `--tls-extra-root`); certificate pinning stays rejected.
-- **The Windows credential is `CRED_PERSIST_LOCAL_MACHINE`** (`secrets.rs::entry_for`).
-- **There is no lease over `watch_marks`**: two overlapping runs can report one
-  arrival twice, which costs a duplicate and never loses a window.
-- **Highlights are a command of their own**, not a flag on `stories`.
-- **A post's or a reel's page is never loaded.** A link's code is the post's pk
-  (`snob_ig::shortcode`), and the post is its info, asked from the page it opens
-  on, as the app asks it; a reel's link loaded cold lands on the app's reels
-  screen, which reports what it plays. Nothing of a link's query (the share
-  token among it) is read or sent.
-- **Posts are a grid and a post, as the app shows them**: `posts` is
-  `highlights`' shape (a listing, and a number to look inside one), `post` one
-  post by its link. A grid page is a read and not a list of accounts; a page of
-  comments is, and is charged to the day's accounts. Videos are the progressive
-  file the app plays, 720 wide at most; the DASH tracks are not joined.
-- **Stories are handed to the system viewer**, not drawn in the terminal.
-- **The site's own page is loaded, and not charged.** The app boots in the tab and
-  makes requests of its own, which do not go through the `Pacer`; the counts snob
-  reports are its own calls. That traffic is kept on purpose, since the calls
-  without it are what a script looks like, but it is listened to for push-back and
-  judged by the guard.
-- **Everything is per user, never per directory.**
-- **`snob import dyi` reads, crosses and prints, and nothing more**: nothing stored,
-  nothing crossed live.
+- Windows (`windows-sys`): launching the browser with an explicit handle list
+  and a job object (`pipe.rs`), starting a process detached with its own
+  handle list and out of the command's job where the job allows it
+  (`detach.rs`), the owner's named pipe and its DACL
+  (`owner/socket.rs`, `snob-store/src/windows_user.rs`), the hidden window that
+  hears the end of a session (`owner/end_of_session.rs`), power requests,
+  EcoQoS, the data directory's ACL, the keyring's local persistence, the
+  language preference, `QueryUnbiasedInterruptTime` for sleep detection
+  (`snob_ig::awake`). Static CRT and `/Brepro` via `.cargo/config.toml`.
+- Unix (`libc`): `dup2` of the CDP pipe ends onto fds 3 and 4, `setsid`
+  for a detached start (`detach.rs`), the owner's socket with `peer_cred`.
+  Linux adds a logind `idle` inhibitor (`zbus`) and `SCHED_BATCH`/`uclamp_max`;
+  macOS uses `caffeinate -i -w <pid>` and leaves the browser's scheduling
+  alone.
+- TLS backend and `--strict-roots` differ on Windows ARM64 (see above).
 
 ## Known walls
 
-- A list of tens of thousands may come back truncated (a short page with no
-  cursor); the walker catches it and the set commands refuse.
-- The REST reads (`/api/v1/users/{pk}/info/`, `web_profile_info`) draw a 429
-  from the headless browser. The app's own web client makes neither call, which
-  is why the browser route sends the app's calls instead.
-- WebGL is absent in the headless browser. Whether a headless browser on a Windows
-  desktop reaches the real GPU has not been measured.
-- Two browsers cannot share a profile (see the owner and `start_when_free`).
-- A browser costs memory (roughly 425 MB while it runs on a Raspberry Pi 5) and
-  about 90 MB of profile per account.
+What Instagram does that snob cannot fix, only report:
 
-## Planned
-
-- **The retirements, in this order.** Each lands in the commit after its
-  replacement:
-  1. The REST read path goes (session validation, `web_profile_info`, `topsearch`,
-     the REST highlights and stories, the write token scraping); it stays only
-     behind `SNOB_NO_BROWSER`.
-  2. The `reqwest` transport to Instagram goes, and its tests move to a fake `Page`.
-  3. The migrations from older versions (single-account layout, `watch.toml`
-     schema 1, the old browser profile, the `watch_state` interval seed) go one
-     release later, which then refuses an older layout.
-- The path of `CLAIM_HANDED_OUT`, the capture of what the listener counts as a
-  push-back, the owner outliving the terminal on a desktop, and whether Ubuntu's
-  snap Chromium can open a profile under a hidden directory are unchecked.
-- Two endpoints worth a command someday, both GETs about the viewer's own account:
-  `friendships/pending/` and `archive/reel/day_shells/`.
-- A list the profile card opens changes accounts only from the card
-  (`ui::people::browse_in`).
+- **Truncated lists.** Instagram can stop serving pages well before a list's
+  declared size; a walk that falls short of a declared size past
+  `pager::TRUNCATION_THRESHOLD` (10,000, a guess from unverified reports) ends
+  `StopReason::Truncated`, which is not a success and cannot be a baseline.
+  On some accounts `following` hits it on every walk while `followers`
+  completes, so `watch status` treats a list never read as unhealthy.
+- **Profiles that answer 400** (some business accounts): the id comes from
+  search, which carries no counters, so truncation cannot be detected and the
+  cache cannot judge freshness (`report::counters_unknowable`).
+- **Private accounts the viewer does not follow**: refused before any walk.
 
 ## Costs worth knowing
 
-Measured and recorded so nobody re-measures them. The binary is about 5 MB on
-Windows ARM64 (bundled SQLite roughly 9%, the `xlsx` feature roughly 9% more, an
-opt-out). The release profile is `opt-level = "s"`, fat LTO, `panic = "abort"`,
-stripped; nothing on a walk is CPU-bound against minutes of deliberate pacing.
-Running the browser took `snob whoami` from 0.1 s to about 2.7 s on a Pi 5 against a
-local fake. Under callgrind (October 2026, x86_64), a 12,000-account walk with the
-waits off is about 870 million instructions, of which snob's own crates are under half
-a percent: SQLite 46%, the allocator and `memcpy` 18%, the standard library 13%,
-`serde_json` 6%. Exporting the same list takes 0.03 s of CPU to csv or json and 0.19 s
-to xlsx. So no code of snob's is worth compiling twice for newer instructions, and the
-libraries that do the heavy lifting choose theirs at run time; the one baseline raised
-is Windows x86_64's, to `x86-64-v2`, which Windows 11 requires anyway
-(`.cargo/config.toml`). `clap` without `color` and `zstd` out of `Accept-Encoding` would save
-bytes and are kept anyway as positions: help in color, and an `Accept-Encoding` that
-is Chrome's character for character.
+A walk is not compute: about 0.69 s of client CPU for a 12,000-follower walk
+against roughly fifteen minutes of deliberate pacing. Optimize for requests
+sent and binary size, not speed. Measured, and recorded beside the setting:
 
-## Notes for the working tree
+- `opt-level = "s"` takes 23.7% off the Windows ARM64 binary for at most
+  +7.7% on the CPU-bound exports (`Cargo.toml`, `[profile.release]`).
+- Static CRT on Windows: +126,976 bytes per binary, 20 imported DLLs down to
+  11 (`.cargo/config.toml`).
+- The `xlsx` feature (`rust_xlsxwriter` and `zopfli`): about 498 KiB and six
+  crates for one of six formats; on by default, removable with
+  `--no-default-features` (also drops reading a zipped export).
+- Dropping the Windows keyring's `search` feature removed `regex` and
+  `aho-corasick`: 863,744 bytes, 11.4% of the Windows binaries.
+- The `mcp-http` feature (`snob mcp --listen`: hyper's server half and
+  rmcp's Streamable HTTP; tokio-stream and sse-stream are the only new
+  crates, the rest was in the tree through reqwest): 486,912 bytes, 4.8%
+  of the Windows x86-64 release binary (10,180,608 against 9,693,696
+  with `--no-default-features --features xlsx,mcp`); on by default.
 
-`/docs/` is gitignored scratch (plans, hand-off notes, review output) and is not
-read by any guard or test; do not rely on it for anything that has to survive, and
-do not commit it. The same goes for `tools/capture/out/`.
+## Open questions
+
+Assumptions the code marks as not yet confirmed against the real app; settle
+them with a capture (`tools/capture/record.js`, which writes redacted
+recordings to the gitignored `tools/capture/out/`; `summarize.js` reads them)
+before relying on them further: the paths and thresholds the listener counts as
+push-back (`headless/listen.rs`), the prefix of `CLAIM_HANDED_OUT`
+(`headless/guard.rs`), whether Instagram varies on `Sec-Fetch-*`
+(`client/headers.rs`), and `TRUNCATION_THRESHOLD`.
+
+## Website (`web/`)
+
+A static Astro site (`output: 'static'`, Tailwind 4) served by Cloudflare
+Workers from `dist/` (`wrangler.jsonc`, custom domain `snob.dennisgr7.dev`).
+Workers Builds deploys `main` and uploads a preview for every other branch.
+Node `24.21.0` (`web/.node-version`), pnpm `12.9.1` via Corepack; exact
+versions only, a 24 h release quarantine and an install-script allowlist in
+`web/pnpm-workspace.yaml`. CI (`.github/workflows/web.yml`, only on changes
+under `web/`):
+
+```bash
+cd web
+pnpm install --frozen-lockfile
+pnpm exec playwright install --with-deps chromium
+pnpm check && pnpm build && pnpm test   # Playwright against `wrangler dev` serving dist/
+```
+
+- `web/DESIGN.md` is the reasoning behind the look; a change to the look
+  starts there. `/design-system` shows every token live.
+- Every word on the page is in `web/src/lib/content.ts`, shared by the HTML,
+  `llms.txt` and the Markdown twin (`index.md`); it may promise nothing the
+  README and `--help` do not. The version is read from `Cargo.toml` at build
+  time (`src/lib/version.ts`); never copy it.
+- Three small scripts, hashed into the CSP; no `is:inline` code, no `style`
+  attributes; everything works without JavaScript.
+- `pnpm brand` regenerates the committed images in `public/` (after
+  `pnpm build`).
+
+## Release and packaging
+
+1. Changes land on `dev` through pull requests; Dependabot also targets `dev`
+   (weekly; cargo updates are lockfile-only).
+2. A release commit sets `[workspace.package] version` (subject
+   `Snob CLI X.Y.Z`); `dev` goes to `main` through a pull request, which
+   `claude-code-review.yml` reviews.
+3. `git tag vX.Y.Z` on a commit of `main` and push it. `release.yml` refuses a
+   tag that is not an ancestor of `origin/main` or disagrees with
+   `Cargo.toml`; builds the five targets with no cache and with
+   `--remap-path-prefix`, reproducibly (`.zip` on Windows, `.tar.gz` and `.deb`
+   elsewhere, times from the tagged commit); publishes `SHA256SUMS` and a
+   build-provenance attestation; then runs `packaging/render.sh`, commits
+   "Point the formula and the manifest at vX.Y.Z" to `main` and cherry-picks
+   it onto `dev`.
+4. `Formula/snob.rb` (Homebrew tap) and `bucket/snob.json` (Scoop bucket) are
+   read straight from this repository; `packaging/winget/` is generated for a
+   manual pull request to `microsoft/winget-pkgs`. `packaging/install.sh`
+   (POSIX sh) and `install.ps1` install the latest release
+   (`SNOB_VERSION`, `SNOB_INSTALL_DIR`).
+
+The no-writes claim is stated in four places that must move together: the
+`.deb` `extended-description` in `crates/snob-cli/Cargo.toml`, the winget
+locale manifest that `render.sh` renders from it, `crates/snob-ig/src/lib.rs`,
+and `README.md`.
+
+Workflows pin every action to a commit SHA with the version in a comment;
+Dependabot moves them. Every workflow starts from `permissions: contents:
+read`. `claude.yml` (`@claude`) and `claude-code-review.yml` only take effect
+once identical on `main`.
+
+## Git
+
+- Branches: `dev` is where work goes; `main` only takes what `dev` has, via
+  the release pull request. Topic branches are named by kind and subject
+  (`feat/ssh-remote-login`, `fix/story-browser`, `deps/rustls-0.23.46`) and
+  merged into `dev` by pull request.
+- Commit subjects are English sentences in the imperative, saying what the
+  change does for the person using snob, with no type prefix and no final
+  period: "Bind the tunnel's near end to loopback by name", "Take tokio 1.53.3
+  and rustls-webpki 0.103.16 for two advisories". The body, wrapped at about
+  72 columns, says why: the failure as it happened, what changes, what was
+  measured. Dependency bumps name the advisories they answer.
+- No `Co-Authored-By`, "Generated with" or other tool trailers, and never push
+  unless asked.
+- Never commit what snob produces: exports (`*.json`, `*.csv`, `*.xlsx`, ...
+  at the root are ignored), data exports, `tools/capture/out/`, or anything
+  under `/docs/` (scratch notes, ignored). A new root-level `.md` file is
+  ignored unless `.gitignore` lists it.

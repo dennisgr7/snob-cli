@@ -58,7 +58,7 @@ async fn main() -> std::process::ExitCode {
 /// a list into JSON on its own. A program reading one stream should not
 /// have to read the other in English.
 fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
-    use snob_cli::cli::{AccountCommand, Format, WatchCommand};
+    use snob_cli::cli::{AccountCommand, Format, JobsCommand, WatchCommand};
     use snob_cli::output::effective_format;
     use snob_cli::report::Wording;
 
@@ -93,6 +93,7 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
         Command::Whoami(args) => args.output.json,
         Command::Status(args) => args.output.json,
         Command::Account(AccountCommand::List(args)) => args.output.json,
+        Command::Follow(args) | Command::Unfollow(args) => args.output.json,
         // It takes no format flag and answers in JSON down a pipe, the way
         // `commands::import::run` decides it.
         Command::Import(_) => document(None, None),
@@ -110,9 +111,20 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
         | Command::Purge(_)
         | Command::Pfp(_)
         | Command::Fetch(_)
-        | Command::Follow(_)
-        | Command::Unfollow(_)
         | Command::BrowserOwner => false,
+        // A job's own processes answer in JSON, as the server reading them
+        // does (`jobs::start`); the supervisor's errors go to its log.
+        Command::Job(snob_cli::cli::JobCommand::Run(_)) => false,
+        Command::Job(_) => true,
+        Command::Jobs(args) => match &args.command {
+            None => args.list.output.json,
+            Some(JobsCommand::List(list)) => list.output.json,
+            Some(JobsCommand::Show(show)) => show.output.json,
+            Some(JobsCommand::Cancel(cancel)) => cancel.output.json,
+        },
+        // The protocol is on standard output; its failures are JSON-RPC.
+        #[cfg(feature = "mcp")]
+        Command::Mcp(_) => false,
     };
     if json { Wording::Json } else { Wording::Prose }
 }
@@ -250,6 +262,72 @@ fn sandbox_keyring_namespace(root: &std::path::Path) -> String {
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let (paths, no_keyring, keyring_namespace) = wiring(&cli)?;
+    snob_cli::app::wait_at_most(cli.max_wait);
+    if cli.stop_when_stdin_closes {
+        snob_cli::app::stop_when_stdin_closes();
+    }
+    if cli.spend_alone {
+        snob_cli::app::spend_alone();
+    }
+    if cli.progress_json {
+        snob_cli::app::progress_json();
+    }
+    // Before the layout, the owner and the session: the server spends nothing
+    // and stores nothing itself. Each tool call is a child `snob`, which does
+    // all of that for itself.
+    #[cfg(feature = "mcp")]
+    if let Command::Mcp(args) = &cli.command {
+        return match &args.command {
+            Some(snob_cli::cli::McpCommand::Config(config)) => commands::mcp::config::run(
+                config,
+                mcp_globals(&cli, cli.max_wait)?,
+                cli.max_wait.unwrap_or(commands::mcp::MAX_WAIT),
+            ),
+            // The key is the machine's, in the keyring whatever
+            // `--no-keyring` says (`commands::mcp::key`); a sandbox's under
+            // its own name, like everything else it keeps there.
+            #[cfg(feature = "mcp-http")]
+            Some(snob_cli::cli::McpCommand::Key(key)) => {
+                let store = SecretStore::new(paths.clone(), no_keyring);
+                let store = match &keyring_namespace {
+                    Some(service) => store.with_service(service),
+                    None => store,
+                };
+                commands::mcp::key::run(key, &store)
+            }
+            None => {
+                // `--max-wait` is the server's to hand each child, which
+                // waits as long as what it runs allows (`mcp::Waits`).
+                let launch = commands::mcp::child::Launch::new(
+                    std::env::current_exe()?,
+                    mcp_globals(&cli, None)?,
+                );
+                let settings = commands::mcp::Settings {
+                    writes: args.allow_writes,
+                    in_chat: args.confirm_in_chat,
+                    writes_a_day: args.max_writes_per_day,
+                    max_wait: cli.max_wait,
+                };
+                // Over HTTP the one thing the server reads is the key its
+                // clients present, from where `snob mcp key` keeps it.
+                #[cfg(feature = "mcp-http")]
+                if let Some(at) = args.listen {
+                    let store = SecretStore::new(paths.clone(), no_keyring);
+                    let store = match &keyring_namespace {
+                        Some(service) => store.with_service(service),
+                        None => store,
+                    };
+                    let listen = commands::mcp::http::Listen {
+                        at,
+                        public: args.public_url.clone(),
+                        data_dir: paths.data_dir().to_path_buf(),
+                    };
+                    return commands::mcp::http::serve(launch, settings, listen, &store).await;
+                }
+                commands::mcp::serve(launch, settings).await
+            }
+        };
+    }
     if let Command::BrowserOwner = cli.command {
         let linger = if keyring_namespace.is_some() {
             snob_cli::owner::Linger::for_a_sandbox()
@@ -290,6 +368,12 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                  with \"snob login\". It may still be active on Instagram."
             ));
         }
+    }
+
+    // The jobs send nothing themselves and use no browser: a walk a job runs
+    // is a process of its own, which comes through here again.
+    if matches!(cli.command, Command::Job(_) | Command::Jobs(_)) {
+        return snob_cli::jobs::dispatch(&cli, &store, &paths).await;
     }
 
     // Every request to Instagram goes out from a browser from here on, unless
@@ -382,12 +466,10 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
         }
         Command::Purge(args) => match cli.account.as_deref() {
             Some(name) => commands::purge::run_for_account(args, store, paths, name).await,
-            None => {
-                // The whole data directory goes, the owner's log with it, so
-                // the owner is asked to leave, not only to close its browsers.
-                snob_cli::owner::quit(paths).await;
-                commands::purge::run(args, store, paths)
-            }
+            // The whole data directory goes, the owner's log with it, so the
+            // owner is asked to leave, not only to close its browsers, once
+            // the jobs that would start it again have stopped.
+            None => commands::purge::run_everything(args, store, paths).await,
         },
         Command::Account(command) => commands::account::run(
             command,
@@ -449,8 +531,11 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
             };
             commands::fetch::run(args, account_ua).await
         }
-        // Answered at the top.
-        Command::BrowserOwner => Ok(ExitCode::Ok),
+        // Answered at the top, and in `run`.
+        Command::BrowserOwner | Command::Job(_) | Command::Jobs(_) => Ok(ExitCode::Ok),
+        // Answered in `run`.
+        #[cfg(feature = "mcp")]
+        Command::Mcp(_) => Ok(ExitCode::Ok),
     }
 }
 
@@ -471,6 +556,58 @@ fn owner_args(cli: &Cli) -> anyhow::Result<Vec<std::ffi::OsString>> {
         args.push("--verbose".into());
     }
     args.push(snob_cli::owner::COMMAND.into());
+    Ok(args)
+}
+
+/// What every command `snob mcp` runs for a tool call is started with, ahead
+/// of its own arguments: the global flags the server was given, so the child
+/// lands on the same files, account and trust, and `--max-wait` when
+/// `max_wait` is given.
+///
+/// `snob mcp config` prints the same flags in front of `mcp`, so the server
+/// a client starts is the one this command line describes, `--max-wait`
+/// among them when it was given. The server itself passes none here: it
+/// hands each child the wait that child's kind of run allows
+/// (`commands::mcp::Waits`), and clap refuses the flag twice.
+#[cfg(feature = "mcp")]
+fn mcp_globals(
+    cli: &Cli,
+    max_wait: Option<std::time::Duration>,
+) -> anyhow::Result<Vec<std::ffi::OsString>> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(account) = &cli.account {
+        args.push("--account".into());
+        args.push(account.into());
+    }
+    if cli.no_keyring {
+        args.push("--no-keyring".into());
+    }
+    if cli.strict_roots {
+        args.push("--strict-roots".into());
+        for root in &cli.tls_extra_root {
+            args.push("--tls-extra-root".into());
+            args.push(std::path::absolute(root)?.into());
+        }
+    }
+    // Whole seconds, which is all `--max-wait` can be written in. **Zero
+    // stays zero**: it means "never wait for the budget", and a floor of one
+    // second here would hand every child a wait the person did not allow.
+    if let Some(max_wait) = max_wait {
+        args.push("--max-wait".into());
+        args.push(format!("{}s", max_wait.as_secs()).into());
+    }
+    #[cfg(feature = "testing")]
+    if let Some(root) = &cli.sandbox_root {
+        args.push("--sandbox-root".into());
+        args.push(std::path::absolute(root)?.into());
+        if let Some(base) = &cli.ig_base_url {
+            args.push("--ig-base-url".into());
+            args.push(base.as_str().into());
+        }
+        if cli.through_the_browser {
+            args.push("--through-the-browser".into());
+        }
+    }
     Ok(args)
 }
 
@@ -599,6 +736,39 @@ mod filter_tests {
         let typo = log_filter(false, Some("snob_ig=loud"), false);
         assert!(typo.would_enable("snob_ig::client", &Level::WARN));
         assert!(!typo.would_enable("snob_ig::client", &Level::INFO));
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod mcp_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn a_max_wait_of_zero_reaches_the_children_as_zero() {
+        let cli = Cli::try_parse_from(["snob", "--max-wait", "0", "mcp"]).expect("it parses");
+        // Printed by `snob mcp config` in front of `mcp`, as it was given.
+        let globals = mcp_globals(&cli, cli.max_wait).expect("no path to resolve");
+        let at = globals
+            .iter()
+            .position(|arg| arg == "--max-wait")
+            .expect("the limit is passed on");
+        assert_eq!(globals[at + 1], "0s");
+        // And handed by the server to every child, a job's walk included.
+        let waits = commands::mcp::Waits::given(cli.max_wait);
+        assert_eq!(waits.call, std::time::Duration::ZERO);
+        assert_eq!(waits.job, std::time::Duration::ZERO);
+
+        // None given: none in the server's globals, and its own defaults.
+        let cli = Cli::try_parse_from(["snob", "mcp"]).expect("it parses");
+        let globals = mcp_globals(&cli, None).expect("no path to resolve");
+        assert!(
+            !globals.iter().any(|arg| arg == "--max-wait"),
+            "{globals:?}"
+        );
+        let waits = commands::mcp::Waits::given(cli.max_wait);
+        assert_eq!(waits.call, commands::mcp::MAX_WAIT);
+        assert_eq!(waits.job, commands::mcp::JOB_MAX_WAIT);
     }
 }
 

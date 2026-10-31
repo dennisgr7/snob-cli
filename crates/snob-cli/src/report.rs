@@ -107,9 +107,16 @@ pub enum Wording {
 /// `$?` are told the same thing; `message` and `causes` are the chain the
 /// prose prints, in the same order; `hint` is the advice the prose sets
 /// apart; `url` is the address a challenge has to be cleared at;
-/// `cooldown_until` is when a cooldown that refused the run lifts, and only
-/// that: a push-back met in this run starts one this does not look up.
-/// Printed as one line, the last on standard error. Filtered line by line
+/// `cooldown_until` is when a cooldown that refused the run lifts (the
+/// refusal's own, `ExitError::with_cooldown_until`, or the client's
+/// backstop), and only that: a push-back met in this run starts one this
+/// does not look up; `reason` is a finer token than `code` when the failure
+/// has one (`ExitError::with_reason`: `busy`; `budget_wait` for a wait for
+/// the request budget past `--max-wait`), and null otherwise; `retry_at` is
+/// when a refusal that is no cooldown stops applying
+/// (`ExitError::with_retry_at`: the day's cap on an agent's writes, and a
+/// list a lost job may still hold), and null otherwise. Printed as one
+/// line, the last on standard error. Filtered line by line
 /// like the prose, and for the same reason -- a name is filtered before
 /// anything draws it, and a JSON consumer may well print it. `viewer`, beside
 /// `error`, is the account the run acted as, or null before there was one.
@@ -123,9 +130,25 @@ fn error_json_for(error: &anyhow::Error, viewer: Option<&Viewer>) -> serde_json:
     let instagram = instagram_in(error);
     let hint = advice_in(error).map(|hint| filtered(hint, "\n"));
     let url = instagram.and_then(|e| e.challenge_url());
-    let lifts = instagram.and_then(|e| match e {
-        snob_ig::error::IgError::InCooldown { until_ms } => Some(until_ms.to_epoch()),
-        _ => None,
+    let ours = error.chain().find_map(|c| c.downcast_ref::<ExitError>());
+    let lifts = ours
+        .and_then(ExitError::cooldown_until)
+        .or_else(|| {
+            instagram.and_then(|e| match e {
+                snob_ig::error::IgError::InCooldown { until_ms } => Some(*until_ms),
+                _ => None,
+            })
+        })
+        .map(|until_ms| until_ms.to_epoch());
+    let retry_at = ours
+        .and_then(ExitError::retry_at)
+        .map(|at| at.to_epoch_not_before());
+    // A wait past `--max-wait` exits as a stop does (130), and is told
+    // apart from one by this: it is the one worth trying again later.
+    let reason = ours.and_then(ExitError::reason).or_else(|| {
+        instagram
+            .is_some_and(|e| matches!(e, snob_ig::error::IgError::WaitTooLong { .. }))
+            .then_some("budget_wait")
     });
 
     serde_json::json!({
@@ -138,6 +161,8 @@ fn error_json_for(error: &anyhow::Error, viewer: Option<&Viewer>) -> serde_json:
             "hint": hint,
             "url": url,
             "cooldown_until": lifts,
+            "retry_at": retry_at,
+            "reason": reason,
         }
     })
 }
@@ -392,24 +417,30 @@ pub fn refuse_different_moments(
     // Each arm asks the same question of the same pair, so each one asks it the
     // same way.
     let either = |wanted: Provenance| a == wanted || b == wanted;
-    let (code, hint) = if either(Provenance::Cooldown) {
+    // `stored_moments` names the one an agent cannot act on as written: its
+    // server passed the `--offline` (a stored list, a later page no longer
+    // held), so it is told in its own tools' words (`mcp::answer`).
+    let (code, hint, reason) = if either(Provenance::Cooldown) {
         (
             ExitCode::RateLimited,
             "Run it again once the cooldown lifts.",
+            None,
         )
     } else if either(Provenance::CacheFlag) {
         (
             ExitCode::Error,
             "Run it again without --offline, so both lists are checked against the account.",
+            Some("stored_moments"),
         )
     } else {
         (
             ExitCode::Error,
             "Instagram could not be reached to check either list. Run it again in a while.",
+            None,
         )
     };
 
-    ExitError::new(
+    let refusal = ExitError::new(
         code,
         format!(
             "the two stored lists are from different moments ({} and {}), so crossing \
@@ -418,8 +449,11 @@ pub fn refuse_different_moments(
             stored_on(b_at)
         ),
     )
-    .with_hint(hint)
-    .into()
+    .with_hint(hint);
+    match reason {
+        Some(reason) => refusal.with_reason(reason).into(),
+        None => refusal.into(),
+    }
 }
 
 /// Why a cooldown could not be served around.
@@ -438,6 +472,7 @@ pub enum Blocked<'a> {
 
 /// The account is in cooldown and storage cannot answer either.
 pub fn refuse_in_cooldown(held: &Held, blocked: Blocked<'_>) -> anyhow::Error {
+    let lifts = held.until_ms;
     let held = held_until(held);
     let detail = match blocked {
         Blocked::RefreshWanted => format!("{held}; --refresh cannot walk until it lifts"),
@@ -456,7 +491,9 @@ pub fn refuse_in_cooldown(held: &Held, blocked: Blocked<'_>) -> anyhow::Error {
              is nothing to serve"
         ),
     };
-    ExitError::new(ExitCode::RateLimited, detail).into()
+    ExitError::new(ExitCode::RateLimited, detail)
+        .with_cooldown_until(lifts)
+        .into()
 }
 
 /// A cooldown, or the brake, that landed between the check and the walk.
@@ -465,18 +502,28 @@ pub fn refuse_cooldown_mid_walk(held: &Held) -> anyhow::Error {
         ExitCode::RateLimited,
         format!("{}; nothing can be walked until it lifts", held_until(held)),
     )
+    .with_cooldown_until(held.until_ms)
     .into()
 }
 
 /// A list another snob is walking right now, awake or asleep on the budget.
+///
+/// Exit 1 with `walked_elsewhere` as the reason a program reads
+/// (`ExitError::with_reason`), so a job's start and an agent can tell it from
+/// any other failure: it is the one that goes away by itself.
 pub fn walked_elsewhere(target: Option<&str>, kind: ListKind) -> anyhow::Error {
     let who = crate::app::target_label(target);
     let minutes = snob_store::store::snapshots::CLAIM_TTL_SECS / 60;
-    anyhow::anyhow!(
-        "another snob is walking {who}'s {kind} list right now; run this again \
-         once it has finished, and it will use what that walk stored.\n\
-         A walk that stopped without letting go is taken over after {minutes} minutes."
+    ExitError::new(
+        ExitCode::Error,
+        format!(
+            "another snob is walking {who}'s {kind} list right now; run this again \
+             once it has finished, and it will use what that walk stored.\n\
+             A walk that stopped without letting go is taken over after {minutes} minutes."
+        ),
     )
+    .with_reason("walked_elsewhere")
+    .into()
 }
 
 /// What somebody is agreeing to when they let a run read a stranger's lists.
@@ -527,6 +574,37 @@ pub const BATTERY_CRITICAL_SKIP: &str =
 /// What the scheduled monitor says when the run that is due waits for power.
 pub const BATTERY_CRITICAL_HOLD: &str = "the battery is critical; the run that is due waits \
      until the machine is on power or charged again";
+
+/// What is left of a rest between sittings, as a person counts it: whole
+/// minutes, rounded up, since the walk does not go before it ends.
+pub fn rest_left(left: std::time::Duration) -> String {
+    match left.as_secs().div_ceil(60) {
+        1 => "1 minute".to_string(),
+        minutes => format!("{minutes} minutes"),
+    }
+}
+
+/// How long a walk has left, from the fewest and the most seconds it may
+/// take, as a person says it: whole minutes rounded up, as [`rest_left`]
+/// counts them, **one figure when both round to the same**, and "under a
+/// minute" when not one is left. The one home of the sentence the MCP
+/// answers, a task's message and `snob jobs` end with.
+pub fn time_left(least: u64, most: u64) -> String {
+    let (least, most) = (least.min(most), least.max(most));
+    let minutes = |n: u64| {
+        if n == 1 {
+            "1 minute".to_string()
+        } else {
+            format!("{n} minutes")
+        }
+    };
+    match (least.div_ceil(60), most.div_ceil(60)) {
+        (_, 0) => "under a minute".to_string(),
+        (low, high) if low == high => format!("about {}", minutes(high)),
+        (0, high) => format!("up to {}", minutes(high)),
+        (low, high) => format!("about {low} to {high} minutes"),
+    }
+}
 
 /// What a walk says when it finds the machine slept in the middle of it.
 pub fn slept_during_the_walk(slept: std::time::Duration) -> String {
@@ -837,6 +915,10 @@ fn advice_for(error: &snob_ig::error::IgError) -> Option<&'static str> {
     use snob_ig::error::IgError;
     match error {
         IgError::SessionExpired => Some("run \"snob login\" again"),
+        IgError::WaitTooLong { .. } => Some(
+            "run it again later, or with a longer --max-wait; \"snob status --budget\" says \
+             when the budget has room",
+        ),
         IgError::NoCsrfToken => Some(
             "run \"snob login --browser\", or, with SNOB_NO_BROWSER, pass the token with \
              \"snob login --paste --csrftoken\"",
@@ -905,16 +987,24 @@ pub fn pager_warning(warning: Warning) -> String {
 /// account is known but this list of it has never been walked. They get the
 /// same answer because there is one thing to do about either.
 ///
-/// It carries the `hint:` its four siblings here carry. It gains no exit code:
-/// the `anyhow` fallback is already `Error`, and this is the shape that keeps
-/// the advice apart from what happened.
-pub fn refuse_nothing_stored(kind: ListKind) -> anyhow::Error {
-    ExitError::new(
-        ExitCode::Error,
-        format!("no {kind} list is stored, and --offline says not to look for one"),
-    )
-    .with_hint(format!("run \"snob {kind}\" once, or drop --offline"))
-    .into()
+/// It carries the `hint:` its four siblings here carry, naming the account
+/// the list is of, `target` as it was typed (`None` is the viewer's own):
+/// the command without it would read somebody else's list, the viewer's.
+/// Exit 1, with `nothing_stored` as the reason a program reads, which the
+/// MCP server answers with advice in its own tools' words (`answer.rs`):
+/// an agent never passed `--offline`, which its server added.
+pub fn refuse_nothing_stored(kind: ListKind, target: Option<&str>) -> anyhow::Error {
+    let target = target.map(|name| printable(name.strip_prefix('@').unwrap_or(name)));
+    let (of, command) = match &target {
+        Some(name) => (format!(" of @{name}"), format!("snob {kind} {name}")),
+        None => (String::new(), format!("snob {kind}")),
+    };
+    ExitError::new(ExitCode::Error, format!("no {kind} list{of} is stored"))
+        .with_reason("nothing_stored")
+        .with_hint(format!(
+            "run \"{command}\" once, or drop --offline, which says not to look for one"
+        ))
+        .into()
 }
 
 /// "pepito, carlos and 4 others", or `None` when there is nobody to name.
@@ -1016,6 +1106,110 @@ mod tests {
     use super::*;
     use crate::engine::ListOutcome;
     use snob_core::Pk;
+
+    /// The time a walk has left says one figure when both ends round to the
+    /// same minute, and never "0 minutes".
+    #[test]
+    fn the_time_left_is_one_figure_when_both_ends_are_the_same_minute() {
+        assert_eq!(time_left(0, 0), "under a minute");
+        assert_eq!(time_left(3, 10), "about 1 minute");
+        assert_eq!(time_left(61, 90), "about 2 minutes");
+        assert_eq!(time_left(30, 200), "about 1 to 4 minutes");
+        assert_eq!(time_left(0, 200), "up to 4 minutes");
+        assert_eq!(time_left(0, 45), "up to 1 minute");
+        assert_eq!(
+            time_left(400, 130),
+            "about 3 to 7 minutes",
+            "in either order"
+        );
+    }
+
+    /// Nothing stored names the account the list is of, in the command to
+    /// type back, without an at sign, and carries its reason.
+    #[test]
+    fn nothing_stored_names_whose_list_it_is() {
+        let theirs = refuse_nothing_stored(ListKind::Followers, Some("@user3"));
+        let json = error_json_for(&theirs, None);
+        assert_eq!(json["error"]["reason"], "nothing_stored");
+        assert_eq!(
+            json["error"]["message"],
+            "no followers list of @user3 is stored"
+        );
+        let hint = json["error"]["hint"].as_str().unwrap();
+        assert!(hint.contains("run \"snob followers user3\" once"), "{hint}");
+        let own = refuse_nothing_stored(ListKind::Following, None);
+        let json = error_json_for(&own, None);
+        assert!(
+            json["error"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("run \"snob following\" once"),
+            "{json}"
+        );
+    }
+
+    /// A refusal by a cooldown says when it lifts as a moment, not only in
+    /// the sentence.
+    #[test]
+    fn a_cooldown_refusal_says_when_it_lifts_in_its_json() {
+        let held = Held {
+            until_ms: EpochMs::new(1_700_000_000_000),
+            braked: Vec::new(),
+        };
+        for refused in [
+            refuse_in_cooldown(&held, Blocked::RefreshWanted),
+            refuse_in_cooldown(&held, Blocked::NothingStored(ListKind::Followers)),
+            refuse_cooldown_mid_walk(&held),
+        ] {
+            let json = error_json_for(&refused, None);
+            assert_eq!(
+                json["error"]["cooldown_until"],
+                serde_json::json!(held.until_ms.to_epoch()),
+                "{json}"
+            );
+            assert_eq!(json["error"]["code"], "rate_limited");
+        }
+    }
+
+    /// The cap on an agent's writes says when the next is free as a moment,
+    /// which is no cooldown's end.
+    #[test]
+    fn a_refusal_by_the_write_cap_says_when_it_frees_in_its_json() {
+        let free_at = EpochMs::new(1_700_000_000_500);
+        let refused = crate::commands::common::write_cap_reached(10, free_at);
+        let json = error_json_for(&refused, None);
+        assert_eq!(
+            json["error"]["retry_at"],
+            serde_json::json!(free_at.to_epoch_not_before()),
+            "{json}"
+        );
+        assert_eq!(json["error"]["reason"], "mcp_write_cap");
+        assert!(json["error"]["cooldown_until"].is_null(), "{json}");
+    }
+
+    /// A wait for the budget past `--max-wait` exits as a stop does, and is
+    /// told apart by its reason.
+    #[test]
+    fn a_wait_past_the_limit_has_a_reason_of_its_own() {
+        let error = anyhow::Error::new(snob_ig::error::IgError::WaitTooLong {
+            wait: std::time::Duration::from_secs(900),
+            limit: std::time::Duration::from_secs(300),
+        });
+        let json = error_json_for(&error, None);
+        assert_eq!(json["error"]["code"], "interrupted");
+        assert_eq!(json["error"]["reason"], "budget_wait");
+    }
+
+    /// What is left of a rest is said in whole minutes, never fewer than it
+    /// is: a second over a minute is two.
+    #[test]
+    fn the_rest_left_is_said_in_minutes_rounded_up() {
+        let secs = std::time::Duration::from_secs;
+        assert_eq!(rest_left(secs(1)), "1 minute");
+        assert_eq!(rest_left(secs(60)), "1 minute");
+        assert_eq!(rest_left(secs(61)), "2 minutes");
+        assert_eq!(rest_left(secs(483)), "9 minutes");
+    }
 
     /// Every string this module draws goes through the name filter, and the
     /// paragraph breaks it lays out survive it.
@@ -1231,6 +1425,15 @@ mod tests {
         assert_eq!(json["error"]["code"], "no_session");
         assert_eq!(json["error"]["hint"], "run \"snob login\"");
         assert!(json["error"]["url"].is_null());
+        assert!(json["error"]["reason"].is_null());
+
+        // A finer token than the exit's, beside it, never in its place.
+        let busy: anyhow::Error = ExitError::new(ExitCode::Error, "held elsewhere")
+            .with_reason("busy")
+            .into();
+        let json = error_json_for(&busy, None);
+        assert_eq!(json["error"]["code"], "error");
+        assert_eq!(json["error"]["reason"], "busy");
     }
 
     /// A failure names the account the run acted as, beside the error, so a
@@ -1366,6 +1569,16 @@ mod tests {
         assert!(hint.contains("--offline"), "{hint}");
         assert!(!hint.contains("cooldown"), "{hint}");
         assert_eq!(crate::exit::from_chain(&asked_for), Some(ExitCode::Error));
+        // A reason of its own, so an agent, whose server passed the flag, is
+        // told something it can do instead.
+        let reason = |error: &anyhow::Error| {
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<ExitError>())
+                .and_then(ExitError::reason)
+        };
+        assert_eq!(reason(&asked_for), Some("stored_moments"));
+        assert_eq!(reason(&throttled), None);
 
         // A failed poll is neither of the two. Nobody asked for storage — the
         // request to check went out and did not come back — so it is not told

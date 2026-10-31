@@ -408,7 +408,9 @@ async fn cache_with_an_unknown_target_fails_without_the_network() {
     let error = execute(&server, tmp.path(), &args).await.unwrap_err();
 
     assert!(
-        error.to_string().contains("--offline says not to look"),
+        error
+            .to_string()
+            .contains("no followers list of @nobody is stored"),
         "{error}"
     );
     assert_eq!(

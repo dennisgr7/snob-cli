@@ -20,7 +20,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use snob_core::EpochMs;
 use snob_core::Pk;
-use snob_core::budget::{Brake, RateBudget, RateBudgetError, common_brake};
+use snob_core::budget::{Brake, RateBudget, RateBudgetError, Sitting, SittingRule, common_brake};
 use snob_core::clock::now_ms;
 
 use super::StoreError;
@@ -142,6 +142,12 @@ const WRITE_EMISSION_MS: i64 = 900_000;
 /// is no longer somebody tidying their following list, which is the only use
 /// this budget is sized for.
 const WRITE_BURST_MS: i64 = WRITE_EMISSION_MS * 2;
+
+/// About the most writes the write bucket lets through in any 24 hours: the
+/// burst of three, then one every [`WRITE_EMISSION_MS`] for the rest of the
+/// day, 99. A cap on writes counted elsewhere (`mcp_acts`) past this would
+/// promise nothing the bucket does not already stop.
+pub const WRITES_IN_A_DAY: u32 = (DAY_MS / WRITE_EMISSION_MS) as u32 + 3;
 
 /// Slack before deciding the system clock has gone backwards.
 const CLOCK_SKEW_TOLERANCE_MS: i64 = 5_000;
@@ -375,6 +381,18 @@ impl SqliteRateBudget {
         Ok(decide(Self::stored_tat(conn, bucket, now)?, now, emission, burst).1)
     }
 
+    /// The longest wait any of `buckets` (name, emission, burst) would hand
+    /// back now, charged nothing: what `write_wait` and `read_wait` share.
+    fn longest_wait(&self, buckets: &[(&str, i64, i64)]) -> Result<Duration, RateBudgetError> {
+        let now = now_ms();
+        let conn = self.conn();
+        let mut wait = 0;
+        for &(bucket, emission, burst) in buckets {
+            wait = wait.max(Self::bucket_wait(&conn, bucket, emission, burst, now)?);
+        }
+        Ok(Duration::from_millis(wait.max(0) as u64))
+    }
+
     /// The theoretical instant `bucket` holds at `now`, as the next charge
     /// would read it: `now` for a bucket never charged, and for one written
     /// by a clock that has since gone backwards.
@@ -541,6 +559,9 @@ pub struct BudgetState {
     pub last_cooldown: Option<CooldownRecord>,
     /// The brake on every account, if one stands.
     pub brake: Option<Brake>,
+    /// The sitting of list pages the account is in, and the rest it owes,
+    /// as the next page would find it (`sitting`); `None` before any page.
+    pub sitting: Option<Sitting>,
 }
 
 impl BudgetState {
@@ -601,7 +622,26 @@ pub fn state(
         accounts_ceiling: SqliteRateBudget::accounts_ceiling(conn, now)?,
         last_cooldown: SqliteRateBudget::last_cooldown(conn)?,
         brake,
+        sitting: sitting(conn)?,
     })
+}
+
+/// The sitting the account is in, as the last page left it: the one row of
+/// `sitting`, or `None` before any page was walked here. Reads only.
+pub fn sitting(conn: &Connection) -> Result<Option<Sitting>, RateBudgetError> {
+    conn.query_row(
+        "SELECT pages, last_page_at, rest_until FROM sitting WHERE id = 1",
+        [],
+        |row| {
+            Ok(Sitting {
+                pages: row.get(0)?,
+                last_page_at: EpochMs::new(row.get(1)?),
+                rest_until: row.get::<_, Option<i64>>(2)?.map(EpochMs::new),
+            })
+        },
+    )
+    .optional()
+    .map_err(budget_err)
 }
 
 impl RateBudget for SqliteRateBudget {
@@ -616,17 +656,19 @@ impl RateBudget for SqliteRateBudget {
     /// The longest of the three waits a write would be handed now: the
     /// buckets `reserve_buckets` charges for one, read and not charged.
     fn write_wait(&self) -> Result<Duration, RateBudgetError> {
-        let now = now_ms();
-        let conn = self.conn();
-        let mut wait = 0;
-        for (bucket, emission, burst) in [
+        self.longest_wait(&[
             (PACE_BUCKET, PACE_EMISSION_MS, PACE_BURST_MS),
             (DAILY_BUCKET, DAILY_EMISSION_MS, DAILY_BURST_MS),
             (WRITE_BUCKET, WRITE_EMISSION_MS, WRITE_BURST_MS),
-        ] {
-            wait = wait.max(Self::bucket_wait(&conn, bucket, emission, burst, now)?);
-        }
-        Ok(Duration::from_millis(wait.max(0) as u64))
+        ])
+    }
+
+    /// The same for a read, which pays the first two.
+    fn read_wait(&self) -> Result<Duration, RateBudgetError> {
+        self.longest_wait(&[
+            (PACE_BUCKET, PACE_EMISSION_MS, PACE_BURST_MS),
+            (DAILY_BUCKET, DAILY_EMISSION_MS, DAILY_BURST_MS),
+        ])
     }
 
     /// How long until the last day holds room for `accounts` more: the moment
@@ -717,6 +759,58 @@ impl RateBudget for SqliteRateBudget {
             return Ok(None);
         }
         self.brake_at(now_ms())
+    }
+
+    /// The sitting is the account's, kept in its database, so that every
+    /// process walking it counts one sitting and pays one rest.
+    fn keeps_sitting(&self) -> bool {
+        true
+    }
+
+    /// Reads the sitting and writes the next one in one `IMMEDIATE`
+    /// transaction, for the reason `start_cooldown` gives: two processes
+    /// walking the same account at once would otherwise both read page
+    /// thirty-nine and both write forty, and the one rest drawn would be
+    /// whichever wrote last.
+    fn sitting_page(&self, at: EpochMs, rule: SittingRule) -> Result<Sitting, RateBudgetError> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(budget_err)?;
+        let after = Sitting::after_page(sitting(&tx)?, at, rule);
+        tx.execute(
+            "INSERT INTO sitting (id, pages, last_page_at, rest_until)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                 pages = excluded.pages,
+                 last_page_at = excluded.last_page_at,
+                 rest_until = excluded.rest_until",
+            params![
+                after.pages,
+                after.last_page_at.get(),
+                after.rest_until.map(EpochMs::get)
+            ],
+        )
+        .map_err(budget_err)?;
+        tx.commit().map_err(budget_err)?;
+        Ok(after)
+    }
+
+    fn rest_owed(&self, now: EpochMs) -> Result<Option<EpochMs>, RateBudgetError> {
+        Ok(sitting(&self.conn())?.and_then(|s| s.rest_owed(now)))
+    }
+
+    /// One statement, so it needs no transaction: only the rest that was
+    /// paid is cleared, never one another process drew since.
+    fn rest_paid(&self, until: EpochMs) -> Result<(), RateBudgetError> {
+        self.conn()
+            .execute(
+                "UPDATE sitting SET pages = 0, rest_until = NULL
+                 WHERE id = 1 AND rest_until = ?1",
+                params![until.get()],
+            )
+            .map_err(budget_err)?;
+        Ok(())
     }
 
     /// Reads the previous cooldown and writes the next one in **one**
@@ -1493,5 +1587,74 @@ mod tests {
             one.reserve().unwrap() > Duration::ZERO,
             "both connections should share one budget"
         );
+    }
+
+    /// The pace's sitting, in small: two pages, a minute's rest, and the
+    /// fifteen minutes alone after which a sitting ends.
+    const SITTING: SittingRule = SittingRule {
+        pages: 2,
+        rest: Duration::from_secs(60),
+        idle: Duration::from_secs(900),
+    };
+
+    /// Two budgets on one database are two processes walking one account:
+    /// the pages one walked count in the other's sitting, the rest the page
+    /// that filled it drew is owed to both, and paying it starts the sitting
+    /// again for both.
+    #[test]
+    fn a_sitting_carries_across_two_budgets_on_one_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::AppPaths::rooted_at(tmp.path()).account(Pk::new(42));
+        let _db = super::super::Store::open(&paths).unwrap();
+        let one = SqliteRateBudget::open(&paths).unwrap();
+        let two = SqliteRateBudget::open(&paths).unwrap();
+        assert!(one.keeps_sitting());
+        let at = |ms: i64| EpochMs::new(1_800_000_000_000 + ms);
+
+        assert_eq!(one.sitting_page(at(0), SITTING).unwrap().pages, 1);
+        let full = two.sitting_page(at(1_000), SITTING).unwrap();
+        assert_eq!(full.pages, 2, "the other process's page is in it");
+        let until = at(1_000 + 60_000);
+        assert_eq!(full.rest_until, Some(until));
+
+        drop(two);
+        let three = SqliteRateBudget::open(&paths).unwrap();
+        assert_eq!(three.rest_owed(at(2_000)).unwrap(), Some(until));
+        assert_eq!(one.rest_owed(at(2_000)).unwrap(), Some(until));
+        assert_eq!(one.rest_owed(until).unwrap(), None, "over at its end");
+
+        three.rest_paid(at(5)).unwrap();
+        assert_eq!(
+            one.rest_owed(at(2_000)).unwrap(),
+            Some(until),
+            "paying another rest pays nothing"
+        );
+        three.rest_paid(until).unwrap();
+        assert_eq!(one.rest_owed(at(2_000)).unwrap(), None);
+        assert_eq!(one.sitting_page(at(3_000), SITTING).unwrap().pages, 1);
+
+        let read = state(&one.conn(), None, at(3_000)).unwrap();
+        let sitting = read.sitting.expect("a page was walked");
+        assert_eq!((sitting.pages, sitting.rest_until), (1, None));
+    }
+
+    /// A sitting that is not full and was left alone for longer than the
+    /// longest rest ends: the next page starts a new one, and owes nothing.
+    /// Left alone for less, the next page fills it.
+    #[test]
+    fn a_sitting_left_alone_for_the_longest_rest_starts_again() {
+        let (_tmp, budget) = temp_budget();
+        let at = |ms: i64| EpochMs::new(1_800_000_000_000 + ms);
+
+        budget.sitting_page(at(0), SITTING).unwrap();
+        let later = budget.sitting_page(at(900_001), SITTING).unwrap();
+        assert_eq!((later.pages, later.rest_until), (1, None));
+
+        let full = budget.sitting_page(at(1_800_000), SITTING).unwrap();
+        assert_eq!(
+            full.pages, 2,
+            "a millisecond short of fifteen minutes counts on"
+        );
+        assert_eq!(full.rest_until, Some(at(1_800_000 + 60_000)));
     }
 }
