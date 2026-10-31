@@ -50,6 +50,7 @@ export function homeToMarkdown(site: URL | string): string {
 
   const flags = AGENTS.flags.map((item) => `- \`${item.flag}\`: ${item.means}`).join('\n');
   const exits = AGENTS.exitCodes.map((item) => `- \`${item.code}\`: ${item.means}`).join('\n');
+  const mcp = AGENTS.mcp.points.map((item) => `- \`${item.term}\`: ${item.means}`).join('\n');
 
   return `# ${SITE.name}
 
@@ -92,6 +93,14 @@ ${flags}
 ### Exit codes
 
 ${exits}
+
+### ${AGENTS.mcp.title}
+
+${AGENTS.mcp.lead}
+
+${mcp}
+
+${block(AGENTS.mcp.sample)}
 
 ## ${heading(INSTALL_SECTION.title, INSTALL_SECTION.accent)}
 
