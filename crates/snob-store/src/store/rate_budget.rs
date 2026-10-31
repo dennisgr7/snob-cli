@@ -1338,6 +1338,7 @@ mod tests {
         assert_eq!(b.accounts_left().unwrap(), 2_000);
         assert_eq!(b.accounts_wait(25).unwrap(), Duration::ZERO);
 
+        let started = std::time::Instant::now();
         for _ in 0..79 {
             b.spend_accounts(25).unwrap();
         }
@@ -1347,10 +1348,16 @@ mod tests {
 
         assert_eq!(b.accounts_left().unwrap(), 0);
         let wait = b.accounts_wait(25).unwrap();
-        // All of it was read just now, so the room comes back a day from now.
+        // All of it was read just now, so the room comes back a day from the
+        // first read. How long ago that was is measured, not assumed: on a
+        // loaded windows-latest runner the 80 writes took more than the 10 s
+        // this test once allowed (86388.282 s left, 2026-10-31). The second
+        // of slack covers the store's milliseconds against the monotonic
+        // clock.
+        let earliest = Duration::from_secs(86_400) - started.elapsed() - Duration::from_secs(1);
         assert!(
-            wait > Duration::from_secs(86_390) && wait <= Duration::from_secs(86_400),
-            "{wait:?}"
+            wait >= earliest && wait <= Duration::from_secs(86_400),
+            "{wait:?}, at least {earliest:?}"
         );
     }
 
