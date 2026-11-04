@@ -131,8 +131,9 @@ pub fn specs(writes: bool) -> Vec<Spec> {
             title: "Session, budget and cooldown",
             description: "What snob knows without asking Instagram anything: whether a session \
                           is stored, how much of today's request budget is left, whether the \
-                          account is cooling down after a push-back and until when, and which \
-                          lists are stored and how old they are. Sends no request. Call it \
+                          account is cooling down after a push-back and until when, how long \
+                          Instagram's answers have been taking, and which lists are stored and \
+                          how old they are. Sends no request. Call it \
                           before anything that walks a list.",
             input: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
             read_only: true,

@@ -3094,6 +3094,47 @@ async fn status_reports_the_budget_and_sends_nothing() {
     );
 }
 
+/// A walk writes down how long each of its answers took to arrive, and
+/// `status` says so, still sending nothing: answers as fast as a local
+/// server's slow nothing down.
+#[tokio::test]
+async fn status_says_how_long_the_answers_of_a_walk_took() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+
+    let out = snob(tmp.path(), Some(&instagram), &["followers"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let before = instagram.received_requests().await.unwrap().len();
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["status", "--answers", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let said = json(&out);
+    let keys: Vec<&String> = said.as_object().unwrap().keys().collect();
+    assert_eq!(keys, vec!["answers", "viewer"]);
+    let answers = &said["answers"];
+    assert!(answers["count"].as_u64().unwrap() >= 1, "{answers}");
+    assert_eq!(answers["refused"], 0, "{answers}");
+    assert!(answers["median_ms"].as_u64().is_some(), "{answers}");
+    assert_eq!(answers["via"], "direct", "{answers}");
+    assert_eq!(answers["slowing_ms"], serde_json::Value::Null, "{answers}");
+
+    let text = snob(tmp.path(), Some(&instagram), &["status", "--answers"]);
+    assert!(text.status.success(), "{}", stderr(&text));
+    assert!(stdout(&text).contains("at the median"), "{}", stdout(&text));
+    assert!(stdout(&text).contains("as usual"), "{}", stdout(&text));
+
+    assert_eq!(
+        instagram.received_requests().await.unwrap().len(),
+        before,
+        "status sent a request"
+    );
+}
+
 /// In a cooldown it says until when and why, and exits 5 whatever section
 /// was asked for, so a script can ask "may I send" with any of them.
 #[tokio::test]

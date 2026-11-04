@@ -106,6 +106,9 @@ can read:
 - `snob status --budget` says what can still be sent today, for no request, and
   exits 5 while the account is cooling down. `--dry-run` on a list command says
   what its walks would cost against that, and sends nothing.
+- `snob status --answers` says how long Instagram's answers took in the last
+  24 hours. When the latest of them are slow, snob waits longer between pages
+  (at least twice their median, at most a minute); it never goes faster.
 - `-o -` is standard output: a list as with no `-o`, and a single downloaded
   file, as in `snob reel <link> -d 1 -o - | ffmpeg -i - ...`.
 - `--no-interactive` always prints. Down a pipe this is the default, and the

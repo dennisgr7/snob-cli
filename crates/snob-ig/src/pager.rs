@@ -479,10 +479,8 @@ impl<'a> ListWalker<'a> {
                 if let Err(e) = self.client.open_list(request.username, false).await {
                     break self.stop_reason_for(e, &mut state);
                 }
-                if self
-                    .wait(WaitKind::Dwell, self.pace.dwell(), &mut observe)
-                    .await
-                {
+                let dwell = self.slowed(self.pace.dwell()).await;
+                if self.wait(WaitKind::Dwell, dwell, &mut observe).await {
                     break StopReason::Canceled;
                 }
             }
@@ -491,13 +489,13 @@ impl<'a> ListWalker<'a> {
             // action starting. The budget's own wait is not paid here. It
             // happens inside the client, after this one, so an exhausted
             // budget makes the walk slower than the step suggests — the safe
-            // direction, and only once it is already rationing.
-            if state.pages > 0
-                && self
-                    .wait(WaitKind::Step, self.pace.step(), &mut observe)
-                    .await
-            {
-                break StopReason::Canceled;
+            // direction, and only once it is already rationing. Answers
+            // that came slowly lengthen it (`Pacer::slowed`), never shorten it.
+            if state.pages > 0 {
+                let step = self.slowed(self.pace.step()).await;
+                if self.wait(WaitKind::Step, step, &mut observe).await {
+                    break StopReason::Canceled;
+                }
             }
 
             // **A machine that slept is a walk to pick up again**, looked for
@@ -789,6 +787,15 @@ impl<'a> ListWalker<'a> {
                 return Err(IgError::Canceled);
             }
         }
+    }
+
+    /// `drawn`, lengthened when the latest answers came slowly
+    /// (`Pacer::slowed`).
+    async fn slowed(&self, drawn: Duration) -> Duration {
+        self.client
+            .pacer()
+            .slowed(&self.pace, drawn, (self.wall)())
+            .await
     }
 
     /// Returns `true` if it was canceled while waiting.
@@ -2255,6 +2262,67 @@ mod tests {
         (client, documents)
     }
 
+    /// A walk on a browser's page whose list pages each took `waited_ms` to
+    /// arrive, five pages long, at the production pace: its events.
+    async fn walk_answered_in(waited_ms: u32) -> Vec<Event> {
+        use crate::client::harness::{Scripted, page_said, spending_client};
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let page = Scripted::telling(move |call| match &call.ask {
+            crate::web::Ask::Rest { .. } => {
+                let i = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let cursor = (i < 4).then(|| format!("c{i}"));
+                let from = i as u64 * 12;
+                Ok(Told::Answer(crate::client::page::PageResponse {
+                    waited_ms: Some(waited_ms),
+                    ..page_said(200, &body(from, 12, cursor.as_deref()))
+                }))
+            }
+            _ => Ok(Told::Answer(page_said(200, r#"{"status":"ok"}"#))),
+        });
+        let (client, _) = spending_client(page);
+        walk_at_pace(&client, request()).await
+    }
+
+    /// The steps of a walk, in order, in milliseconds.
+    fn steps(events: &[Event]) -> Vec<u128> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Waiting {
+                    kind: WaitKind::Step,
+                    duration,
+                } => Some(duration.as_millis()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Pages that take three seconds to arrive lengthen the step to twice
+    /// that once three of them have: one or two slow answers are not yet a
+    /// slow server.
+    #[tokio::test]
+    async fn slow_answers_lengthen_the_steps_after_them() {
+        let events = walk_answered_in(3_000).await;
+        let steps = steps(&events);
+        assert_eq!(steps.len(), 4, "{events:?}");
+        for step in &steps[..2] {
+            assert!((1_000..=3_000).contains(step), "{steps:?}");
+        }
+        assert_eq!(steps[2..], [6_000, 6_000], "{steps:?}");
+    }
+
+    /// Answers as fast as Instagram's ordinarily are leave every step where
+    /// the pace drew it.
+    #[tokio::test]
+    async fn fast_answers_leave_the_steps_alone() {
+        let events = walk_answered_in(250).await;
+        let steps = steps(&events);
+        assert_eq!(steps.len(), 4, "{events:?}");
+        for step in &steps {
+            assert!((1_000..=3_000).contains(step), "{steps:?}");
+        }
+    }
+
     /// After a sleep the page the walk reads from is loaded again, as many
     /// times as the network takes to come back, with a wait before each, and
     /// the walk then carries on.
@@ -2354,6 +2422,7 @@ mod tests {
             step_ms: (0, 0),
             dwell_ms: (0, 0),
             sitting_pause_ms: (0, 0),
+            slow: snob_core::budget::SlowRule::OFF,
             ..Pace::default()
         }
     }

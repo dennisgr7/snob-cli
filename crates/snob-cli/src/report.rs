@@ -831,6 +831,15 @@ pub fn counted(shown: usize, kept: usize, total: usize, one: &str, many: &str) -
     line
 }
 
+/// "1 answer", "12 answers": how many answers of the API `snob status`
+/// counted.
+pub fn answers(n: u32) -> String {
+    match n {
+        1 => "1 answer".to_string(),
+        n => format!("{n} answers"),
+    }
+}
+
 /// "1 request" / "7 requests".
 pub fn requests(n: u32) -> String {
     if n == 1 {

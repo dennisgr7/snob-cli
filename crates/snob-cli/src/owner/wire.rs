@@ -339,6 +339,7 @@ mod tests {
                 redirected: true,
                 hops: 2,
                 too_large: false,
+                waited_ms: Some(840),
             }),
             Err(PageError::Unreachable("dns".to_string())),
             Err(PageError::NoCsrfToken),

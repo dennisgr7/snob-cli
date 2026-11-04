@@ -395,7 +395,7 @@ pub enum Command {
     /// Show which account you are authenticated as
     Whoami(WhoamiArgs),
 
-    /// Where the account stands: session, budget, cooldown, lists, monitor, agents, jobs
+    /// Where the account stands: session, budget, answers, cooldown, lists, monitor, agents, jobs
     #[command(
         after_help = "Read from what is stored here; nothing is sent and nothing stored is \
                       changed, not even a database an older snob left, which is read as the \
@@ -841,6 +841,10 @@ pub struct StatusArgs {
     #[arg(long)]
     pub budget: bool,
 
+    /// How long Instagram's answers took in the last 24 hours, and whether the pace is slowing for them
+    #[arg(long)]
+    pub answers: bool,
+
     /// The cooldown: whether one stands, until when and why, and the last one
     #[arg(long)]
     pub cooldown: bool,
@@ -870,6 +874,7 @@ pub struct StatusArgs {
 pub struct StatusSections {
     pub session: bool,
     pub budget: bool,
+    pub answers: bool,
     pub cooldown: bool,
     pub lists: bool,
     pub watch: bool,
@@ -884,6 +889,7 @@ impl StatusSections {
         [
             (self.session, "session"),
             (self.budget, "budget"),
+            (self.answers, "answers"),
             (self.cooldown, "cooldown"),
             (self.lists, "lists"),
             (self.watch, "watch"),
@@ -902,6 +908,7 @@ impl StatusArgs {
         let named = StatusSections {
             session: self.session,
             budget: self.budget,
+            answers: self.answers,
             cooldown: self.cooldown,
             lists: self.lists,
             watch: self.watch,
@@ -910,6 +917,7 @@ impl StatusArgs {
         };
         if named.session
             || named.budget
+            || named.answers
             || named.cooldown
             || named.lists
             || named.watch
@@ -921,6 +929,7 @@ impl StatusArgs {
             StatusSections {
                 session: true,
                 budget: true,
+                answers: true,
                 cooldown: true,
                 lists: true,
                 watch: true,

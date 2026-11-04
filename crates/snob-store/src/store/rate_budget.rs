@@ -20,7 +20,9 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use snob_core::EpochMs;
 use snob_core::Pk;
-use snob_core::budget::{Brake, RateBudget, RateBudgetError, Sitting, SittingRule, common_brake};
+use snob_core::budget::{
+    AnswerTime, Brake, RateBudget, RateBudgetError, Sitting, SittingRule, common_brake,
+};
 use snob_core::clock::now_ms;
 
 use super::StoreError;
@@ -150,7 +152,7 @@ const WRITE_BURST_MS: i64 = WRITE_EMISSION_MS * 2;
 pub const WRITES_IN_A_DAY: u32 = (DAY_MS / WRITE_EMISSION_MS) as u32 + 3;
 
 /// Slack before deciding the system clock has gone backwards.
-const CLOCK_SKEW_TOLERANCE_MS: i64 = 5_000;
+pub(crate) const CLOCK_SKEW_TOLERANCE_MS: i64 = 5_000;
 
 const MAX_COOLDOWN_MS: i64 = 24 * 3600 * 1000;
 
@@ -811,6 +813,20 @@ impl RateBudget for SqliteRateBudget {
             )
             .map_err(budget_err)?;
         Ok(())
+    }
+
+    /// The answers are the account's, kept in its database, so that every
+    /// process walking it is slowed by what the others were answered.
+    fn keeps_answers(&self) -> bool {
+        true
+    }
+
+    fn answer_timed(&self, answer: &AnswerTime) -> Result<(), RateBudgetError> {
+        super::answers::record(&mut self.conn(), answer, now_ms()).map_err(budget_err)
+    }
+
+    fn recent_waits(&self, since: EpochMs, n: usize) -> Result<Vec<Duration>, RateBudgetError> {
+        super::answers::recent_waits(&self.conn(), since, n).map_err(budget_err)
     }
 
     /// Reads the previous cooldown and writes the next one in **one**

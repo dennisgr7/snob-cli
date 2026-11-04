@@ -230,6 +230,14 @@ with a documented reason in the same place.
   refuses a wait for the budget (asked with `read_wait`/`write_wait` before
   the charge, so the refusal costs nothing) and never cuts a sitting's rest,
   which would only be owed again by the next run.
+  **Slow answers lengthen the waits, never shorten them** (`SlowRule` in
+  `snob_core::budget`, the numbers in `pace.rs`): every answer of the API
+  is timed to its headers (inside the tab on the browser's path, around
+  `send` on `reqwest`'s) and written to the account's `answers` table with
+  the load it declared; before a step or a dwell, `Pacer::slowed` takes the
+  median of the latest five healthy answers of the last ten minutes, and
+  with at least three of them the wait lasts at least twice that, at most a
+  minute. The load headers are written down and still never acted on.
 - **Push-back is a hard stop.** The first refusal stops the run and starts a
   cooldown: 2 h for a throttle, 12 h for an action block, 30 min for a
   challenge (`snob_core::budget`, pinned by
@@ -332,7 +340,9 @@ with a documented reason in the same place.
   synced folder corrupts SQLite), created with a user-only DACL and
   `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED`. Per account under `accounts/<pk>/`;
   `shared.db` for what accounts share; the account's database also keeps
-  what agents were told yes to through `snob mcp` (`mcp_acts`, a week of
+  how long Instagram's answers took (`answers`, a week of rows, the last
+  day shown by `snob status --answers`, by the call's name and never its
+  path), and what agents were told yes to through `snob mcp` (`mcp_acts`, a week of
   rows, the last day shown by `snob status`); its jobs under
   `accounts/<pk>/jobs/<id>/` (`job.json`, `state.json`, the walk's output and
   log, `0600` on Unix; a finished job's result kept a day, the job a week, at

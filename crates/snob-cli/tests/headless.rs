@@ -1414,6 +1414,20 @@ async fn profile_and_followers_of_someone_through_the_browser() {
         )
         .await;
     assert!(found.is_empty(), "{found:?}");
+
+    // Each answer was timed inside the tab, and `status` says so.
+    let out = snob(
+        tmp.path(),
+        &instagram,
+        &["status", "--answers", "--json"],
+        None,
+    );
+    assert!(out.status.success(), "{}", told(tmp.path(), &out));
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let answers = &status["answers"];
+    assert_eq!(answers["via"], "browser", "{answers}");
+    assert!(answers["count"].as_u64().unwrap() >= 3, "{answers}");
+    assert!(answers["median_ms"].as_u64().is_some(), "{answers}");
 }
 
 /// Another account's highlights through the browser: the tray is the web

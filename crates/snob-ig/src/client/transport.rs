@@ -14,6 +14,8 @@
 use serde::de::DeserializeOwned;
 use url::Url;
 
+use snob_core::budget::Via;
+
 use crate::error::IgError;
 use crate::http::Deadline;
 
@@ -281,6 +283,43 @@ pub(super) struct Answer {
     pub(super) served: Option<String>,
 }
 
+/// The name an answer's time is written down under (`Pacer::answered`):
+/// the call's, never its path, which carries the account it was about.
+/// `None` for a document, which is a page and not an answer of the API.
+///
+/// A REST read is named by what it reads, a Relay read by its operation,
+/// and anything this does not know by `other`: a name it cannot vouch for
+/// is not copied out of a path.
+pub(super) fn named(path: &str, style: &Surface<'_>) -> Option<String> {
+    match style {
+        Surface::Document => return None,
+        Surface::Relay { friendly_name, .. } => return Some((*friendly_name).to_string()),
+        Surface::App => {}
+    }
+    let name = match path {
+        crate::web::BULK_ROUTE_DEFINITIONS => "pk",
+        crate::web::NAVIGATION => "navigation",
+        crate::web::SHOW_MANY => "show_many",
+        "/api/graphql" | "/graphql/query" => "graphql",
+        _ => {
+            let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+            let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+            match segments.as_slice() {
+                ["api", "v1", "friendships", pk, read] if numeric(pk) => match *read {
+                    "followers" => "followers",
+                    "following" => "following",
+                    "mutual_followers" => "mutual_followers",
+                    _ => "other",
+                },
+                ["api", "v1", "media", pk, "info"] if numeric(pk) => "media_info",
+                ["api", "v1", "media", pk, "comments"] if numeric(pk) => "comments",
+                _ => "other",
+            }
+        }
+    };
+    Some(name.to_string())
+}
+
 impl Answer {
     /// Whether the status is a 2xx. Half the question: a 200 can still
     /// declare failure in the body, and [`crate::error::refused`] asks both
@@ -358,9 +397,13 @@ impl IgClient {
             // this — the hops included, which is the whole point of the loop.
             self.pacer.clear_to_send().await?;
 
+            // From the moment it leaves, paid for, to its headers, which is
+            // when `send` hands the answer back.
+            let sent = std::time::Instant::now();
             let response = self
                 .send_or_cancel(self.api_request(&url, query, referer, style))
                 .await?;
+            let waited = sent.elapsed();
             self.remember_claim(&response);
             let status = response.status();
 
@@ -393,6 +436,16 @@ impl IgClient {
             let retry_after = retry_after(&response);
             let load = load_of(&response);
             let served = served_of(&response);
+            if let Some(operation) = named(url.path(), &style) {
+                self.timed(
+                    operation,
+                    status.as_u16(),
+                    Some(waited),
+                    load.clone(),
+                    Via::Direct,
+                )
+                .await;
+            }
 
             let body = match self.read_or_cancel(response, MAX_BODY_BYTES).await {
                 Ok(body) => body,
@@ -473,6 +526,16 @@ impl IgClient {
                 status: 0,
                 body: "Instagram answered with a redirect, which is not followed".into(),
             });
+        }
+        if let Some(operation) = named(url.path(), &style) {
+            self.timed(
+                operation,
+                response.status,
+                response.waited(),
+                response.load(),
+                Via::Browser,
+            )
+            .await;
         }
         self.answer_from_page(&url, response).await
     }
@@ -667,6 +730,75 @@ mod tests {
     use super::*;
     use crate::client::Direction;
     use crate::client::harness::{Scripted, client, page_said, watching};
+
+    /// An answer from `reqwest` is timed to its headers, written down under
+    /// what it read rather than its path, with the load it declared.
+    #[tokio::test]
+    async fn an_answer_is_timed_under_its_name_and_never_its_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(300))
+                    .insert_header("x-ig-capacity-level", "3")
+                    .set_body_string("{}"),
+            )
+            .mount(&server)
+            .await;
+        let client = client(&server).await;
+
+        client
+            .get_body("/api/v1/friendships/4242/following/", &[], "", Surface::App)
+            .await
+            .unwrap();
+
+        let answers = client.pacer().latest_answers();
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        let answer = &answers[0];
+        assert_eq!(answer.operation, "following");
+        assert_eq!(answer.status, 200);
+        assert_eq!(answer.via, Via::Direct);
+        assert!(
+            answer.waited >= std::time::Duration::from_millis(300),
+            "{answer:?}"
+        );
+        assert_eq!(answer.load.as_deref(), Some("x-ig-capacity-level=3"));
+    }
+
+    /// A document is a page, not an answer of the API, and is not timed.
+    #[tokio::test]
+    async fn a_document_is_not_timed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html></html>"))
+            .mount(&server)
+            .await;
+        let client = client(&server).await;
+
+        client
+            .get_body("/someone/", &[], "", Surface::Document)
+            .await
+            .unwrap();
+
+        assert!(client.pacer().latest_answers().is_empty());
+    }
+
+    #[test]
+    fn a_name_is_never_copied_out_of_a_path() {
+        let app = Surface::App;
+        let named = |path: &str| named(path, &app).unwrap();
+        assert_eq!(named("/api/v1/friendships/42/followers/"), "followers");
+        assert_eq!(
+            named("/api/v1/friendships/42/mutual_followers/"),
+            "mutual_followers"
+        );
+        assert_eq!(named("/api/v1/media/3141/comments/"), "comments");
+        assert_eq!(named(crate::web::SHOW_MANY), "show_many");
+        assert_eq!(named("/api/v1/friendships/someone/followers/"), "other");
+        assert_eq!(named("/api/v1/users/web_profile_info/"), "other");
+        assert_eq!(named("/someone/"), "other");
+        assert_eq!(super::named("/someone/", &Surface::Document), None);
+    }
 
     /// A 429 whose body dies mid-stream is still a 429.
     ///

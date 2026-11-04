@@ -158,6 +158,161 @@ pub trait RateBudget: Send + Sync {
         let _ = until;
         Ok(())
     }
+
+    /// Whether this budget keeps the answers' times ([`AnswerTime`]), so
+    /// that [`Self::recent_waits`] answers for every process of the account.
+    ///
+    /// The default is no, which is what every test double wants: the pacer
+    /// then keeps the last few in the process. The real budget keeps them in
+    /// the account's database, so an agent reading a list a page at a time,
+    /// one process a page, is slowed by the answers the pages before it got.
+    fn keeps_answers(&self) -> bool {
+        false
+    }
+
+    /// Records how long an answer took. Nothing reads it back unless
+    /// [`Self::keeps_answers`] says yes.
+    fn answer_timed(&self, answer: &AnswerTime) -> Result<(), RateBudgetError> {
+        let _ = answer;
+        Ok(())
+    }
+
+    /// How long the healthy answers ([`AnswerTime::healthy`]) received
+    /// after `since` took, newest first, at most `n` of them: what
+    /// [`SlowRule::floor`] reads.
+    fn recent_waits(&self, since: EpochMs, n: usize) -> Result<Vec<Duration>, RateBudgetError> {
+        let _ = (since, n);
+        Ok(Vec::new())
+    }
+}
+
+/// How a request left: from a tab in the browser, or from this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    /// `fetch()` from an instagram.com tab, timed inside the tab.
+    Browser,
+    /// `reqwest`, under `SNOB_NO_BROWSER`.
+    Direct,
+}
+
+impl Via {
+    /// The name it is stored and shown under.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Via::Browser => "browser",
+            Via::Direct => "direct",
+        }
+    }
+
+    /// Back from [`Self::as_str`]; anything else is `None`.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "browser" => Some(Via::Browser),
+            "direct" => Some(Via::Direct),
+            _ => None,
+        }
+    }
+}
+
+/// How long one answer of the API took to arrive, and what Instagram said
+/// about its own load in it.
+///
+/// **The time is to the answer's headers**, from the moment the request
+/// left, after the budget had been paid: the server's thinking and one
+/// round trip, and not the size of the page. On the browser's path it is
+/// taken inside the tab, so starting the browser, the owner's pipe and the
+/// DevTools protocol are not in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnswerTime {
+    /// When it arrived.
+    pub at: EpochMs,
+    /// The call's name as the allowlist knows it, never its path: a path
+    /// carries the account it was about.
+    pub operation: String,
+    /// The HTTP status.
+    pub status: u16,
+    /// How long it took to arrive.
+    pub waited: Duration,
+    /// `x-ig-capacity-level` and `x-ig-peak-time`, as `snob_ig` joins
+    /// them, when Instagram sent either. Written down, never acted on.
+    pub load: Option<String>,
+    pub via: Via,
+}
+
+impl AnswerTime {
+    /// A 2xx: an answer whose time says how busy the server was, rather
+    /// than how quickly it refused.
+    pub fn healthy(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
+/// When answers are slow enough to lengthen the waits between them, from
+/// the pace (`snob_ig::pace::Pace`, where each number has its reason).
+///
+/// **It only ever lengthens a wait.** The wait the pace drew stands unless
+/// the floor is longer: a fast answer never makes the next request sooner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlowRule {
+    /// The floor is this many times the median recent answer. Zero turns
+    /// the rule off.
+    pub factor: u32,
+    /// How many of the latest answers the median is over.
+    pub samples: usize,
+    /// How far back an answer still counts.
+    pub window: Duration,
+    /// The longest floor the rule sets, however slow the answers.
+    pub ceiling: Duration,
+}
+
+impl SlowRule {
+    /// The rule that never lengthens anything.
+    pub const OFF: SlowRule = SlowRule {
+        factor: 0,
+        samples: 0,
+        window: Duration::ZERO,
+        ceiling: Duration::ZERO,
+    };
+
+    /// The oldest moment an answer read at `now` still counts from.
+    pub fn since(&self, now: EpochMs) -> EpochMs {
+        now - self.window
+    }
+
+    /// The fewest answers the rule judges from: a majority of
+    /// [`Self::samples`], so that the median is a slow answer only when
+    /// most of them were. One slow answer, the first of a run paying for
+    /// its connection, is not a slow server.
+    pub fn least(&self) -> usize {
+        self.samples / 2 + 1
+    }
+
+    /// The shortest wait the answers in `recent` allow before the next
+    /// request, newest first: [`Self::factor`] times their median, at most
+    /// [`Self::ceiling`]. `None` when the rule is off or there are fewer
+    /// than [`Self::least`] of them.
+    ///
+    /// Only the first [`Self::samples`] are read; the caller has already
+    /// left out what is older than [`Self::window`] and what was not
+    /// healthy ([`AnswerTime::healthy`]).
+    pub fn floor(&self, recent: &[Duration]) -> Option<Duration> {
+        if self.factor == 0 || self.samples == 0 {
+            return None;
+        }
+        let mut latest: Vec<Duration> = recent.iter().take(self.samples).copied().collect();
+        if latest.len() < self.least() {
+            return None;
+        }
+        latest.sort_unstable();
+        let median = latest[latest.len() / 2];
+        Some(median.saturating_mul(self.factor).min(self.ceiling))
+    }
+
+    /// `drawn`, or the floor `recent` sets when that is longer: never
+    /// shorter than `drawn`.
+    pub fn lengthen(&self, drawn: Duration, recent: &[Duration]) -> Duration {
+        self.floor(recent).map_or(drawn, |floor| floor.max(drawn))
+    }
 }
 
 /// The pages of lists walked on one account since its last rest, and the
@@ -401,6 +556,93 @@ mod tests {
             at: EpochMs::new(at_min * MINUTE),
             until: EpochMs::new((at_min + for_min) * MINUTE),
         }
+    }
+
+    const SLOW: SlowRule = SlowRule {
+        factor: 2,
+        samples: 5,
+        window: Duration::from_secs(600),
+        ceiling: Duration::from_secs(60),
+    };
+
+    fn ms(values: &[u64]) -> Vec<Duration> {
+        values.iter().map(|v| Duration::from_millis(*v)).collect()
+    }
+
+    #[test]
+    fn no_answers_set_no_floor() {
+        assert_eq!(SLOW.floor(&[]), None);
+    }
+
+    #[test]
+    fn fewer_answers_than_a_majority_set_no_floor() {
+        assert_eq!(SLOW.floor(&ms(&[4_000, 4_000])), None);
+    }
+
+    #[test]
+    fn the_floor_is_twice_the_median_of_the_latest_five() {
+        let recent = ms(&[3_000, 200, 2_500, 2_800, 250, 9_000, 9_000]);
+        assert_eq!(SLOW.floor(&recent), Some(Duration::from_millis(5_000)));
+    }
+
+    #[test]
+    fn one_slow_answer_among_fast_ones_does_not_lengthen_a_step() {
+        let recent = ms(&[300, 280, 5_000, 310, 290]);
+        let drawn = Duration::from_millis(1_200);
+        assert_eq!(SLOW.lengthen(drawn, &recent), drawn);
+    }
+
+    #[test]
+    fn fast_answers_leave_the_drawn_wait_alone() {
+        let recent = ms(&[400, 450, 380, 420, 410]);
+        for drawn in [1_000, 2_000, 3_000].map(Duration::from_millis) {
+            assert_eq!(SLOW.lengthen(drawn, &recent), drawn);
+        }
+    }
+
+    #[test]
+    fn slow_answers_lengthen_the_wait_up_to_the_ceiling() {
+        let drawn = Duration::from_millis(1_500);
+        let slow = ms(&[3_000, 3_200, 2_900]);
+        assert_eq!(SLOW.lengthen(drawn, &slow), Duration::from_millis(6_000));
+        let stuck = ms(&[45_000, 50_000, 47_000]);
+        assert_eq!(SLOW.lengthen(drawn, &stuck), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_wait_is_never_shortened() {
+        let drawn = Duration::from_secs(4);
+        let recent = ms(&[1_100, 1_000, 1_200, 900, 1_000]);
+        assert_eq!(SLOW.floor(&recent), Some(Duration::from_millis(2_000)));
+        assert_eq!(SLOW.lengthen(drawn, &recent), drawn);
+    }
+
+    #[test]
+    fn the_rule_turned_off_sets_no_floor() {
+        assert_eq!(SlowRule::OFF.floor(&ms(&[9_000, 9_000, 9_000])), None);
+    }
+
+    #[test]
+    fn an_answer_is_healthy_only_when_it_is_a_2xx() {
+        let answer = |status| AnswerTime {
+            at: EpochMs::new(0),
+            operation: "followers".to_string(),
+            status,
+            waited: Duration::ZERO,
+            load: None,
+            via: Via::Browser,
+        };
+        assert!(answer(200).healthy());
+        assert!(!answer(429).healthy());
+        assert!(!answer(302).healthy());
+    }
+
+    #[test]
+    fn via_round_trips_through_its_name() {
+        for via in [Via::Browser, Via::Direct] {
+            assert_eq!(Via::parse(via.as_str()), Some(via));
+        }
+        assert_eq!(Via::parse("carrier pigeon"), None);
     }
 
     #[test]

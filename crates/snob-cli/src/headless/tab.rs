@@ -112,6 +112,8 @@ pub(super) async fn navigate_and_read(
             .get("tooLarge")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // A document is a page, not an answer of the API: not timed.
+        waited_ms: None,
     })
 }
 
@@ -176,6 +178,7 @@ const FETCH: &str = r#"(async (q) => {
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), q.timeout_ms);
   try {
+    const sent = performance.now();
     const r = await fetch(q.url, {
       method: q.method,
       headers,
@@ -184,6 +187,7 @@ const FETCH: &str = r#"(async (q) => {
       redirect: 'manual',
       signal: abort.signal,
     });
+    const waitedMs = Math.round(performance.now() - sent);
     const fresh = r.headers.get('x-ig-set-www-claim');
     if (fresh) { try { sessionStorage.setItem('www-claim-v2', fresh); } catch (e) {} }
     const list = [];
@@ -192,7 +196,7 @@ const FETCH: &str = r#"(async (q) => {
     const tooLarge = wire(text) > q.cap;
     return {
       status: r.status, headers: list, body: tooLarge ? '' : text,
-      url: r.url, redirected: r.redirected, tooLarge, claim, claimSet: !!fresh,
+      url: r.url, redirected: r.redirected, tooLarge, claim, claimSet: !!fresh, waitedMs,
     };
   } catch (e) {
     return { error: String(e), kind: 'network' };
@@ -295,6 +299,11 @@ pub(super) async fn fetch(
             .get("tooLarge")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // From the `fetch()` to its headers, which is when it resolves.
+        waited_ms: answer
+            .get("waitedMs")
+            .and_then(Value::as_u64)
+            .and_then(|ms| u32::try_from(ms).ok()),
     })
 }
 
@@ -393,6 +402,8 @@ pub(super) async fn fetch_asset(
             .get("tooLarge")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // The CDN is not Instagram's API, and is not timed.
+        waited_ms: None,
     })
 }
 

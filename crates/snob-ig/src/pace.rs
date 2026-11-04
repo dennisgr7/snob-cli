@@ -61,15 +61,24 @@
 //! has nothing to do with these endpoints; and a recorded session in which
 //! nothing was refused says what the app does, not how far past it one may
 //! go. Instagram's `x-ig-capacity-level` and `x-ig-peak-time` are written down
-//! when it pushes back (`IgClient::note_push_back`) and deliberately not acted
-//! on: they describe a datacenter's headroom, not a checkpoint on one account.
+//! with every answer (the account's `answers` table, shown by `snob status`)
+//! and deliberately not acted on: they describe a datacenter's headroom, not a
+//! checkpoint on one account.
+//!
+//! **What is acted on is how long the answers take**, and only to slow down
+//! ([`SlowRule`], the idea of Scrapling's AutoThrottle): when the latest
+//! healthy answers of the account took long to arrive, the step and the dwell
+//! before the next page last at least [`SLOW_FACTOR`] times their median. A
+//! server that takes three seconds to answer is a busy one, and a person
+//! waits for a slow page too. Fast answers change nothing, and nothing here
+//! can make a request come sooner than the cadence above would send it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use snob_core::EpochMs;
-use snob_core::budget::{RateBudget, Sitting, SittingRule};
+use snob_core::budget::{AnswerTime, RateBudget, Sitting, SittingRule, SlowRule};
 
 /// Accounts asked for per list page: what the web app asks for, `count=12`
 /// on both lists, of which it gets eight to twelve back.
@@ -151,6 +160,45 @@ pub const SITTING_PAUSE_MS: (u64, u64) = (300_000, 900_000);
 /// the app again asks too (`pager::ListWalker`).
 pub const RECONNECT_WAITS_SECS: [u64; 5] = [5, 10, 20, 40, 60];
 
+/// The floor on a step or a dwell is this many times the median of the
+/// latest answers: two.
+///
+/// Waiting at least twice what an answer took keeps snob's share of the
+/// server's time, answer and wait together, to a third at most. With the
+/// answers this account ordinarily gets (well under half a second) the floor
+/// is under the shortest step ([`STEP_MS`]) and changes nothing: the cadence
+/// stays the app's until the server slows. Scrapling's AutoThrottle waits
+/// once the answer's time, for one request in flight; twice is slower, which
+/// needs no argument here.
+pub const SLOW_FACTOR: u32 = 2;
+
+/// How many of the latest healthy answers the median is over: five, so it
+/// needs three of them slow ([`SlowRule::least`]). The first answer of a run
+/// pays for its connection, and one slow answer is noise; three in a row are
+/// the server.
+pub const SLOW_SAMPLES: usize = 5;
+
+/// How far back an answer still says how busy the server is: ten minutes.
+///
+/// Shorter than the longest rest ([`SITTING_PAUSE_MS`]), so a sitting that
+/// rested its longest starts again with the server as it is now, not as it
+/// was before the rest; long enough to span the pages of a sitting, and an
+/// agent's one-page calls minutes apart.
+pub const SLOW_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// The longest floor slow answers set: a minute.
+///
+/// Answers that take thirty seconds are close to the request's own timeout,
+/// and that is a failing server rather than a slow one, which the network
+/// retries and the push-back handling already answer. A step of a minute is
+/// past any rhythm a person keeps; a longer one would only hold a run up
+/// for nothing.
+pub const SLOW_CEILING: Duration = Duration::from_secs(60);
+
+/// How many answers the pacer keeps in the process: enough for
+/// [`SLOW_SAMPLES`], and the series a push-back's log line shows.
+const ANSWERS_KEPT: usize = 8;
+
 /// Request cadence: within an action, and between sittings.
 #[derive(Debug, Clone, Copy)]
 pub struct Pace {
@@ -164,6 +212,9 @@ pub struct Pace {
     pub sitting_pause_ms: (u64, u64),
     /// How many pages make a sitting: [`PAGES_PER_SITTING`].
     pub pages_per_sitting: u32,
+    /// When slow answers lengthen a step or a dwell: [`SLOW_FACTOR`],
+    /// [`SLOW_SAMPLES`], [`SLOW_WINDOW`], [`SLOW_CEILING`].
+    pub slow: SlowRule,
     /// How many times a network failure is retried before giving up.
     pub network_retries: u32,
     /// Base of the exponential delay between retries.
@@ -187,6 +238,12 @@ impl Default for Pace {
             dwell_ms: DWELL_MS,
             sitting_pause_ms: SITTING_PAUSE_MS,
             pages_per_sitting: PAGES_PER_SITTING,
+            slow: SlowRule {
+                factor: SLOW_FACTOR,
+                samples: SLOW_SAMPLES,
+                window: SLOW_WINDOW,
+                ceiling: SLOW_CEILING,
+            },
             network_retries: 3,
             backoff_base_ms: 2_000,
         }
@@ -283,6 +340,9 @@ pub struct Pacer {
     /// The longest wait for the budget this run accepts. See
     /// [`Pacer::waiting_at_most`].
     max_wait: Option<Duration>,
+    /// The latest answers this process was given, newest last. See
+    /// [`Pacer::answered`].
+    answers: std::sync::Mutex<std::collections::VecDeque<AnswerTime>>,
 }
 
 impl Pacer {
@@ -295,6 +355,7 @@ impl Pacer {
             sitting: std::sync::Mutex::new(None),
             actions: AtomicU32::new(0),
             max_wait: None,
+            answers: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -389,6 +450,91 @@ impl Pacer {
         let mut sitting = self.sitting.lock().unwrap_or_else(|e| e.into_inner());
         *sitting = sitting.map(|s| s.rested(until));
         Ok(())
+    }
+
+    /// Writes down how long an answer of the API took, and what load it
+    /// declared: kept in the process for [`Self::latest_answers`], and by
+    /// the budget when it keeps them ([`RateBudget::keeps_answers`]), in the
+    /// account's database.
+    ///
+    /// **A measurement never fails a request**: a database that will not
+    /// take the row is said at `debug` and the answer goes on to be read.
+    pub async fn answered(&self, answer: AnswerTime) {
+        {
+            let mut kept = self.answers.lock().unwrap_or_else(|e| e.into_inner());
+            if kept.len() == ANSWERS_KEPT {
+                kept.pop_front();
+            }
+            kept.push_back(answer.clone());
+        }
+        if self.budget.keeps_answers()
+            && let Err(e) = self
+                .off_thread(move |budget| budget.answer_timed(&answer))
+                .await
+        {
+            tracing::debug!(error = %e, "could not write down how long an answer took");
+        }
+    }
+
+    /// The latest answers this process was given, oldest first: what a
+    /// push-back's log line shows of the run up to it.
+    pub fn latest_answers(&self) -> Vec<AnswerTime> {
+        self.answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// `drawn`, a step or a dwell the pace drew, lengthened when the latest
+    /// healthy answers of the account were slow ([`SlowRule::lengthen`]):
+    /// **never shorter than `drawn`**.
+    ///
+    /// The answers are the account's when the budget keeps them, so a page
+    /// read by one process is slowed by what the pages before it, read by
+    /// others, were answered; otherwise this process's own. A budget that
+    /// cannot be read leaves `drawn` as it is: the cadence is the floor
+    /// that holds whatever else does not.
+    pub async fn slowed(&self, pace: &Pace, drawn: Duration, now: EpochMs) -> Duration {
+        let rule = pace.slow;
+        if rule.factor == 0 {
+            return drawn;
+        }
+        let since = rule.since(now);
+        let recent = if self.budget.keeps_answers() {
+            let samples = rule.samples;
+            match self
+                .off_thread(move |budget| budget.recent_waits(since, samples))
+                .await
+            {
+                Ok(recent) => recent,
+                Err(e) => {
+                    tracing::debug!(error = %e, "could not read how long the latest answers took");
+                    return drawn;
+                }
+            }
+        } else {
+            self.latest_answers()
+                .iter()
+                .rev()
+                .filter(|a| a.healthy() && a.at > since)
+                .map(|a| a.waited)
+                .take(rule.samples)
+                .collect()
+        };
+        let wait = rule.lengthen(drawn, &recent);
+        if wait > drawn {
+            tracing::info!(
+                median_ms = rule
+                    .floor(&recent)
+                    .map_or(0, |f| f.as_millis() / u128::from(rule.factor)),
+                drawn_ms = drawn.as_millis(),
+                wait_ms = wait.as_millis(),
+                "Instagram is answering slowly; waiting longer before the next request"
+            );
+        }
+        wait
     }
 
     /// How many requests have been paid for since the client was built.
@@ -812,6 +958,116 @@ impl RateBudget for KeptSitting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn timed(at: EpochMs, status: u16, waited_ms: u64) -> AnswerTime {
+        AnswerTime {
+            at,
+            operation: "followers".to_string(),
+            status,
+            waited: Duration::from_millis(waited_ms),
+            load: None,
+            via: snob_core::budget::Via::Browser,
+        }
+    }
+
+    /// A budget that keeps the answers, as the account's database does,
+    /// and hands back the waits it was given.
+    struct KeptAnswers(Vec<Duration>);
+
+    impl RateBudget for KeptAnswers {
+        fn reserve(&self) -> Result<Duration, snob_core::budget::RateBudgetError> {
+            Ok(Duration::ZERO)
+        }
+        fn reserve_write(&self) -> Result<Duration, snob_core::budget::RateBudgetError> {
+            Ok(Duration::ZERO)
+        }
+        fn cooldown(&self) -> Result<Option<EpochMs>, snob_core::budget::RateBudgetError> {
+            Ok(None)
+        }
+        fn start_cooldown(
+            &self,
+            _: &str,
+            _: Duration,
+        ) -> Result<EpochMs, snob_core::budget::RateBudgetError> {
+            Ok(EpochMs::new(0))
+        }
+        fn keeps_answers(&self) -> bool {
+            true
+        }
+        fn recent_waits(
+            &self,
+            _: EpochMs,
+            n: usize,
+        ) -> Result<Vec<Duration>, snob_core::budget::RateBudgetError> {
+            Ok(self.0.iter().take(n).copied().collect())
+        }
+    }
+
+    /// The answers another process was given, kept by the budget, slow a
+    /// pacer that was given none itself.
+    #[tokio::test]
+    async fn the_answers_the_budget_keeps_slow_a_new_pacer() {
+        let slow = [4_000, 3_500, 3_800].map(Duration::from_millis).to_vec();
+        let pacer = Pacer::new(Arc::new(KeptAnswers(slow)));
+        let drawn = Duration::from_millis(1_500);
+        let wait = pacer
+            .slowed(&Pace::default(), drawn, EpochMs::new(1_700_000_000_000))
+            .await;
+        assert_eq!(wait, Duration::from_millis(7_600));
+    }
+
+    /// Kept in the process, only the healthy answers inside the window
+    /// count: a refusal answers fast, and an answer from before a long
+    /// rest says nothing about the server now.
+    #[tokio::test]
+    async fn the_process_counts_only_healthy_answers_inside_the_window() {
+        let pacer = Pacer::unlimited();
+        let now = EpochMs::new(1_700_000_000_000);
+        let long_ago = now - Duration::from_secs(20 * 60);
+        for _ in 0..3 {
+            pacer.answered(timed(long_ago, 200, 9_000)).await;
+        }
+        for _ in 0..2 {
+            pacer.answered(timed(now, 200, 5_000)).await;
+            pacer.answered(timed(now, 429, 10)).await;
+        }
+        let drawn = Duration::from_millis(1_500);
+        assert_eq!(pacer.slowed(&Pace::default(), drawn, now).await, drawn);
+
+        pacer.answered(timed(now, 200, 5_000)).await;
+        assert_eq!(
+            pacer.slowed(&Pace::default(), drawn, now).await,
+            Duration::from_secs(10)
+        );
+    }
+
+    /// The process keeps the last few answers and no more.
+    #[tokio::test]
+    async fn the_process_keeps_the_latest_answers() {
+        let pacer = Pacer::unlimited();
+        for ms in 0..20 {
+            pacer
+                .answered(timed(EpochMs::new(ms), 200, ms as u64))
+                .await;
+        }
+        let kept: Vec<_> = pacer
+            .latest_answers()
+            .iter()
+            .map(|a| a.waited.as_millis())
+            .collect();
+        assert_eq!(kept, (12..20).collect::<Vec<u128>>());
+    }
+
+    /// The numbers the rule is held to, documented on each constant.
+    #[test]
+    fn the_slow_rule_is_the_documented_one() {
+        let slow = Pace::default().slow;
+        assert_eq!(slow.factor, 2);
+        assert_eq!(slow.samples, 5);
+        assert_eq!(slow.window, Duration::from_secs(600));
+        assert_eq!(slow.ceiling, Duration::from_secs(60));
+        assert!(slow.window < Duration::from_millis(SITTING_PAUSE_MS.1));
+    }
 
     /// A budget that is always a quarter of an hour away, and counts what it
     /// was charged.

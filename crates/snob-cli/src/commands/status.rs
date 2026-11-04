@@ -21,6 +21,7 @@ use snob_core::{Epoch, EpochMs};
 use snob_store::paths::{AccountPaths, AppPaths};
 use snob_store::registry::Registry;
 use snob_store::secrets::SecretStore;
+use snob_store::store::answers::{self, AnswersDay};
 use snob_store::store::rate_budget::{self, BucketState, BudgetState};
 use snob_store::store::shared::Shared;
 use snob_store::store::{Store, accounts, mcp_acts, snapshots, users, watch as watch_store};
@@ -104,6 +105,19 @@ pub fn run(
         }
     }
 
+    // How long Instagram's answers took, and the floor the pace would put
+    // under the next step from the latest of them (`Pacer::slowed`).
+    let answered = if sections.answers {
+        let rule = snob_ig::pace::Pace::default().slow;
+        let recent = answers::recent_waits(store.conn(), rule.since(now), rule.samples)?;
+        Answered {
+            day: answers::last_day(store.conn(), now)?,
+            slowing: slowing(rule.floor(&recent)),
+        }
+    } else {
+        Answered::default()
+    };
+
     // What agents were told yes to, through `snob mcp`: the day the cap on
     // their writes counts.
     let acts = if sections.agents {
@@ -127,6 +141,7 @@ pub fn run(
         session: &session,
         storage: storage.as_str(),
         budget: &budget,
+        answered: &answered,
         held,
         braked: &braked,
         lists: &lists,
@@ -179,6 +194,32 @@ fn row(label: &str, value: &str) -> String {
     format!("  {label:<14} {value}")
 }
 
+/// The answers of the day, and how much longer than its shortest the next
+/// step would be for them.
+#[derive(Default)]
+struct Answered {
+    day: AnswersDay,
+    slowing: Option<std::time::Duration>,
+}
+
+/// The floor slow answers put under a step, when it is longer than the
+/// shortest step the pace draws: only then does it lengthen any.
+fn slowing(floor: Option<std::time::Duration>) -> Option<std::time::Duration> {
+    let shortest = std::time::Duration::from_millis(snob_ig::pace::STEP_MS.0);
+    floor.filter(|floor| *floor > shortest)
+}
+
+/// A length of time as a line of `status` says it: milliseconds under a
+/// second, tenths of a second above.
+fn took(wait: std::time::Duration) -> String {
+    let ms = wait.as_millis();
+    if ms < 1_000 {
+        format!("{ms} ms")
+    } else {
+        format!("{:.1} s", wait.as_secs_f64())
+    }
+}
+
 /// One of the account's own lists, as stored.
 struct Stored {
     kind: ListKind,
@@ -194,6 +235,7 @@ struct Found<'a> {
     session: &'a snob_core::session::Session,
     storage: &'a str,
     budget: &'a BudgetState,
+    answered: &'a Answered,
     held: Option<EpochMs>,
     braked: &'a [String],
     lists: &'a [Stored],
@@ -238,6 +280,26 @@ impl Found<'_> {
                     "accounts_read": b.accounts_read,
                     "accounts_ceiling": b.accounts_ceiling,
                     "accounts_left": b.accounts_left(),
+                }),
+            );
+        }
+        if self.sections.answers {
+            let day = &self.answered.day;
+            let ms = |wait: Option<std::time::Duration>| wait.map(|w| w.as_millis() as u64);
+            out.insert(
+                "answers".into(),
+                json!({
+                    "count": day.answers,
+                    "refused": day.refused,
+                    "median_ms": ms(day.median),
+                    "p95_ms": ms(day.p95),
+                    "slowest_ms": ms(day.slowest),
+                    "via": day.via.map(snob_core::budget::Via::as_str),
+                    "load": day.load.as_ref().map(|(value, at)| json!({
+                        "value": printable(value),
+                        "at": at.to_epoch(),
+                    })),
+                    "slowing_ms": ms(self.answered.slowing),
                 }),
             );
         }
@@ -444,6 +506,9 @@ impl Found<'_> {
                 ),
             ]);
         }
+        if self.sections.answers {
+            blocks.push(self.answers_text());
+        }
         if self.sections.cooldown {
             let mut lines = vec!["Cooldown".to_string()];
             match self.held {
@@ -564,6 +629,52 @@ impl Found<'_> {
             .join("\n\n")
     }
 
+    /// The answers of the day, as the text form says them.
+    fn answers_text(&self) -> Vec<String> {
+        let day = &self.answered.day;
+        let mut lines = vec!["Answers".to_string()];
+        if day.answers == 0 {
+            lines.push("  None from Instagram in the last 24 hours".to_string());
+            return lines;
+        }
+        let refused = match day.refused {
+            0 => String::new(),
+            n => format!(", {n} refused"),
+        };
+        lines.push(row(
+            "Last 24 hours",
+            &format!("{}{refused}", report::answers(day.answers)),
+        ));
+        if let (Some(median), Some(p95), Some(slowest)) = (day.median, day.p95, day.slowest) {
+            lines.push(row(
+                "Took",
+                &format!(
+                    "{} at the median, {} or less for 95 in 100, {} the slowest",
+                    took(median),
+                    took(p95),
+                    took(slowest)
+                ),
+            ));
+        }
+        if let Some((load, at)) = &day.load {
+            lines.push(row(
+                "Load",
+                &format!("{} {}", printable(load), report::stored_on(at.to_epoch())),
+            ));
+        }
+        lines.push(row(
+            "Pace",
+            &match self.answered.slowing {
+                Some(floor) => format!(
+                    "slowed: the latest answers were slow, so a step lasts at least {}",
+                    took(floor)
+                ),
+                None => "as usual: the latest answers were not slow".to_string(),
+            },
+        ));
+        lines
+    }
+
     /// How many of the acts were follows or unfollows: what the cap counts.
     fn agent_writes(&self) -> usize {
         self.acts.iter().filter(|act| act.is_write()).count()
@@ -630,11 +741,13 @@ mod tests {
     fn the_sections_are_all_of_them_or_the_ones_named() {
         let all = args(&[]).sections();
         assert!(all.session && all.budget && all.cooldown && all.lists && all.watch && all.agents);
-        assert!(all.jobs);
+        assert!(all.jobs && all.answers);
         let some = args(&["--budget", "--cooldown"]).sections();
         assert!(some.budget && some.cooldown);
         assert!(!some.session && !some.lists && !some.watch && !some.agents && !some.jobs);
+        assert!(!some.answers);
         assert_eq!(args(&["--jobs"]).sections().names(), ["jobs"]);
+        assert_eq!(args(&["--answers"]).sections().names(), ["answers"]);
     }
 
     /// The JSON carries only what was asked for.
@@ -654,6 +767,7 @@ mod tests {
             session: &session,
             storage: "file",
             budget: &budget,
+            answered: &Answered::default(),
             held: None,
             braked: &[],
             lists: &[],
@@ -717,6 +831,7 @@ mod tests {
             session: &session,
             storage: "file",
             budget: &budget,
+            answered: &Answered::default(),
             held: None,
             braked: &[],
             lists: &[],
@@ -735,5 +850,82 @@ mod tests {
         let text = found.text();
         assert!(text.starts_with("Agents\n"), "{text}");
         assert!(text.contains("1 in the last 24 hours"), "{text}");
+    }
+
+    /// The answers of the day, and the floor the latest of them put under
+    /// a step, said in the JSON and in lines.
+    #[test]
+    fn the_answers_of_the_day_are_said_in_the_json_and_in_lines() {
+        use snob_core::budget::Via;
+        let session = snob_core::session::Session::from_sessionid(
+            "42%3AAbCdEfGh%3A20",
+            "Mozilla/5.0",
+            snob_core::session::SessionOrigin::Paste,
+        )
+        .unwrap();
+        let store = Store::in_memory().unwrap();
+        let now = snob_core::clock::now_ms();
+        let budget = rate_budget::state(store.conn(), None, now).unwrap();
+        let answered = |day| Answered {
+            day,
+            slowing: slowing(Some(std::time::Duration::from_millis(6_400))),
+        };
+        let day = AnswersDay {
+            answers: 12,
+            refused: 1,
+            median: Some(std::time::Duration::from_millis(420)),
+            p95: Some(std::time::Duration::from_millis(3_200)),
+            slowest: Some(std::time::Duration::from_millis(3_400)),
+            load: Some(("x-ig-capacity-level=3".to_string(), now)),
+            via: Some(Via::Browser),
+        };
+        let answered = answered(day);
+        let found = Found {
+            sections: args(&["--answers"]).sections(),
+            session: &session,
+            storage: "file",
+            budget: &budget,
+            answered: &answered,
+            held: None,
+            braked: &[],
+            lists: &[],
+            runs: &[],
+            acts: &[],
+            jobs: &[],
+            now,
+        };
+        let out = found.json();
+        let keys: Vec<&String> = out.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["answers"]);
+        assert_eq!(out["answers"]["count"], 12);
+        assert_eq!(out["answers"]["refused"], 1);
+        assert_eq!(out["answers"]["median_ms"], 420);
+        assert_eq!(out["answers"]["p95_ms"], 3_200);
+        assert_eq!(out["answers"]["via"], "browser");
+        assert_eq!(out["answers"]["load"]["value"], "x-ig-capacity-level=3");
+        assert_eq!(out["answers"]["slowing_ms"], 6_400);
+        let text = found.text();
+        assert!(text.starts_with("Answers\n"), "{text}");
+        assert!(text.contains("12 answers, 1 refused"), "{text}");
+        assert!(
+            text.contains("420 ms at the median, 3.2 s or less"),
+            "{text}"
+        );
+        assert!(text.contains("at least 6.4 s"), "{text}");
+
+        // An answer at no more than the shortest step slows nothing, and
+        // a day with none says so.
+        assert_eq!(slowing(Some(std::time::Duration::from_millis(900))), None);
+        let none = Answered::default();
+        let found = Found {
+            answered: &none,
+            ..found
+        };
+        assert_eq!(found.json()["answers"]["slowing_ms"], Value::Null);
+        assert!(
+            found.text().contains("None from Instagram"),
+            "{}",
+            found.text()
+        );
     }
 }
