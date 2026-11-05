@@ -1845,6 +1845,25 @@ impl<R: wiremock::Respond> wiremock::Respond for Slowly<R> {
     }
 }
 
+/// What `R` answers, late enough that a command started while the request
+/// is held has certainly done what it does first.
+///
+/// **Long, not a few seconds**: the logout test needs `snob logout` to have
+/// signed the account out before the walk's next request is checked, and
+/// that request is checked as soon as this one is answered. A logout is a
+/// process of its own, which on a loaded CI runner took longer than five
+/// seconds to get there. The logout waits for this request to end
+/// (`owner::release`), so the test takes this long once per mode, no more.
+struct Held<R>(R);
+
+impl<R: wiremock::Respond> wiremock::Respond for Held<R> {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        self.0
+            .respond(request)
+            .set_delay(std::time::Duration::from_secs(20))
+    }
+}
+
 /// A crossing of account 42's own lists, fetched afresh.
 const CROSSING_42: &[&str] = &[
     "unfollowers",
@@ -1929,7 +1948,7 @@ async fn a_walk_running_when_its_account_is_logged_out_of_sends_nothing_more() {
         .and(path_regex(
             r"^/api/v1/friendships/42/(followers|following)/$",
         ))
-        .respond_with(Slowly(world.lists()))
+        .respond_with(Held(world.lists()))
         .with_priority(1)
         .mount(&instagram)
         .await;
