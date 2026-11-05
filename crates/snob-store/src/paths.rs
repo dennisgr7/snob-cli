@@ -341,6 +341,24 @@ impl AccountPaths {
         self.dir().join("jobs")
     }
 
+    /// Makes [`Self::jobs_dir`], private, **only inside an account directory
+    /// that is there**: `false`, and nothing made, when it is not. Never by
+    /// `create_dir_all`, which would make the account's directory again when
+    /// a `purge` removed it between a look and the making, and with no list
+    /// of who is signed in ([`Self::signed_in`]), which sends as every
+    /// session.
+    pub fn create_jobs_dir(&self) -> Result<bool, PathError> {
+        let dir = self.jobs_dir();
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+            Err(source) => return Err(PathError::Create { path: dir, source }),
+        }
+        restrict_to_this_account(&dir)?;
+        Ok(true)
+    }
+
     /// One job's directory. Only ever from a [`JobId`], which is checked, so
     /// no name read from anywhere can reach outside [`AccountPaths::jobs_dir`].
     pub fn job_dir(&self, id: &JobId) -> PathBuf {
@@ -1522,6 +1540,30 @@ mod tests {
         start_signed_out(&account.dir()).unwrap();
         account.admit_session(login).unwrap();
         assert!(!account.refuses_session(login));
+    }
+
+    /// The jobs directory is made only inside the account's directory, never
+    /// with it: one `purge` removed stays gone.
+    #[test]
+    fn the_jobs_directory_never_makes_the_accounts_again() {
+        let root = tempfile::tempdir().unwrap();
+        let account = AppPaths::rooted_at(root.path()).account(snob_core::Pk::new(42));
+        assert!(!account.create_jobs_dir().unwrap());
+        assert!(!account.dir().exists());
+
+        account.ensure_dirs().unwrap();
+        assert!(account.create_jobs_dir().unwrap());
+        assert!(account.create_jobs_dir().unwrap(), "there already");
+        assert!(account.jobs_dir().is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(account.jobs_dir())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
     }
 
     /// The list keeps the latest [`SIGNED_IN_KEPT`] logins, and a line not
