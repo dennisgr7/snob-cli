@@ -55,7 +55,10 @@
 //! **What the app's own traffic may do beyond that** is [`refused_app`]'s:
 //! the reads it sends on every document it loads (`APP_READS`), by name and
 //! number, or by a number the call vouches for where the app moves it, and
-//! nothing it writes.
+//! nothing it writes. **Not even the registry's two writes**, which
+//! [`refused`] lets out by their name and endpoint alone: from the app they
+//! are refused under any number. snob's own, sent from the same tab, is let
+//! out by the guard as the one request it was told to expect, matched whole.
 
 use std::collections::HashMap;
 
@@ -729,11 +732,30 @@ const APP_READS: [AppRead; 7] = [
 ];
 
 /// What `request`, one the app sent on its own, is when the tab must not let
-/// it out: [`refused_with`]'s, unless it is one of [`APP_READS`]. Nothing
-/// snob builds goes through here; its own calls are held to the registry.
+/// it out: [`refused_with`]'s, unless it is one of [`APP_READS`], and a
+/// follow or an unfollow whatever its number, which [`refused_with`] lets
+/// out for snob. Nothing snob builds goes through here; its own calls are
+/// held to the registry, and its write is let out by the guard only as the
+/// request it armed.
 pub fn refused_app(request: &PageRequest, found: &Rediscovered) -> Option<String> {
+    if let Some(write) = a_write(request, found) {
+        return Some(write);
+    }
     let what = refused_with(request, found)?;
     (!app_read(request)).then_some(what)
+}
+
+/// `POST <path>` when `request` is one of the registry's two writes as
+/// [`refused_with`] would let it out: its name, its header, its endpoint,
+/// under any number.
+fn a_write(request: &PageRequest, found: &Rediscovered) -> Option<String> {
+    if request.method != Method::Post || request.navigate {
+        return None;
+    }
+    let url = Url::parse(&request.url).ok()?;
+    let path = url.path();
+    operation_posted(request, path, found)?.write()?;
+    Some(format!("POST {path}"))
 }
 
 /// Whether `request` is one of [`APP_READS`], announced in
@@ -1575,6 +1597,27 @@ mod tests {
             refused_app(&moved, &Rediscovered::of(profile, "1000000000000777")),
             None
         );
+    }
+
+    /// A follow or an unfollow the app sends on its own is refused under any
+    /// number, its seed's and a rediscovered one's included, though the same
+    /// form is one [`refused`] lets out for snob.
+    #[test]
+    fn the_apps_own_follow_and_unfollow_are_refused_under_any_number() {
+        for write in [Operation::Follow, Operation::Unfollow] {
+            for doc_id in [write.doc_id(), "1000000000000003"] {
+                let sent = relay(write.path(), write.friendly_name(), doc_id);
+                assert_eq!(refused(&sent), None, "snob's {write:?}");
+                let found = Rediscovered::of(write, doc_id);
+                for found in [&Rediscovered::default(), &found] {
+                    assert_eq!(
+                        refused_app(&sent, found),
+                        Some(format!("POST {}", write.path())),
+                        "the app's {write:?} under {doc_id}"
+                    );
+                }
+            }
+        }
     }
 
     /// The profile's posts go out under whatever number the app sends them,

@@ -415,6 +415,9 @@ struct Live {
     /// What the listener to the app's traffic shares with the requests sent
     /// from the same tab; see [`listen`].
     listened: Arc<listen::Shared>,
+    /// The write of snob's the tab's guard lets out, armed as it is sent
+    /// ([`built_and_sent`]); see [`guard::Armed`].
+    armed: Arc<guard::Armed>,
     /// Where a push-back heard on it is recorded: the account's own.
     account: AccountPaths,
     /// The loader of the last document whose token the owner log named
@@ -1182,12 +1185,15 @@ impl Headless {
                 ("Fetch.enable", guard::patterns()),
             ],
         });
-        // Created here so the guard can read what the app is seen to send.
+        // Created here so the guard can read what the app is seen to send,
+        // and which write of snob's to let through.
         let listened = Arc::new(listen::Shared::default());
         let judged = Arc::clone(&listened);
+        let armed = Arc::new(guard::Armed::default());
+        let expected = Arc::clone(&armed);
         cdp.connection().set_pause_rule(Arc::new(move |params| {
             let documents = lock(&judged.documents);
-            guard::judge(params, documents.rediscovered())
+            guard::judge(params, documents.rediscovered(), &expected)
         }));
         cdp.browser_call(
             "Target.setAutoAttach",
@@ -1279,6 +1285,7 @@ impl Headless {
             checked: false,
             mark,
             listened,
+            armed,
             account: account_paths,
             token_named: None,
             asked_document: None,
@@ -1423,8 +1430,12 @@ async fn built_and_sent(
     let request = live.build(session, call).await?;
     refuse(&request, &live.rediscovered())?;
     let world = tab::isolated_world(live).await?;
-    let response = fetch(live, world, &request).await?;
-    own_answer(live, &request, response).await
+    // The guard refuses every follow and unfollow but the one it expects,
+    // until the fetch has answered or is given up.
+    let expecting = matches!(call.ask, Ask::Write { .. }).then(|| live.armed.expect(&request));
+    let response = fetch(live, world, &request).await;
+    drop(expecting);
+    own_answer(live, &request, response?).await
 }
 
 /// The tab goes to `path` on the call's origin, a navigation the allowlist
@@ -4187,16 +4198,17 @@ mod tests {
 
     /// The guard on the wire: what the page's own script sends is paused and
     /// judged before it leaves, whatever its address. A Relay call the
-    /// registry does not name, a POST off the API's paths, a beacon, the
-    /// view-count, sync and event-log paths (a GET of them included) and a
-    /// piece of video never reach the site; a query of the registry's and a
-    /// REST read do.
+    /// registry does not name, a follow snob did not send, a POST off the
+    /// API's paths, a beacon, the view-count, sync and event-log paths (a GET
+    /// of them included) and a piece of video never reach the site; a query
+    /// of the registry's and a REST read do.
     #[tokio::test]
     async fn the_tab_lets_out_only_what_the_allowlist_names() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
         let hover = snob_ig::allowlist::Operation::HoverCard;
+        let follow = snob_ig::allowlist::Operation::Follow;
         let relay = |name: &str, doc_id: &str| {
             url::form_urlencoded::Serializer::new(String::new())
                 .extend_pairs([
@@ -4222,6 +4234,12 @@ mod tests {
                 "/api/graphql",
                 "SomeBadgeQuery",
                 &relay("SomeBadgeQuery", "1000000000000001"),
+            ),
+            // A write the app sends on its own, as snob would send it.
+            post(
+                follow.path(),
+                follow.friendly_name(),
+                &relay(follow.friendly_name(), follow.doc_id()),
             ),
             // Off every path the API is known under.
             post("/web/likes/1/like/", "", "a=b"),
@@ -4297,9 +4315,11 @@ mod tests {
         ] {
             assert!(reached.contains(&out), "{out} never arrived: {reached:?}");
         }
+        let the_apps_write = format!("POST {} {}", follow.path(), follow.friendly_name());
         for kept in [
             "POST /beacon/x",
             "POST /api/graphql SomeBadgeQuery",
+            &the_apps_write,
             "POST /web/likes/1/like/",
             "POST /stories/reel/seen",
             "POST /video/x/",

@@ -206,7 +206,11 @@ with a documented reason in the same place.
   every document, by its kind and whatever its address, the app's own
   included: GETs go on, a POST only if `allowlist::refused` lets it, and
   the view count, the event log and the Facebook sync fail whatever the
-  method.
+  method. **A follow or an unfollow goes on only as snob's own write**:
+  the tab arms the guard with that request just before it fetches it
+  (`guard::Armed`), the first paused POST matching its address and form
+  exactly spends it, and every other one, the app's under any `doc_id`,
+  fails (`allowlist::refused_app`).
   `doc_id`s are discovered from the page's JavaScript, never hard-coded.
 - **Headers.** Every value is the page's, or computed from the User-Agent of
   the browser actually installed; what cannot be computed is left out. An

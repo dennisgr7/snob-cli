@@ -31,6 +31,17 @@
 //! out, is written at `APP_READS`. The numbers of the registry's reads follow
 //! the app when it moves them ([`Rediscovered`]).
 //!
+//! **snob's own write goes on only as the request it armed** ([`Armed`]).
+//! The allowlist lets a follow or an unfollow out by its name and endpoint,
+//! since its number rotates; from the app it is refused outright
+//! (`refused_app`), so that a write nobody asked for, paid for or recorded
+//! cannot leave the tab. snob's write is fetched from the same tab and paused
+//! the same way, so it is told apart by what nobody else could send: just
+//! before the fetch, the tab arms the guard with that request's address and
+//! form, and the first paused POST that matches both exactly is let through
+//! (after the allowlist's own check) and spends it. Any other write fails,
+//! and the expectation is gone once the fetch has answered, whatever it was.
+//!
 //! **One exception, named.** The app's empty POST to [`CLAIM_HANDED_OUT`] is
 //! let through though the allowlist does not name it (snob never sends it):
 //! it is neither a write nor a seen signal, and its answer is the only one
@@ -61,9 +72,11 @@
 //! `clips.mp4` is a username snob may ask about — and `\?` is a literal `?`
 //! in the protocol's patterns, where a bare one is any character.
 
+use std::sync::{Arc, Mutex};
+
 use base64::Engine as _;
 use serde_json::{Value, json};
-use snob_ig::allowlist::{Operation, Rediscovered, document, refused_app};
+use snob_ig::allowlist::{Operation, Rediscovered, document, refused_app, refused_with};
 use snob_ig::client::page::{Method, PageRequest};
 use url::Url;
 
@@ -129,10 +142,106 @@ pub(super) fn patterns() -> Value {
     json!({ "patterns": patterns })
 }
 
+/// The one write of snob's the guard is told to expect, if any: armed by the
+/// tab just before it sends one ([`Armed::expect`]), spent by the first
+/// paused POST that is it ([`Armed::spend`]). Its form carries the page's
+/// tokens, so it is never printed.
+#[derive(Default)]
+pub(super) struct Armed(Mutex<Held>);
+
+#[derive(Default)]
+struct Held {
+    /// The request expected, and the number of the [`Expecting`] that armed
+    /// it.
+    expected: Option<(u64, Expected)>,
+    /// The number the next [`Expecting`] takes.
+    next: u64,
+}
+
+/// A write, by what a paused request must match exactly to be it.
+struct Expected {
+    url: String,
+    form: String,
+}
+
+impl Armed {
+    /// Expects `request`, snob's own write about to be fetched from the tab,
+    /// until the guard handed back is dropped, which is once the fetch has
+    /// answered or was given up. One at a time: arming again replaces it.
+    pub(super) fn expect(self: &Arc<Self>, request: &PageRequest) -> Expecting {
+        let mut armed = self.lock();
+        let number = armed.next;
+        armed.next = armed.next.wrapping_add(1);
+        armed.expected = Some((
+            number,
+            Expected {
+                url: request.url.clone(),
+                form: request.body.clone().unwrap_or_default(),
+            },
+        ));
+        Expecting {
+            armed: Arc::clone(self),
+            number,
+        }
+    }
+
+    /// Whether the paused POST to `url` with `form` is the write expected,
+    /// which it then spends: a second one like it is not.
+    fn spend(&self, url: &str, form: Option<&str>) -> bool {
+        let mut armed = self.lock();
+        let is_it = armed.expected.as_ref().is_some_and(|(_, expected)| {
+            same_address(&expected.url, url) && expected.form == form.unwrap_or_default()
+        });
+        if is_it {
+            armed.expected = None;
+        }
+        is_it
+    }
+
+    /// The state, whether or not a thread panicked holding it: the guard is
+    /// fed by a browser and never panics.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// While held, the guard expects the write it was made for; dropped, it no
+/// longer does, unless another was armed since.
+#[must_use = "the write is expected only while this is held"]
+pub(super) struct Expecting {
+    armed: Arc<Armed>,
+    number: u64,
+}
+
+impl Drop for Expecting {
+    fn drop(&mut self) {
+        let mut armed = self.armed.lock();
+        if armed
+            .expected
+            .as_ref()
+            .is_some_and(|(number, _)| *number == self.number)
+        {
+            armed.expected = None;
+        }
+    }
+}
+
+/// Whether two addresses are one, as the browser writes back the one it was
+/// asked for: compared parsed, and whole when either does not parse.
+fn same_address(asked: &str, paused: &str) -> bool {
+    match (Url::parse(asked), Url::parse(paused)) {
+        (Ok(asked), Ok(paused)) => asked == paused,
+        _ => asked == paused,
+    }
+}
+
 /// What becomes of one paused request, from the `Fetch.requestPaused`
 /// event's `params`, with the numbers the app was seen to send the
-/// registry's reads under (`found`).
-pub(super) fn judge(params: &Value, found: &Rediscovered) -> Paused {
+/// registry's reads under (`found`) and the write of snob's it was told to
+/// expect (`armed`).
+pub(super) fn judge(params: &Value, found: &Rediscovered, armed: &Armed) -> Paused {
     let request = &params["request"];
     let url = request["url"].as_str().unwrap_or_default();
     if params["resourceType"] == "Media" || is_video(url) {
@@ -156,14 +265,20 @@ pub(super) fn judge(params: &Value, found: &Rediscovered) -> Paused {
     }
     match method {
         Some("GET") => Paused::Continue,
-        Some("POST") => judge_post(request, url, path, found),
+        Some("POST") => judge_post(request, url, path, found, armed),
         Some(other) => Paused::Fail(format!("{other} {path}")),
         None => Paused::Fail(format!("a request with no method to {path}")),
     }
 }
 
 /// A POST, judged on the form it carries.
-fn judge_post(request: &Value, url: &str, path: &str, found: &Rediscovered) -> Paused {
+fn judge_post(
+    request: &Value,
+    url: &str,
+    path: &str,
+    found: &Rediscovered,
+    armed: &Armed,
+) -> Paused {
     let Ok(form) = form_of(request) else {
         return Paused::Fail(format!(
             "POST {path} with a form the browser did not hand over"
@@ -191,6 +306,13 @@ fn judge_post(request: &Value, url: &str, path: &str, found: &Rediscovered) -> P
         cap: 0,
         timeout_ms: 0,
     };
+    // snob's own write, held to the allowlist as everything of snob's is.
+    if armed.spend(url, sent.body.as_deref()) {
+        return match refused_with(&sent, found) {
+            None => Paused::Continue,
+            Some(what) => Paused::Fail(what),
+        };
+    }
     match refused_app(&sent, found) {
         None => Paused::Continue,
         Some(what) => {
@@ -303,9 +425,9 @@ mod tests {
 
     const SITE: &str = "https://www.instagram.com";
 
-    /// A call judged with no number rediscovered.
+    /// A call judged with no number rediscovered and no write expected.
     fn judge(params: &Value) -> Paused {
-        super::judge(params, &Rediscovered::default())
+        super::judge(params, &Rediscovered::default(), &Armed::default())
     }
 
     fn paused(method: &str, url: &str, request: Value) -> Value {
@@ -420,7 +542,10 @@ mod tests {
         let moved = "1000000000000777";
         let sent = relay(hover.friendly_name(), moved);
         let found = Rediscovered::of(hover, moved);
-        assert_eq!(super::judge(&sent, &found), Paused::Continue);
+        assert_eq!(
+            super::judge(&sent, &found, &Armed::default()),
+            Paused::Continue
+        );
     }
 
     /// A Relay call the registry does not name is refused, whatever it
@@ -432,6 +557,106 @@ mod tests {
             verdict,
             Paused::Fail("POST /api/graphql (SomeBadgeQuery)".to_string())
         );
+    }
+
+    /// A follow or an unfollow the app sends on its own fails under any
+    /// number, the seed's included, and is named in the log.
+    #[test]
+    fn the_apps_own_follow_and_unfollow_fail() {
+        for write in [Operation::Follow, Operation::Unfollow] {
+            for doc_id in [write.doc_id(), "1000000000000003"] {
+                let mut sent = relay(write.friendly_name(), doc_id);
+                sent["request"]["url"] = json!(format!("{SITE}{}", write.path()));
+                assert_eq!(
+                    judge(&sent),
+                    Paused::Fail(format!("POST {} ({})", write.path(), write.friendly_name())),
+                    "{write:?} under {doc_id}"
+                );
+            }
+        }
+    }
+
+    /// snob's own write goes on as the request armed, matched whole, once,
+    /// and only while it is armed: another write while it is, the same one
+    /// a second time, and the same one once the fetch has answered all fail.
+    #[test]
+    fn snobs_own_write_goes_on_once_and_only_as_armed() {
+        let follow = Operation::Follow;
+        let url = format!("{SITE}{}", follow.path());
+        let paused_write = |form: &str| {
+            paused(
+                "POST",
+                &url,
+                json!({
+                    "headers": { "X-FB-Friendly-Name": follow.friendly_name() },
+                    "hasPostData": true,
+                    "postData": form,
+                }),
+            )
+        };
+        let ours = relay_form(follow.friendly_name(), follow.doc_id());
+        let theirs = ours.replace("2345678901", "2345678902");
+        let request = PageRequest {
+            method: Method::Post,
+            url: url.clone(),
+            headers: Vec::new(),
+            referrer: String::new(),
+            body: Some(ours.clone()),
+            navigate: false,
+            cap: 0,
+            timeout_ms: 0,
+        };
+        let found = Rediscovered::default();
+        let armed = Arc::new(Armed::default());
+        let judged = |form: &str| super::judge(&paused_write(form), &found, &armed);
+
+        assert!(fails(&judged(&ours)), "not armed yet");
+        let expecting = armed.expect(&request);
+        assert!(fails(&judged(&theirs)), "another write while armed");
+        assert_eq!(judged(&ours), Paused::Continue, "the write armed");
+        assert!(fails(&judged(&ours)), "spent");
+        drop(expecting);
+
+        let expecting = armed.expect(&request);
+        drop(expecting);
+        assert!(fails(&judged(&ours)), "the fetch answered without it");
+
+        // A guard dropped late does not take away a write armed since.
+        let first = armed.expect(&request);
+        let second = armed.expect(&request);
+        drop(first);
+        assert_eq!(judged(&ours), Paused::Continue, "the second armed");
+        drop(second);
+    }
+
+    /// A write armed is still held to the allowlist: a form under a name
+    /// that is no write's does not go on by matching.
+    #[test]
+    fn a_write_armed_is_still_held_to_the_allowlist() {
+        let url = format!("{SITE}/api/graphql");
+        let form = relay_form("SomeBadgeQuery", "1000000000000001");
+        let request = PageRequest {
+            method: Method::Post,
+            url: url.clone(),
+            headers: Vec::new(),
+            referrer: String::new(),
+            body: Some(form.clone()),
+            navigate: false,
+            cap: 0,
+            timeout_ms: 0,
+        };
+        let armed = Arc::new(Armed::default());
+        let _expecting = armed.expect(&request);
+        let sent = paused(
+            "POST",
+            &url,
+            json!({ "headers": { "X-FB-Friendly-Name": "SomeBadgeQuery" }, "hasPostData": true, "postData": form }),
+        );
+        assert!(fails(&super::judge(
+            &sent,
+            &Rediscovered::default(),
+            &armed
+        )));
     }
 
     /// A name that is not a plain identifier is not repeated into the log.
