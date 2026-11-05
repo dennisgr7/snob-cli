@@ -202,8 +202,9 @@ pub(crate) fn sign_out(paths: &AppPaths, leaving: &[Pk]) {
 /// again since and no login let this session in there
 /// (`AccountPaths::refuses_session`). The session is known by when it was
 /// made, compared for equality only, so no clock set back refuses a login.
-/// Asked before every request, by the command and by the owner: it is a look
-/// at one small file.
+/// Asked before every request, by the command, by the owner, and by the
+/// browser's holder once it holds the account's browser
+/// (`headless::Headless`): it is a look at one small file.
 pub(crate) fn signed_out(paths: &AppPaths, session: &Session) -> bool {
     paths
         .account(session.ds_user_id)
@@ -1085,7 +1086,14 @@ mod tests {
             "the refused write never left"
         );
 
-        // With no owner to send through, this process's own browser answers.
+        // With no owner to send through, this process's own browser answers:
+        // made once, with whichever test's paths asked first, where the
+        // session is let in too.
+        crate::headless::alone(&paths)
+            .paths()
+            .account(Pk::new(42))
+            .admit_session(session.created_at)
+            .unwrap();
         let alone = Remote::new(paths.clone(), None);
         let told = alone.ask_as(&session, call(Ask::Viewer)).await.unwrap();
         assert!(

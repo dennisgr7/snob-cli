@@ -366,10 +366,11 @@ with a documented reason in the same place.
   the sessions that may be sent as by their `created_at`, compared for
   equality only, so no clock set back can refuse a login): a walk typed
   elsewhere, the monitor's run or an agent's call still holding a session
-  in memory is refused its next request, by itself and by the owner, as
-  exit 3, and starts no browser on the profile going (one running its own
-  browser closes it within two seconds, and the profiles are removed once
-  it has let go). **It
+  in memory is refused its next request, by itself, by the owner and by
+  the browser's holder once it has the account's browser, as exit 3, and
+  starts no browser on the profile going (one running its own browser
+  closes it within two seconds, and the profiles are removed once it has
+  let go). **It
   stays refused through any later login**, which lets in its own session
   only (`AccountPaths::admit_session`, before its check), a sessionid
   pasted again included. An account directory that is gone, as `purge`
