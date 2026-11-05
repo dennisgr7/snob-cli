@@ -3076,6 +3076,7 @@ dependencies = [
  "base64 0.22.1",
  "directories",
  "keyring-core",
+ "libc",
  "rusqlite",
  "rusqlite_migration",
  "serde",

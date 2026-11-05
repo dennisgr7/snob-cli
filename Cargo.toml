@@ -231,6 +231,7 @@ url = "2"
 # Only for the Unix half of that: `dup2` in a `pre_exec` hook is what puts the
 # two pipe ends in front of the browser as descriptors 3 and 4. Windows needs
 # no such crate -- it goes through `windows-sys`, which is already here.
+# `snob-store` takes it for `geteuid` alone: the scratch sweep's owner check.
 libc = "0.2"
 base64 = "0.22"
 # The monitor's configuration file. Reading only: the file is written by hand
