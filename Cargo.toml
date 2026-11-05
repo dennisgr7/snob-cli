@@ -119,7 +119,7 @@ comfy-table = "7"
 indicatif = "0.18"
 supports-hyperlinks = "3"
 csv = "1"
-rust_xlsxwriter = "0.97"
+rust_xlsxwriter = "0.102"
 # The Model Context Protocol SDK behind `snob mcp`. Pinned to the exact
 # version: it moves fast (eight releases in the two months before this one),
 # the protocol revision it speaks is part of what `snob mcp` promises a
@@ -140,14 +140,19 @@ bytes = "1"
 # rust_xlsxwriter already pulls this crate in, so the features are kept narrow
 # rather than adding a second copy of the compression code.
 #
-# The decoder feature by name, not the `deflate` umbrella: in zip 8 the umbrella
-# also turns on `deflate-zopfli`, a *compressor*, and the one use here is
+# The decoder feature by name, not the `deflate` umbrella: in zip 9 the umbrella
+# still turns on `deflate-zopfli`, a *compressor*, and the one use here is
 # `ZipArchive` reading an export. Today this changes nothing in the tree --
 # rust_xlsxwriter asks for the umbrella and features are additive -- but the
 # line states what this dependency is for, and the day the xlsx writer is
 # measured out (see AGENTS.md) zopfli leaves with it instead of staying behind
 # unasked-for.
-zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+#
+# At least 9.0.5: every zip before it has GHSA-m665-v7pm-7grj (two readers of
+# one archive see different files), and 9.0.0 fixed the RUSTSEC-2026-0367 to
+# 0369 advisories `deny.toml` used to ignore. rust_xlsxwriter moved to zip 9 in
+# 0.100.0, which is what let this one move without leaving a second copy.
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # No `attributes`, which is a default feature. It exists for
 # `#[tracing::instrument]`, which nothing in this tree writes -- every event
 # here is an explicit `tracing::debug!`/`warn!` call -- and it is what keeps
