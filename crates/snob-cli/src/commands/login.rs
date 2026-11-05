@@ -778,8 +778,13 @@ async fn finish(
         Ok(outcome) => store.save(&session).map(|()| outcome).map_err(Into::into),
         // A rejection during login means different things depending on where
         // the session came from. Telling someone to check what they pasted is
-        // useless advice when the browser handed it over itself.
+        // useless advice when the browser handed it over itself. Signed out
+        // on this computer while it was checked (a logout or a purge in
+        // another terminal) is not Instagram's doing, and says so itself.
         Err(e) => Err(match &e {
+            login::LoginError::Instagram(snob_ig::error::IgError::SignedOutHere) => {
+                anyhow::anyhow!(e)
+            }
             login::LoginError::Instagram(ig) if ig.invalidates_session() => anyhow::anyhow!(e)
                 .context(match method {
                     LoginMethod::Paste => {

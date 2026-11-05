@@ -95,8 +95,8 @@ pub struct Checked {
 /// [`Problem::Foreign`] carries text this program did not write — what the
 /// schedule parser refused, what Instagram answered, what the user's own
 /// receiver said — because inventing a sentence for those would lose the only
-/// detail that identifies the cause. It is one variant among twelve rather
-/// than a reason for the other eleven to be strings.
+/// detail that identifies the cause. It is one variant among thirteen rather
+/// than a reason for the other twelve to be strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Problem {
     /// There is no `watch.toml`, so a bare `snob watch` has nothing to run on.
@@ -120,6 +120,9 @@ pub enum Problem {
     SessionSilent,
     /// There is no session at all.
     NoSession,
+    /// The session stored was signed out on this computer since
+    /// (`owner::signed_out`), so nothing is sent as it.
+    SignedOutHere,
     /// The session carries no username and Instagram did not name the account
     /// either, so there is nothing to ask the profile endpoint with.
     NoUsername,

@@ -110,6 +110,11 @@ pub async fn run(
             account.pk(),
             session.ds_user_id
         ),
+        // Refused as the walk would refuse it at its start (`App::open`),
+        // the check ahead of an agent's question included.
+        Some(session) if crate::owner::signed_out(account, &session) => {
+            return Err(crate::commands::common::signed_out_here());
+        }
         Some(_) => {}
     }
     if args.check {
@@ -356,11 +361,16 @@ fn make(
     let Some(_lock) = super::lock_jobs(account)? else {
         return Err(crate::commands::common::no_session());
     };
-    if !secrets
+    let Some(session) = secrets
         .load()?
-        .is_some_and(|session| session.ds_user_id == account.pk())
-    {
+        .filter(|session| session.ds_user_id == account.pk())
+    else {
         return Err(crate::commands::common::no_session());
+    };
+    // Asked again under the lock, as the session is: a logout may have
+    // signed it out while this waited on it.
+    if crate::owner::signed_out(account, &session) {
+        return Err(crate::commands::common::signed_out_here());
     }
     let now = snob_core::clock::now_ms().get();
     super::sweep(account, now);

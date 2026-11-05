@@ -940,7 +940,7 @@ impl Headless {
                 if starts > 0 {
                     account.close(&mut slot).await;
                 }
-                return Err(PageError::LoggedOut);
+                return Err(PageError::SignedOutHere);
             }
             if slot.is_none() {
                 let started = self.start_when_free(session, &account).await?;
@@ -1095,7 +1095,7 @@ impl Headless {
         let mut waited = Duration::ZERO;
         loop {
             if crate::owner::signed_out(&self.paths, session) {
-                return Err(PageError::LoggedOut);
+                return Err(PageError::SignedOutHere);
             }
             let error = match self.start(session, account).await {
                 Err(e) => e,
@@ -1976,7 +1976,7 @@ mod tests {
             .send_as(&made("42%3Asigned%3A1", 1_000), answer(&server))
             .await
             .unwrap_err();
-        assert!(matches!(error, PageError::LoggedOut), "{error:?}");
+        assert!(matches!(error, PageError::SignedOutHere), "{error:?}");
         assert!(headless.account(pk).live.lock().await.is_none());
         assert!(!paths.browser_profile_for(pk).exists());
         assert!(server.received_requests().await.unwrap().is_empty());
@@ -2001,7 +2001,7 @@ mod tests {
             .await
             .err()
             .expect("nothing is started");
-        assert!(matches!(error, PageError::LoggedOut), "{error:?}");
+        assert!(matches!(error, PageError::SignedOutHere), "{error:?}");
         assert!(!paths.browser_profile_for(pk).exists());
     }
 

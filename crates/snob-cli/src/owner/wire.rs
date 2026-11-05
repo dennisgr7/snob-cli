@@ -420,6 +420,7 @@ mod tests {
             })),
             Err(PageError::NotReady("the web session id".to_string())),
             Err(PageError::LoggedOut),
+            Err(PageError::SignedOutHere),
             Err(PageError::NotAllowed("POST /api/graphql".to_string())),
         ];
         for told in told {

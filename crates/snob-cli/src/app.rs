@@ -306,6 +306,14 @@ impl App {
     /// the same message and the same exit code. A session that is another
     /// account's is refused: its requests would be paid for, and recorded, in
     /// this account's database.
+    ///
+    /// **A session this computer no longer sends as is refused here**, with
+    /// the no-session exit and a sentence that says so
+    /// (`commands::common::signed_out_here`): its account was signed out of
+    /// here since it was stored, which `owner::signed_out` asks again before
+    /// every request, the backstop for one signed out of while the run goes
+    /// on. Refused at the start, it opens nothing and makes no directory, and
+    /// is not blamed on Instagram.
     pub fn open(
         secrets: &SessionStore,
         paths: &AccountPaths,
@@ -321,6 +329,9 @@ impl App {
                 paths.pk(),
                 session.ds_user_id
             );
+        }
+        if crate::owner::signed_out(paths, &session) {
+            return Err(crate::commands::common::signed_out_here());
         }
 
         // Before anything that could send a request: a run refused here has
@@ -619,6 +630,42 @@ mod tests {
             .expect("another account's session is refused");
         assert!(refused.to_string().contains("account 42"), "{refused}");
         assert!(!other.db_file().exists(), "nothing was opened");
+        store.delete().unwrap();
+    }
+
+    /// A session stored here whose account was signed out of since, as a
+    /// `logout` that could not remove it leaves it, is refused at the start
+    /// with the no-session exit and a sentence that says so, and nothing is
+    /// opened for it.
+    #[test]
+    fn a_session_signed_out_of_here_is_refused_before_anything_is_opened() {
+        use snob_core::session::{Session, SessionOrigin};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = snob_store::paths::AppPaths::rooted_at(tmp.path());
+        let secrets = snob_store::secrets::SecretStore::new(paths.clone(), true).with_service(
+            &format!("snob-ig-test-app-signed-out-{}", std::process::id()),
+        );
+        let account = paths.account(Pk::new(42));
+        let store = secrets.session_of(&account);
+        store
+            .save(
+                &Session::from_sessionid("42%3Aabc%3A1", "Mozilla/5.0", SessionOrigin::Paste)
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let refused = App::open(&store, &account, false)
+            .err()
+            .expect("a session signed out of is refused");
+        assert_eq!(
+            crate::exit::from_chain(&refused),
+            Some(crate::exit::ExitCode::NoSession)
+        );
+        assert!(
+            refused.to_string().contains("signed out on this computer"),
+            "{refused}"
+        );
+        assert!(!account.db_file().exists(), "nothing was opened");
         store.delete().unwrap();
     }
 

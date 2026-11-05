@@ -367,13 +367,22 @@ with a documented reason in the same place.
   equality only, so no clock set back can refuse a login): a walk typed
   elsewhere, the monitor's run or an agent's call still holding a session
   in memory is refused its next request, by itself, by the owner and by
-  the browser's holder once it has the account's browser, as exit 3, and
-  starts no browser on the profile going (one running its own browser
+  the browser's holder once it has the account's browser (before every
+  start while it waits for the profile included), as exit 3 saying it was
+  signed out on this computer (`IgError::SignedOutHere`, never Instagram's
+  "expired"), and starts no browser on the profile going (one running its own browser
   closes it within two seconds, and the profiles are removed once it has
   let go, seen on Windows as on Unix, `headless::profile::in_use`). **It
   stays refused through any later login**, which lets in its own session
   only (`AccountPaths::admit_session`, before its check), a sessionid
-  pasted again included. An account directory that is gone, as `purge`
+  pasted again included. **A session stored here and signed out of** (a
+  `logout` that could not remove it, or its account's directory gone) is
+  refused by every command at its start (`App::open`, and the checks
+  ahead of a job and of a write), exit 3 with the same sentence
+  (`report::SIGNED_OUT_HERE`); `snob status` reports it as no session,
+  with that sentence as the error's message, and `snob whoami` reports it
+  with `alive: false` and `not_checked: "signed_out"` (a value added).
+  An account directory that is gone, as `purge`
   leaves it, refuses every session, and one made again (`ensure_dirs`, or
   the layout's move landing one whole as a login adopts the database left
   `unclaimed`) starts with nobody signed in; a directory with no list, as every one

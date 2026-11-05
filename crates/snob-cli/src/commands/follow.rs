@@ -207,7 +207,8 @@ fn cannot_write(verb: Verb) -> anyhow::Error {
 /// (AGENTS.md, "The MCP server").
 ///
 /// The refusals of [`run`] that cost nothing to know, in its order, each the
-/// same error a run would give: another run started by an agent holding the
+/// same error a run would give: a session this computer no longer sends as
+/// (`owner::signed_out`), another run started by an agent holding the
 /// account (a job's walk, or anything under `--spend-alone`), no CSRF token,
 /// the cooldown, the day's cap on an agent's writes (`--mcp-write-cap`, or
 /// its default), and a wait for the budget past `--max-wait`. Read from the
@@ -231,6 +232,10 @@ fn check_ahead(
             paths.pk(),
             session.ds_user_id
         );
+    }
+    // As the run refuses it at its start (`App::open`).
+    if crate::owner::signed_out(paths, &session) {
+        return Err(common::signed_out_here());
     }
     let now = snob_core::clock::now_ms();
     // A job's walk holds the account for as long as it walks, from before

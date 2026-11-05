@@ -717,6 +717,7 @@ impl<'a> ListWalker<'a> {
             Reaction::Retry => StopReason::Network,
             Reaction::Abort => match error {
                 IgError::SessionExpired
+                | IgError::SignedOutHere
                 | IgError::UserAgentMismatch
                 | IgError::Challenge { .. }
                 | IgError::Checkpoint { .. } => StopReason::SessionInvalid,

@@ -152,6 +152,11 @@ pub enum PageError {
     /// nothing was sent as this one.
     #[error("{}", crate::error::IgError::SessionExpired)]
     LoggedOut,
+    /// The session's account was signed out of on this computer since the
+    /// session was read, so nothing was sent as it: refused by the caller,
+    /// never by Instagram.
+    #[error("{}", crate::error::IgError::SignedOutHere)]
+    SignedOutHere,
 }
 
 impl From<PageError> for crate::error::IgError {
@@ -164,6 +169,7 @@ impl From<PageError> for crate::error::IgError {
             PageError::NotAllowed(what) => Self::NotAllowed(what),
             PageError::NotReady(what) => Self::PageNotReady(what),
             PageError::LoggedOut => Self::SessionExpired,
+            PageError::SignedOutHere => Self::SignedOutHere,
         }
     }
 }

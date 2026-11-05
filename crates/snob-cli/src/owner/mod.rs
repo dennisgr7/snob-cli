@@ -178,8 +178,10 @@ pub async fn release(paths: &AppPaths, pk: Option<Pk>) {
 /// the monitor's or an agent's, holds its session in memory, and would start
 /// the browser again on the profile being removed and write that session
 /// into it. From now on its next request is refused, as the no-session
-/// failure (exit 3), by the command itself and by the owner, and no browser
-/// is started for it ([`signed_out`]). **Every session the account has now**,
+/// failure (exit 3) that says it was signed out here
+/// (`PageError::SignedOutHere`), by the command itself and by the owner, and
+/// no browser is started for it ([`signed_out`]); a command started later
+/// is refused before it opens anything (`App::open`). **Every session the account has now**,
 /// the one stored and any a login replaced while a walk still held it: only
 /// a later login's own is let in again (`AccountPaths::admit_session`).
 ///
@@ -459,7 +461,9 @@ impl Remote {
     /// Refuses a request as `session` once its account was signed out of
     /// and no login let it in again ([`signed_out`]), as a session Instagram
     /// no longer takes: nothing is sent, nothing retries it, and the command
-    /// ends with the no-session exit. A browser this process runs itself for
+    /// ends with the no-session exit, saying the session was signed out on
+    /// this computer (`IgError::SignedOutHere`), not that Instagram expired
+    /// it. A browser this process runs itself for
     /// the account is closed, since nobody else can reach it to.
     async fn still_signed_in(&self, session: &Session) -> Result<(), PageError> {
         if !signed_out(&self.paths, session) {
@@ -470,7 +474,7 @@ impl Remote {
             "the account was signed out of and this session not let in again; nothing more is sent as it"
         );
         crate::headless::release_own(Some(session.ds_user_id)).await;
-        Err(PageError::LoggedOut)
+        Err(PageError::SignedOutHere)
     }
 
     /// Reads what each browser this command used holds, then leaves them.
@@ -1137,12 +1141,12 @@ mod tests {
             let remote = Remote::new(paths.clone(), start);
             let asked = remote.ask_as(session, call()).await;
             assert!(
-                matches!(asked, Err(PageError::LoggedOut)),
+                matches!(asked, Err(PageError::SignedOutHere)),
                 "{when}: {asked:?}"
             );
             let sent = remote.send_as(session, request()).await;
             assert!(
-                matches!(sent, Err(PageError::LoggedOut)),
+                matches!(sent, Err(PageError::SignedOutHere)),
                 "{when}: {sent:?}"
             );
             assert!(remote.leave().await.is_empty());
@@ -1179,11 +1183,11 @@ mod tests {
                 Some(wire::FromOwner::Heard { .. }) => {}
                 Some(wire::FromOwner::Told {
                     id: 1,
-                    told: Err(PageError::LoggedOut),
+                    told: Err(PageError::SignedOutHere),
                 }) => answered.push(1),
                 Some(wire::FromOwner::Answer {
                     id: 2,
-                    answer: Err(PageError::LoggedOut),
+                    answer: Err(PageError::SignedOutHere),
                 }) => answered.push(2),
                 other => panic!("{when}: {other:?}"),
             }
