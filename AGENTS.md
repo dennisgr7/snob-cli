@@ -370,7 +370,7 @@ with a documented reason in the same place.
   the browser's holder once it has the account's browser, as exit 3, and
   starts no browser on the profile going (one running its own browser
   closes it within two seconds, and the profiles are removed once it has
-  let go). **It
+  let go, seen on Windows as on Unix, `headless::profile::in_use`). **It
   stays refused through any later login**, which lets in its own session
   only (`AccountPaths::admit_session`, before its check), a sessionid
   pasted again included. An account directory that is gone, as `purge`

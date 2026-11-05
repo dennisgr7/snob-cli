@@ -78,8 +78,8 @@ const LEAVING: Duration = Duration::from_secs(30);
 /// account it sent as was signed out of ([`sign_out`]), to close that
 /// account's browser: nobody else can reach it to. Only while the command
 /// has sent as one that way, which is rare (`SNOB_NO_OWNER`, or an owner out
-/// of reach), and short beside what `remove_tree_patiently` gives a browser
-/// to let go of a profile on Windows.
+/// of reach), and short beside the [`LEAVING`] that `logout` and `purge`
+/// wait for its browser to let go of the profile ([`let_go_of`]).
 const SIGN_OUT_LOOK: Duration = Duration::from_secs(2);
 
 /// This process's way to the owner, once something has asked for a page.
@@ -215,10 +215,11 @@ pub(crate) fn signed_out(paths: &AppPaths, session: &Session) -> bool {
 /// these profiles to close, before they are removed: told their account was
 /// signed out, such a process closes its own within [`SIGN_OUT_LOOK`] and
 /// the request it has in flight, and a browser closing writes into its
-/// profile, which would make a removed one again. Seen only where a
-/// browser's hold on its profile can be seen (Unix); on Windows the removal
-/// itself is refused while one is open, and is tried patiently. A path may
-/// be a profile or the directory every profile is kept in.
+/// profile, which would make a removed one again. A browser's hold is seen
+/// as Chromium itself sees it (`headless::profile::in_use`: the profile's
+/// lock on Unix, its `lockfile` held open on Windows). Past [`LEAVING`] the
+/// removal goes ahead and says what it could not remove. A path may be a
+/// profile or the directory every profile is kept in.
 pub(crate) async fn let_go_of(profiles: &[PathBuf]) {
     use crate::headless::profile::in_use;
     let held = |path: &PathBuf| {

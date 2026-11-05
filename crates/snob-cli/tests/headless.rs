@@ -1915,8 +1915,9 @@ async fn another_accounts_login_logout_or_purge_leaves_this_ones_browser() {
 /// A walk still running as an account when it is logged out of sends
 /// nothing more: its next request is refused as no session (exit 3), and no
 /// browser is started again on the profile the logout removed, through the
-/// owner or, where a profile a browser holds can be removed at all, with a
-/// browser of the walk's own. Logging in again afterwards is not refused.
+/// owner or with a browser of the walk's own, which the logout waits for to
+/// let go of the profile, on Windows too (`owner::let_go_of`). Logging in
+/// again afterwards is not refused.
 #[tokio::test]
 async fn a_walk_running_when_its_account_is_logged_out_of_sends_nothing_more() {
     let Some(_alone) = a_browser_alone().await else {
@@ -1934,13 +1935,7 @@ async fn a_walk_running_when_its_account_is_logged_out_of_sends_nothing_more() {
         .await;
     let profile = AppPaths::rooted_at(tmp.path()).browser_profile_for(snob_core::Pk::new(42));
 
-    // Windows keeps a profile a browser holds from being removed, so a walk
-    // with a browser of its own there makes the logout fail, as it says.
-    let modes: &[&[(&str, &str)]] = if cfg!(unix) {
-        &[&[], &[("SNOB_NO_OWNER", "1")]]
-    } else {
-        &[&[]]
-    };
+    let modes: &[&[(&str, &str)]] = &[&[], &[("SNOB_NO_OWNER", "1")]];
     for envs in modes {
         logged_in(tmp.path(), &instagram, SESSIONID, &format!("{envs:?}: "));
         let since = requests_so_far(&instagram).await;
