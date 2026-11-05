@@ -376,7 +376,11 @@ with a documented reason in the same place.
   pasted again included. An account directory that is gone, as `purge`
   leaves it, refuses every session, and one made again (`ensure_dirs`)
   starts with nobody signed in; a directory with no list, as every one
-  made before the list existed, was never signed out of and refuses none.
+  made before the list existed, was never signed out of and refuses none
+  until its first sign-out or login: **a login starts a missing list with
+  its own session**, never reading it as "refuses none", since the
+  directory may be one another process has just made and is about to give
+  its empty list.
   `SNOB_NO_BROWSER` sends with `reqwest`, which asks nothing of it.
   `accounts.toml` changed only
   through `Registry::update` (file lock). `watch.toml` and `accounts.toml`
