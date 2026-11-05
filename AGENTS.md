@@ -799,10 +799,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
 - **Every string from another person goes through `snob_core::model::printable`**
   before it reaches a terminal, a JSON list (`output::readable`) or a
   monitor's report, printed or sent to a webhook (`watch/wire.rs`,
-  `account_json`); a JSON reader may be a model, and `serde_json` writes `Cf`
-  as it is: all of `Cc` and all of `Cf` removed, plus the invisible letters
-  such as Hangul fillers
-  and the marks that draw nothing (the whole of `Default_Ignorable_Code_Point`:
+  `account_json`), since a JSON reader may be a model and `serde_json` writes
+  `Cf` as it is. `printable` removes all of `Cc` and all of `Cf`, plus the
+  invisible letters such as Hangul fillers and the marks that draw nothing
+  (the whole of `Default_Ignorable_Code_Point`:
   the combining grapheme joiner, the Mongolian and supplementary variation
   selectors, U+FE00 to U+FE0D, and U+FE0E/U+FE0F anywhere but alone right
   after a symbol in the ranges where Unicode puts the bases of presentation
@@ -888,7 +888,12 @@ Platform-specific code, all of it reached only by the CI job on that OS:
   language preference, `QueryUnbiasedInterruptTime` for sleep detection
   (`snob_ig::awake`). Static CRT and `/Brepro` via `.cargo/config.toml`.
 - Unix (`libc`): `dup2` of the CDP pipe ends onto fds 3 and 4, `setsid`
-  for a detached start (`detach.rs`), the owner's socket with `peer_cred`.
+  for a detached start (`detach.rs`), the owner's socket with `peer_cred`,
+  `geteuid` to refuse starting the browser as root (`headless::refuse_root`).
+  In `snob-store` (`paths.rs`), the scratch root and the data directory's
+  fresh parents are opened with `O_DIRECTORY | O_NOFOLLOW` and made `0700`
+  through the descriptor, and the scratch root is asked its owner
+  (`geteuid`) before it is made private or swept.
   Linux adds a logind `idle` inhibitor (`zbus`) and `SCHED_BATCH`/`uclamp_max`;
   macOS uses `caffeinate -i -w <pid>` and leaves the browser's scheduling
   alone.

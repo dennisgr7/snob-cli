@@ -258,8 +258,8 @@ fn unanswered(error: reqwest::Error, url: &Url) -> String {
     snob_core::model::printable(&without_address(&words, url))
 }
 
-/// `text` with the address replaced by [`shown`]'s, and where the path is the
-/// credential, the path too.
+/// `text` with the address replaced by [`shown`]'s, and where the path or
+/// the query is the credential, each of those on its own too.
 ///
 /// For text this process did not write (an error's causes, a receiver's
 /// answer) that is stored and printed: an address whose shown form is itself
@@ -274,6 +274,10 @@ fn without_address(text: &str, url: &Url) -> String {
         && clean.path() != url.path()
     {
         text = text.replace(url.path(), clean.path());
+    }
+    // A receiver may echo the parameters it was given without the rest.
+    if let Some(query) = url.query().filter(|query| !query.is_empty()) {
+        text = text.replace(query, HIDDEN);
     }
     text
 }
@@ -298,21 +302,35 @@ fn describe(status: reqwest::StatusCode, body: &str) -> String {
     format!("{status}: {excerpt}")
 }
 
+/// What [`shown`] puts where a part of the address was.
+const HIDDEN: &str = "...";
+
 /// The address as it may be shown to a person or written to a log.
 ///
 /// Userinfo cleared: `check` refuses an address that carries a password, and a
 /// refusal, a `status` line or a warning built before `check` is reached must
 /// not print the secret it is refusing.
 ///
-/// The host and path are kept, because which address was meant is the whole
-/// content of every one of those messages.
+/// The scheme, host and path are kept, because which address was meant is the
+/// whole content of every one of those messages.
 ///
-/// **Except where the path is the credential.** A Slack incoming webhook is
-/// `/services/T…/B…/<secret>` and a Discord one `/api/webhooks/<id>/<token>`;
-/// there is no userinfo to clear because the whole secret is in the path,
-/// which would otherwise be printed on every `watch check`, in `--json`, and
-/// into the log of an unattended service. For those hosts the path stops at
-/// the segment that names the service, which is still enough to recognize.
+/// **The query is not, nor the fragment.** On many receivers the query is the
+/// credential: Google Chat's `?key=…&token=…`, the `&sig=…` of an Azure Logic
+/// Apps or Power Automate trigger, the `?token=` of a self-hosted endpoint.
+/// One that is there is shown as `?...`, which says there was one, and the
+/// host and path already say which address was meant.
+///
+/// **Nor is the path, where the path is the credential.** A Slack incoming
+/// webhook is `/services/T…/B…/<secret>`, a Discord one
+/// `/api/webhooks/<id>/<token>`, a Zapier one `/hooks/catch/<id>/<key>`, an
+/// IFTTT one `/trigger/<event>/with/key/<key>`, a Teams one on
+/// `*.webhook.office.com` `/webhookb2/<ids>/IncomingWebhook/<ids>`, and a
+/// Make one `hook.<zone>.make.com/<token>`; there is no userinfo to clear
+/// because the whole secret is in the path, which would otherwise be printed
+/// on every `watch check`, in `--json`, and into the log of an unattended
+/// service. For those hosts the path stops at the segment that names the
+/// service, which is still enough to recognize, or goes whole where no
+/// segment does (Make's, or one of those hosts' paths without the segment).
 pub fn shown(url: &Url) -> String {
     let mut clean = url.clone();
     // Both calls fail only on a URL that cannot have a host -- `mailto:`, say --
@@ -320,30 +338,77 @@ pub fn shown(url: &Url) -> String {
     // it was in that case: there is no userinfo to clear.
     let _ = clean.set_username("");
     let _ = clean.set_password(None);
+    if clean.query().is_some_and(|query| !query.is_empty()) {
+        clean.set_query(Some(HIDDEN));
+    } else {
+        clean.set_query(None);
+    }
+    clean.set_fragment(None);
 
-    let secret_path = match clean.host_str() {
-        Some("hooks.slack.com") => Some("services"),
-        Some("discord.com" | "discordapp.com" | "canary.discord.com" | "ptb.discord.com") => {
-            Some("webhooks")
-        }
-        _ => None,
-    };
-    if let Some(marker) = secret_path {
+    if let Some(marker) = clean.host_str().and_then(secret_path) {
         let segments: Vec<&str> = clean.path().split('/').filter(|s| !s.is_empty()).collect();
-        if let Some(at) = segments.iter().position(|s| *s == marker) {
-            let kept = segments[..=at].join("/");
-            clean.set_path(&format!("/{kept}/..."));
-        }
+        let kept = marker
+            .and_then(|marker| segments.iter().position(|s| *s == marker))
+            .map_or_else(String::new, |at| format!("/{}", segments[..=at].join("/")));
+        clean.set_path(&format!("{kept}/{HIDDEN}"));
     }
     clean.to_string()
 }
 
+/// Whether `host` is a receiver whose path is its credential, and if so, the
+/// segment of the path up to which it may be shown (none: no part of it).
+fn secret_path(host: &str) -> Option<Option<&'static str>> {
+    match host {
+        "hooks.slack.com" => Some(Some("services")),
+        "discord.com" | "discordapp.com" | "canary.discord.com" | "ptb.discord.com" => {
+            Some(Some("webhooks"))
+        }
+        "hooks.zapier.com" => Some(Some("catch")),
+        "maker.ifttt.com" => Some(Some("trigger")),
+        _ if host.ends_with(".webhook.office.com") => Some(Some("webhookb2")),
+        _ if host.starts_with("hook.") && host.ends_with(".make.com") => Some(None),
+        _ => None,
+    }
+}
+
 /// [`shown`], asked of an address held as a string (the outbox's, the file's).
 ///
-/// An address that does not parse is shown as it came rather than dropped,
-/// because which address was meant is the content of the line.
+/// **An address that does not parse is never shown as it came**: `shown`'s
+/// rules cannot be applied to what has no parts, and the likeliest such
+/// address, one hand-edited without its scheme, is a Slack or Discord one
+/// whose path is the secret. Which address was meant is still the content
+/// of the line, so its host is kept, as far as the first `/`, `?`, `#` or a
+/// backslash, with what came before an `@` and after the host left out.
 pub fn shown_str(address: &str) -> String {
-    Url::parse(address).map_or_else(|_| address.to_string(), |url| shown(&url))
+    Url::parse(address).map_or_else(|_| unparsed(address), |url| shown(&url))
+}
+
+/// The host of an address that does not parse, as [`shown_str`] says.
+fn unparsed(address: &str) -> String {
+    // A scheme only where what precedes `://` could be one, so that a `://`
+    // later in a path does not make the path a scheme.
+    let (scheme, rest) = match address.split_once("://") {
+        Some((scheme, rest))
+            if scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
+        {
+            (format!("{scheme}://"), rest)
+        }
+        _ => (String::new(), address),
+    };
+    let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let tail = if end < rest.len() {
+        format!("/{HIDDEN}")
+    } else {
+        String::new()
+    };
+    format!("{scheme}{host}{tail}")
 }
 
 /// The same refusals, asked of a configuration file rather than of a built
@@ -693,12 +758,31 @@ mod tests {
     /// message that names one.
     #[test]
     fn the_shown_address_keeps_everything_but_the_credential() {
-        let shown = shown(&Url::parse("https://alice:hunter2@host.test/hook?x=1").unwrap());
-        assert_eq!(shown, "https://host.test/hook?x=1");
+        let shown = shown(&Url::parse("https://alice:hunter2@host.test/hook").unwrap());
+        assert_eq!(shown, "https://host.test/hook");
+    }
+
+    /// A query can be the credential (Google Chat's `key` and `token`, a
+    /// Power Automate trigger's `sig`), so it is said to be there and no
+    /// more, and a fragment goes.
+    #[test]
+    fn the_shown_address_says_there_is_a_query_and_not_what_it_is() {
+        let chat = Url::parse(
+            "https://chat.googleapis.com/v1/spaces/AAAA/messages?key=K-secret&token=T-secret",
+        )
+        .unwrap();
+        assert_eq!(
+            shown(&chat),
+            "https://chat.googleapis.com/v1/spaces/AAAA/messages?..."
+        );
+        let flow = Url::parse("https://host.test/hook?sp=x&sig=S-secret#part").unwrap();
+        assert_eq!(shown(&flow), "https://host.test/hook?...");
+        let empty = Url::parse("https://host.test/hook?#").unwrap();
+        assert_eq!(shown(&empty), "https://host.test/hook");
     }
 
     /// An address held as a string loses the same parts, and one that does not
-    /// parse comes back as it was.
+    /// parse is never shown as it came, only as far as its host.
     #[test]
     fn an_address_held_as_a_string_is_shown_the_same_way() {
         assert_eq!(
@@ -709,7 +793,26 @@ mod tests {
             shown_str("https://hooks.slack.com/services/T0000/B0000/XXXXYYYY"),
             "https://hooks.slack.com/services/..."
         );
-        assert_eq!(shown_str("n8n.local/hook"), "n8n.local/hook");
+        assert_eq!(shown_str("n8n.local/hook"), "n8n.local/...");
+        assert_eq!(
+            shown_str("hooks.slack.com/services/T0000/B0000/XXXXYYYY"),
+            "hooks.slack.com/..."
+        );
+        assert_eq!(shown_str("n8n.local"), "n8n.local");
+        // What came before an `@` is somebody's credential, a `://` in the
+        // path is no scheme, and a host that does not parse is still a host.
+        assert_eq!(
+            shown_str("https://alice:hunter2@exa mple.test/hook?key=K"),
+            "https://exa mple.test/..."
+        );
+        assert_eq!(
+            shown_str("hooks.slack.com/services/T0/x://B0/XXXXYYYY"),
+            "hooks.slack.com/..."
+        );
+        assert_eq!(
+            shown_str("hooks.slack.com\\services\\XXXXYYYY"),
+            "hooks.slack.com/..."
+        );
     }
 
     /// Where the path is the credential, the path is what goes.
@@ -719,10 +822,25 @@ mod tests {
         assert_eq!(shown(&slack), "https://hooks.slack.com/services/...");
         let discord =
             Url::parse("https://discord.com/api/webhooks/123456/abcdef-token?wait=true").unwrap();
+        assert_eq!(shown(&discord), "https://discord.com/api/webhooks/...?...");
+        let zapier = Url::parse("https://hooks.zapier.com/hooks/catch/123/abc-key/").unwrap();
+        assert_eq!(shown(&zapier), "https://hooks.zapier.com/hooks/catch/...");
+        let ifttt = Url::parse("https://maker.ifttt.com/trigger/run/with/key/abc-key").unwrap();
+        assert_eq!(shown(&ifttt), "https://maker.ifttt.com/trigger/...");
+        let teams = Url::parse(
+            "https://contoso.webhook.office.com/webhookb2/1@2/IncomingWebhook/abc-key/3",
+        )
+        .unwrap();
         assert_eq!(
-            shown(&discord),
-            "https://discord.com/api/webhooks/...?wait=true"
+            shown(&teams),
+            "https://contoso.webhook.office.com/webhookb2/..."
         );
+        // Make's path is the token and nothing else, and a path on one of
+        // those hosts without the segment that names the service goes whole.
+        let make = Url::parse("https://hook.eu1.make.com/abc-token").unwrap();
+        assert_eq!(shown(&make), "https://hook.eu1.make.com/...");
+        let odd = Url::parse("https://hooks.slack.com/T0000/B0000/XXXXYYYY").unwrap();
+        assert_eq!(shown(&odd), "https://hooks.slack.com/...");
         // Anybody else's path is the address, and stays.
         let own = Url::parse("https://n8n.local/webhook/snob").unwrap();
         assert_eq!(shown(&own), "https://n8n.local/webhook/snob");
@@ -791,6 +909,19 @@ mod tests {
             echoed,
             "no webhook at https://discord.com/api/webhooks/... \
              (POST /api/webhooks/...)"
+        );
+
+        // A query is the credential on others, and goes the same way, the
+        // address whole and the parameters echoed on their own.
+        let chat =
+            Url::parse("https://chat.googleapis.com/v1/spaces/A/messages?key=K1&token=T1").unwrap();
+        assert_eq!(
+            without_address(
+                "403 for https://chat.googleapis.com/v1/spaces/A/messages?key=K1&token=T1 \
+                 (key=K1&token=T1)",
+                &chat,
+            ),
+            "403 for https://chat.googleapis.com/v1/spaces/A/messages?... (...)"
         );
 
         // An address that hides nothing is left as it was.

@@ -628,7 +628,7 @@ fn runtime_dir() -> PathBuf {
 /// **It walks only a root that is this user's own.** The root sits at a
 /// predictable name in a directory anybody can write to (`/tmp`, wherever
 /// `$XDG_RUNTIME_DIR` is unset), and the sweep runs before
-/// [`create_fresh_private_dir`] gets to refuse a foreign one. So on Unix the
+/// [`create_fresh_scratch_dir`] gets to refuse a foreign one. So on Unix the
 /// root is opened without following a link, and the open descriptor, not the
 /// name, is asked whether it is a real directory, owned by the effective user
 /// and closed to everybody else ([`own_private_dir`]). Anything else is left
@@ -696,30 +696,58 @@ impl ScratchWalk {
 }
 
 /// Opens `dir` without following a link at its name, and answers the
-/// descriptor with what `fstat` read from it, provided it is a real directory
-/// the effective user owns; an `Err` otherwise, of kind `PermissionDenied`
-/// for a directory that is somebody else's.
+/// descriptor with what `fstat` read from it, provided it is a real
+/// directory; an `Err` otherwise.
 ///
 /// What it answers is about the directory the descriptor holds, so a name
 /// swapped for something else after this call does not move the check.
 #[cfg(unix)]
-fn own_dir(dir: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+fn open_dir(dir: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let held = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(dir)?;
     let found = held.metadata()?;
-    // SAFETY: `geteuid` takes no argument, touches no memory of ours and
-    // cannot fail.
-    let me = unsafe { libc::geteuid() };
-    if !found.is_dir() || found.uid() != me {
+    if !found.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "it is not a directory",
+        ));
+    }
+    Ok((held, found))
+}
+
+/// An `Err` of kind `PermissionDenied` unless what `found` describes is owned
+/// by the user `me`.
+#[cfg(unix)]
+fn owned_by(found: &std::fs::Metadata, me: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if found.uid() != me {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "it belongs to another account",
         ));
     }
+    Ok(())
+}
+
+/// The effective user of this process.
+#[cfg(unix)]
+fn effective_user() -> u32 {
+    // SAFETY: `geteuid` takes no argument, touches no memory of ours and
+    // cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// [`open_dir`], provided the directory is the effective user's own; an
+/// `Err` of kind `PermissionDenied` for one that is somebody else's.
+#[cfg(unix)]
+fn own_dir(dir: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let (held, found) = open_dir(dir)?;
+    owned_by(&found, effective_user())?;
     Ok((held, found))
 }
 
@@ -873,12 +901,30 @@ pub fn create_private_dir(dir: &Path) -> Result<(), PathError> {
     restrict_to_this_account(dir)
 }
 
+/// Where the parent of a fresh directory sits ([`create_fresh_private_dir`],
+/// [`create_fresh_scratch_dir`]), which is who could have made a directory at
+/// its name before this run did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Root {
+    /// The scratch root, at a predictable name in a temporary directory
+    /// anybody can write to (`/tmp`, wherever `$XDG_RUNTIME_DIR` is unset):
+    /// a directory found there must be this account's own.
+    Shared,
+    /// A directory under the data directory, which only this account can
+    /// enter, so nobody else could have made it. The owner is not asked: a
+    /// filesystem may report a wrong one (NFSv4 with broken id mapping, sshfs
+    /// without `idmap=user`) while letting this account change the mode, and
+    /// a login or a browser probe refused there would refuse nothing.
+    Private,
+}
+
 /// Creates and restricts a directory at a name somebody else can predict,
 /// keeping a real directory that is already there and never following a link.
 ///
 /// For the scratch **root** under the world-writable temporary directory --
-/// the parent every [`create_fresh_private_dir`] leaf sits in, and the
-/// directory [`sweep_old_scratch`] walks with `remove_dir_all`.
+/// the parent every [`create_fresh_scratch_dir`] leaf sits in, and the
+/// directory [`sweep_old_scratch`] walks with `remove_dir_all` -- and for the
+/// parents [`create_fresh_private_dir`] makes in the data directory.
 /// [`create_private_dir`] cannot be trusted with that name: `create_dir_all`
 /// answers `Ok` over a planted link, and [`restrict_to_this_account`] then
 /// lands the `0700` on **whatever the link points at** -- so whoever planted
@@ -886,17 +932,34 @@ pub fn create_private_dir(dir: &Path) -> Result<(), PathError> {
 /// out of. A link or a stray file found at the name is removed as itself --
 /// the same recipe as at the leaf, through [`remove_entry`] on the one reading
 /// of it -- while a real directory is kept, because it holds other runs'
-/// scratch. A real directory that belongs to somebody else is refused, which
-/// is the refusal wanted.
+/// scratch. At the [`Root::Shared`] name, a real directory that belongs to
+/// somebody else is refused, which is the refusal wanted.
 ///
 /// On Unix the `0700` goes on through a descriptor opened without following a
-/// link ([`own_dir`]), never through the name again: whoever planted a real
+/// link ([`open_dir`]), never through the name again: whoever planted a real
 /// directory at the name owns it, and could swap it for a link into this
 /// account's home between the look above and a `chmod` by path, choosing
-/// which of this account's directories is made private. The descriptor is
-/// also asked who owns it, so a planted directory is refused even for root,
-/// whom a `chmod` would not stop.
-fn create_private_root(dir: &Path) -> Result<(), PathError> {
+/// which of this account's directories is made private. At the shared name
+/// the descriptor is also asked who owns it, so a planted directory is
+/// refused even for root, whom a `chmod` would not stop.
+fn create_private_root(dir: &Path, root: Root) -> Result<(), PathError> {
+    #[cfg(unix)]
+    {
+        create_private_root_as(dir, root, effective_user())
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows' temporary directory is the user's own, so nobody else
+        // could have made the scratch root there either.
+        let _ = root;
+        create_root_entry(dir)?;
+        restrict_to_this_account(dir)
+    }
+}
+
+/// The first half of [`create_private_root`]: a real directory at the name,
+/// whatever was there before it.
+fn create_root_entry(dir: &Path) -> Result<(), PathError> {
     let create = |source| PathError::Create {
         path: dir.to_path_buf(),
         source,
@@ -912,50 +975,76 @@ fn create_private_root(dir: &Path) -> Result<(), PathError> {
             std::fs::create_dir(dir).map_err(create)?;
         }
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let not_private = |e: std::io::Error| PathError::NotPrivate {
-            path: dir.to_path_buf(),
-            detail: e.to_string(),
-        };
-        let (held, _) = own_dir(dir).map_err(not_private)?;
-        held.set_permissions(std::fs::Permissions::from_mode(0o700))
-            .map_err(not_private)
+    Ok(())
+}
+
+/// [`create_private_root`] for the user `me`, which a test can make somebody
+/// the filesystem does not report as the owner.
+#[cfg(unix)]
+fn create_private_root_as(dir: &Path, root: Root, me: u32) -> Result<(), PathError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    create_root_entry(dir)?;
+    let not_private = |e: std::io::Error| PathError::NotPrivate {
+        path: dir.to_path_buf(),
+        detail: e.to_string(),
+    };
+    let (held, found) = open_dir(dir).map_err(not_private)?;
+    if root == Root::Shared {
+        owned_by(&found, me).map_err(not_private)?;
     }
-    #[cfg(not(unix))]
-    restrict_to_this_account(dir)
+    held.set_permissions(std::fs::Permissions::from_mode(0o700))
+        .map_err(not_private)
 }
 
 /// Creates a private directory that **did not exist a moment ago**, under a
-/// parent that is made private first.
+/// parent in the data directory that is made private first.
 ///
 /// For a directory whose name somebody else can predict, which is what a
-/// scratch directory named after the process id is. [`create_private_dir`]
-/// adopts whatever is already at the path: `create_dir_all` answers `Ok` when
-/// the entry exists, a symbolic link to a directory included, and the
-/// permissions are then set on **whatever it points at**. On a machine with
-/// other users, a `/tmp/snob-ig-stories/run-<pid>` planted ahead of time as a
-/// link would choose where a run writes every story it fetches, and have a
-/// directory of the victim's own made `0700`. That needs a parent anybody can
-/// create entries in, which an unrestricted one under `/tmp` is.
+/// directory named after the process id is. [`create_private_dir`] adopts
+/// whatever is already at the path: `create_dir_all` answers `Ok` when the
+/// entry exists, a symbolic link to a directory included, and the
+/// permissions are then set on **whatever it points at**.
+///
+/// The parent is made private with [`create_private_root`], which refuses to
+/// follow a link planted at *its* name too; it is not asked who owns it
+/// ([`Root::Private`]), since nobody else can enter the data directory. The
+/// scratch, outside it, is [`create_fresh_scratch_dir`].
+pub fn create_fresh_private_dir(dir: &Path) -> Result<(), PathError> {
+    create_fresh(dir, Root::Private)
+}
+
+/// [`create_fresh_private_dir`] for the scratch, whose root sits at a
+/// predictable name in a temporary directory anybody can write to.
+///
+/// On a machine with other users, a `/tmp/snob-ig-stories/run-<pid>` planted
+/// ahead of time as a link would choose where a run writes every story it
+/// fetches, and have a directory of the victim's own made `0700`. That needs
+/// a parent anybody can create entries in, which an unrestricted one under
+/// `/tmp` is.
 ///
 /// Two things close it. The parent is created and restricted first -- with
 /// `create_private_root`, which refuses to follow a link planted at *its*
-/// predictable name too -- so on a run that is the first to use it nobody else
-/// can put an entry inside; and the leaf is created with `create_dir`, which
-/// fails rather than adopts when something is already there. What is already
-/// there is removed if it is something this tool could have left -- an
-/// earlier run's directory under a reused process id, which Windows hands out
-/// again freely -- and the creation is tried once more. [`remove_tree`] takes
-/// a link as the link itself, never following it.
-pub fn create_fresh_private_dir(dir: &Path) -> Result<(), PathError> {
+/// predictable name too, and refuses a directory there that is somebody
+/// else's ([`Root::Shared`]) -- so on a run that is the first to use it nobody
+/// else can put an entry inside; and the leaf is created with `create_dir`,
+/// which fails rather than adopts when something is already there. What is
+/// already there is removed if it is something this tool could have left --
+/// an earlier run's directory under a reused process id, which Windows hands
+/// out again freely -- and the creation is tried once more. [`remove_tree`]
+/// takes a link as the link itself, never following it.
+pub fn create_fresh_scratch_dir(dir: &Path) -> Result<(), PathError> {
+    create_fresh(dir, Root::Shared)
+}
+
+/// What [`create_fresh_private_dir`] and [`create_fresh_scratch_dir`] share.
+fn create_fresh(dir: &Path, root: Root) -> Result<(), PathError> {
     let create = |source| PathError::Create {
         path: dir.to_path_buf(),
         source,
     };
     if let Some(parent) = dir.parent() {
-        create_private_root(parent)?;
+        create_private_root(parent, root)?;
     }
     if let Err(e) = std::fs::create_dir(dir) {
         if e.kind() != std::io::ErrorKind::AlreadyExists {
@@ -1507,7 +1596,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // Made the way every run makes it: the sweep walks no other kind.
         let root = tmp.path().join("snob-ig-stories");
-        create_private_root(&root).unwrap();
+        create_private_root(&root, Root::Shared).unwrap();
         let old = root.join("run-old");
         let fresh = root.join("run-fresh");
         std::fs::create_dir_all(&old).unwrap();
@@ -1577,7 +1666,7 @@ mod tests {
     fn the_sweep_walks_the_directory_it_checked_not_what_the_name_became() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("snob-ig-stories");
-        create_private_root(&root).unwrap();
+        create_private_root(&root, Root::Shared).unwrap();
         std::fs::create_dir(root.join("run-ours")).unwrap();
         let home = tmp.path().join("home");
         std::fs::create_dir(&home).unwrap();
@@ -1753,7 +1842,7 @@ mod tests {
         #[cfg(windows)]
         let planted = std::os::windows::fs::symlink_dir(&elsewhere, &leaf).is_ok();
 
-        create_fresh_private_dir(&leaf).unwrap();
+        create_fresh_scratch_dir(&leaf).unwrap();
 
         let made = std::fs::symlink_metadata(&leaf).unwrap();
         assert!(made.is_dir() && !made.is_symlink(), "a link was adopted");
@@ -1766,7 +1855,7 @@ mod tests {
         // An earlier run's directory under a reused process id is replaced,
         // and what it held does not survive into the new run.
         std::fs::write(leaf.join("stale.jpg"), b"x").unwrap();
-        create_fresh_private_dir(&leaf).unwrap();
+        create_fresh_scratch_dir(&leaf).unwrap();
         assert!(!leaf.join("stale.jpg").exists());
         assert!(leaf.is_dir());
     }
@@ -1779,11 +1868,45 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let leaf = tmp.path().join("snob-ig-stories").join("run-1");
-        create_fresh_private_dir(&leaf).unwrap();
+        create_fresh_scratch_dir(&leaf).unwrap();
         for dir in [leaf.parent().unwrap(), leaf.as_path()] {
             let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{}", dir.display());
         }
+    }
+
+    /// A filesystem may report an owner other than the account that can
+    /// change the mode there. Under the data directory, which nobody else can
+    /// enter, the parent is not asked who owns it, so a login is not refused
+    /// on such a home; the scratch root, at a name anybody could take first,
+    /// still is.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_scratch_root_is_refused_for_an_owner_that_is_not_this_account() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let somebody_else = effective_user().wrapping_add(1);
+
+        let profiles = tmp.path().join("browser-profile");
+        create_private_root_as(&profiles, Root::Private, somebody_else).unwrap();
+        let mode = std::fs::metadata(&profiles).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        let scratch = tmp.path().join("snob-ig-stories");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let refused = create_private_root_as(&scratch, Root::Shared, somebody_else);
+        assert!(
+            matches!(refused, Err(PathError::NotPrivate { .. })),
+            "{refused:?}"
+        );
+        let mode = std::fs::metadata(&scratch).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "a refused root was made private");
+
+        // As the account it is, the same root is made private.
+        create_private_root_as(&scratch, Root::Shared, effective_user()).unwrap();
+        let mode = std::fs::metadata(&scratch).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     /// A failed replacement names the step that failed: the temporary when it
@@ -1819,7 +1942,7 @@ mod tests {
 
         let root = tmp.path().join("snob-ig-stories");
         std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
-        create_fresh_private_dir(&root.join("run-1")).unwrap();
+        create_fresh_scratch_dir(&root.join("run-1")).unwrap();
         let made = std::fs::symlink_metadata(&root).unwrap();
         assert!(made.is_dir() && !made.is_symlink(), "the link was followed");
         assert_eq!(made.permissions().mode() & 0o777, 0o700);
@@ -1829,7 +1952,7 @@ mod tests {
 
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::write(&root, b"stray").unwrap();
-        create_fresh_private_dir(&root.join("run-1")).unwrap();
+        create_fresh_scratch_dir(&root.join("run-1")).unwrap();
         let made = std::fs::symlink_metadata(&root).unwrap();
         assert!(made.is_dir(), "the stray file is still there");
         assert_eq!(made.permissions().mode() & 0o777, 0o700);

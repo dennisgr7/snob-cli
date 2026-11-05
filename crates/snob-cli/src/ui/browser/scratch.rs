@@ -46,9 +46,9 @@ pub struct Scratch(PathBuf);
 impl Scratch {
     pub fn new(dir: PathBuf) -> Result<Self> {
         // Fresh, not adopted: the name carries the process id, which anybody
-        // on the machine can guess ahead of time. `create_fresh_private_dir`
+        // on the machine can guess ahead of time. `create_fresh_scratch_dir`
         // says what a planted entry under that name could do.
-        snob_store::paths::create_fresh_private_dir(&dir)
+        snob_store::paths::create_fresh_scratch_dir(&dir)
             .with_context(|| format!("could not create {}", dir.display()))?;
         Ok(Self(dir))
     }

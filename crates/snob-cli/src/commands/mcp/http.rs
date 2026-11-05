@@ -304,33 +304,9 @@ pub async fn serve(
     let gate = Gate::new(&key)?;
     drop(key);
 
-    let (hosts, origins) = allowed(bound.host(), listen.public.as_ref());
-    let config = StreamableHttpServerConfig::default()
-        .with_allowed_hosts(hosts)
-        .with_allowed_origins(origins)
-        // With no public URL there is no origin to allow, and an empty
-        // list would otherwise mean no check at all: a page in a browser
-        // on this machine has no business here.
-        .enforce_origin_validation()
-        .with_max_request_body_bytes(MOST_BODY)
-        // Sessions for the revisions before 2026-07-28, which is where a
-        // question asked with `elicitation/create` travels, on the stream of
-        // the call that asks it.
-        .with_legacy_session_mode(true);
+    let config = config(bound.host(), listen.public.as_ref());
     let stopping = config.cancellation_token.clone();
-    // Both `#[non_exhaustive]`: built from their defaults, then changed.
-    let mut manager = LocalSessionManager::default();
-    manager.session_config.keep_alive = Some(SESSION_IDLE);
-    let manager = Arc::new(manager);
-    let service =
-        StreamableHttpService::new(move || Ok(server.clone()), Arc::clone(&manager), config);
-    let front = Arc::new(Front {
-        gate,
-        service,
-        manager,
-        answering: Arc::new(InFlight::default()),
-        activity: Activity::default(),
-    });
+    let front = Arc::new(Front::new(server, gate, config));
 
     started(
         &bound,
@@ -393,6 +369,24 @@ pub async fn serve(
     let _ = tokio::time::timeout(CLOSING_WITHIN, ended).await;
     connections.abort_all();
     Ok(ExitCode::Interrupted)
+}
+
+/// The SDK's configuration for a server bound to `bound`, and reached
+/// through `public` when given.
+fn config(bound: IpAddr, public: Option<&Url>) -> StreamableHttpServerConfig {
+    let (hosts, origins) = allowed(bound, public);
+    StreamableHttpServerConfig::default()
+        .with_allowed_hosts(hosts)
+        .with_allowed_origins(origins)
+        // With no public URL there is no origin to allow, and an empty
+        // list would otherwise mean no check at all: a page in a browser
+        // on this machine has no business here.
+        .enforce_origin_validation()
+        .with_max_request_body_bytes(MOST_BODY)
+        // Sessions for the revisions before 2026-07-28, which is where a
+        // question asked with `elicitation/create` travels, on the stream of
+        // the call that asks it.
+        .with_legacy_session_mode(true)
 }
 
 /// A connection, whichever listener it came from.
@@ -732,6 +726,23 @@ struct Front {
 }
 
 impl Front {
+    /// What stands in front of `server`, behind `gate`.
+    fn new(server: Server, gate: Gate, config: StreamableHttpServerConfig) -> Self {
+        // Both `#[non_exhaustive]`: built from their defaults, then changed.
+        let mut manager = LocalSessionManager::default();
+        manager.session_config.keep_alive = Some(SESSION_IDLE);
+        let manager = Arc::new(manager);
+        let service =
+            StreamableHttpService::new(move || Ok(server.clone()), Arc::clone(&manager), config);
+        Self {
+            gate,
+            service,
+            manager,
+            answering: Arc::new(InFlight::default()),
+            activity: Activity::default(),
+        }
+    }
+
     /// Answers one request, in the order the header gives, noting on `seen`
     /// that it came, and whether it showed the key.
     async fn answer(&self, request: Request<Incoming>, seen: &Seen) -> Response {
@@ -1274,6 +1285,98 @@ mod tests {
         assert_eq!(activity.seen().get(&id).map(|lately| lately.calls), Some(0));
         assert_eq!(activity.seen().len(), 1);
         manager.close_session(&id).await.unwrap();
+    }
+
+    /// The same, through the request path: over HTTP to a [`Front`] as
+    /// [`serve`] builds it, requests that name a session nobody was given,
+    /// each answered 404, leave nothing in what [`Front::answer`] notes, and
+    /// the one session opened is all it holds. [`Activity::touch`] called on
+    /// a request's own header would keep every one of them.
+    #[tokio::test]
+    async fn a_request_naming_a_session_nobody_was_given_is_noted_nowhere() {
+        let key = key::Key::generate().unwrap();
+        let settings = Settings {
+            writes: false,
+            in_chat: None,
+            writes_a_day: None,
+            max_wait: None,
+        };
+        // No tool is called, so the binary is never started.
+        let launch = child::Launch::new(std::path::PathBuf::from("snob"), Vec::new());
+        let closing = CancelToken::default();
+        let server = Server::new(launch, &settings, ConfirmInChat::Lists, closing.clone()).unwrap();
+        let front = Arc::new(Front::new(
+            server,
+            Gate::new(&key).unwrap(),
+            config(IpAddr::V4(Ipv4Addr::LOCALHOST), None),
+        ));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let url = format!("http://{}{PATH}", listener.local_addr().unwrap());
+        let serving = {
+            let front = Arc::clone(&front);
+            let closing = closing.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(connection(
+                        Box::new(stream),
+                        Arc::clone(&front),
+                        closing.clone(),
+                        Arc::new(Seen::default()),
+                    ));
+                }
+            })
+        };
+
+        let http = reqwest::Client::new();
+        let post = async |session: Option<&str>, message: String| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(key.expose())
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .body(message);
+            if let Some(id) = session {
+                request = request
+                    .header("Mcp-Session-Id", id)
+                    .header("MCP-Protocol-Version", "2025-11-25");
+            }
+            let response = request.send().await.unwrap();
+            let status = response.status().as_u16();
+            let session = response
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|id| id.to_str().ok())
+                .map(str::to_string);
+            // Read whole, so the call it answered has ended.
+            let _ = response.bytes().await;
+            (status, session)
+        };
+
+        let hello = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
+        let (status, session) = post(None, hello.to_string()).await;
+        assert_eq!(status, 200);
+        let session = session.expect("a session id");
+        let initialized = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let (status, _) = post(Some(&session), initialized.to_string()).await;
+        assert_eq!(status, 202);
+
+        for n in 0..64 {
+            let made_up = format!("{n}{}", "x".repeat(BUFFER / 4));
+            let ping = format!(r#"{{"jsonrpc":"2.0","id":{},"method":"ping"}}"#, n + 2);
+            let (status, _) = post(Some(&made_up), ping).await;
+            assert_eq!(status, 404, "a session nobody was given");
+        }
+        let ping = r#"{"jsonrpc":"2.0","id":100,"method":"ping"}"#;
+        let (status, _) = post(Some(&session), ping.to_string()).await;
+        assert_eq!(status, 200, "the session opened is still served");
+
+        let noted: Vec<Arc<str>> = front.activity.seen().keys().cloned().collect();
+        assert_eq!(noted.len(), 1, "sessions nobody was given were noted");
+        assert_eq!(&*noted[0], session.as_str());
+
+        closing.cancel();
+        serving.abort();
+        let _ = front.manager.close_session(&Arc::from(session)).await;
     }
 
     /// A new session closes the one asked anything longest ago that has no

@@ -33,9 +33,12 @@ windows-native-keyring-store.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store.workspace = true
 
-# `geteuid`, which `std` does not offer: the age sweep of the scratch root in
-# the shared temporary directory walks a directory only when this user owns
-# it, and asks the open descriptor rather than the name (`paths.rs`,
+# `geteuid` and the `O_DIRECTORY`/`O_NOFOLLOW` flags, which `std` does not
+# offer (`paths.rs`): the scratch root in the shared temporary directory, and
+# the parents `create_private_root` makes private in the data directory, are
+# opened without following a link and made `0700` through that descriptor
+# (`open_dir`); the scratch root is refused, and walked by the age sweep,
+# only when the descriptor says this user owns it (`own_dir`,
 # `own_private_dir`). Already in the tree through `snob-cli`.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

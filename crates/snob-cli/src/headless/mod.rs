@@ -52,8 +52,8 @@
 //! And two things that are not about looking like a browser but about what
 //! a browser does to other people: the feed plays videos on its own, and a
 //! play counts, so no video reaches the page; and the site's app sends calls
-//! of its own, seen signals among them, so each of its API calls is judged
-//! against the same allowlist as snob's before it leaves ([`guard`]).
+//! of its own, seen signals among them, so every request the app sends is
+//! judged before it leaves, by the rule [`guard`] writes down.
 //!
 //! What is left is left knowingly: WebGL is absent — `getContext` returns
 //! nothing without a GPU the browser will use headless — and the switch that
