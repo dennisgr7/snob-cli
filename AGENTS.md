@@ -360,7 +360,16 @@ with a documented reason in the same place.
   starts it again into what is going, and **both holding the account's jobs
   lock until its session is gone** (an account that never ran a job
   included), since a start checks the session again under that lock and
-  makes nothing without one; `accounts.toml` changed only
+  makes nothing without one. **Then, before the browsers close, both sign
+  the account out for every other process** (`owner::sign_out`: the
+  `signed-out` file in the account's directory, read by its modification
+  time): a walk typed elsewhere, the monitor's run or an agent's call still
+  holding the session in memory is refused its next request, by itself and
+  by the owner, as exit 3, and starts no browser on the profile going (one
+  running its own browser closes it within two seconds, and the profiles are
+  removed once it has let go); a session a later login makes is not refused,
+  and an account directory that is gone refuses every one. `SNOB_NO_BROWSER`
+  sends with `reqwest`, which asks nothing of it. `accounts.toml` changed only
   through `Registry::update` (file lock). `watch.toml` and `accounts.toml`
   are read with serde and written from a hand-written template, tested to
   round-trip. `snob status` and `--dry-run` write nothing. `snob purge`

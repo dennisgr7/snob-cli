@@ -503,7 +503,7 @@ fn holds_account_profiles(dir: &Path) -> bool {
 /// holds it. A lock left by a process that is gone, or by another host, is no
 /// browser of this machine's. On Windows there is no such link; a rename under
 /// an open browser fails there instead, which [`rename_patiently`] reports.
-fn in_use(dir: &Path) -> bool {
+pub(crate) fn in_use(dir: &Path) -> bool {
     #[cfg(unix)]
     {
         let Ok(target) = std::fs::read_link(dir.join("SingletonLock")) else {

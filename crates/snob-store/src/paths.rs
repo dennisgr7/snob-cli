@@ -346,6 +346,56 @@ impl AccountPaths {
         self.app.ensure_dirs()?;
         create_private_dir(&self.dir())
     }
+
+    /// Left by `logout` and `purge` before the session goes
+    /// ([`Self::mark_signed_out`]). It holds nothing: what it says is when
+    /// it was written, its modification time.
+    pub fn signed_out_mark(&self) -> PathBuf {
+        self.dir().join("signed-out")
+    }
+
+    /// Says, for every process on this machine, that the account was signed
+    /// out of now: a session made before this is no longer sent as
+    /// ([`Self::refuses_session_made`]), whichever process still holds one
+    /// in memory. An account with no directory writes nothing, since a
+    /// directory that is gone already refuses every session.
+    pub fn mark_signed_out(&self) -> std::io::Result<()> {
+        if !self.dir().try_exists()? {
+            return Ok(());
+        }
+        let mark = std::fs::File::create(self.signed_out_mark())?;
+        // Set rather than left to the write: truncating a file already empty
+        // need not move its time, and a second logout must.
+        mark.set_modified(std::time::SystemTime::now())
+    }
+
+    /// Whether a session made at `made` may no longer be sent as: the
+    /// account was signed out of here at a later second
+    /// ([`Self::mark_signed_out`]), or its directory is gone (`purge`), or
+    /// neither can be told. A session made after, which only a new login
+    /// makes, is sent.
+    ///
+    /// **To the second, and strictly later**, as `created_at` is kept: a
+    /// login made in the very second of a logout is not refused for it,
+    /// which a script running one after the other would otherwise meet.
+    pub fn refuses_session_made(&self, made: snob_core::Epoch) -> bool {
+        let mark = match std::fs::metadata(self.signed_out_mark()) {
+            Ok(mark) => mark,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return !self.dir().try_exists().unwrap_or(false);
+            }
+            Err(_) => return true,
+        };
+        let Some(at) = mark
+            .modified()
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|at| i64::try_from(at.as_secs()).ok())
+        else {
+            return true;
+        };
+        made.get() < at
+    }
 }
 
 impl std::ops::Deref for AccountPaths {
@@ -1033,6 +1083,52 @@ mod windows_acl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session made before the account was signed out of here is refused,
+    /// and one a later login made is not; with the account's directory gone,
+    /// as `purge` leaves it, every one is, and nothing is written for it.
+    #[test]
+    fn a_session_made_before_a_sign_out_is_refused_and_a_later_one_is_not() {
+        let root = tempfile::tempdir().unwrap();
+        let account = AppPaths::rooted_at(root.path()).account(snob_core::Pk::new(42));
+        let now = snob_core::clock::now();
+        let before = snob_core::Epoch::new(now.get() - 120);
+        let after = snob_core::Epoch::new(now.get() + 120);
+
+        account.mark_signed_out().unwrap();
+        assert!(
+            !account.signed_out_mark().exists(),
+            "an account with no directory gets no mark, nor a directory"
+        );
+        assert!(!account.dir().exists());
+        assert!(account.refuses_session_made(before));
+        assert!(
+            account.refuses_session_made(after),
+            "a directory gone refuses all"
+        );
+
+        account.ensure_dirs().unwrap();
+        assert!(!account.refuses_session_made(before), "never signed out");
+        account.mark_signed_out().unwrap();
+        assert!(account.refuses_session_made(before));
+        assert!(
+            !account.refuses_session_made(now),
+            "the same second is let through"
+        );
+        assert!(!account.refuses_session_made(after));
+
+        // A second sign-out moves the mark on.
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(account.signed_out_mark())
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+        assert!(!account.refuses_session_made(before));
+        account.mark_signed_out().unwrap();
+        assert!(account.refuses_session_made(before));
+    }
 
     /// **A sandboxed run must not reach the real temporary directory.**
     /// The scratch directory is the one location that comes from the
