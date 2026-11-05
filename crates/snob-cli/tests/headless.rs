@@ -1912,6 +1912,68 @@ async fn another_accounts_login_logout_or_purge_leaves_this_ones_browser() {
     }
 }
 
+/// A walk still running as an account when it is logged out of sends
+/// nothing more: its next request is refused as no session (exit 3), and no
+/// browser is started again on the profile the logout removed, through the
+/// owner or, where a profile a browser holds can be removed at all, with a
+/// browser of the walk's own. Logging in again afterwards is not refused.
+#[tokio::test]
+async fn a_walk_running_when_its_account_is_logged_out_of_sends_nothing_more() {
+    let Some(_alone) = a_browser_alone().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let (world, instagram) = fake_instagram().await;
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v1/friendships/42/(followers|following)/$",
+        ))
+        .respond_with(Slowly(world.lists()))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    let profile = AppPaths::rooted_at(tmp.path()).browser_profile_for(snob_core::Pk::new(42));
+
+    // Windows keeps a profile a browser holds from being removed, so a walk
+    // with a browser of its own there makes the logout fail, as it says.
+    let modes: &[&[(&str, &str)]] = if cfg!(unix) {
+        &[&[], &[("SNOB_NO_OWNER", "1")]]
+    } else {
+        &[&[]]
+    };
+    for envs in modes {
+        logged_in(tmp.path(), &instagram, SESSIONID, &format!("{envs:?}: "));
+        let since = requests_so_far(&instagram).await;
+        let walk = snob_started(tmp.path(), &instagram, CROSSING_42, None, envs);
+        a_list_of_42_asked_for(&instagram, since).await;
+        let out = snob(tmp.path(), &instagram, &["logout"], None);
+        assert!(out.status.success(), "{envs:?}: {}", told(tmp.path(), &out));
+        let logged_out = requests_so_far(&instagram).await;
+        assert!(
+            !profile.exists(),
+            "{envs:?}: the logout removed the profile"
+        );
+
+        let walked = walk.wait_with_output().unwrap();
+        assert_eq!(
+            walked.status.code(),
+            Some(3),
+            "{envs:?}: {}",
+            told(tmp.path(), &walked)
+        );
+        assert!(
+            api_paths_since(&instagram, logged_out).await.is_empty(),
+            "{envs:?}: sent as the account after it was logged out of"
+        );
+        assert_eq!(page_loads_of_42(&instagram, logged_out).await, 0);
+        owner_gone(&AppPaths::rooted_at(tmp.path())).await;
+        assert!(
+            !profile.exists(),
+            "{envs:?}: a browser was started again on the profile removed"
+        );
+    }
+}
+
 /// With no owner to share a browser through, a command on an account whose
 /// profile another browser holds waits for it, says so once, and goes on when
 /// it is free.

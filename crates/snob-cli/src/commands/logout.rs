@@ -43,6 +43,11 @@ pub async fn run(
     let _stopping =
         crate::jobs::stop_before_leaving(leaving.iter().map(|pk| paths.account(*pk)).collect())
             .await?;
+    // Then every other process still holding one of these sessions: a walk
+    // typed in another terminal, the monitor's run, an agent's call. Each is
+    // refused its next request, and starts no browser on the profile about
+    // to go; before the browsers close, so none is started again after.
+    crate::owner::sign_out(paths, &leaving);
     // A browser still running on a profile about to go would write into it
     // as it went, or keep Windows from removing it. Only the profiles going:
     // another account's browser is left to the commands using it.
@@ -99,6 +104,10 @@ pub async fn run(
             .map(|pk| paths.browser_profile_for(*pk))
             .collect()
     };
+    // A walk running its own browser (`SNOB_NO_OWNER`) closes it once it sees
+    // the account signed out; until then the browser would make a removed
+    // profile again as it closed.
+    crate::owner::let_go_of(&profiles).await;
     let mut deleted = false;
     let mut profile_failure = None;
     for profile in profiles {
