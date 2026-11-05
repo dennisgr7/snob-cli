@@ -735,15 +735,21 @@ impl Front {
         let answering = (request.method() == Method::POST).then(|| self.answering.enter());
         // A request in a session is that session alive; a `POST` is one of
         // its calls until its answer has been sent, and its session is never
-        // closed under it.
+        // closed under it. Only a session the manager holds: any other id
+        // is answered 404 by the SDK, and is noted nowhere.
         let session = request
             .headers()
             .get("mcp-session-id")
             .and_then(|id| id.to_str().ok())
             .map(Arc::<str>::from);
-        let call = session
-            .as_ref()
-            .and_then(|id| self.activity.touch(id, request.method() == Method::POST));
+        let call = match &session {
+            Some(id) => {
+                self.activity
+                    .touch_held(&self.manager, id, request.method() == Method::POST)
+                    .await
+            }
+            None => None,
+        };
         let (parts, body) = request.into_parts();
         let body = match read(&parts.headers, body).await {
             Ok(body) => body,
@@ -813,6 +819,15 @@ impl Front {
 
 /// What each session has done lately, by its id: when it was last asked
 /// anything, and how many of its calls are being answered.
+///
+/// **Only sessions the manager holds are kept**: the id is whatever the
+/// client's `Mcp-Session-Id` says, up to the size of [`BUFFER`], and every
+/// request with an id nobody was given is answered 404 by the SDK without a
+/// tool being called, so none of the call limits counts it. Noting those
+/// would grow this map by one header per request, with nothing to remove
+/// them but the next `initialize`. So a request's session is noted through
+/// [`Activity::touch_held`], and the map holds no more than the sessions
+/// open and those closed since the last one opened ([`Activity::keep_only`]).
 #[derive(Default)]
 struct Activity(Arc<Mutex<HashMap<Arc<str>, Lately>>>);
 
@@ -844,6 +859,23 @@ impl Activity {
             of: Arc::clone(&self.0),
             id: Arc::clone(id),
         })
+    }
+
+    /// [`Activity::touch`], for the session a request names, only if
+    /// `manager` holds it; an id it does not hold is noted nowhere. Asked
+    /// under the manager's lock, so a session closed in between is closed
+    /// after it was noted, and the next opening forgets it.
+    async fn touch_held(
+        &self,
+        manager: &LocalSessionManager,
+        id: &Arc<str>,
+        call: bool,
+    ) -> Option<Call> {
+        let sessions = manager.sessions.read().await;
+        if !sessions.contains_key(id) {
+            return None;
+        }
+        self.touch(id, call)
     }
 
     /// Forgets the sessions that are not in `open`, so what is kept is
@@ -1168,6 +1200,41 @@ mod tests {
         // SAFETY: `raw` is the bound socket the listener owns.
         assert_eq!(unsafe { listen(raw, 1) }, 0, "listen");
         Some(listener)
+    }
+
+    /// A request naming a session the manager does not hold, which the SDK
+    /// answers 404 past every call limit, leaves nothing behind however many
+    /// come and however long their ids; one the manager holds is noted, and
+    /// its call counted.
+    #[tokio::test]
+    async fn only_a_session_the_manager_holds_is_noted() {
+        let manager = LocalSessionManager::default();
+        let activity = Activity::default();
+        for n in 0..1_000 {
+            let made_up: Arc<str> = Arc::from(format!("{n}{}", "x".repeat(BUFFER / 2)));
+            assert!(
+                activity
+                    .touch_held(&manager, &made_up, true)
+                    .await
+                    .is_none()
+            );
+            assert!(
+                activity
+                    .touch_held(&manager, &made_up, false)
+                    .await
+                    .is_none()
+            );
+        }
+        assert!(activity.seen().is_empty(), "made-up ids were kept");
+
+        let (id, _transport) = manager.create_session().await.unwrap();
+        let call = activity.touch_held(&manager, &id, true).await;
+        assert!(call.is_some(), "a held session's call is counted");
+        assert_eq!(activity.seen().get(&id).map(|lately| lately.calls), Some(1));
+        drop(call);
+        assert_eq!(activity.seen().get(&id).map(|lately| lately.calls), Some(0));
+        assert_eq!(activity.seen().len(), 1);
+        manager.close_session(&id).await.unwrap();
     }
 
     /// A new session closes the one asked anything longest ago that has no
