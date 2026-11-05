@@ -331,11 +331,22 @@ const HIDDEN: &str = "...";
 /// service. For those hosts the path stops at the segment that names the
 /// service, which is still enough to recognize, or goes whole where no
 /// segment does (Make's, or one of those hosts' paths without the segment).
+///
+/// **An address with no host is shown as one that does not parse**
+/// ([`unparsed`]). A hand-edited one that lost its scheme but has a colon
+/// before its first `/` parses all the same, as an opaque URL whose scheme is
+/// whatever came before the colon: `alice:hunter2@n8n.local/hook` has the
+/// scheme `alice` and the path `hunter2@n8n.local/hook`, and
+/// `hooks.slack.com:443/services/...` the scheme `hooks.slack.com`. There is
+/// no userinfo to clear and no host to judge the path by, so the rules above
+/// would show it as it came, password or secret path included.
 pub fn shown(url: &Url) -> String {
+    if url.host_str().is_none() {
+        return unparsed(url.as_str());
+    }
     let mut clean = url.clone();
-    // Both calls fail only on a URL that cannot have a host -- `mailto:`, say --
-    // which `check` refuses anyway. Nothing is lost by leaving the address as
-    // it was in that case: there is no userinfo to clear.
+    // Both calls fail only on a URL that cannot have a host, which is shown
+    // above as one that does not parse.
     let _ = clean.set_username("");
     let _ = clean.set_password(None);
     if clean.query().is_some_and(|query| !query.is_empty()) {
@@ -357,16 +368,34 @@ pub fn shown(url: &Url) -> String {
 
 /// Whether `host` is a receiver whose path is its credential, and if so, the
 /// segment of the path up to which it may be shown (none: no part of it).
+///
+/// Every spelling of the same receiver is one: a host written with its final
+/// dot (`hooks.slack.com.`, which the `url` crate keeps) is the host without
+/// it, and the older names still answer (Discord's on `discordapp.com` and
+/// its `canary.` and `ptb.` builds, Teams' legacy Office 365 connectors on
+/// `outlook.office.com` and `outlook.office365.com`, Make's as Integromat).
+/// A host matched here that is not such a receiver only has its path hidden,
+/// which reveals nothing, so the rules lean wide.
 fn secret_path(host: &str) -> Option<Option<&'static str>> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let on = |domain: &str| {
+        host == domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|sub| sub.ends_with('.'))
+    };
     match host {
-        "hooks.slack.com" => Some(Some("services")),
-        "discord.com" | "discordapp.com" | "canary.discord.com" | "ptb.discord.com" => {
-            Some(Some("webhooks"))
-        }
+        "hooks.slack.com" | "hooks.slack-gov.com" => Some(Some("services")),
+        _ if on("discord.com") || on("discordapp.com") => Some(Some("webhooks")),
         "hooks.zapier.com" => Some(Some("catch")),
         "maker.ifttt.com" => Some(Some("trigger")),
+        "outlook.office.com" | "outlook.office365.com" => Some(Some("webhook")),
         _ if host.ends_with(".webhook.office.com") => Some(Some("webhookb2")),
-        _ if host.starts_with("hook.") && host.ends_with(".make.com") => Some(None),
+        _ if host.starts_with("hook.")
+            && (host.ends_with(".make.com") || host.ends_with(".integromat.com")) =>
+        {
+            Some(None)
+        }
         _ => None,
     }
 }
@@ -377,8 +406,16 @@ fn secret_path(host: &str) -> Option<Option<&'static str>> {
 /// rules cannot be applied to what has no parts, and the likeliest such
 /// address, one hand-edited without its scheme, is a Slack or Discord one
 /// whose path is the secret. Which address was meant is still the content
-/// of the line, so its host is kept, as far as the first `/`, `?`, `#` or a
-/// backslash, with what came before an `@` and after the host left out.
+/// of the line, so its host is kept, as far as the first `/`, `?`, `#`, a
+/// backslash or a port's `:`, with what came before an `@` and after the
+/// host left out.
+///
+/// **An `@` past that first `/`, `?`, `#` or backslash hides the host too.**
+/// A password holding one of those characters unencoded is what makes such
+/// an address fail to parse (`https://alice:hunter/2@n8n.local/hook`), and
+/// cut there the "host" would be the user and the start of the password;
+/// the `@` might as well be a path's, and what follows it the end of a
+/// secret path, so nothing around it is shown.
 pub fn shown_str(address: &str) -> String {
     Url::parse(address).map_or_else(|_| unparsed(address), |url| shown(&url))
 }
@@ -399,10 +436,22 @@ fn unparsed(address: &str) -> String {
         _ => (String::new(), address),
     };
     let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
-    let authority = &rest[..end];
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
+    let (authority, after) = rest.split_at(end);
+    let host = if after.contains('@') {
+        HIDDEN
+    } else {
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        // A port is no part of which address was meant, and in an address
+        // that lost its scheme what follows a colon may be a password.
+        match host.strip_prefix('[') {
+            Some(inside) => inside
+                .split_once(']')
+                .map_or(HIDDEN, |(literal, _)| &host[..literal.len() + 2]),
+            None => host.split_once(':').map_or(host, |(name, _)| name),
+        }
+    };
     let tail = if end < rest.len() {
         format!("/{HIDDEN}")
     } else {
@@ -813,6 +862,48 @@ mod tests {
             shown_str("hooks.slack.com\\services\\XXXXYYYY"),
             "hooks.slack.com/..."
         );
+        // A password holding a `/`, `?` or `#` unencoded is why the address
+        // does not parse, and none of it is shown, nor the user.
+        for address in [
+            "https://alice:hunter/2xyz@n8n.local/hook",
+            "https://alice:hun?ter2@n8n.local/hook",
+            "https://alice:hun#ter2@n8n.local/hook",
+        ] {
+            let shown = shown_str(address);
+            assert_eq!(shown, "https://.../...", "{address}");
+        }
+        // A port is left out, and so is whatever follows a colon in an
+        // address with no scheme; an address literal is kept whole.
+        assert_eq!(
+            shown_str("https://n8n.local:99999/hook"),
+            "https://n8n.local/..."
+        );
+        assert_eq!(
+            shown_str("https://[fd00::1]:99999/hook"),
+            "https://[fd00::1]/..."
+        );
+    }
+
+    /// An address that lost its scheme but has a colon before its first `/`
+    /// parses, as an opaque URL with no host, and is shown as one that does
+    /// not: its "scheme" is a user or a host, and its "path" a password or a
+    /// secret path.
+    #[test]
+    fn an_address_with_no_host_is_shown_as_one_that_does_not_parse() {
+        for (address, expected) in [
+            ("alice:hunter2@n8n.local/hook", "n8n.local/..."),
+            (
+                "hooks.slack.com:443/services/T0/B0/XXXXsecret",
+                "hooks.slack.com/...",
+            ),
+        ] {
+            let url = Url::parse(address).expect("an opaque URL parses");
+            assert!(url.cannot_be_a_base(), "{address}");
+            assert_eq!(shown(&url), expected, "{address}");
+            assert_eq!(shown_str(address), expected, "{address}");
+            let said = without_address(&format!("no answer from {address}"), &url);
+            assert_eq!(said, format!("no answer from {expected}"));
+        }
     }
 
     /// Where the path is the credential, the path is what goes.
@@ -844,6 +935,57 @@ mod tests {
         // Anybody else's path is the address, and stays.
         let own = Url::parse("https://n8n.local/webhook/snob").unwrap();
         assert_eq!(shown(&own), "https://n8n.local/webhook/snob");
+    }
+
+    /// Every spelling of the same receivers hides the same path: the host
+    /// with its final dot, the older Discord, Teams and Make names, and
+    /// GovSlack's.
+    #[test]
+    fn another_spelling_of_the_same_receiver_hides_the_same_path() {
+        for (address, expected) in [
+            (
+                "https://hooks.slack.com./services/T0/B0/XXXXsecret",
+                "https://hooks.slack.com./services/...",
+            ),
+            (
+                "https://hooks.slack-gov.com/services/T0/B0/XXXXsecret",
+                "https://hooks.slack-gov.com/services/...",
+            ),
+            (
+                "https://canary.discordapp.com/api/webhooks/123/TOKEN",
+                "https://canary.discordapp.com/api/webhooks/...",
+            ),
+            (
+                "https://ptb.discordapp.com/api/webhooks/123/TOKEN",
+                "https://ptb.discordapp.com/api/webhooks/...",
+            ),
+            (
+                "https://discord.com./api/webhooks/123/TOKEN",
+                "https://discord.com./api/webhooks/...",
+            ),
+            (
+                "https://outlook.office.com/webhook/1@2/IncomingWebhook/KEY/3",
+                "https://outlook.office.com/webhook/...",
+            ),
+            (
+                "https://outlook.office365.com/webhook/1@2/IncomingWebhook/KEY/3",
+                "https://outlook.office365.com/webhook/...",
+            ),
+            (
+                "https://hook.integromat.com/TOKEN",
+                "https://hook.integromat.com/...",
+            ),
+            (
+                "https://hook.eu1.make.com./TOKEN",
+                "https://hook.eu1.make.com./...",
+            ),
+        ] {
+            let url = Url::parse(address).unwrap();
+            assert_eq!(shown(&url), expected, "{address}");
+        }
+        // A name that only ends the same way is somebody else's.
+        let own = Url::parse("https://notdiscord.com/api/webhooks/snob").unwrap();
+        assert_eq!(shown(&own), "https://notdiscord.com/api/webhooks/snob");
     }
 
     /// A report that found nobody listening says why, and not where: the
