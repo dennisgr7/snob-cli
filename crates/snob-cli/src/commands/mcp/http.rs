@@ -630,7 +630,8 @@ fn started(
             ));
             ui::info(&format!(
                 "Only you, and root, can connect to it. A tunnel of your own brings it \
-                 elsewhere: ssh -L 8750:\"{path}\" to this machine, and then \
+                 elsewhere: ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8750:\"{path}\" \
+                 to this machine, which stops at once if that port is taken there, and then \
                  http://127.0.0.1:8750{PATH} there, or cloudflared with the service \
                  unix:{path}."
             ));

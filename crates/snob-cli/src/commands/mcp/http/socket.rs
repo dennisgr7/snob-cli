@@ -12,8 +12,12 @@
 //! is at the other end (`peer_cred`), as the owner's and the relay's are:
 //! this user, or root, who can read everything snob keeps anyway (a tunnel
 //! run as a system service is often root). A tunnel of the person's own
-//! brings it elsewhere: `ssh -L 8750:<path>` from the far end, or
-//! cloudflared's `unix:<path>` service.
+//! brings it elsewhere: `ssh -N -o ExitOnForwardFailure=yes -L
+//! 127.0.0.1:8750:<path>` from the far end, or cloudflared's `unix:<path>`
+//! service. The option makes `ssh` stop when the near end is taken, as the
+//! relay's printed command does (`relay::tunnel_command`): without it `ssh`
+//! warns and stays up, and the client hands the key to whoever holds the
+//! port there.
 //!
 //! **One server at a time, at a fixed name**, so a tunnel's configuration
 //! outlives a restart. Who serves is decided by a lock (`mcp.sock.lock`
