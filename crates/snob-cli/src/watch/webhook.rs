@@ -373,10 +373,42 @@ fn secret_path(host: &str) -> Option<Option<&'static str>> {
 
 /// [`shown`], asked of an address held as a string (the outbox's, the file's).
 ///
-/// An address that does not parse is shown as it came rather than dropped,
-/// because which address was meant is the content of the line.
+/// **An address that does not parse is never shown as it came**: `shown`'s
+/// rules cannot be applied to what has no parts, and the likeliest such
+/// address, one hand-edited without its scheme, is a Slack or Discord one
+/// whose path is the secret. Which address was meant is still the content
+/// of the line, so its host is kept, as far as the first `/`, `?`, `#` or a
+/// backslash, with what came before an `@` and after the host left out.
 pub fn shown_str(address: &str) -> String {
-    Url::parse(address).map_or_else(|_| address.to_string(), |url| shown(&url))
+    Url::parse(address).map_or_else(|_| unparsed(address), |url| shown(&url))
+}
+
+/// The host of an address that does not parse, as [`shown_str`] says.
+fn unparsed(address: &str) -> String {
+    // A scheme only where what precedes `://` could be one, so that a `://`
+    // later in a path does not make the path a scheme.
+    let (scheme, rest) = match address.split_once("://") {
+        Some((scheme, rest))
+            if scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
+        {
+            (format!("{scheme}://"), rest)
+        }
+        _ => (String::new(), address),
+    };
+    let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let tail = if end < rest.len() {
+        format!("/{HIDDEN}")
+    } else {
+        String::new()
+    };
+    format!("{scheme}{host}{tail}")
 }
 
 /// The same refusals, asked of a configuration file rather than of a built
@@ -750,7 +782,7 @@ mod tests {
     }
 
     /// An address held as a string loses the same parts, and one that does not
-    /// parse comes back as it was.
+    /// parse is never shown as it came, only as far as its host.
     #[test]
     fn an_address_held_as_a_string_is_shown_the_same_way() {
         assert_eq!(
@@ -761,7 +793,26 @@ mod tests {
             shown_str("https://hooks.slack.com/services/T0000/B0000/XXXXYYYY"),
             "https://hooks.slack.com/services/..."
         );
-        assert_eq!(shown_str("n8n.local/hook"), "n8n.local/hook");
+        assert_eq!(shown_str("n8n.local/hook"), "n8n.local/...");
+        assert_eq!(
+            shown_str("hooks.slack.com/services/T0000/B0000/XXXXYYYY"),
+            "hooks.slack.com/..."
+        );
+        assert_eq!(shown_str("n8n.local"), "n8n.local");
+        // What came before an `@` is somebody's credential, a `://` in the
+        // path is no scheme, and a host that does not parse is still a host.
+        assert_eq!(
+            shown_str("https://alice:hunter2@exa mple.test/hook?key=K"),
+            "https://exa mple.test/..."
+        );
+        assert_eq!(
+            shown_str("hooks.slack.com/services/T0/x://B0/XXXXYYYY"),
+            "hooks.slack.com/..."
+        );
+        assert_eq!(
+            shown_str("hooks.slack.com\\services\\XXXXYYYY"),
+            "hooks.slack.com/..."
+        );
     }
 
     /// Where the path is the credential, the path is what goes.

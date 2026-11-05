@@ -99,7 +99,18 @@ fn plan(
         return Ok((None, warnings));
     };
 
-    let url = Url::parse(&url).with_context(|| format!("\"{url}\" is not an address"))?;
+    // Never the address itself: the likeliest one that does not parse is one
+    // hand-edited without its scheme, where `shown` cannot take a Slack or
+    // Discord secret out of the path, and this is the error every scheduled
+    // run fails with into the log of an unattended service. Where it came
+    // from says which, and the parse error carries none of the input.
+    let url = Url::parse(&url).with_context(|| {
+        if args.webhook.is_some() {
+            "the address given with --webhook is not an address"
+        } else {
+            "the webhook's url in watch.toml is not an address"
+        }
+    })?;
 
     // Whether this run is posting to the address the configuration was written
     // for.
@@ -928,6 +939,36 @@ mod tests {
             warnings.iter().any(|w| w.contains("stored token")),
             "withholding it silently would read as never having stored one: {warnings:?}"
         );
+    }
+
+    /// An address that does not parse is never echoed: the likeliest one is
+    /// a Slack address hand-edited without its scheme, whose path is the
+    /// secret, and this is what every scheduled run fails with.
+    #[test]
+    fn an_address_that_does_not_parse_is_not_echoed_in_the_failure() {
+        let file = configured("hooks.slack.com/services/T0/B0/XXXXsecret", &[]);
+        let Err(error) = plan(
+            &WebhookArgs::default(),
+            Some(&file),
+            Stored::Nothing,
+            Stored::Nothing,
+        ) else {
+            panic!("an address that does not parse cannot be posted to");
+        };
+        let said = format!("{error:#}");
+        assert!(!said.contains("XXXXsecret"), "{said}");
+        assert!(said.contains("watch.toml"), "{said}");
+
+        let args = WebhookArgs {
+            webhook: Some("discord.com/api/webhooks/1/YYYYsecret".into()),
+            ..Default::default()
+        };
+        let Err(error) = plan(&args, None, Stored::Nothing, Stored::Nothing) else {
+            panic!("an address that does not parse cannot be posted to");
+        };
+        let said = format!("{error:#}");
+        assert!(!said.contains("YYYYsecret"), "{said}");
+        assert!(said.contains("--webhook"), "{said}");
     }
 
     /// A configured address that does not parse is not an address to match
