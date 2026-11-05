@@ -534,23 +534,33 @@ fn runtime_dir() -> PathBuf {
 ///
 /// Every failure is ignored on purpose. This is housekeeping, and a run that
 /// cannot tidy up after an earlier one still has a story to show.
+///
+/// **It walks only a root that is this user's own.** The root sits at a
+/// predictable name in a directory anybody can write to (`/tmp`, wherever
+/// `$XDG_RUNTIME_DIR` is unset), and the sweep runs before
+/// [`create_fresh_private_dir`] gets to refuse a foreign one. So on Unix the
+/// root is opened without following a link, and the open descriptor, not the
+/// name, is asked whether it is a real directory, owned by the effective user
+/// and closed to everybody else ([`own_private_dir`]). Anything else is left
+/// alone unwalked: a directory another user planted there is theirs to
+/// rename, and theirs to swap for a link into this user's home between a
+/// look at the name and a walk of it. On Linux the walk then goes through
+/// `/proc/self/fd`, so it is of the very directory the descriptor checked;
+/// where that is not mounted it goes by the name, which is still the same
+/// directory, since an entry this user owns in a sticky or private directory
+/// cannot be renamed or replaced by anybody else. Windows keeps the link
+/// check alone: its temporary directory is the user's own.
 pub fn sweep_old_scratch(root: &Path, older_than: std::time::Duration) {
-    // Never walk through a link at the root. `read_dir` follows one, and the
-    // root sits at a predictable name in a directory anybody can write to, so
-    // "the root" could be a link into somebody's home with everything in it
-    // older than the cutoff. A link is left alone here; creating the scratch
-    // afterwards removes it as a link, the same as at the leaf.
-    let Ok(found) = std::fs::symlink_metadata(root) else {
+    let Some(walk) = ScratchWalk::of(root) else {
         return; // nothing has ever run, which is the common case
     };
-    if !found.is_dir() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(root) else {
+    let Ok(entries) = std::fs::read_dir(&walk.path) else {
         return;
     };
     let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
+        // `DirEntry::metadata` does not follow a link, and `remove_dir_all`
+        // removes a link as itself, so an entry is never reached through.
         let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
             continue;
         };
@@ -561,6 +571,104 @@ pub fn sweep_old_scratch(root: &Path, older_than: std::time::Duration) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// The scratch root as [`sweep_old_scratch`] may walk it, or `None` when it
+/// must not be walked at all.
+struct ScratchWalk {
+    /// The path the walk reads and removes through.
+    path: PathBuf,
+    /// Held open for the walk, so `/proc/self/fd/<n>` in `path` keeps naming
+    /// the directory that was checked.
+    #[cfg(unix)]
+    _held: std::fs::File,
+}
+
+impl ScratchWalk {
+    #[cfg(unix)]
+    fn of(root: &Path) -> Option<Self> {
+        let (held, found) = own_private_dir(root).ok()?;
+        let path = through_descriptor(&held, &found).unwrap_or_else(|| root.to_path_buf());
+        Some(Self { path, _held: held })
+    }
+
+    /// Never through a link at the root: `read_dir` follows one, and the root
+    /// could be a link into somebody's home with everything in it older than
+    /// the cutoff. A link is left alone here; creating the scratch afterwards
+    /// removes it as a link, the same as at the leaf.
+    #[cfg(not(unix))]
+    fn of(root: &Path) -> Option<Self> {
+        let found = std::fs::symlink_metadata(root).ok()?;
+        found.is_dir().then(|| Self {
+            path: root.to_path_buf(),
+        })
+    }
+}
+
+/// Opens `dir` without following a link at its name, and answers the
+/// descriptor with what `fstat` read from it, provided it is a real directory
+/// the effective user owns; an `Err` otherwise, of kind `PermissionDenied`
+/// for a directory that is somebody else's.
+///
+/// What it answers is about the directory the descriptor holds, so a name
+/// swapped for something else after this call does not move the check.
+#[cfg(unix)]
+fn own_dir(dir: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)?;
+    let found = held.metadata()?;
+    // SAFETY: `geteuid` takes no argument, touches no memory of ours and
+    // cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if !found.is_dir() || found.uid() != me {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "it belongs to another account",
+        ));
+    }
+    Ok((held, found))
+}
+
+/// [`own_dir`], and also closed to everybody else: no group or other bits,
+/// which is what [`create_private_root`] leaves it. A root this user owns but
+/// left open may hold entries somebody else put there, so it is not walked.
+#[cfg(unix)]
+fn own_private_dir(dir: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let (held, found) = own_dir(dir)?;
+    if found.mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "it is open to other accounts",
+        ));
+    }
+    Ok((held, found))
+}
+
+/// The path that reaches the directory `held` is open on, rather than
+/// whatever is at its name now: `/proc/self/fd/<n>` is a link the kernel
+/// resolves to the open directory itself. Taken only when what it reaches is
+/// the same directory (`st_dev` and `st_ino`), so a `/proc` that is missing,
+/// or mounted so as to hide it, falls back to the name.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn through_descriptor(held: &std::fs::File, found: &std::fs::Metadata) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let path = PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd()));
+    let seen = std::fs::metadata(&path).ok()?;
+    (seen.dev() == found.dev() && seen.ino() == found.ino()).then_some(path)
+}
+
+/// No `/proc` to go through: the walk goes by the name.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn through_descriptor(_held: &std::fs::File, _found: &std::fs::Metadata) -> Option<PathBuf> {
+    None
 }
 
 /// Replaces `path` with `contents` by way of `temporary`: written whole with
@@ -688,8 +796,16 @@ pub fn create_private_dir(dir: &Path) -> Result<(), PathError> {
 /// out of. A link or a stray file found at the name is removed as itself --
 /// the same recipe as at the leaf, through [`remove_entry`] on the one reading
 /// of it -- while a real directory is kept, because it holds other runs'
-/// scratch. A real directory that belongs to somebody else fails in
-/// `restrict_to_this_account`, which is the refusal wanted.
+/// scratch. A real directory that belongs to somebody else is refused, which
+/// is the refusal wanted.
+///
+/// On Unix the `0700` goes on through a descriptor opened without following a
+/// link ([`own_dir`]), never through the name again: whoever planted a real
+/// directory at the name owns it, and could swap it for a link into this
+/// account's home between the look above and a `chmod` by path, choosing
+/// which of this account's directories is made private. The descriptor is
+/// also asked who owns it, so a planted directory is refused even for root,
+/// whom a `chmod` would not stop.
 fn create_private_root(dir: &Path) -> Result<(), PathError> {
     let create = |source| PathError::Create {
         path: dir.to_path_buf(),
@@ -706,6 +822,18 @@ fn create_private_root(dir: &Path) -> Result<(), PathError> {
             std::fs::create_dir(dir).map_err(create)?;
         }
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let not_private = |e: std::io::Error| PathError::NotPrivate {
+            path: dir.to_path_buf(),
+            detail: e.to_string(),
+        };
+        let (held, _) = own_dir(dir).map_err(not_private)?;
+        held.set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(not_private)
+    }
+    #[cfg(not(unix))]
     restrict_to_this_account(dir)
 }
 
@@ -1234,8 +1362,11 @@ mod tests {
     #[test]
     fn the_sweep_takes_the_abandoned_and_leaves_the_living() {
         let tmp = tempfile::tempdir().unwrap();
-        let old = tmp.path().join("run-old");
-        let fresh = tmp.path().join("run-fresh");
+        // Made the way every run makes it: the sweep walks no other kind.
+        let root = tmp.path().join("snob-ig-stories");
+        create_private_root(&root).unwrap();
+        let old = root.join("run-old");
+        let fresh = root.join("run-fresh");
         std::fs::create_dir_all(&old).unwrap();
         std::fs::create_dir_all(&fresh).unwrap();
         std::fs::write(old.join("story.jpg"), b"x").unwrap();
@@ -1243,12 +1374,86 @@ mod tests {
         // Zero, so everything already on disk counts as abandoned; then a
         // generous one, so nothing does. Testing it this way rather than by
         // waiting keeps the suite off the wall clock.
-        sweep_old_scratch(tmp.path(), std::time::Duration::ZERO);
+        sweep_old_scratch(&root, std::time::Duration::ZERO);
         assert!(!old.exists(), "an abandoned directory should have gone");
 
         std::fs::create_dir_all(&fresh).unwrap();
-        sweep_old_scratch(tmp.path(), std::time::Duration::from_secs(3600));
+        sweep_old_scratch(&root, std::time::Duration::from_secs(3600));
         assert!(fresh.exists(), "a live directory must be left alone");
+    }
+
+    /// A root this account owns but left open to others may hold entries
+    /// somebody else put there, and is not walked: what was planted in it is
+    /// theirs to swap for a link between the look and the removal.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_walks_no_root_that_is_open_to_other_accounts() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("snob-ig-stories");
+        let old = root.join("run-old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        sweep_old_scratch(&root, std::time::Duration::ZERO);
+        assert!(old.exists(), "a root open to others was walked");
+
+        // Closed again, the same root is swept: the refusal was the mode.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        sweep_old_scratch(&root, std::time::Duration::ZERO);
+        assert!(
+            !old.exists(),
+            "a private root of this account's was not swept"
+        );
+    }
+
+    /// A link planted at the root's name is not walked, whatever it points
+    /// at: this account's home has plenty in it older than the cutoff.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_never_walks_through_a_link_at_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(home.join("documents")).unwrap();
+        let root = tmp.path().join("snob-ig-stories");
+        std::os::unix::fs::symlink(&home, &root).unwrap();
+
+        sweep_old_scratch(&root, std::time::Duration::ZERO);
+        assert!(
+            home.join("documents").exists(),
+            "the sweep followed the link"
+        );
+    }
+
+    /// On Linux the walk goes through the descriptor that was checked, so a
+    /// name renamed away and replaced by a link after the check still walks
+    /// the directory the check was about.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn the_sweep_walks_the_directory_it_checked_not_what_the_name_became() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("snob-ig-stories");
+        create_private_root(&root).unwrap();
+        std::fs::create_dir(root.join("run-ours")).unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(home.join("documents")).unwrap();
+
+        let walk = ScratchWalk::of(&root).expect("a private root of ours is walked");
+        assert!(
+            walk.path.starts_with("/proc/self/fd"),
+            "{}",
+            walk.path.display()
+        );
+
+        std::fs::rename(&root, tmp.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&home, &root).unwrap();
+        let seen: Vec<_> = std::fs::read_dir(&walk.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(seen, vec![std::ffi::OsString::from("run-ours")]);
     }
 
     /// A root that does not exist is not an error. It is the common case: the

@@ -57,11 +57,24 @@ fn link(user: &User) -> String {
     )
 }
 
-/// Escapes what would otherwise break the table or the link around it.
+/// Escapes what would otherwise break the table or the link around it, or be
+/// read as HTML.
 ///
 /// The backslash goes first: doing it after the pipe would escape the escape
 /// and leave the pipe bare. A newline cannot live in a cell at all, so it
 /// becomes a space.
+///
+/// **`<`, `>` and `&` become entities**, because CommonMark passes inline
+/// HTML through and the renderers people open these files in (GitHub, VS
+/// Code's preview, Obsidian) draw it: a display name of
+/// `<img src="https://somewhere.test/t.png">` fetched that picture from
+/// whoever named it, telling them when the file was opened and from where,
+/// and an `<a href>` put a link in the row as though this file had written
+/// it. The `&` goes first, so the entities written here are not escaped again,
+/// and is escaped at all because an entity a name spells out (`&#8238;`) would
+/// otherwise be drawn as the character `printable` took away. Entities rather
+/// than backslashes: every renderer reads an entity, and not every one takes
+/// a backslash before `<`.
 ///
 /// The brackets are here because every string this escapes is then wrapped in
 /// `[…]` by [`link`], and a `]` in a name ends that label early — so a username
@@ -70,6 +83,9 @@ fn link(user: &User) -> String {
 /// a separate problem with a separate answer: `User::profile_url` encodes.
 pub(crate) fn escape(text: &str) -> String {
     text.replace('\\', "\\\\")
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
         .replace('|', "\\|")
         .replace('[', "\\[")
         .replace(']', "\\]")
@@ -212,6 +228,22 @@ mod tests {
         let table = out.find("| Count").unwrap();
         assert!(heading < line && line < table, "{out}");
         assert!(out.contains("@lu\\|is"), "{out}");
+    }
+
+    /// A name is shown as the text it is, never drawn as HTML: no picture
+    /// fetched from whoever chose the name, no link the file did not write,
+    /// and no character an entity spells out.
+    #[test]
+    fn html_in_a_name_is_shown_as_text_not_rendered() {
+        let out = table(&[User {
+            full_name: Some(r#"<img src="https://somewhere.test/t.png"> &#8238;"#.into()),
+            ..user()
+        }]);
+        assert!(!out.contains('<') && !out.contains('>'), "{out}");
+        assert!(
+            out.contains(r#"&lt;img src="https://somewhere.test/t.png"&gt; &amp;#8238;"#),
+            "{out}"
+        );
     }
 
     #[test]

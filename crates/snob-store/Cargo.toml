@@ -33,6 +33,13 @@ windows-native-keyring-store.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store.workspace = true
 
+# `geteuid`, which `std` does not offer: the age sweep of the scratch root in
+# the shared temporary directory walks a directory only when this user owns
+# it, and asks the open descriptor rather than the name (`paths.rs`,
+# `own_private_dir`). Already in the tree through `snob-cli`.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 zbus-secret-service-keyring-store.workspace = true
 
