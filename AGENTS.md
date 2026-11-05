@@ -904,8 +904,9 @@ Platform-specific code, all of it reached only by the CI job on that OS:
 - Unix (`libc`): the CDP pipe made with `pipe2` (on macOS, which has
   none, `pipe` and `fcntl(FD_CLOEXEC)`), its ends put onto fds 3 and 4
   with `dup2` and `fcntl` clearing `FD_CLOEXEC` on one already there, the
-  browser in a process group of its own with `setpgid`, asked after and
-  killed with `kill`/`killpg` (`pipe.rs`), `setsid` for a detached start
+  parent's copies of the child's ends closed with `close`, the browser in
+  a process group of its own with `setpgid`, asked after and killed with
+  `kill`/`killpg` (`pipe.rs`), `setsid` for a detached start
   (`detach.rs`), another snob's browser holding a profile asked after with
   `kill(pid, 0)` and the machine's name from `gethostname`
   (`headless/profile.rs`, `cdp/mod.rs`), the owner's lock with `flock`, and
@@ -917,7 +918,8 @@ Platform-specific code, all of it reached only by the CI job on that OS:
   In `snob-store` (`paths.rs`), the scratch root is opened with
   `O_DIRECTORY | O_NOFOLLOW`, made `0700` through the descriptor, and asked
   its owner (`geteuid`) before it is made private or swept.
-  Linux adds a logind `idle` inhibitor (`zbus`) and `SCHED_BATCH`/`uclamp_max`;
+  Linux adds a logind `idle` inhibitor (`zbus`) and `SCHED_BATCH`/`uclamp_max`
+  (`syscall` for `sched_setscheduler`/`sched_setattr`, `power/qos.rs`);
   macOS uses `caffeinate -i -w <pid>` and leaves the browser's scheduling
   alone.
 - TLS backend and `--strict-roots` differ on Windows ARM64 (see above).
