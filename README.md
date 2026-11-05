@@ -163,9 +163,11 @@ can read:
   cloudflared, a VPN) to reach from elsewhere: it refuses any address that
   is not loopback and any request without the key (`Authorization: Bearer`),
   and a yes given in the chat covers only reading lists unless
-  `--confirm-in-chat all`. A client on the stateless revision of MCP has no
-  session, so a chat yes it is handed is bound to the call alone, and any
-  client with the key may redeem it once. TLS ends at the tunnel, whose
+  `--confirm-in-chat all`, though whoever holds the key can still confirm
+  the writes in a form it answers itself, since it is the client. A client
+  on the stateless revision of MCP has no session, so a chat yes it is
+  handed is bound to the call alone, and any client with the key may
+  redeem it once. TLS ends at the tunnel, whose
   provider sees the key and every answer, other people's names and lists
   included; put an access layer in front where the tunnel offers one. The
   server does not prove itself to its clients: they send the key to

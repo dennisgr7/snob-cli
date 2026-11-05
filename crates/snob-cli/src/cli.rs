@@ -378,7 +378,8 @@ macro_rules! mcp_listen_help {
                       request \
                       carries the key \"snob mcp key new\" makes, as Authorization: Bearer, \
                       and the server does not start without one. A yes in the chat covers \
-                      reading lists there and not the writes, unless --confirm-in-chat all. \
+                      reading lists there and not the writes, unless --confirm-in-chat all; \
+                      whoever holds the key can still confirm both in a form it answers. \
                       --public-url names the https address the tunnel serves it at. TLS ends \
                       at the tunnel, whose provider sees the key and every answer; put an \
                       access layer in front where it offers one. \"snob mcp config <client> \

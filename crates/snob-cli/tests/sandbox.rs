@@ -8098,9 +8098,18 @@ async fn a_remote_server_takes_no_chat_yes_for_a_write_by_default() {
     serve_an_unfollow(&instagram).await;
     log_in_writing(tmp.path(), &instagram);
     let mut server = HttpMcp::start(tmp.path(), &instagram, &["--allow-writes"]).await;
+    // The chat is closed to the writes; a form the key holder answers is
+    // not, and startup says so.
     assert!(
         server
             .has_said("whoever holds the key can call follow and unfollow")
+            .await,
+        "{}",
+        server.said()
+    );
+    assert!(
+        server
+            .has_said("in a form it answers itself, whatever --confirm-in-chat says")
             .await,
         "{}",
         server.said()
@@ -8143,7 +8152,7 @@ async fn a_remote_server_takes_no_chat_yes_for_a_write_by_default() {
     )
     .await;
     assert!(
-        all.has_said("confirm them in the chat").await,
+        all.has_said("confirm them, in the chat or in a form").await,
         "{}",
         all.said()
     );

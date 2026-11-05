@@ -291,7 +291,10 @@ pub async fn serve(
         .into());
     };
     // Narrower than on standard input and output: whoever holds the key
-    // can call, and a yes in the chat may be theirs.
+    // can call, and a yes in the chat may be theirs. **This narrows the chat
+    // only**: a client that declares a form answers it as it likes
+    // (`Server::consent` asks a form first), so whoever holds the key can
+    // confirm a write whatever this says, which [`writes_warning`] tells.
     let in_chat = settings.in_chat.unwrap_or(ConfirmInChat::Lists);
     let closing = crate::interrupt::install();
     let server = Server::new(launch, &settings, in_chat, closing.clone())?;
@@ -645,17 +648,27 @@ fn started(
         ));
     }
     if settings.writes {
-        let confirm = if in_chat == ConfirmInChat::All {
-            ", and can confirm them in the chat itself"
-        } else {
-            ""
-        };
-        ui::warn(&format!(
-            "with --allow-writes, whoever holds the key can call follow and unfollow{confirm}; \
-             keep the key to clients you trust."
-        ));
+        ui::warn(&writes_warning(in_chat));
     }
     ui::info("Ctrl+C stops it, giving the calls still running their grace.");
+}
+
+/// What startup warns of with `--allow-writes`. **Whoever holds the key can
+/// confirm a write whatever `--confirm-in-chat` says**: it is the client,
+/// and a client that declares a form answers the form itself, which the
+/// server cannot tell from a person ticking a box (and records as a yes
+/// given in a form). `--confirm-in-chat` closes the chat only.
+fn writes_warning(in_chat: ConfirmInChat) -> String {
+    let how = if in_chat == ConfirmInChat::All {
+        "in the chat or in a form it answers itself"
+    } else {
+        "in a form it answers itself, whatever --confirm-in-chat says, which closes only the \
+         chat"
+    };
+    format!(
+        "with --allow-writes, whoever holds the key can call follow and unfollow and confirm \
+         them, {how}; keep the key to clients you trust."
+    )
 }
 
 /// One connection, served until it ends or the server stops, when it is
@@ -1201,6 +1214,31 @@ mod tests {
         // SAFETY: `raw` is the bound socket the listener owns.
         assert_eq!(unsafe { listen(raw, 1) }, 0, "listen");
         Some(listener)
+    }
+
+    /// The warning with `--allow-writes` says that whoever holds the key can
+    /// confirm the writes, through a form it answers, whatever
+    /// `--confirm-in-chat` says, and through the chat too only under `all`.
+    #[test]
+    fn the_writes_warning_says_a_key_holder_confirms_them_whatever_the_chat_allows() {
+        for in_chat in [
+            ConfirmInChat::None,
+            ConfirmInChat::Lists,
+            ConfirmInChat::All,
+        ] {
+            let said = writes_warning(in_chat);
+            assert!(
+                said.contains("whoever holds the key can call follow and unfollow and confirm"),
+                "{said}"
+            );
+            assert!(said.contains("a form it answers itself"), "{said}");
+            assert_eq!(
+                said.contains("in the chat or"),
+                in_chat == ConfirmInChat::All,
+                "{said}"
+            );
+        }
+        assert!(writes_warning(ConfirmInChat::Lists).contains("closes only the chat"));
     }
 
     /// A request naming a session the manager does not hold, which the SDK
