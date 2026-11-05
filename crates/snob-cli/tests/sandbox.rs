@@ -3046,6 +3046,53 @@ fn status_with_no_session_exits_three() {
     );
 }
 
+/// A session stored here whose account was signed out of on this computer
+/// since, as a `logout` that could not remove it leaves it, is no session to
+/// any command, and is said as what it is rather than blamed on Instagram:
+/// `status` and `whoami` say it was signed out here, a list refuses it
+/// before it opens anything, all with exit 3, and nothing is sent.
+#[tokio::test]
+async fn a_session_signed_out_of_here_is_said_as_such_and_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    snob_store::paths::AppPaths::rooted_at(tmp.path())
+        .account(PK)
+        .sign_out()
+        .unwrap();
+    let before = instagram.received_requests().await.unwrap().len();
+    let here = |said: &str| said.contains("signed out on this computer");
+
+    let out = snob(tmp.path(), Some(&instagram), &["status", "--json"]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    let said = json(&out);
+    assert_eq!(said["error"]["code"], "no_session", "{said}");
+    assert!(here(said["error"]["message"].as_str().unwrap()), "{said}");
+    assert_eq!(said["session"], serde_json::Value::Null, "{said}");
+
+    let out = snob(tmp.path(), Some(&instagram), &["whoami", "--json"]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    let said = json(&out);
+    assert_eq!(said["pk"], PK.get(), "{said}");
+    assert_eq!(said["alive"], false, "{said}");
+    assert_eq!(said["not_checked"], "signed_out", "{said}");
+    assert_eq!(said["error"]["code"], "no_session", "{said}");
+    assert!(here(said["error"]["message"].as_str().unwrap()), "{said}");
+
+    let out = snob(tmp.path(), Some(&instagram), &["followers", "--refresh"]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    let said = stderr(&out);
+    assert!(here(&said), "{said}");
+    assert!(said.contains("snob login"), "{said}");
+    assert!(!said.contains("expired"), "{said}");
+
+    assert_eq!(
+        instagram.received_requests().await.unwrap().len(),
+        before,
+        "nothing was sent"
+    );
+}
+
 /// Signed in and at rest: the whole budget, every section, exit 0, and not
 /// one request to the fake Instagram.
 #[tokio::test]
@@ -8098,9 +8145,18 @@ async fn a_remote_server_takes_no_chat_yes_for_a_write_by_default() {
     serve_an_unfollow(&instagram).await;
     log_in_writing(tmp.path(), &instagram);
     let mut server = HttpMcp::start(tmp.path(), &instagram, &["--allow-writes"]).await;
+    // The chat is closed to the writes; a form the key holder answers is
+    // not, and startup says so.
     assert!(
         server
             .has_said("whoever holds the key can call follow and unfollow")
+            .await,
+        "{}",
+        server.said()
+    );
+    assert!(
+        server
+            .has_said("in a form it answers itself, whatever --confirm-in-chat says")
             .await,
         "{}",
         server.said()
@@ -8143,7 +8199,7 @@ async fn a_remote_server_takes_no_chat_yes_for_a_write_by_default() {
     )
     .await;
     assert!(
-        all.has_said("confirm them in the chat").await,
+        all.has_said("confirm them, in the chat or in a form").await,
         "{}",
         all.said()
     );

@@ -46,26 +46,14 @@ pub fn run(
         None => None,
     };
     let (Some((session, storage)), Some(account)) = (located, account) else {
-        eprintln!("No session stored. Run \"snob login\".");
-        if args.output.json {
-            // Every section asked for is there and null, as `whoami` gives
-            // every field with no session, beside the error.
-            let mut out = serde_json::Map::new();
-            for key in args.sections().names() {
-                out.insert(key.into(), Value::Null);
-            }
-            out.insert(
-                "error".into(),
-                json!({
-                    "code": ExitCode::NoSession.as_str(),
-                    "message": "no session is stored on this computer",
-                }),
-            );
-            out.insert("viewer".into(), viewer.unwrap_or(Value::Null));
-            crate::ui::say!("{}", serde_json::to_string_pretty(&Value::Object(out))?);
-        }
-        return Ok(ExitCode::NoSession);
+        return no_session(&args, viewer, "no session is stored on this computer");
     };
+    // A session this computer no longer sends as is no session to report on
+    // either, and is said as what it is: every command refuses it at its
+    // start (`App::open`), with the same code.
+    if crate::owner::signed_out(paths, &session) {
+        return no_session(&args, viewer, report::SIGNED_OUT_HERE);
+    }
 
     let now = snob_core::clock::now_ms();
     // An account that has never sent anything has no database, and its
@@ -165,6 +153,32 @@ pub fn run(
     } else {
         ExitCode::Ok
     })
+}
+
+/// What is said with no session to report on, `why` being the reason: the
+/// sentence on standard error with its advice, and with `--json` every
+/// section asked for there and null, as `whoami` gives every field with no
+/// session, beside the error.
+fn no_session(args: &StatusArgs, viewer: Option<Value>, why: &str) -> Result<ExitCode> {
+    let mut said = format!("{why}.");
+    said[..1].make_ascii_uppercase();
+    eprintln!("{said} Run \"snob login\".");
+    if args.output.json {
+        let mut out = serde_json::Map::new();
+        for key in args.sections().names() {
+            out.insert(key.into(), Value::Null);
+        }
+        out.insert(
+            "error".into(),
+            json!({
+                "code": ExitCode::NoSession.as_str(),
+                "message": why,
+            }),
+        );
+        out.insert("viewer".into(), viewer.unwrap_or(Value::Null));
+        crate::ui::say!("{}", serde_json::to_string_pretty(&Value::Object(out))?);
+    }
+    Ok(ExitCode::NoSession)
 }
 
 /// The accounts whose push-backs braked every account, named from the

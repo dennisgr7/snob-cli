@@ -37,6 +37,21 @@ pub const NOTHING_CONFIGURED: &str =
 pub const NO_RECORDED_CONSENT: &str =
     "no recorded consent, so an unattended run will refuse to read it";
 
+/// What a session stored here that this computer no longer sends as is
+/// (`owner::signed_out`): its account was signed out of here, by a `logout`
+/// whose removal of the session failed, or a `purge`, or the account's data
+/// directory went. Said by every command that meets one at its start
+/// (`App::open`), by `snob status` and `snob whoami`, and by `snob watch
+/// check`, so none of them blames Instagram for it; the refusal a request
+/// meets later is `IgError::SignedOutHere`, and both carry
+/// [`SIGN_IN_AGAIN`].
+pub const SIGNED_OUT_HERE: &str = "the session stored was signed out on this computer (a \
+     logout or a purge, or its data was removed), so nothing is sent as it";
+
+/// The advice for a session this computer no longer sends as, which only a
+/// login lets in again.
+pub const SIGN_IN_AGAIN: &str = "run \"snob login\"";
+
 /// Prints a failed run's error, as one message rather than as several.
 ///
 /// The refusals this tool produces are paragraphs — two or three sentences with
@@ -924,6 +939,7 @@ fn advice_for(error: &snob_ig::error::IgError) -> Option<&'static str> {
     use snob_ig::error::IgError;
     match error {
         IgError::SessionExpired => Some("run \"snob login\" again"),
+        IgError::SignedOutHere => Some(SIGN_IN_AGAIN),
         IgError::WaitTooLong { .. } => Some(
             "run it again later, or with a longer --max-wait; \"snob status --budget\" says \
              when the budget has room",
@@ -1823,6 +1839,7 @@ third",
 
         for (error, advice) in [
             (IgError::SessionExpired, "run \"snob login\" again"),
+            (IgError::SignedOutHere, "run \"snob login\""),
             (
                 IgError::NoCsrfToken,
                 "run \"snob login --browser\", or, with SNOB_NO_BROWSER, pass the token with \

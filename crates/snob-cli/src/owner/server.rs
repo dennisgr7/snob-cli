@@ -16,6 +16,13 @@
 //! efficiently (`power::qos`): at the normal pace only while a command
 //! somebody waits on is using it ([`ToOwner::Attention`]).
 //!
+//! **Nothing is sent as a session its account was signed out of**
+//! (`owner::sign_out`) and no login let in again since, whoever hands it:
+//! the command asks before each request, the owner asks again here, and the
+//! account's browser once it holds it (`headless::Headless`), so a command
+//! that slipped a request in as `logout` began starts no browser on the
+//! profile going.
+//!
 //! The one thing stored from here is the cooldown such a push-back earns,
 //! written by the listener (`headless::listen`) to the account's database,
 //! and from it to `shared.db` when that opens. What a browser rotated is
@@ -29,6 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use snob_core::Pk;
+use snob_ig::client::page::PageError;
 use snob_store::paths::AppPaths;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Notify, mpsc};
@@ -102,6 +110,9 @@ fn nap(next: Option<Duration>, first_command_left: Option<Duration>, cap: Durati
 struct State {
     /// Which binary this owner was started from ([`wire::build`]).
     build: String,
+    /// Where the commands it serves keep their files: where an account is
+    /// told signed out ([`super::signed_out`]).
+    paths: AppPaths,
     /// Per account, the commands connected that have sent as it.
     users: std::sync::Mutex<HashMap<Pk, usize>>,
     /// Per account, how many of those somebody is waiting on
@@ -161,6 +172,7 @@ pub(super) async fn run_on(
     );
     let state = Arc::new(State {
         build,
+        paths: paths.clone(),
         users: std::sync::Mutex::new(HashMap::new()),
         watched: std::sync::Mutex::new(HashMap::new()),
         connections: AtomicUsize::new(0),
@@ -361,6 +373,11 @@ async fn serve_commands<R: AsyncRead + Unpin>(
                 session,
                 request,
             } => {
+                if super::signed_out(&state.paths, &session) {
+                    let answer = Err(PageError::SignedOutHere);
+                    let _ = outgoing.send(FromOwner::Answer { id, answer });
+                    continue;
+                }
                 uses(engine, state, used, session.ds_user_id, *attended);
                 let (engine, outgoing) = (Arc::clone(engine), outgoing.clone());
                 tokio::spawn(async move {
@@ -369,6 +386,11 @@ async fn serve_commands<R: AsyncRead + Unpin>(
                 });
             }
             ToOwner::Ask { id, session, call } => {
+                if super::signed_out(&state.paths, &session) {
+                    let told = Err(PageError::SignedOutHere);
+                    let _ = outgoing.send(FromOwner::Told { id, told });
+                    continue;
+                }
                 uses(engine, state, used, session.ds_user_id, *attended);
                 let (engine, outgoing) = (Arc::clone(engine), outgoing.clone());
                 tokio::spawn(async move {
@@ -542,6 +564,7 @@ mod tests {
     fn state() -> State {
         State {
             build: "test".to_string(),
+            paths: AppPaths::rooted_at("/nowhere"),
             users: std::sync::Mutex::new(HashMap::new()),
             watched: std::sync::Mutex::new(HashMap::new()),
             connections: AtomicUsize::new(0),

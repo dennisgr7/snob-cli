@@ -76,7 +76,23 @@ pub async fn run(
     // sentence.
     let mut code = ExitCode::Ok;
 
-    if !args.offline {
+    // A session this computer no longer sends as (`owner::signed_out`) is
+    // not checked with Instagram, `--offline` or not: it is said as what it
+    // is, with the code of having none, which every command refuses it with
+    // at its start (`App::open`).
+    let signed_out = crate::owner::signed_out(paths, &session);
+    if signed_out {
+        alive = Some(false);
+        code = ExitCode::NoSession;
+        failure = Some(serde_json::json!({
+            "code": code.as_str(),
+            "url": serde_json::Value::Null,
+            "message": report::SIGNED_OUT_HERE,
+        }));
+        let mut said = report::SIGNED_OUT_HERE.to_string();
+        said[..1].make_ascii_uppercase();
+        eprintln!("{said}. Run \"snob login\".");
+    } else if !args.offline {
         // Through `app::pacer_saying_a_line`, so Ctrl+C reaches the request
         // and a wait the budget imposes is announced.
         let pacer = crate::app::pacer_saying_a_line(paths)?;
@@ -156,14 +172,14 @@ pub async fn run(
             "created_at": session.created_at,
             "validated_at": session.validated_at,
             "alive": alive,
-            "not_checked": not_checked(args.offline, cooldown_until),
+            "not_checked": not_checked(signed_out, args.offline, cooldown_until),
             "cooldown_until": cooldown_until,
             "error": failure,
             "viewer": viewer,
         });
         crate::ui::say!("{}", serde_json::to_string_pretty(&out)?);
     } else {
-        crate::ui::say!("{}", describe(&session, alive));
+        crate::ui::say!("{}", describe(&session, alive, signed_out));
     }
 
     Ok(code)
@@ -171,11 +187,19 @@ pub async fn run(
 
 /// Why the session was not checked, when it was not.
 ///
-/// Derived rather than tracked. Both inputs are already held for their own sake
-/// — `--offline` is the request not to look, and a cooldown end only exists when
-/// one was found — so there is nothing here that can disagree with them.
-fn not_checked(offline: bool, cooldown_until: Option<Epoch>) -> Option<&'static str> {
-    if offline {
+/// Derived rather than tracked. Every input is already held for its own sake
+/// — a session signed out of here is never checked, `--offline` is the
+/// request not to look, and a cooldown end only exists when one was found —
+/// so there is nothing here that can disagree with them. `signed_out` is the
+/// one value added since the others: a token added, none renamed.
+fn not_checked(
+    signed_out: bool,
+    offline: bool,
+    cooldown_until: Option<Epoch>,
+) -> Option<&'static str> {
+    if signed_out {
+        Some("signed_out")
+    } else if offline {
         Some("offline")
     } else if cooldown_until.is_some() {
         Some("cooldown")
@@ -184,7 +208,11 @@ fn not_checked(offline: bool, cooldown_until: Option<Epoch>) -> Option<&'static 
     }
 }
 
-fn describe(session: &snob_core::session::Session, alive: Option<bool>) -> String {
+fn describe(
+    session: &snob_core::session::Session,
+    alive: Option<bool>,
+    signed_out: bool,
+) -> String {
     let mut lines = Vec::new();
 
     match &session.username {
@@ -201,6 +229,7 @@ fn describe(session: &snob_core::session::Session, alive: Option<bool>) -> Strin
     }
     lines.push(format!("Origin:   {}", session.origin));
     lines.push(match alive {
+        _ if signed_out => "Status:   signed out on this computer".to_string(),
         Some(true) => "Status:   the session is responding".to_string(),
         Some(false) => "Status:   the session is NOT responding".to_string(),
         None => "Status:   not checked".to_string(),
@@ -213,14 +242,22 @@ fn describe(session: &snob_core::session::Session, alive: Option<bool>) -> Strin
 mod tests {
     use super::*;
 
-    /// The three states, and the one that matters: `--offline` is why nothing
-    /// was checked even when a cooldown is also in force, because the user asked
-    /// not to look before anything went to find out.
+    /// The states, and the one that matters: `--offline` is why nothing was
+    /// checked even when a cooldown is also in force, because the user asked
+    /// not to look before anything went to find out. A session signed out of
+    /// here is why above all, since it is never checked.
     #[test]
     fn why_nothing_was_checked_is_read_back_off_the_two_facts() {
-        assert_eq!(not_checked(true, None), Some("offline"));
-        assert_eq!(not_checked(true, Some(Epoch::new(1))), Some("offline"));
-        assert_eq!(not_checked(false, Some(Epoch::new(1))), Some("cooldown"));
-        assert_eq!(not_checked(false, None), None);
+        assert_eq!(not_checked(false, true, None), Some("offline"));
+        assert_eq!(
+            not_checked(false, true, Some(Epoch::new(1))),
+            Some("offline")
+        );
+        assert_eq!(
+            not_checked(false, false, Some(Epoch::new(1))),
+            Some("cooldown")
+        );
+        assert_eq!(not_checked(false, false, None), None);
+        assert_eq!(not_checked(true, true, None), Some("signed_out"));
     }
 }

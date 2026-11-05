@@ -372,12 +372,14 @@ macro_rules! mcp_listen_help {
                       to reach from elsewhere; any other address is refused. On Linux and \
                       macOS, --listen socket serves on a socket in snob's data directory that \
                       only you can reach, which no other user can take while snob is not \
-                      running (ssh -L 8750:<its path>, or cloudflared's unix:<its path>); on a \
+                      running (ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8750:<its path>, \
+                      or cloudflared's unix:<its path>); on a \
                       port, whoever listens there while snob does not is handed the key. Every \
                       request \
                       carries the key \"snob mcp key new\" makes, as Authorization: Bearer, \
                       and the server does not start without one. A yes in the chat covers \
-                      reading lists there and not the writes, unless --confirm-in-chat all. \
+                      reading lists there and not the writes, unless --confirm-in-chat all; \
+                      whoever holds the key can still confirm both in a form it answers. \
                       --public-url names the https address the tunnel serves it at. TLS ends \
                       at the tunnel, whose provider sees the key and every answer; put an \
                       access layer in front where it offers one. \"snob mcp config <client> \

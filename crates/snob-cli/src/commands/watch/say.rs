@@ -78,6 +78,7 @@ pub(super) fn problem_line(problem: &Problem) -> String {
         ),
         Problem::SessionSilent => "not checked: the session is not responding".to_string(),
         Problem::NoSession => "no session is stored; run \"snob login\"".to_string(),
+        Problem::SignedOutHere => format!("{}; {}", report::SIGNED_OUT_HERE, report::SIGN_IN_AGAIN),
         Problem::NoUsername => "not checked: the session carries no username, and Instagram \
              did not name the account either"
             .to_string(),
@@ -347,6 +348,7 @@ mod tests {
             Problem::NoRecordedConsent { in_cooldown: true },
             Problem::SessionSilent,
             Problem::NoSession,
+            Problem::SignedOutHere,
             Problem::NoUsername,
             Problem::CountersUnknowable,
             Problem::FirstRunLaysTheBaseline,

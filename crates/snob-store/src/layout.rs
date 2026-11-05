@@ -25,6 +25,13 @@
 //!
 //! A database nobody could be named for waits in `unclaimed` until a login
 //! [`adopt`]s it.
+//!
+//! **An account's directory this lands whole starts with nobody signed in**
+//! (`AccountPaths::signed_in`, empty), as one `AccountPaths::ensure_dirs`
+//! makes does: a directory with no list sends as every session, and the
+//! login that adopts a database after a `purge` would otherwise hand the
+//! sessions held from before it back their account. The session the move
+//! carries, and the login's own, are let in after (`admit_session`).
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -34,7 +41,9 @@ use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
 
 use crate::config::{self, ConfigError};
-use crate::paths::{AppPaths, PathError, create_private_dir, rename_patiently};
+use crate::paths::{
+    AccountPaths, AppPaths, PathError, create_private_dir, rename_patiently, start_signed_out,
+};
 use crate::registry::{Registry, RegistryError};
 use crate::secrets::{Kind, SecretStore, SecretsError, Stored};
 use snob_core::Pk;
@@ -147,8 +156,12 @@ pub fn settle(paths: &AppPaths, secrets: &SecretStore) -> Result<Settled, Layout
     let session = match found {
         Some((session, backend)) => {
             // Made first: once the old copy is gone, a run that stops before
-            // the registry is written finds the account by its directory.
-            paths.account(session.ds_user_id).ensure_dirs()?;
+            // the registry is written finds the account by its directory. The
+            // session moved is the account's, as a login's is: one made here
+            // starts with nobody signed in (`AccountPaths::ensure_dirs`).
+            paths
+                .account(session.ds_user_id)
+                .admit_session(session.created_at)?;
             let account = secrets.session_of(&paths.account(session.ds_user_id));
             account.save_in(backend, &session)?;
             let back = account.load()?;
@@ -248,8 +261,29 @@ pub fn unadopt(paths: &AppPaths, pk: Pk) -> Result<bool, LayoutError> {
     move_database_files(&account.dir(), &staging)?;
     land(paths, &staging)?;
     // Unless something else is in it, such as a session file.
-    let _ = std::fs::remove_dir(account.dir());
+    remove_if_only_the_list(&account);
     Ok(true)
+}
+
+/// Removes the account's directory when all it holds is its list of who is
+/// signed in, as [`adopt`] made it and a login that did not happen left it.
+/// Moved aside first and removed there, so nothing finds the directory
+/// without its list on the way: with none it would send as every session.
+/// Gone, it refuses them all, as the list did.
+fn remove_if_only_the_list(account: &AccountPaths) {
+    let dir = account.dir();
+    let only_the_list = std::fs::read_dir(&dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .all(|entry| entry.path() == account.signed_in())
+    });
+    if !only_the_list {
+        return;
+    }
+    let aside = dir.with_extension(format!("leaving-{}", std::process::id()));
+    if rename_patiently(&dir, &aside).is_ok() {
+        let _ = std::fs::remove_dir_all(&aside);
+    }
 }
 
 /// The account a database says it belongs to, read without writing to it.
@@ -418,6 +452,15 @@ fn land(paths: &AppPaths, staging: &Path) -> Result<Option<PathBuf>, LayoutError
     }
 
     if !destination.exists() {
+        // An account's directory made by the rename starts as every other
+        // way of making one does, with nobody signed in.
+        if is_an_accounts(paths, &destination) {
+            start_signed_out(staging).map_err(|source| LayoutError::Io {
+                what: "write into",
+                path: staging.to_path_buf(),
+                source,
+            })?;
+        }
         rename(staging, &destination)?;
         return Ok(None);
     }
@@ -429,6 +472,16 @@ fn land(paths: &AppPaths, staging: &Path) -> Result<Option<PathBuf>, LayoutError
         source,
     })?;
     Ok(None)
+}
+
+/// Whether `dir` is an account's own directory, named after its id, as
+/// `AppPaths::account_dirs` finds them; `unclaimed` is nobody's.
+fn is_an_accounts(paths: &AppPaths, dir: &Path) -> bool {
+    dir.parent() == Some(paths.accounts_dir().as_path())
+        && dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.parse::<Pk>().is_ok())
 }
 
 /// Moves the database's files that are in `from` to the same names in `to`,

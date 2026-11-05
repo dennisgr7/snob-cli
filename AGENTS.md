@@ -202,8 +202,15 @@ with a documented reason in the same place.
   command run its own. Nothing that spends no network starts a browser.
 - **Allowlist.** Every call snob may send is a value in `snob_ig::allowlist`
   (call sites pass those values, never a path or a name). The tab's guard
-  (`headless::guard`) pauses every API call the page makes, the app's own
-  included: GETs go on, a POST only if `allowlist::refused` lets it.
+  (`headless::guard`) pauses every request the page's scripts make, and
+  every document, by its kind and whatever its address, the app's own
+  included: GETs go on, a POST only if `allowlist::refused` lets it, and
+  the view count, the event log and the Facebook sync fail whatever the
+  method. **A follow or an unfollow goes on only as snob's own write**:
+  the tab arms the guard with that request just before it fetches it
+  (`guard::Armed`), the first paused POST matching its address and form
+  exactly spends it, and every other one, the app's under any `doc_id`,
+  fails (`allowlist::refused_app`).
   `doc_id`s are discovered from the page's JavaScript, never hard-coded.
 - **Headers.** Every value is the page's, or computed from the User-Agent of
   the browser actually installed; what cannot be computed is left out. An
@@ -353,7 +360,39 @@ with a documented reason in the same place.
   starts it again into what is going, and **both holding the account's jobs
   lock until its session is gone** (an account that never ran a job
   included), since a start checks the session again under that lock and
-  makes nothing without one; `accounts.toml` changed only
+  makes nothing without one. **Then, before the browsers close, both sign
+  the account out for every other process** (`owner::sign_out`: the
+  account's `signed-in` list emptied, `AccountPaths::signed_in`, which names
+  the sessions that may be sent as by their `created_at`, compared for
+  equality only, so no clock set back can refuse a login): a walk typed
+  elsewhere, the monitor's run or an agent's call still holding a session
+  in memory is refused its next request, by itself, by the owner and by
+  the browser's holder once it has the account's browser (before every
+  start while it waits for the profile included), as exit 3 saying it was
+  signed out on this computer (`IgError::SignedOutHere`, never Instagram's
+  "expired"), and starts no browser on the profile going (one running its own browser
+  closes it within two seconds, and the profiles are removed once it has
+  let go, seen on Windows as on Unix, `headless::profile::in_use`). **It
+  stays refused through any later login**, which lets in its own session
+  only (`AccountPaths::admit_session`, before its check), a sessionid
+  pasted again included. **A session stored here and signed out of** (a
+  `logout` that could not remove it, or its account's directory gone) is
+  refused by every command at its start (`App::open`, and the checks
+  ahead of a job and of a write), exit 3 with the same sentence
+  (`report::SIGNED_OUT_HERE`); `snob status` reports it as no session,
+  with that sentence as the error's message, and `snob whoami` reports it
+  with `alive: false` and `not_checked: "signed_out"` (a value added).
+  An account directory that is gone, as `purge`
+  leaves it, refuses every session, and one made again (`ensure_dirs`, or
+  the layout's move landing one whole as a login adopts the database left
+  `unclaimed`) starts with nobody signed in; a directory with no list, as every one
+  made before the list existed, was never signed out of and refuses none
+  until its first sign-out or login: **a login starts a missing list with
+  its own session**, never reading it as "refuses none", since the
+  directory may be one another process has just made and is about to give
+  its empty list.
+  `SNOB_NO_BROWSER` sends with `reqwest`, which asks nothing of it.
+  `accounts.toml` changed only
   through `Registry::update` (file lock). `watch.toml` and `accounts.toml`
   are read with serde and written from a hand-written template, tested to
   round-trip. `snob status` and `--dry-run` write nothing. `snob purge`
@@ -405,7 +444,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   word for word and hands back on the same call only on a yes. A decline, a
   dismissal or a timeout in a form is a no, never a reason to ask in the
   chat. `--confirm-in-chat none|lists|all` (`all` when not given on stdio,
-  `lists` with `--listen`) says what the chat may cover; past it the call is `cannot_confirm`. Not
+  `lists` with `--listen`) says what the chat may cover; past it the call is `cannot_confirm`.
+  **It limits the chat route only**: a client that declares a form answers
+  it as it likes, so over `--listen` whoever holds the key can confirm a
+  write whatever it says (recorded as a yes given in a form). Not
   offered, ever: `login`, `logout`, `purge`, the monitor, `--same-day`,
   downloads (outside the request budget), any flag that writes a file.
 - **The yes comes from the client, not provably from the person.** The
@@ -669,9 +711,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   mandatory** (no key, exit 1 and a hint), because loopback TCP is
   reachable by every local user, unlike the owner's pipe; startup says its
   source and fingerprint, never the key, and with `--allow-writes` warns
-  that whoever holds it can call the writes (and confirm them in the chat
-  under `--confirm-in-chat all`). **The reverse does not hold: the server
-  does not prove itself to its clients.** A client or tunnel sends the key
+  that whoever holds it can call the writes and confirm them, in a form it
+  answers itself whatever `--confirm-in-chat` says (and in the chat too
+  under `all`). **The reverse does not hold: the server does not prove
+  itself to its clients.** A client or tunnel sends the key
   to whatever answers on the port, so another local user who binds it while
   snob is not listening is handed the key; `--listen` is for a machine where
   nobody else can run code, and startup says to replace the key if the
@@ -768,10 +811,12 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   separate from the wire models in `snob-ig`, which follow Instagram. A JSON
   shape change is a contract change.
 - **Every string from another person goes through `snob_core::model::printable`**
-  before it reaches a terminal or a JSON list (`output::readable`; a JSON
-  reader may be a model, and `serde_json` writes `Cf` as it is): all of `Cc`
-  and all of `Cf` removed, plus the invisible letters such as Hangul fillers
-  and the marks that draw nothing (the whole of `Default_Ignorable_Code_Point`:
+  before it reaches a terminal, a JSON list (`output::readable`) or a
+  monitor's report, printed or sent to a webhook (`watch/wire.rs`,
+  `account_json`), since a JSON reader may be a model and `serde_json` writes
+  `Cf` as it is. `printable` removes all of `Cc` and all of `Cf`, plus the
+  invisible letters such as Hangul fillers and the marks that draw nothing
+  (the whole of `Default_Ignorable_Code_Point`:
   the combining grapheme joiner, the Mongolian and supplementary variation
   selectors, U+FE00 to U+FE0D, and U+FE0E/U+FE0F anywhere but alone right
   after a symbol in the ranges where Unicode puts the bases of presentation
@@ -856,9 +901,25 @@ Platform-specific code, all of it reached only by the CI job on that OS:
   EcoQoS, the data directory's ACL, the keyring's local persistence, the
   language preference, `QueryUnbiasedInterruptTime` for sleep detection
   (`snob_ig::awake`). Static CRT and `/Brepro` via `.cargo/config.toml`.
-- Unix (`libc`): `dup2` of the CDP pipe ends onto fds 3 and 4, `setsid`
-  for a detached start (`detach.rs`), the owner's socket with `peer_cred`.
-  Linux adds a logind `idle` inhibitor (`zbus`) and `SCHED_BATCH`/`uclamp_max`;
+- Unix (`libc`): the CDP pipe made with `pipe2` (on macOS, which has
+  none, `pipe` and `fcntl(FD_CLOEXEC)`), its ends put onto fds 3 and 4
+  with `dup2` and `fcntl` clearing `FD_CLOEXEC` on one already there, the
+  parent's copies of the child's ends closed with `close`, the browser in
+  a process group of its own with `setpgid`, asked after and killed with
+  `kill`/`killpg` (`pipe.rs`), `setsid` for a detached start
+  (`detach.rs`), another snob's browser holding a profile asked after with
+  `kill(pid, 0)` and the machine's name from `gethostname`
+  (`headless/profile.rs`, `cdp/mod.rs`), the owner's lock with `flock`, and
+  `geteuid`, compared with `peer_cred`, for every socket that admits this
+  user alone: the owner's (`owner/socket.rs`), the relay's
+  (`relay/mod.rs`) and `snob mcp --listen socket`'s
+  (`commands/mcp/http/socket.rs`, root too); and `geteuid` to refuse
+  starting the browser as root (`headless::refuse_root`).
+  In `snob-store` (`paths.rs`), the scratch root is opened with
+  `O_DIRECTORY | O_NOFOLLOW`, made `0700` through the descriptor, and asked
+  its owner (`geteuid`) before it is made private or swept.
+  Linux adds a logind `idle` inhibitor (`zbus`) and `SCHED_BATCH`/`uclamp_max`
+  (`syscall` for `sched_setscheduler`/`sched_setattr`, `power/qos.rs`);
   macOS uses `caffeinate -i -w <pid>` and leaves the browser's scheduling
   alone.
 - TLS backend and `--strict-roots` differ on Windows ARM64 (see above).

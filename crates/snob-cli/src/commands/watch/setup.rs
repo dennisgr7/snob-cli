@@ -592,8 +592,9 @@ fn ask_webhook() -> Result<WebhookAnswers> {
     }
 
     let url = ui::prompt_line("Where? (https://n8n.local/webhook/snob)")?;
-    let parsed =
-        url::Url::parse(url.trim()).with_context(|| format!("\"{url}\" is not an address"))?;
+    // Not echoed, as nowhere else an address that does not parse is
+    // (`webhook::shown_str`): the person has just typed it.
+    let parsed = url::Url::parse(url.trim()).context("what was typed is not an address")?;
 
     // Headers whose values are not secret go in the file; the Authorization
     // value goes to the keyring and nothing about it is written here. An empty

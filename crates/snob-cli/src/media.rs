@@ -335,6 +335,15 @@ pub(crate) async fn save_story(
 /// steps and for the same reasons. `stem` is already filtered and is the
 /// whole name but its extension; `what` names the file in the sentence for
 /// one that offers no address; `cap` is the ceiling on its size.
+///
+/// **The stem passes `output::usable_stem` before anything is made of it.**
+/// `printable` leaves a `..`, a separator and a share name as they are, and
+/// the look for an earlier copy and the `.part` are paths built from the
+/// stem: checked only by `default_path` at the end, a name off the server
+/// such as `../x` was probed and streamed to outside `dir`, and on Windows
+/// one such as `\\host\share\x` reached for that host over SMB before the
+/// refusal.
+/// Refused here, nothing is looked at, created or sent.
 pub(crate) async fn save_named(
     client: &IgClient,
     stem: &str,
@@ -343,6 +352,7 @@ pub(crate) async fn save_named(
     cap: usize,
     dir: &Path,
 ) -> Result<Saved> {
+    output::usable_stem(stem)?;
     if let Some(existing) = already_saved(dir, stem) {
         return Ok(Saved::Already(existing));
     }
@@ -641,5 +651,45 @@ mod tests {
     #[test]
     fn an_unknown_expiry_is_not_reported_as_expired() {
         assert_eq!(remaining(None), "-");
+    }
+
+    /// A stem off the server that is no file name is refused before a path
+    /// is built from it: an earlier copy is not looked for outside the
+    /// directory (here one is waiting there, and was handed back as saved),
+    /// and no `.part` is made anywhere.
+    #[tokio::test]
+    async fn a_stem_that_is_no_file_name_is_refused_before_any_path_is_built() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("downloads");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(tmp.path().join("escaped-1.jpg"), b"theirs").unwrap();
+
+        let session = snob_core::session::Session::from_sessionid(
+            "42%3Aabc%3A1",
+            "Mozilla/5.0",
+            snob_core::session::SessionOrigin::Paste,
+        )
+        .unwrap();
+        let client = IgClient::new(session, snob_ig::pace::Pacer::unlimited()).unwrap();
+
+        // No address, so nothing could be sent whatever the order of the
+        // steps; what is under test is what is looked at and made first.
+        let saved = save_named(&client, "../escaped-1", None, "story 1", 1024, &dir).await;
+        let error = saved.err().expect("a stem with a separator was used");
+        assert!(
+            error.to_string().contains("cannot be used as a file name"),
+            "{error}"
+        );
+
+        let left: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            left.len(),
+            2,
+            "something was made beside the directory: {left:?}"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 }

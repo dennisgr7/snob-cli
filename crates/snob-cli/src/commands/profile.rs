@@ -880,7 +880,10 @@ fn clip(text: &str, width: usize) -> String {
 fn as_markdown(profile: &Profile) -> String {
     let mut s = String::new();
     let badges = badges(profile);
-    s.push_str(&format!("# @{}", profile.username));
+    // Every string the account or Instagram wrote goes through
+    // `md::escape`, which keeps HTML in it from being drawn; the address
+    // below is the one exception, and is encoded instead.
+    s.push_str(&format!("# @{}", output::md::escape(&profile.username)));
     if let Some(name) = &profile.full_name {
         s.push_str(&format!(" — {}", output::md::escape(name)));
     }
@@ -923,7 +926,7 @@ fn as_markdown(profile: &Profile) -> String {
     }
     if let Some(mutual) = &profile.mutual {
         if let Some(line) = followed_by_line(mutual) {
-            s.push_str(&format!("{line}.\n\n"));
+            s.push_str(&format!("{}.\n\n", output::md::escape(&line)));
         }
         if !mutual.people.is_empty() {
             for person in &mutual.people {
@@ -1158,6 +1161,36 @@ mod tests {
         assert!(md.contains("> first line\n> second line\n"), "{md}");
         assert!(md.contains("| 244 | 319 | 0 |"), "{md}");
         assert!(md.contains("## Highlights"), "{md}");
+    }
+
+    /// The profile document draws no HTML the account wrote, in its name,
+    /// its category, its bio, the names it shares with you or a highlight's
+    /// title: each is shown as text. The address is the one `<` and `>` of
+    /// the document, around an autolink.
+    #[test]
+    fn the_markdown_draws_no_html_the_account_wrote() {
+        let html = r#"<img src="https://somewhere.test/t.png">"#;
+        let mut profile = sample();
+        profile.full_name = Some(html.to_string());
+        profile.category = Some(html.to_string());
+        profile.biography = Some(format!("hello\n{html}"));
+        if let Some(mutual) = profile.mutual.as_mut() {
+            mutual.preview = vec![html.to_string()];
+        }
+        profile.highlights = Visibility::Shown(vec![Highlight {
+            id: "highlight:1".to_string(),
+            title: html.to_string(),
+            items: Some(1),
+            updated_at: None,
+        }]);
+        profile.external_url = Some("https://example.test/".to_string());
+
+        let md = as_markdown(&profile);
+        assert_eq!(md.matches('<').count(), 1, "{md}");
+        // The autolink's, and the quote marks of the bio's two lines.
+        assert_eq!(md.matches('>').count(), 1 + 2, "{md}");
+        assert!(md.contains("<https://example.test/>"), "{md}");
+        assert_eq!(md.matches("&lt;img").count(), 5, "{md}");
     }
 
     #[test]
