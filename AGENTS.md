@@ -202,8 +202,15 @@ with a documented reason in the same place.
   command run its own. Nothing that spends no network starts a browser.
 - **Allowlist.** Every call snob may send is a value in `snob_ig::allowlist`
   (call sites pass those values, never a path or a name). The tab's guard
-  (`headless::guard`) pauses every API call the page makes, the app's own
-  included: GETs go on, a POST only if `allowlist::refused` lets it.
+  (`headless::guard`) pauses every request the page's scripts make, and
+  every document, by its kind and whatever its address, the app's own
+  included: GETs go on, a POST only if `allowlist::refused` lets it, and
+  the view count, the event log and the Facebook sync fail whatever the
+  method. **A follow or an unfollow goes on only as snob's own write**:
+  the tab arms the guard with that request just before it fetches it
+  (`guard::Armed`), the first paused POST matching its address and form
+  exactly spends it, and every other one, the app's under any `doc_id`,
+  fails (`allowlist::refused_app`).
   `doc_id`s are discovered from the page's JavaScript, never hard-coded.
 - **Headers.** Every value is the page's, or computed from the User-Agent of
   the browser actually installed; what cannot be computed is left out. An
