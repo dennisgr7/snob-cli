@@ -4186,7 +4186,8 @@ mod tests {
     }
 
     /// The guard on the wire: what the page's own script sends is paused and
-    /// judged before it leaves. A Relay call the registry does not name, the
+    /// judged before it leaves, whatever its address. A Relay call the
+    /// registry does not name, a POST off the API's paths, a beacon, the
     /// view-count, sync and event-log paths (a GET of them included) and a
     /// piece of video never reach the site; a query of the registry's and a
     /// REST read do.
@@ -4215,11 +4216,16 @@ mod tests {
         // One after the other, so that once the last has arrived every one
         // before it has been judged.
         let calls = [
+            // A beacon, which the browser sends when it will.
+            "['/beacon/x', 'beacon']".to_string(),
             post(
                 "/api/graphql",
                 "SomeBadgeQuery",
                 &relay("SomeBadgeQuery", "1000000000000001"),
             ),
+            // Off every path the API is known under.
+            post("/web/likes/1/like/", "", "a=b"),
+            post("/stories/reel/seen", "", "a=b"),
             post("/video/x/", "", "a=b"),
             post("/sync/instagram/", "", "a=b"),
             post("/logging_client_events", "", "a=b"),
@@ -4235,7 +4241,9 @@ mod tests {
         ];
         let page = format!(
             "<!doctype html><title>site</title><script>(async () => {{ \
-             for (const [to, how] of [{}]) {{ try {{ await fetch(to, how); }} catch (e) {{}} }} \
+             for (const [to, how] of [{}]) {{ try {{ \
+             if (how === 'beacon') navigator.sendBeacon(to, 'a=b'); else await fetch(to, how); \
+             }} catch (e) {{}} }} \
              }})();</script>",
             calls.join(", ")
         );
@@ -4261,7 +4269,9 @@ mod tests {
         let received = loop {
             let received = server.received_requests().await.unwrap_or_default();
             if received.iter().any(|r| r.url.path() == "/api/v1/probe/") {
-                break received;
+                // A moment more for the beacon, which is not awaited.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                break server.received_requests().await.unwrap_or_default();
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -4288,7 +4298,10 @@ mod tests {
             assert!(reached.contains(&out), "{out} never arrived: {reached:?}");
         }
         for kept in [
+            "POST /beacon/x",
             "POST /api/graphql SomeBadgeQuery",
+            "POST /web/likes/1/like/",
+            "POST /stories/reel/seen",
             "POST /video/x/",
             "POST /sync/instagram/",
             "POST /logging_client_events",

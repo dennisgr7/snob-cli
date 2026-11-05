@@ -20,10 +20,11 @@
 //! **It is written for the calls snob sends, and the tab holds the app's
 //! to it too.** The app keeps running on each document the tab loads (the
 //! home page, a profile) and sends its own calls from it, seen signals among
-//! them. The browser pauses each of its API calls and judges a POST with
-//! [`refused`] before it leaves (`snob-cli`'s `headless::guard`), with one
-//! named exception there; its GETs go on, but for the three paths outside
-//! the API where it reports what was seen, which fail whatever the method.
+//! them. The browser pauses each request its scripts make, whatever its
+//! address, and judges a POST with [`refused`] before it leaves
+//! (`snob-cli`'s `headless::guard`), with one named exception there; its
+//! GETs go on, but for the three paths outside the API where it reports
+//! what was seen, which fail whatever the method.
 //!
 //! What [`refused`] lets out:
 //!

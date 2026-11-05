@@ -11,6 +11,16 @@
 //! requests pass. A call refused is failed as a content blocker fails one
 //! (`cdp::connection`), and said in the log.
 //!
+//! **Paused by what sends it, not only by where it goes** (`SENT_BY_A_PAGE`).
+//! A list of the API's paths is only as good as the app's habits: a POST
+//! under `/web/`, a beacon at the root or wherever Meta puts the next one
+//! would leave without a verdict. So every request a page's scripts make —
+//! `fetch`, XHR, a beacon, an event stream, what the browser calls other —
+//! and every document, a form posted among them, is paused whatever its
+//! address and host, and a POST among them that the allowlist does not name
+//! fails. Scripts, stylesheets, fonts and images are not paused by kind:
+//! they are GETs, which go on, and the paths below catch a pixel.
+//!
 //! **The app's own reads go on, by name and number.** Its boot calls ask for
 //! the promotions, the message badge's counts and what a profile says of its
 //! account, its posts and the accounts it suggests among them;
@@ -85,7 +95,15 @@ pub(super) fn video_patterns() -> Vec<Value> {
     ]
 }
 
-/// The one `Fetch.enable` a target gets: a second would replace it.
+/// The kinds of request, as the protocol names them, that are paused
+/// whatever their address: everything a page's scripts send (`fetch` is
+/// `Fetch`, `navigator.sendBeacon` is `Ping`), and the documents, where a
+/// form is posted. `Other` is what the browser files a request under when it
+/// is none of its kinds, which is where a new way of sending would land.
+const SENT_BY_A_PAGE: [&str; 6] = ["Document", "XHR", "Fetch", "EventSource", "Ping", "Other"];
+
+/// The one `Fetch.enable` a target gets: a second would replace it. A
+/// request is paused when any one pattern matches it.
 pub(super) fn patterns() -> Value {
     let api = [
         // The API, the app's and snob's.
@@ -104,6 +122,9 @@ pub(super) fn patterns() -> Value {
             .chain(events)
             .chain(facebook)
             .map(|pattern| json!({ "urlPattern": pattern, "requestStage": "Request" })),
+    );
+    patterns.extend(
+        SENT_BY_A_PAGE.map(|kind| json!({ "resourceType": kind, "requestStage": "Request" })),
     );
     json!({ "patterns": patterns })
 }
@@ -625,6 +646,66 @@ mod tests {
         let said = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
         assert!(said.contains("under another doc_id"), "{said}");
         assert!(said.contains("1000000000000002"), "{said}");
+    }
+
+    /// Whatever a page's scripts send, and every document, is paused by its
+    /// kind, with no address to miss it by; the kinds that only fetch what a
+    /// page shows are not.
+    #[test]
+    fn what_a_page_sends_is_paused_whatever_its_address() {
+        let all = patterns();
+        let kinds: Vec<&str> = all["patterns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p.get("urlPattern").is_none())
+            .filter_map(|p| p["resourceType"].as_str())
+            .collect();
+        for kind in ["Document", "XHR", "Fetch", "EventSource", "Ping", "Other"] {
+            assert!(kinds.contains(&kind), "{kind}: {kinds:?}");
+        }
+        for kind in ["Script", "Stylesheet", "Image", "Font", "Preflight"] {
+            assert!(!kinds.contains(&kind), "{kind}");
+        }
+    }
+
+    /// A POST off every path the API is known under fails as one on them
+    /// does, on any host and from any kind of request: a form posted, a
+    /// beacon, a fetch.
+    #[test]
+    fn a_post_off_the_apis_paths_fails() {
+        for url in [
+            format!("{SITE}/web/likes/1/like/"),
+            format!("{SITE}/stories/reel/seen"),
+            format!("{SITE}/qp/batch_fetch_web/"),
+            format!("{SITE}/"),
+            "https://graph.instagram.com/beacon".to_string(),
+            "https://example.com/collect".to_string(),
+        ] {
+            for kind in ["Fetch", "XHR", "Ping", "Document", "Other"] {
+                let mut post = paused(
+                    "POST",
+                    &url,
+                    json!({ "hasPostData": true, "postData": "a=b" }),
+                );
+                post["resourceType"] = json!(kind);
+                assert!(fails(&judge(&post)), "{kind} POST {url}");
+            }
+        }
+        // And a GET from any of them, a document, a fetch of the CDN, still
+        // goes on.
+        for (kind, url) in [
+            ("Document", format!("{SITE}/someone/")),
+            (
+                "Fetch",
+                "https://scontent.cdninstagram.com/v/t51/x.jpg".into(),
+            ),
+            ("Other", format!("{SITE}/favicon.ico")),
+        ] {
+            let mut get = paused("GET", &url, json!({}));
+            get["resourceType"] = json!(kind);
+            assert_eq!(judge(&get), Paused::Continue, "{kind} GET {url}");
+        }
     }
 
     /// Every pattern is at the request stage, and only the Facebook ones
