@@ -231,8 +231,8 @@ url = "2"
 # Only for the Unix half of that: `dup2` in a `pre_exec` hook is what puts the
 # two pipe ends in front of the browser as descriptors 3 and 4. Windows needs
 # no such crate -- it goes through `windows-sys`, which is already here.
-# `snob-cli` also takes it wherever `std` stops short on Unix (`setsid`,
-# `geteuid`, `kill`, `flock`, the scheduler's calls), each use saying why.
+# `snob-cli` also takes it wherever `std` stops short on Unix, each use
+# saying why; the list of them is kept in one place, AGENTS.md "Platforms".
 # `snob-store` takes it for `geteuid` and the `O_DIRECTORY`/`O_NOFOLLOW` flags:
 # the scratch root is opened without following a link, made `0700` through
 # that descriptor, and asked who owns it (`paths.rs`).
