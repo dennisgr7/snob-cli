@@ -363,7 +363,25 @@ pub fn shown(url: &Url) -> String {
             .map_or_else(String::new, |at| format!("/{}", segments[..=at].join("/")));
         clean.set_path(&format!("{kept}/{HIDDEN}"));
     }
-    clean.to_string()
+    let text = clean.to_string();
+    match clean
+        .host_str()
+        .and_then(|host| secret_host(host).map(|keep| (host, keep)))
+    {
+        // The scheme comes first and never holds the host, so the first
+        // occurrence is the host's own.
+        Some((host, keep)) => text.replacen(host, &format!("{HIDDEN}.{keep}"), 1),
+        None => text,
+    }
+}
+
+/// Whether `host` is itself a receiver's credential, and if so, the part of
+/// it that may be shown: Pipedream's `<secret>.m.pipedream.net` names the
+/// endpoint by its first label alone.
+fn secret_host(host: &str) -> Option<&'static str> {
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    host.ends_with(".m.pipedream.net")
+        .then_some("m.pipedream.net")
 }
 
 /// Whether `host` is a receiver whose path is its credential, and if so, the
@@ -376,8 +394,13 @@ pub fn shown(url: &Url) -> String {
 /// `outlook.office.com` and `outlook.office365.com`, Make's as Integromat).
 /// A host matched here that is not such a receiver only has its path hidden,
 /// which reveals nothing, so the rules lean wide.
+///
+/// **In any case**: the `url` crate lowercases the host of an `https`
+/// address, but not of one under a mistyped scheme (`htps://Hooks.Slack.com`),
+/// which a hand-edited file can hold and `watch status` still shows.
 fn secret_path(host: &str) -> Option<Option<&'static str>> {
-    let host = host.strip_suffix('.').unwrap_or(host);
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    let host = host.as_str();
     let on = |domain: &str| {
         host == domain
             || host
@@ -390,12 +413,16 @@ fn secret_path(host: &str) -> Option<Option<&'static str>> {
         "hooks.zapier.com" => Some(Some("catch")),
         "maker.ifttt.com" => Some(Some("trigger")),
         "outlook.office.com" | "outlook.office365.com" => Some(Some("webhook")),
+        "webexapis.com" => Some(Some("incoming")),
+        "media.guilded.gg" => Some(Some("webhooks")),
+        _ if host.ends_with(".cloud.mattermost.com") => Some(Some("hooks")),
         _ if host.ends_with(".webhook.office.com") => Some(Some("webhookb2")),
         _ if host.starts_with("hook.")
             && (host.ends_with(".make.com") || host.ends_with(".integromat.com")) =>
         {
             Some(None)
         }
+        _ if secret_host(host).is_some() => Some(None),
         _ => None,
     }
 }
@@ -978,6 +1005,27 @@ mod tests {
             (
                 "https://hook.eu1.make.com./TOKEN",
                 "https://hook.eu1.make.com./...",
+            ),
+            (
+                "https://webexapis.com/v1/webhooks/incoming/TOKEN",
+                "https://webexapis.com/v1/webhooks/incoming/...",
+            ),
+            (
+                "https://media.guilded.gg/webhooks/123/TOKEN",
+                "https://media.guilded.gg/webhooks/...",
+            ),
+            (
+                "https://team.cloud.mattermost.com/hooks/KEY",
+                "https://team.cloud.mattermost.com/hooks/...",
+            ),
+            (
+                "https://eoSECRET.m.pipedream.net/anything",
+                "https://....m.pipedream.net/...",
+            ),
+            // A mistyped scheme keeps the host's case as it was written.
+            (
+                "htps://Hooks.Slack.com/services/T0/B0/XXXXsecret",
+                "htps://Hooks.Slack.com/services/...",
             ),
         ] {
             let url = Url::parse(address).unwrap();

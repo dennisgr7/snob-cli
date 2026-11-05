@@ -901,14 +901,19 @@ Platform-specific code, all of it reached only by the CI job on that OS:
   EcoQoS, the data directory's ACL, the keyring's local persistence, the
   language preference, `QueryUnbiasedInterruptTime` for sleep detection
   (`snob_ig::awake`). Static CRT and `/Brepro` via `.cargo/config.toml`.
-- Unix (`libc`): the CDP pipe made with `pipe2` and its ends put onto
-  fds 3 and 4 with `dup2`, the browser in a process group of its own with
-  `setpgid`, asked after and killed with `kill`/`killpg` (`pipe.rs`),
-  `setsid` for a detached start (`detach.rs`), another snob's browser
-  holding a profile asked after with `kill(pid, 0)` and the machine's name
-  from `gethostname` (`headless/profile.rs`, `cdp/mod.rs`), the owner's socket with `peer_cred` and its lock
-  with `flock` (`owner/socket.rs`), `geteuid` to refuse starting the
-  browser as root (`headless::refuse_root`).
+- Unix (`libc`): the CDP pipe made with `pipe2` (on macOS, which has
+  none, `pipe` and `fcntl(FD_CLOEXEC)`), its ends put onto fds 3 and 4
+  with `dup2` and `fcntl` clearing `FD_CLOEXEC` on one already there, the
+  browser in a process group of its own with `setpgid`, asked after and
+  killed with `kill`/`killpg` (`pipe.rs`), `setsid` for a detached start
+  (`detach.rs`), another snob's browser holding a profile asked after with
+  `kill(pid, 0)` and the machine's name from `gethostname`
+  (`headless/profile.rs`, `cdp/mod.rs`), the owner's lock with `flock`, and
+  `geteuid`, compared with `peer_cred`, for every socket that admits this
+  user alone: the owner's (`owner/socket.rs`), the relay's
+  (`relay/mod.rs`) and `snob mcp --listen socket`'s
+  (`commands/mcp/http/socket.rs`, root too); and `geteuid` to refuse
+  starting the browser as root (`headless::refuse_root`).
   In `snob-store` (`paths.rs`), the scratch root is opened with
   `O_DIRECTORY | O_NOFOLLOW`, made `0700` through the descriptor, and asked
   its owner (`geteuid`) before it is made private or swept.
