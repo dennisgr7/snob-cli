@@ -755,6 +755,7 @@ async fn finish(
     // session expired, then costs the one request the check needs. So a
     // renamed account keeps its old name through a login, until
     // `snob whoami` reads the new one off the browser's document.
+    let kept = previous.as_ref().map(|previous| previous.created_at);
     if session.username.is_none() {
         session.username = previous.and_then(|previous| previous.username);
     }
@@ -766,8 +767,10 @@ async fn finish(
     // or purge of the account signed out every session it had then, and this
     // one is a login's own (`owner::signed_out`). Pasting the very sessionid
     // a logout signed out of makes a session of its own, let in here; the
-    // one a walk still holds from before stays refused.
-    account.admit_session(session.created_at)?;
+    // one a walk still holds from before stays refused. The session stored
+    // before is let in with it on a directory from before the list, so a
+    // check that fails leaves that one working (`admit_login`).
+    account.admit_login(session.created_at, kept)?;
     ui::info("Checking the session against Instagram...");
     let validated = login::validate(&mut session, pacer).await;
     let rejected = matches!(

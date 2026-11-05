@@ -490,6 +490,31 @@ impl AccountPaths {
             })
     }
 
+    /// Lets a login's session, made at `made`, in ([`Self::admit_session`]),
+    /// where `kept` is the session stored for the account before it, if any.
+    ///
+    /// **A login that fails leaves what worked before working.** A login is
+    /// let in before Instagram is asked about it, and a failed one is not
+    /// taken back out. On a directory with a list, that only adds a line.
+    /// On one a version before the list made (no list, so every session is
+    /// sent as), it would start a list naming the failed login alone, and
+    /// the session still stored would be refused from then on. So there the
+    /// stored one is let in first. After a `purge` nothing is stored, so
+    /// nothing from before is let back in that way.
+    pub fn admit_login(
+        &self,
+        made: snob_core::Epoch,
+        kept: Option<snob_core::Epoch>,
+    ) -> Result<(), PathError> {
+        if let Some(kept) = kept
+            && self.dir().is_dir()
+            && !self.signed_in().try_exists().unwrap_or(true)
+        {
+            self.admit_session(kept)?;
+        }
+        self.admit_session(made)
+    }
+
     /// Whether the session made at `made` may no longer be sent as: the
     /// account was signed out of here since, and no login let that session
     /// in again ([`Self::signed_in`]); or the account's directory is gone, as
@@ -1553,6 +1578,37 @@ mod tests {
         create_private_dir(&account.dir()).unwrap();
         start_signed_out(&account.dir()).unwrap();
         account.admit_session(login).unwrap();
+        assert!(!account.refuses_session(login));
+    }
+
+    /// On a directory from before the list, a login that then fails leaves
+    /// the session stored before it let in; with a list, or with nothing
+    /// stored, only the login is.
+    #[test]
+    fn a_failed_login_on_an_old_directory_keeps_the_stored_session_let_in() {
+        let root = tempfile::tempdir().unwrap();
+        let account = AppPaths::rooted_at(root.path()).account(snob_core::Pk::new(42));
+        let (stored, login) = (
+            snob_core::Epoch::new(1_700_000_000),
+            snob_core::Epoch::new(1_800_000_000),
+        );
+
+        // As 0.8.0 left it: the directory, and no list in it.
+        create_private_dir(&account.dir()).unwrap();
+        account.admit_login(login, Some(stored)).unwrap();
+        assert!(!account.refuses_session(stored), "what worked still works");
+        assert!(!account.refuses_session(login));
+
+        // Signed out of since: the stored one stays refused.
+        account.sign_out().unwrap();
+        account.admit_login(login, Some(stored)).unwrap();
+        assert!(account.refuses_session(stored));
+        assert!(!account.refuses_session(login));
+
+        // Made again after a purge: nothing from before is let in.
+        std::fs::remove_dir_all(account.dir()).unwrap();
+        account.admit_login(login, None).unwrap();
+        assert!(account.refuses_session(stored));
         assert!(!account.refuses_session(login));
     }
 
