@@ -22,7 +22,8 @@
 //! home page, a profile) and sends its own calls from it, seen signals among
 //! them. The browser pauses each of its API calls and judges a POST with
 //! [`refused`] before it leaves (`snob-cli`'s `headless::guard`), with one
-//! named exception there; its GETs go on.
+//! named exception there; its GETs go on, but for the three paths outside
+//! the API where it reports what was seen, which fail whatever the method.
 //!
 //! What [`refused`] lets out:
 //!

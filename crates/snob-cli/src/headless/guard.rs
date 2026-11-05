@@ -32,7 +32,10 @@
 //! under them: the view-count path (`/video/`, never spelled out here), the
 //! app's event log, and the sync it runs with Facebook, whose hosts are the
 //! only ones the patterns name. Everything else has no host, so a sandbox's
-//! fake is judged the same way.
+//! fake is judged the same way. **These fail whatever the method** (`EVENTS`):
+//! a GET carries a signal in its query, or as a pixel, as well as a POST does
+//! in its form. The one GET that goes on is the tab's own navigation to a
+//! profile whose name happens to be one of them (`/video/` is somebody's).
 //!
 //! **What it cannot see**: the app's realtime socket, and a route the app
 //! takes inside the page, which is not a request. snob never clicks, and the
@@ -50,7 +53,7 @@
 
 use base64::Engine as _;
 use serde_json::{Value, json};
-use snob_ig::allowlist::{Operation, Rediscovered, refused_app};
+use snob_ig::allowlist::{Operation, Rediscovered, document, refused_app};
 use snob_ig::client::page::{Method, PageRequest};
 use url::Url;
 
@@ -65,6 +68,12 @@ const CLAIM_HANDED_OUT: &str = "/api/v1/web/fxcal/ig_sso_users/";
 /// Why a call to Facebook is refused.
 const FACEBOOK: &str = "the app's sync with Facebook";
 
+/// Where the app reports, outside the API, what was seen and done: the view
+/// count, its event log and the sync with Facebook. Each is paused wherever
+/// it appears in an address ([`patterns`]) and failed whatever the method
+/// when a path starts with it ([`judge`]); no call snob makes is under any.
+const EVENTS: [&str; 3] = ["/video/", "/logging_client_events", "/sync/instagram"];
+
 /// Every piece of video the site would load, feed and reels and stories
 /// alike.
 pub(super) fn video_patterns() -> Vec<Value> {
@@ -78,23 +87,22 @@ pub(super) fn video_patterns() -> Vec<Value> {
 
 /// The one `Fetch.enable` a target gets: a second would replace it.
 pub(super) fn patterns() -> Value {
-    let judged = [
+    let api = [
         // The API, the app's and snob's.
         "*/api/graphql*",
         "*/graphql/query*",
         "*/ajax/*",
         "*/api/v1/*",
-        // What the app sends outside the API and snob never does.
-        "*/video/*",
-        "*/logging_client_events*",
-        "*/sync/instagram*",
-        "*://facebook.com/*",
-        "*://*.facebook.com/*",
-    ];
+    ]
+    .map(str::to_string);
+    // What the app sends outside the API and snob never does.
+    let events = EVENTS.map(|event| format!("*{event}*"));
+    let facebook = ["*://facebook.com/*", "*://*.facebook.com/*"].map(str::to_string);
     let mut patterns = video_patterns();
     patterns.extend(
-        judged
-            .into_iter()
+        api.into_iter()
+            .chain(events)
+            .chain(facebook)
             .map(|pattern| json!({ "urlPattern": pattern, "requestStage": "Request" })),
     );
     json!({ "patterns": patterns })
@@ -120,7 +128,12 @@ pub(super) fn judge(params: &Value, found: &Rediscovered) -> Paused {
     let path = parsed
         .as_ref()
         .map_or("an address that does not parse", Url::path);
-    match request["method"].as_str() {
+    let method = request["method"].as_str();
+    if is_an_event(path) && !(method == Some("GET") && a_profile_loaded(params, path)) {
+        let method = method.unwrap_or("a request with no method to");
+        return Paused::Fail(format!("{method} {path}"));
+    }
+    match method {
         Some("GET") => Paused::Continue,
         Some("POST") => judge_post(request, url, path, found),
         Some(other) => Paused::Fail(format!("{other} {path}")),
@@ -237,6 +250,19 @@ fn warn_of_a_rotation(form: Option<&str>) {
             "the app sent one of the registry's operations under another doc_id"
         );
     }
+}
+
+/// Whether `path` is under one of [`EVENTS`].
+fn is_an_event(path: &str) -> bool {
+    EVENTS.iter().any(|event| path.starts_with(event))
+}
+
+/// Whether the paused request is a document the tab loads, a profile's own
+/// page (`snob_ig::allowlist::document`): the one way a GET of a path that
+/// starts like one of [`EVENTS`] is not the app's signal, since an account
+/// may be called `video`.
+fn a_profile_loaded(params: &Value, path: &str) -> bool {
+    params["resourceType"] == "Document" && document(path)
 }
 
 /// A piece of video, by its address.
@@ -437,15 +463,42 @@ mod tests {
         assert!(fails(&judge(&paused("POST", &beside, json!({})))));
     }
 
+    /// The view count, the event log and the sync fail as a GET too, a
+    /// pixel or a query string being as good a carrier as a form.
     #[test]
-    fn the_paths_outside_the_api_fail() {
-        for path in ["/video/x/", "/sync/instagram/", "/logging_client_events"] {
+    fn the_paths_outside_the_api_fail_whatever_the_method() {
+        for path in [
+            "/video/x/",
+            "/video/x/?media=1",
+            "/sync/instagram/",
+            "/logging_client_events",
+            "/logging_client_events?e=1",
+        ] {
+            let url = format!("{SITE}{path}");
             let post = paused(
                 "POST",
-                &format!("{SITE}{path}"),
+                &url,
                 json!({ "hasPostData": true, "postData": "a=b" }),
             );
-            assert!(fails(&judge(&post)), "{path}");
+            assert!(fails(&judge(&post)), "POST {path}");
+            for kind in ["Fetch", "XHR", "Image", "Ping", "Document"] {
+                let mut get = paused("GET", &url, json!({}));
+                get["resourceType"] = json!(kind);
+                assert!(fails(&judge(&get)), "GET {path} as {kind}");
+            }
+        }
+    }
+
+    /// An account may be called `video`: the tab loading its profile is not
+    /// the view count, though a fetch of the same address would be.
+    #[test]
+    fn a_profile_named_like_an_event_path_still_loads() {
+        for path in ["/video/", "/logging_client_events/"] {
+            let mut load = paused("GET", &format!("{SITE}{path}"), json!({}));
+            load["resourceType"] = json!("Document");
+            assert_eq!(judge(&load), Paused::Continue, "{path}");
+            load["resourceType"] = json!("Fetch");
+            assert!(fails(&judge(&load)), "{path}");
         }
     }
 
