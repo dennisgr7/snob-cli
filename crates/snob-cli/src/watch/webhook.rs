@@ -331,11 +331,22 @@ const HIDDEN: &str = "...";
 /// service. For those hosts the path stops at the segment that names the
 /// service, which is still enough to recognize, or goes whole where no
 /// segment does (Make's, or one of those hosts' paths without the segment).
+///
+/// **An address with no host is shown as one that does not parse**
+/// ([`unparsed`]). A hand-edited one that lost its scheme but has a colon
+/// before its first `/` parses all the same, as an opaque URL whose scheme is
+/// whatever came before the colon: `alice:hunter2@n8n.local/hook` has the
+/// scheme `alice` and the path `hunter2@n8n.local/hook`, and
+/// `hooks.slack.com:443/services/...` the scheme `hooks.slack.com`. There is
+/// no userinfo to clear and no host to judge the path by, so the rules above
+/// would show it as it came, password or secret path included.
 pub fn shown(url: &Url) -> String {
+    if url.host_str().is_none() {
+        return unparsed(url.as_str());
+    }
     let mut clean = url.clone();
-    // Both calls fail only on a URL that cannot have a host -- `mailto:`, say --
-    // which `check` refuses anyway. Nothing is lost by leaving the address as
-    // it was in that case: there is no userinfo to clear.
+    // Both calls fail only on a URL that cannot have a host, which is shown
+    // above as one that does not parse.
     let _ = clean.set_username("");
     let _ = clean.set_password(None);
     if clean.query().is_some_and(|query| !query.is_empty()) {
@@ -853,6 +864,28 @@ mod tests {
             shown_str("https://[fd00::1]:99999/hook"),
             "https://[fd00::1]/..."
         );
+    }
+
+    /// An address that lost its scheme but has a colon before its first `/`
+    /// parses, as an opaque URL with no host, and is shown as one that does
+    /// not: its "scheme" is a user or a host, and its "path" a password or a
+    /// secret path.
+    #[test]
+    fn an_address_with_no_host_is_shown_as_one_that_does_not_parse() {
+        for (address, expected) in [
+            ("alice:hunter2@n8n.local/hook", "n8n.local/..."),
+            (
+                "hooks.slack.com:443/services/T0/B0/XXXXsecret",
+                "hooks.slack.com/...",
+            ),
+        ] {
+            let url = Url::parse(address).expect("an opaque URL parses");
+            assert!(url.cannot_be_a_base(), "{address}");
+            assert_eq!(shown(&url), expected, "{address}");
+            assert_eq!(shown_str(address), expected, "{address}");
+            let said = without_address(&format!("no answer from {address}"), &url);
+            assert_eq!(said, format!("no answer from {expected}"));
+        }
     }
 
     /// Where the path is the credential, the path is what goes.
