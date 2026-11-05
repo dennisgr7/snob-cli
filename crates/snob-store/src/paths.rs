@@ -430,10 +430,9 @@ impl AccountPaths {
     /// with this one line, never read as "every session is sent as", since
     /// the directory may be one another process has just made and is about
     /// to give its empty list ([`Self::ensure_dirs`]), which would then
-    /// refuse this login. So an old directory with no list starts one at its
-    /// first login, and from then on refuses the sessions that login
-    /// replaced, as any directory with a list does: a walk started before it
-    /// on the session stored then stops at its next request.
+    /// refuse this login. A login lets the session stored before it in with
+    /// it on an old directory with no list ([`Self::admit_login`]), so there
+    /// a first login only adds to what was sent as already.
     ///
     /// **Kept to [`SIGNED_IN_KEPT`] sessions**, the earliest let in going
     /// first: a session that many logins ago is refused, and a walk still
@@ -501,16 +500,37 @@ impl AccountPaths {
     /// the session still stored would be refused from then on. So there the
     /// stored one is let in first. After a `purge` nothing is stored, so
     /// nothing from before is let back in that way.
+    ///
+    /// **Only by making the list, never by adding to one**: both lines are
+    /// written in the one step that creates it. A list there already, a
+    /// logout's or a purge's made a moment ago included, is left to name
+    /// what it names, and only the login's own line goes onto it; adding the
+    /// stored session to it would let back in the very session that logout
+    /// signed out.
     pub fn admit_login(
         &self,
         made: snob_core::Epoch,
         kept: Option<snob_core::Epoch>,
     ) -> Result<(), PathError> {
+        use std::io::Write as _;
         if let Some(kept) = kept
             && self.dir().is_dir()
-            && !self.signed_in().try_exists().unwrap_or(true)
         {
-            self.admit_session(kept)?;
+            let list = self.signed_in();
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&list)
+            {
+                Ok(mut file) => {
+                    let lines = format!("{}\n{}\n", kept.get(), made.get());
+                    return file
+                        .write_all(lines.as_bytes())
+                        .map_err(|source| PathError::Write { path: list, source });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(source) => return Err(PathError::Write { path: list, source }),
+            }
         }
         self.admit_session(made)
     }
