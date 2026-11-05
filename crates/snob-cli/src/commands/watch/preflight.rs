@@ -70,9 +70,18 @@ pub(super) async fn preflight(
         }
     };
 
-    // A missing session is one finding among several here, not a refusal.
+    // A missing session is one finding among several here, not a refusal,
+    // and so is one this computer no longer sends as: the one refusal
+    // `App::open` gives with the no-session code.
+    let mut problem = check::Problem::NoSession;
     let opened = match account {
-        Some(account) => App::open(&secrets.session_of(account), account, false)?,
+        Some(account) => match App::open(&secrets.session_of(account), account, false) {
+            Err(e) if crate::exit::from_chain(&e) == Some(crate::exit::ExitCode::NoSession) => {
+                problem = check::Problem::SignedOutHere;
+                None
+            }
+            opened => opened?,
+        },
         None => None,
     };
     match opened {
@@ -93,7 +102,7 @@ pub(super) async fn preflight(
                 backend: secrets.backend().as_str(),
             },
             verdict: Verdict::Failed,
-            problem: Some(check::Problem::NoSession),
+            problem: Some(problem),
         }),
     }
 

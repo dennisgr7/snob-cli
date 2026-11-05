@@ -52,7 +52,9 @@ pub fn outcome_of(number: i32) -> Option<ExitCode> {
 /// read must not change the answer.
 pub fn from_ig_error(e: &IgError) -> ExitCode {
     match e {
-        IgError::SessionExpired | IgError::UserAgentMismatch => ExitCode::NoSession,
+        IgError::SessionExpired | IgError::SignedOutHere | IgError::UserAgentMismatch => {
+            ExitCode::NoSession
+        }
         IgError::Challenge { .. } | IgError::Checkpoint { .. } => ExitCode::Challenge,
         // `InCooldown` is the backstop in `Pacer::clear` answering, and it
         // exits the same way the explicit gates in front of it do. They all
@@ -341,6 +343,7 @@ mod tests {
     #[test]
     fn what_instagram_said_decides_the_code() {
         assert_eq!(from_ig_error(&IgError::SessionExpired), ExitCode::NoSession);
+        assert_eq!(from_ig_error(&IgError::SignedOutHere), ExitCode::NoSession);
         assert_eq!(
             from_ig_error(&IgError::Checkpoint { url: None }),
             ExitCode::Challenge

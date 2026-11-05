@@ -374,7 +374,7 @@ async fn serve_commands<R: AsyncRead + Unpin>(
                 request,
             } => {
                 if super::signed_out(&state.paths, &session) {
-                    let answer = Err(PageError::LoggedOut);
+                    let answer = Err(PageError::SignedOutHere);
                     let _ = outgoing.send(FromOwner::Answer { id, answer });
                     continue;
                 }
@@ -387,7 +387,7 @@ async fn serve_commands<R: AsyncRead + Unpin>(
             }
             ToOwner::Ask { id, session, call } => {
                 if super::signed_out(&state.paths, &session) {
-                    let told = Err(PageError::LoggedOut);
+                    let told = Err(PageError::SignedOutHere);
                     let _ = outgoing.send(FromOwner::Told { id, told });
                     continue;
                 }

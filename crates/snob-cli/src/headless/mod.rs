@@ -915,8 +915,10 @@ impl Headless {
     /// a `logout` or `purge` may have begun while it waited for it, or while
     /// the browser started, and a browser started for it would make the
     /// profile being removed again, with the session's cookies written in
-    /// (`sync_cookies`). Asked before the browser starts and again before
-    /// the session is handed to it, closing a browser started for it.
+    /// (`sync_cookies`). Asked before the browser starts, before every
+    /// start while it waits for another snob's browser to let go of the
+    /// profile ([`Self::start_when_free`]), and again before the session is
+    /// handed to it, closing a browser started for it.
     async fn on_ready_tab<T>(
         &self,
         session: &Session,
@@ -938,13 +940,10 @@ impl Headless {
                 if starts > 0 {
                     account.close(&mut slot).await;
                 }
-                return Err(PageError::LoggedOut);
+                return Err(PageError::SignedOutHere);
             }
             if slot.is_none() {
-                let started = self
-                    .start_when_free(session, &account)
-                    .await
-                    .map_err(broken)?;
+                let started = self.start_when_free(session, &account).await?;
                 starts += 1;
                 account.touch();
                 *slot = Some(started);
@@ -1081,20 +1080,33 @@ impl Headless {
     /// holds the profile: looked at again every [`PROFILE_RETRY`], until
     /// Ctrl+C. Said once per wait. In the owner, once the browser before it
     /// has let go of the profile, for up to [`PROFILE_LETTING_GO`].
-    async fn start_when_free(&self, session: &Session, account: &Account) -> Result<Live> {
+    ///
+    /// **Asks whether the session was signed out of before every start**
+    /// (`owner::signed_out`), and starts nothing once it was: the wait may
+    /// last minutes, a `logout` may come in it, and the browser holding the
+    /// profile then closes and the profile goes, which a start would make
+    /// again, or race the removal of.
+    async fn start_when_free(
+        &self,
+        session: &Session,
+        account: &Account,
+    ) -> Result<Live, PageError> {
         let mut told = false;
         let mut waited = Duration::ZERO;
         loop {
+            if crate::owner::signed_out(&self.paths, session) {
+                return Err(PageError::SignedOutHere);
+            }
             let error = match self.start(session, account).await {
                 Err(e) => e,
-                started => return started,
+                Ok(started) => return Ok(started),
             };
             let Some(in_use) = error.downcast_ref::<crate::cdp::ProfileInUse>() else {
-                return Err(error);
+                return Err(broken(error));
             };
             if !self.waits.load(Ordering::SeqCst) {
                 let Some(pause) = letting_go(in_use.handed_over(), waited) else {
-                    return Err(error);
+                    return Err(broken(error));
                 };
                 tracing::debug!(
                     waited_ms = waited.as_millis(),
@@ -1115,7 +1127,7 @@ impl Headless {
                 .sleep_or_cancel(PROFILE_RETRY)
                 .await
             {
-                return Err(error);
+                return Err(broken(error));
             }
         }
     }
@@ -1964,10 +1976,33 @@ mod tests {
             .send_as(&made("42%3Asigned%3A1", 1_000), answer(&server))
             .await
             .unwrap_err();
-        assert!(matches!(error, PageError::LoggedOut), "{error:?}");
+        assert!(matches!(error, PageError::SignedOutHere), "{error:?}");
         assert!(headless.account(pk).live.lock().await.is_none());
         assert!(!paths.browser_profile_for(pk).exists());
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A start that waits for another snob's browser to let go of the
+    /// profile asks before every try whether the session was signed out of
+    /// meanwhile, and starts nothing once it was: not the profile a `logout`
+    /// is removing, nor a browser on it. Asked here straight, as a sign-out
+    /// that came during the wait finds it; no browser is needed.
+    #[tokio::test]
+    async fn a_start_waiting_for_the_profile_starts_nothing_once_signed_out() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = never_signed_out(root.path());
+        let headless = Headless::new(paths.clone());
+        let pk = Pk::new(42);
+        paths.account(pk).sign_out().unwrap();
+
+        let session = made("42%3Awaiting%3A1", 1_000);
+        let error = headless
+            .start_when_free(&session, &headless.account(pk))
+            .await
+            .err()
+            .expect("nothing is started");
+        assert!(matches!(error, PageError::SignedOutHere), "{error:?}");
+        assert!(!paths.browser_profile_for(pk).exists());
     }
 
     /// Says why a test that needs a browser does not run, or fails it where
