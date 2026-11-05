@@ -768,9 +768,11 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   separate from the wire models in `snob-ig`, which follow Instagram. A JSON
   shape change is a contract change.
 - **Every string from another person goes through `snob_core::model::printable`**
-  before it reaches a terminal or a JSON list (`output::readable`; a JSON
-  reader may be a model, and `serde_json` writes `Cf` as it is): all of `Cc`
-  and all of `Cf` removed, plus the invisible letters such as Hangul fillers
+  before it reaches a terminal, a JSON list (`output::readable`) or a
+  monitor's report, printed or sent to a webhook (`watch/wire.rs`,
+  `account_json`); a JSON reader may be a model, and `serde_json` writes `Cf`
+  as it is: all of `Cc` and all of `Cf` removed, plus the invisible letters
+  such as Hangul fillers
   and the marks that draw nothing (the whole of `Default_Ignorable_Code_Point`:
   the combining grapheme joiner, the Mongolian and supplementary variation
   selectors, U+FE00 to U+FE0D, and U+FE0E/U+FE0F anywhere but alone right
