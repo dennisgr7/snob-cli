@@ -270,6 +270,25 @@ pub fn execute(
         remove_if_empty(dir.parent());
     }
 
+    // An account directory that did not go whole may have lost, with what
+    // did go, the list of who is signed in, which no list means everybody
+    // (`AccountPaths::signed_in`): on Windows a database another snob still
+    // holds open keeps its directory and nothing beside it. Signed out again,
+    // so a session held from before stays refused there. One that went is
+    // refused for being gone, and made again starts with nobody signed in,
+    // so nothing is written when every directory went: a login may already
+    // have let its session into one made again.
+    let left = match &plan.only {
+        _ if failures.iter().all(|failure| failure.credential) => Vec::new(),
+        Some(account) => vec![account.pk],
+        None => app_paths.account_dirs(),
+    };
+    for pk in left {
+        if let Err(e) = app_paths.account(pk).sign_out() {
+            tracing::debug!(account = %pk, error = %e, "could not sign out again what was left");
+        }
+    }
+
     // Its push-backs, which every other account reads from `shared.db`. A
     // purge of everything takes the file whole with the data directory.
     if let Some(account) = &plan.only
@@ -372,7 +391,8 @@ pub async fn run_for_account(
     // it. The owner and the other accounts' browsers stay.
     let stopping = crate::jobs::stop_before_leaving(vec![app_paths.account(pk)]).await?;
     // And every other process running as it is refused its next request
-    // (`owner::sign_out`), so none starts the browser again on what goes.
+    // (`owner::sign_out`), so none starts the browser again on what goes,
+    // and none sends again once a login has made the directory again.
     crate::owner::sign_out(app_paths, &[pk]);
     crate::owner::release(app_paths, Some(pk)).await;
     crate::owner::let_go_of(&[app_paths.browser_profile_for(pk)]).await;
@@ -399,7 +419,8 @@ pub async fn run_everything(
     let accounts = pks.iter().map(|pk| app_paths.account(*pk)).collect();
     let stopping = crate::jobs::stop_before_leaving(accounts).await?;
     // Every other process running as one of them is refused its next request
-    // (`owner::sign_out`), and once the directory is gone, by that alone.
+    // (`owner::sign_out`), and once the directory is gone, by that alone,
+    // until a login lets in a session of its own.
     crate::owner::sign_out(app_paths, &pks);
     // The whole data directory goes, the owner's log with it, so the owner is
     // asked to leave, not only to close its browsers; after the jobs, which

@@ -51,13 +51,18 @@ impl Machine {
     ///
     /// Written as the account's own and moved: the two files are one format.
     fn old_session_at(&self, file: &Path) {
+        let made = !self.me().dir().exists();
         self.secrets
             .session_of(&self.me())
             .save(&session())
             .unwrap();
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::rename(self.me().session_file(), file).unwrap();
-        // Unless something else is in it already.
+        // With the list of who is signed in a directory is made with, unless
+        // something else is in it already.
+        if made {
+            let _ = std::fs::remove_file(self.me().signed_in());
+        }
         let _ = std::fs::remove_dir(self.me().dir());
     }
 
@@ -261,6 +266,21 @@ fn with_no_session_the_one_account_there_is_takes_it() {
 
     m.assert_settled();
     assert!(m.me().session_file().exists());
+}
+
+/// The session moved is the account's to send as, like a login's, even in
+/// an account directory the move made, which starts with nobody signed in.
+#[test]
+fn the_session_moved_is_signed_in() {
+    let m = machine();
+    m.old_session_at(&m.old_session_file());
+    assert!(!m.me().dir().exists());
+
+    m.settle().unwrap();
+
+    let moved = m.my_session().unwrap();
+    assert!(m.me().signed_in().exists(), "the move made the directory");
+    assert!(!m.me().refuses_session(moved.created_at));
 }
 
 /// A session that never learned its username is registered with none, not

@@ -762,6 +762,12 @@ async fn finish(
     // Checking a session is a request like any other, charged to the budget
     // of the account that signed in: repeated logins spend.
     let pacer = crate::app::pacer_saying_a_line(&account)?;
+    // Let in before the check, which goes out as any request does: a logout
+    // or purge of the account signed out every session it had then, and this
+    // one is a login's own (`owner::signed_out`). Pasting the very sessionid
+    // a logout signed out of makes a session of its own, let in here; the
+    // one a walk still holds from before stays refused.
+    account.admit_session(session.created_at)?;
     ui::info("Checking the session against Instagram...");
     let validated = login::validate(&mut session, pacer).await;
     let rejected = matches!(

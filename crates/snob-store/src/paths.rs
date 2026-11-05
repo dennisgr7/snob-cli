@@ -43,6 +43,12 @@ pub enum PathError {
     /// the whole follower history in the clear.
     #[error("could not restrict {path} to your account: {detail}")]
     NotPrivate { path: PathBuf, detail: String },
+    #[error("could not write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -342,60 +348,144 @@ impl AccountPaths {
     }
 
     /// Creates the data directory and the account's, both private.
+    ///
+    /// **An account directory made here starts with nobody signed in**
+    /// ([`Self::signed_in`], empty): what made it again after a `purge` is
+    /// not a login, and a session somebody still holds from before the
+    /// purge must stay refused once it is back. A login lets its own session
+    /// in after ([`Self::admit_session`]).
     pub fn ensure_dirs(&self) -> Result<(), PathError> {
         self.app.ensure_dirs()?;
-        create_private_dir(&self.dir())
+        let made = !self.dir().try_exists().unwrap_or(true);
+        create_private_dir(&self.dir())?;
+        if made {
+            // Never over a list already there: another process that made the
+            // directory at the same moment may have let a login in since.
+            match std::fs::File::create_new(self.signed_in()) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(source) => {
+                    return Err(PathError::Write {
+                        path: self.signed_in(),
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// Left by `logout` and `purge` before the session goes
-    /// ([`Self::mark_signed_out`]). It holds nothing: what it says is when
-    /// it was written, its modification time.
-    pub fn signed_out_mark(&self) -> PathBuf {
-        self.dir().join("signed-out")
+    /// Which sessions of the account may be sent as, by any process on this
+    /// machine: one `created_at` a line, in whole seconds, as
+    /// [`snob_core::session::Session`] keeps it. **Not there, nothing was
+    /// ever signed out of here** and every session is sent as, as before
+    /// this file existed; there and empty, none is.
+    ///
+    /// A session is named by when it was made because nothing else about it
+    /// lasts: Instagram rotates the `sessionid` itself, and what the browser
+    /// rotated is written back to the store with the `created_at` it had
+    /// (`snob-cli`'s `headless::write_back`), so the session a walk holds in
+    /// memory and the one stored since are still the same one. **Only ever
+    /// compared for equality, never ordered**: the clock that stamped them
+    /// may have been set back since, which would make a later login look
+    /// older.
+    pub fn signed_in(&self) -> PathBuf {
+        self.dir().join("signed-in")
     }
 
-    /// Says, for every process on this machine, that the account was signed
-    /// out of now: a session made before this is no longer sent as
-    /// ([`Self::refuses_session_made`]), whichever process still holds one
-    /// in memory. An account with no directory writes nothing, since a
-    /// directory that is gone already refuses every session.
-    pub fn mark_signed_out(&self) -> std::io::Result<()> {
+    /// Signs the account out for every process on this machine: from now
+    /// on no session it has now is sent as ([`Self::refuses_session`]),
+    /// whichever process still holds one in memory, until a login lets its
+    /// own in ([`Self::admit_session`]). An account with no directory
+    /// writes nothing and makes none: a directory that is gone already
+    /// refuses every session, and one made again starts empty
+    /// ([`Self::ensure_dirs`]).
+    pub fn sign_out(&self) -> std::io::Result<()> {
         if !self.dir().try_exists()? {
             return Ok(());
         }
-        let mark = std::fs::File::create(self.signed_out_mark())?;
-        // Set rather than left to the write: truncating a file already empty
-        // need not move its time, and a second logout must.
-        mark.set_modified(std::time::SystemTime::now())
+        std::fs::File::create(self.signed_in()).map(drop)
     }
 
-    /// Whether a session made at `made` may no longer be sent as: the
-    /// account was signed out of here at a later second
-    /// ([`Self::mark_signed_out`]), or its directory is gone (`purge`), or
-    /// neither can be told. A session made after, which only a new login
-    /// makes, is sent.
+    /// Lets the session made at `made`, which a login has just made, be sent
+    /// as by every process, whatever was signed out of before: it goes on
+    /// [`Self::signed_in`], making the account's directory if it has none.
+    /// An account never signed out of here has no list, and is left without
+    /// one, since every session of it is sent as already.
     ///
-    /// **To the second, and strictly later**, as `created_at` is kept: a
-    /// login made in the very second of a logout is not refused for it,
-    /// which a script running one after the other would otherwise meet.
-    pub fn refuses_session_made(&self, made: snob_core::Epoch) -> bool {
-        let mark = match std::fs::metadata(self.signed_out_mark()) {
-            Ok(mark) => mark,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return !self.dir().try_exists().unwrap_or(false);
-            }
-            Err(_) => return true,
+    /// **Kept to [`SIGNED_IN_KEPT`] sessions**, the earliest let in going
+    /// first: a session that many logins ago is refused, and a walk still
+    /// holding it after so many logins without a logout is not one to go on.
+    pub fn admit_session(&self, made: snob_core::Epoch) -> Result<(), PathError> {
+        self.ensure_dirs()?;
+        let list = self.signed_in();
+        let wrote = |source| PathError::Write {
+            path: list.clone(),
+            source,
         };
-        let Some(at) = mark
-            .modified()
-            .ok()
-            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-            .and_then(|at| i64::try_from(at.as_secs()).ok())
-        else {
-            return true;
+        let mut admitted = match std::fs::read(&list) {
+            Ok(bytes) => sessions_in(&bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(wrote(e)),
         };
-        made.get() < at
+        if admitted.contains(&made.get()) {
+            return Ok(());
+        }
+        if admitted.len() < SIGNED_IN_KEPT {
+            // Appended, one write of a whole line: a reader sees it whole or
+            // not at all ([`sessions_in`] takes only finished lines), and a
+            // sign-out that emptied the list meanwhile leaves it the one line.
+            use std::io::Write as _;
+            return std::fs::OpenOptions::new()
+                .append(true)
+                .open(&list)
+                .and_then(|mut file| file.write_all(format!("{}\n", made.get()).as_bytes()))
+                .map_err(wrote);
+        }
+        admitted.drain(..=admitted.len() - SIGNED_IN_KEPT);
+        admitted.push(made.get());
+        let text: String = admitted.iter().map(|at| format!("{at}\n")).collect();
+        // Written beside and moved over it, so no reader sees it half done.
+        let beside = list.with_extension(format!("{}", std::process::id()));
+        std::fs::write(&beside, text)
+            .and_then(|()| std::fs::rename(&beside, &list))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&beside);
+                wrote(e)
+            })
     }
+
+    /// Whether the session made at `made` may no longer be sent as: the
+    /// account was signed out of here since, and no login let that session
+    /// in again ([`Self::signed_in`]); or the account's directory is gone, as
+    /// `purge` leaves it; or the list cannot be read. A look at one small
+    /// file, asked before every request.
+    pub fn refuses_session(&self, made: snob_core::Epoch) -> bool {
+        match std::fs::read(self.signed_in()) {
+            Ok(bytes) => !sessions_in(&bytes).contains(&made.get()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                !self.dir().try_exists().unwrap_or(false)
+            }
+            Err(_) => true,
+        }
+    }
+}
+
+/// How many sessions [`AccountPaths::signed_in`] keeps.
+pub const SIGNED_IN_KEPT: usize = 64;
+
+/// The sessions a [`AccountPaths::signed_in`] list names: its finished lines,
+/// each a number. A line still being written, with no end yet, names
+/// nothing, and neither does one that is not a number.
+fn sessions_in(bytes: &[u8]) -> Vec<i64> {
+    let finished = bytes
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(&[][..], |end| &bytes[..end]);
+    String::from_utf8_lossy(finished)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
 }
 
 impl std::ops::Deref for AccountPaths {
@@ -1212,50 +1302,103 @@ mod windows_acl {
 mod tests {
     use super::*;
 
-    /// A session made before the account was signed out of here is refused,
-    /// and one a later login made is not; with the account's directory gone,
-    /// as `purge` leaves it, every one is, and nothing is written for it.
+    /// Every session of an account never signed out of here is sent as; once
+    /// it is signed out, none it had is, through any later login, and a
+    /// login's own always is, whatever the clock said when it was made. By
+    /// identity, never by order: a login made "before" the sign-out, as a
+    /// clock set back makes one, is let in all the same.
     #[test]
-    fn a_session_made_before_a_sign_out_is_refused_and_a_later_one_is_not() {
+    fn a_session_signed_out_of_stays_refused_and_a_login_is_always_let_in() {
         let root = tempfile::tempdir().unwrap();
         let account = AppPaths::rooted_at(root.path()).account(snob_core::Pk::new(42));
-        let now = snob_core::clock::now();
-        let before = snob_core::Epoch::new(now.get() - 120);
-        let after = snob_core::Epoch::new(now.get() + 120);
+        let (walking, again, set_back) = (
+            snob_core::Epoch::new(1_800_000_000),
+            snob_core::Epoch::new(1_800_000_600),
+            snob_core::Epoch::new(1_700_000_000),
+        );
 
-        account.mark_signed_out().unwrap();
+        // An account directory from before the list existed.
+        create_private_dir(&account.dir()).unwrap();
+        assert!(!account.refuses_session(walking), "never signed out");
+        account.admit_session(again).unwrap();
         assert!(
-            !account.signed_out_mark().exists(),
-            "an account with no directory gets no mark, nor a directory"
+            !account.signed_in().exists(),
+            "a login where nothing was signed out of writes no list"
         );
-        assert!(!account.dir().exists());
-        assert!(account.refuses_session_made(before));
+        assert!(!account.refuses_session(walking));
+
+        account.sign_out().unwrap();
+        assert!(account.refuses_session(walking));
+        assert!(account.refuses_session(again));
+        account.admit_session(again).unwrap();
+        assert!(!account.refuses_session(again), "a login is let in");
+        assert!(account.refuses_session(walking), "and only its session");
+        account.admit_session(set_back).unwrap();
         assert!(
-            account.refuses_session_made(after),
-            "a directory gone refuses all"
+            !account.refuses_session(set_back),
+            "a login stamped before the sign-out is let in all the same"
         );
+        assert!(account.refuses_session(walking));
+        account.sign_out().unwrap();
+        assert!(account.refuses_session(again), "a sign-out takes them all");
+    }
+
+    /// With the account's directory gone, as `purge` leaves it, no session is
+    /// sent as, and a sign-out makes nothing. Made again by anything but a
+    /// login, the directory still sends none it had before; a login lets in
+    /// only its own.
+    #[test]
+    fn a_session_purged_stays_refused_once_the_directory_is_made_again() {
+        let root = tempfile::tempdir().unwrap();
+        let account = AppPaths::rooted_at(root.path()).account(snob_core::Pk::new(42));
+        let (walking, again) = (
+            snob_core::Epoch::new(1_800_000_000),
+            snob_core::Epoch::new(1_800_000_600),
+        );
+        create_private_dir(&account.dir()).unwrap();
+        assert!(!account.refuses_session(walking));
+
+        std::fs::remove_dir_all(account.dir()).unwrap();
+        assert!(account.refuses_session(walking));
+        account.sign_out().unwrap();
+        assert!(!account.dir().exists(), "a sign-out makes no directory");
 
         account.ensure_dirs().unwrap();
-        assert!(!account.refuses_session_made(before), "never signed out");
-        account.mark_signed_out().unwrap();
-        assert!(account.refuses_session_made(before));
+        assert!(account.refuses_session(walking), "made again, not let in");
+        account.ensure_dirs().unwrap();
+        assert!(account.refuses_session(walking));
+        account.admit_session(again).unwrap();
+        assert!(!account.refuses_session(again));
+        account.ensure_dirs().unwrap();
         assert!(
-            !account.refuses_session_made(now),
-            "the same second is let through"
+            !account.refuses_session(again),
+            "a directory already there keeps its list"
         );
-        assert!(!account.refuses_session_made(after));
+        assert!(account.refuses_session(walking));
+    }
 
-        // A second sign-out moves the mark on.
-        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
-        std::fs::File::options()
-            .write(true)
-            .open(account.signed_out_mark())
-            .unwrap()
-            .set_modified(earlier)
-            .unwrap();
-        assert!(!account.refuses_session_made(before));
-        account.mark_signed_out().unwrap();
-        assert!(account.refuses_session_made(before));
+    /// The list keeps the latest [`SIGNED_IN_KEPT`] logins, and a line not
+    /// finished yet, or not a number, names nobody.
+    #[test]
+    fn the_signed_in_list_keeps_the_latest_logins_and_only_whole_lines() {
+        let root = tempfile::tempdir().unwrap();
+        let account = AppPaths::rooted_at(root.path()).account(snob_core::Pk::new(42));
+        account.ensure_dirs().unwrap();
+        let login = |n: usize| snob_core::Epoch::new(1_800_000_000 + i64::try_from(n).unwrap());
+        for n in 0..=SIGNED_IN_KEPT {
+            account.admit_session(login(n)).unwrap();
+        }
+        account.admit_session(login(SIGNED_IN_KEPT)).unwrap();
+        assert!(account.refuses_session(login(0)), "the earliest went");
+        for n in 1..=SIGNED_IN_KEPT {
+            assert!(!account.refuses_session(login(n)), "{n}");
+        }
+        let kept = std::fs::read(account.signed_in()).unwrap();
+        assert_eq!(sessions_in(&kept).len(), SIGNED_IN_KEPT);
+
+        assert_eq!(sessions_in(b"1\n2\n3"), [1, 2]);
+        assert_eq!(sessions_in(b"1\nnot one\n\n2\n"), [1, 2]);
+        assert!(sessions_in(b"12").is_empty());
     }
 
     /// **A sandboxed run must not reach the real temporary directory.**

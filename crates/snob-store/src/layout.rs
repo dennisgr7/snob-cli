@@ -147,8 +147,12 @@ pub fn settle(paths: &AppPaths, secrets: &SecretStore) -> Result<Settled, Layout
     let session = match found {
         Some((session, backend)) => {
             // Made first: once the old copy is gone, a run that stops before
-            // the registry is written finds the account by its directory.
-            paths.account(session.ds_user_id).ensure_dirs()?;
+            // the registry is written finds the account by its directory. The
+            // session moved is the account's, as a login's is: one made here
+            // starts with nobody signed in (`AccountPaths::ensure_dirs`).
+            paths
+                .account(session.ds_user_id)
+                .admit_session(session.created_at)?;
             let account = secrets.session_of(&paths.account(session.ds_user_id));
             account.save_in(backend, &session)?;
             let back = account.load()?;

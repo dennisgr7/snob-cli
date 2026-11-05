@@ -179,13 +179,15 @@ pub async fn release(paths: &AppPaths, pk: Option<Pk>) {
 /// the browser again on the profile being removed and write that session
 /// into it. From now on its next request is refused, as the no-session
 /// failure (exit 3), by the command itself and by the owner, and no browser
-/// is started for it ([`signed_out`]). A later login is not held to it.
+/// is started for it ([`signed_out`]). **Every session the account has now**,
+/// the one stored and any a login replaced while a walk still held it: only
+/// a later login's own is let in again (`AccountPaths::admit_session`).
 ///
-/// A mark that cannot be written is said, and the leaving goes on: the
+/// A list that cannot be written is said, and the leaving goes on: the
 /// session and the profile going matter more.
 pub(crate) fn sign_out(paths: &AppPaths, leaving: &[Pk]) {
     for pk in leaving {
-        if let Err(e) = paths.account(*pk).mark_signed_out() {
+        if let Err(e) = paths.account(*pk).sign_out() {
             crate::ui::warn(&format!(
                 "could not mark account {pk} as signed out ({e}); a command still running \
                  as it may go on sending until it ends"
@@ -195,13 +197,17 @@ pub(crate) fn sign_out(paths: &AppPaths, leaving: &[Pk]) {
 }
 
 /// Whether `session` may no longer be sent as, by anybody: its account was
-/// signed out of here since it was made ([`sign_out`]), or the account's
-/// directory is gone. Asked before every request, by the command and by the
-/// owner: it is a look at one file.
+/// signed out of here ([`sign_out`]) and no login since let this session in,
+/// or the account's directory is gone, as `purge` leaves it, or was made
+/// again since and no login let this session in there
+/// (`AccountPaths::refuses_session`). The session is known by when it was
+/// made, compared for equality only, so no clock set back refuses a login.
+/// Asked before every request, by the command and by the owner: it is a look
+/// at one small file.
 pub(crate) fn signed_out(paths: &AppPaths, session: &Session) -> bool {
     paths
         .account(session.ds_user_id)
-        .refuses_session_made(session.created_at)
+        .refuses_session(session.created_at)
 }
 
 /// Waits, up to [`LEAVING`], for the browsers another snob runs itself on
@@ -282,8 +288,9 @@ struct Remote {
     /// the owner again, since what kept this one from it may have passed.
     alone: AtomicBool,
     /// The accounts this command sent as from browsers of its own, with when
-    /// the session it handed was made, until it leaves: looked at every
-    /// [`SIGN_OUT_LOOK`] for a sign-out ([`Remote::mind`]).
+    /// the session it handed was made (what names it, [`signed_out`]), until
+    /// it leaves: looked at every [`SIGN_OUT_LOOK`] for a sign-out
+    /// ([`Remote::mind`]).
     own: Arc<Mutex<HashMap<Pk, snob_core::Epoch>>>,
     /// Poked when `own` has something again, for the look asleep without.
     minding: Arc<tokio::sync::Notify>,
@@ -335,7 +342,7 @@ impl Remote {
                 tokio::time::sleep(SIGN_OUT_LOOK).await;
                 let gone: Vec<Pk> = lock(&own)
                     .iter()
-                    .filter(|(pk, made)| paths.account(**pk).refuses_session_made(**made))
+                    .filter(|(pk, made)| paths.account(**pk).refuses_session(**made))
                     .map(|(pk, _)| *pk)
                     .collect();
                 for pk in gone {
@@ -448,17 +455,17 @@ impl Remote {
     }
 
     /// Refuses a request as `session` once its account was signed out of
-    /// since it was made ([`signed_out`]), as a session Instagram no longer
-    /// takes: nothing is sent, nothing retries it, and the command ends with
-    /// the no-session exit. A browser this process runs itself for the
-    /// account is closed, since nobody else can reach it to.
+    /// and no login let it in again ([`signed_out`]), as a session Instagram
+    /// no longer takes: nothing is sent, nothing retries it, and the command
+    /// ends with the no-session exit. A browser this process runs itself for
+    /// the account is closed, since nobody else can reach it to.
     async fn still_signed_in(&self, session: &Session) -> Result<(), PageError> {
         if !signed_out(&self.paths, session) {
             return Ok(());
         }
         tracing::debug!(
             account = %session.ds_user_id,
-            "the account was signed out of since this session was made; nothing more is sent as it"
+            "the account was signed out of and this session not let in again; nothing more is sent as it"
         );
         crate::headless::release_own(Some(session.ds_user_id)).await;
         Err(PageError::LoggedOut)
@@ -996,8 +1003,12 @@ mod tests {
         .unwrap();
         let root = tempfile::tempdir().unwrap();
         let paths = AppPaths::rooted_at(root.path());
-        // A command sends only as an account whose directory it opened.
-        paths.account(Pk::new(42)).ensure_dirs().unwrap();
+        // A command sends only as an account whose directory it opened, and
+        // as the session its login let in.
+        paths
+            .account(Pk::new(42))
+            .admit_session(session.created_at)
+            .unwrap();
         let owner = tokio::spawn({
             let paths = paths.clone();
             let engine = crate::headless::Headless::apart(&paths);
@@ -1084,36 +1095,16 @@ mod tests {
         crate::headless::release_own(Some(Pk::new(42))).await;
     }
 
-    /// Once the account was signed out of, a session made before it is
-    /// refused as no session at all: by the command, whether it sends
-    /// through the owner or runs its own browser, and by the owner when one
-    /// is handed to it straight. No browser is started and the profile is not
-    /// made again; nothing here would reach a browser, so none is needed.
-    /// A later login's session is not refused, and with the account's
-    /// directory gone, as `purge` leaves it, no session is sent.
-    #[tokio::test]
-    async fn a_session_signed_out_of_is_refused_and_starts_no_browser() {
+    /// Asks as `session` the way a walk still running would, by the command
+    /// with no owner and with one, and by the owner handed it straight over
+    /// its socket, and asserts each is refused as no session at all, with no
+    /// browser started and the profile not made again. Nothing here would
+    /// reach a browser, so none is needed: what is not refused fails as
+    /// unreachable or as no browser, never as no session.
+    async fn refused_everywhere(paths: &AppPaths, session: &Session, when: &str) {
         use snob_ig::client::page::Method;
         use snob_ig::web::Ask;
 
-        let root = tempfile::tempdir().unwrap();
-        let paths = AppPaths::rooted_at(root.path());
-        let pk = Pk::new(42);
-        paths.account(pk).ensure_dirs().unwrap();
-        let mut walking = Session::from_sessionid(
-            "42%3Awalking%3A1",
-            "Mozilla/5.0 (X11; Linux x86_64) Chrome/141.0.0.0",
-            snob_core::session::SessionOrigin::Paste,
-        )
-        .unwrap();
-        // Made at the login before, as a walk still running holds it.
-        walking.created_at = snob_core::Epoch::new(snob_core::clock::now().get() - 60);
-        assert!(!signed_out(&paths, &walking));
-        sign_out(&paths, &[pk]);
-        assert!(signed_out(&paths, &walking));
-
-        // Nowhere to send to: whatever is sent fails as unreachable, never as
-        // no session.
         let call = || Call {
             ask: Ask::Viewer,
             origin: "http://127.0.0.1:9".to_string(),
@@ -1133,39 +1124,38 @@ mod tests {
             timeout_ms: 1_000,
         };
 
-        // The command, with no owner and with one.
         for start in [None, Some(vec![OsString::from("--list")])] {
             let remote = Remote::new(paths.clone(), start);
-            assert!(matches!(
-                remote.ask_as(&walking, call()).await,
-                Err(PageError::LoggedOut)
-            ));
-            assert!(matches!(
-                remote.send_as(&walking, request()).await,
-                Err(PageError::LoggedOut)
-            ));
+            let asked = remote.ask_as(session, call()).await;
+            assert!(
+                matches!(asked, Err(PageError::LoggedOut)),
+                "{when}: {asked:?}"
+            );
+            let sent = remote.send_as(session, request()).await;
+            assert!(
+                matches!(sent, Err(PageError::LoggedOut)),
+                "{when}: {sent:?}"
+            );
             assert!(remote.leave().await.is_empty());
         }
 
-        // The owner, handed the session over its socket by a command that
-        // asked before the account was signed out.
         let owner = tokio::spawn({
             let paths = paths.clone();
             let engine = crate::headless::Headless::apart(&paths);
             async move { server::run_on(&paths, Linger::for_a_sandbox(), wire::build(), engine).await }
         });
-        let Handshake::Ours(mut stream) = reach(&paths, &wire::build()).await else {
+        let Handshake::Ours(mut stream) = reach(paths, &wire::build()).await else {
             panic!("an owner of this build is ours");
         };
         let asked = [
             wire::ToOwner::Ask {
                 id: 1,
-                session: Box::new(walking.clone()),
+                session: Box::new(session.clone()),
                 call: Box::new(call()),
             },
             wire::ToOwner::Send {
                 id: 2,
-                session: Box::new(walking.clone()),
+                session: Box::new(session.clone()),
                 request: request(),
             },
         ];
@@ -1186,7 +1176,7 @@ mod tests {
                     id: 2,
                     answer: Err(PageError::LoggedOut),
                 }) => answered.push(2),
-                other => panic!("{other:?}"),
+                other => panic!("{when}: {other:?}"),
             }
         }
         drop(stream);
@@ -1196,17 +1186,51 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            !paths.browser_profile_for(pk).exists(),
-            "no browser was started on the profile"
+            !paths.browser_profile_for(session.ds_user_id).exists(),
+            "{when}: no browser was started on the profile"
         );
+    }
 
-        // A login made since is sent as; nothing is, once the account's
-        // directory is gone.
-        let mut again = walking.clone();
-        again.created_at = snob_core::Epoch::new(snob_core::clock::now().get() + 1);
-        assert!(!signed_out(&paths, &again));
+    /// Once the account was signed out of, every session it had is refused
+    /// as no session at all, by the command and by the owner, through any
+    /// later login: a login's own session is let in, even one whose clock
+    /// stood behind the sign-out's, and only it. After a `purge` the same
+    /// holds once a login has made the account's directory again.
+    #[tokio::test]
+    async fn a_session_signed_out_of_is_refused_and_starts_no_browser() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted_at(root.path());
+        let pk = Pk::new(42);
+        let login = |sessionid: &str, at: i64| {
+            let mut session = Session::from_sessionid(
+                sessionid,
+                "Mozilla/5.0 (X11; Linux x86_64) Chrome/141.0.0.0",
+                snob_core::session::SessionOrigin::Paste,
+            )
+            .unwrap();
+            session.created_at = snob_core::Epoch::new(at);
+            paths.account(pk).admit_session(session.created_at).unwrap();
+            session
+        };
+        // The login a walk still running holds the session of.
+        let walking = login("42%3Awalking%3A1", 1_800_000_000);
+        assert!(!signed_out(&paths, &walking));
+
+        // `logout`, then a login again pasting the very same sessionid, by a
+        // clock set back since.
+        sign_out(&paths, &[pk]);
+        refused_everywhere(&paths, &walking, "logged out of").await;
+        let again = login("42%3Awalking%3A1", 1_700_000_000);
+        assert!(!signed_out(&paths, &again), "a login is let in");
+        refused_everywhere(&paths, &walking, "logged in again").await;
+
+        // `purge`, then a login, which makes the account's directory again.
+        sign_out(&paths, &[pk]);
         std::fs::remove_dir_all(paths.account(pk).dir()).unwrap();
         assert!(signed_out(&paths, &again));
+        let third = login("42%3Athird%3A1", 1_800_000_600);
+        assert!(!signed_out(&paths, &third));
+        refused_everywhere(&paths, &again, "purged and logged in again").await;
     }
 
     /// A command of another build leaves alone an owner still serving a
