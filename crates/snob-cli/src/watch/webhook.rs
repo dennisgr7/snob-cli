@@ -175,7 +175,10 @@ impl WebhookClient {
                 }
                 _ => {
                     return Attempt::Refused {
-                        error: format!("\"{name}\" is not a header this can send"),
+                        error: format!(
+                            "\"{}\" is not a header this can send",
+                            snob_core::model::printable(name)
+                        ),
                     };
                 }
             }
@@ -194,7 +197,9 @@ impl WebhookClient {
                 let detail = http::read_capped(response, MAX_RESPONSE_BYTES)
                     .await
                     .unwrap_or_default();
-                let error = describe(status, &detail);
+                // Scrubbed before `describe` cuts it short, so a cut cannot
+                // leave half an address that no longer matches.
+                let error = describe(status, &without_address(&detail, &self.webhook.url));
 
                 // Every answer is worth another try, including a 4xx, for the
                 // reason `Attempt::Failed` gives. The 4xx a webhook actually
@@ -217,10 +222,60 @@ impl WebhookClient {
             // resolve, a timeout. All of those are things that come back.
             Err(e) => Attempt::Failed {
                 status: None,
-                error: e.to_string(),
+                error: unanswered(e, &self.webhook.url),
             },
         }
     }
+}
+
+/// Why a request got no answer, in words that never carry the address.
+///
+/// **Not `reqwest::Error`'s own `Display`**, which ends in ` for url (<the
+/// whole address>)`: that string is written to `watch_deliveries`, warned on
+/// every retry, handed to `snob watch check` and its `--json`, and so into
+/// the log of an unattended service, and on a Slack or Discord webhook the
+/// address is the credential [`shown`] exists to keep out of all four.
+/// `without_url` drops it; the causes under it (a refused connection, a name
+/// that does not resolve, a certificate) are what a person can act on, so
+/// they follow it the way anyhow's `{:#}` would, and the top line alone
+/// ("error sending request") says nothing. None of them is known to name the
+/// address, but this string is kept and printed, so [`without_address`]
+/// checks rather than trusts that, and `printable` takes out what a terminal
+/// would obey.
+fn unanswered(error: reqwest::Error, url: &Url) -> String {
+    let error = error.without_url();
+    let mut words = error.to_string();
+    let mut cause = std::error::Error::source(&error);
+    while let Some(next) = cause {
+        let said = next.to_string();
+        // Some layers repeat their cause in their own sentence.
+        if !said.is_empty() && !words.ends_with(&said) {
+            words.push_str(": ");
+            words.push_str(&said);
+        }
+        cause = next.source();
+    }
+    snob_core::model::printable(&without_address(&words, url))
+}
+
+/// `text` with the address replaced by [`shown`]'s, and where the path is the
+/// credential, the path too.
+///
+/// For text this process did not write (an error's causes, a receiver's
+/// answer) that is stored and printed: an address whose shown form is itself
+/// hides nothing, and is left alone.
+fn without_address(text: &str, url: &Url) -> String {
+    let shown = shown(url);
+    if shown == url.as_str() {
+        return text.to_string();
+    }
+    let mut text = text.replace(url.as_str(), &shown);
+    if let Ok(clean) = Url::parse(&shown)
+        && clean.path() != url.path()
+    {
+        text = text.replace(url.path(), clean.path());
+    }
+    text
 }
 
 /// What the far end said, in one line.
@@ -671,6 +726,79 @@ mod tests {
         // Anybody else's path is the address, and stays.
         let own = Url::parse("https://n8n.local/webhook/snob").unwrap();
         assert_eq!(shown(&own), "https://n8n.local/webhook/snob");
+    }
+
+    /// A report that found nobody listening says why, and not where: the
+    /// failure is stored and printed on every retry, and a webhook's path can
+    /// be its credential.
+    #[tokio::test]
+    async fn a_request_that_got_no_answer_does_not_name_the_address() {
+        // Something that takes the connection and closes it unanswered, so
+        // the failure is the client's and comes from no server's words.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+
+        let client = WebhookClient::new(webhook(&format!(
+            "http://127.0.0.1:{port}/api/webhooks/123456/a-secret-token"
+        )))
+        .unwrap();
+        let attempt = client.post("{}", "watch.changes", "run-1", 1).await;
+
+        let Attempt::Failed {
+            status: None,
+            error,
+        } = &attempt
+        else {
+            panic!("no answer is a failure worth retrying: {attempt:?}");
+        };
+        assert!(!error.contains("a-secret-token"), "{error}");
+        assert!(!error.contains("for url"), "{error}");
+        assert!(
+            error.starts_with("error sending request: "),
+            "the cause is said after the top line: {error}"
+        );
+    }
+
+    /// Whatever a failure's words carry, a Slack or Discord address comes out
+    /// as [`shown`] has it, the path on its own included.
+    #[test]
+    fn a_failure_never_names_a_secret_address() {
+        let discord = Url::parse("https://discord.com/api/webhooks/123456/abcdef-token").unwrap();
+
+        // reqwest's own words name the address it was given.
+        let error = reqwest::Client::new()
+            .get("not an address")
+            .build()
+            .expect_err("that is no address")
+            .with_url(discord.clone());
+        assert!(error.to_string().contains("abcdef-token"), "{error}");
+        let said = unanswered(error, &discord);
+        assert!(!said.contains("abcdef-token"), "{said}");
+
+        // And text this process did not write, a receiver's answer echoing
+        // the address or its path, loses it too.
+        let echoed = without_address(
+            "no webhook at https://discord.com/api/webhooks/123456/abcdef-token \
+             (POST /api/webhooks/123456/abcdef-token)",
+            &discord,
+        );
+        assert_eq!(
+            echoed,
+            "no webhook at https://discord.com/api/webhooks/... \
+             (POST /api/webhooks/...)"
+        );
+
+        // An address that hides nothing is left as it was.
+        let own = Url::parse("https://n8n.local/webhook/snob").unwrap();
+        assert_eq!(
+            without_address("https://n8n.local/webhook/snob is down", &own),
+            "https://n8n.local/webhook/snob is down"
+        );
     }
 
     /// `[::]` is what `0.0.0.0` is, and both are accepted.
