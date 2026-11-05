@@ -279,6 +279,13 @@ fn without_address(text: &str, url: &Url) -> String {
     if let Some(query) = url.query().filter(|query| !query.is_empty()) {
         text = text.replace(query, HIDDEN);
     }
+    // And a host that is itself the secret may be named on its own, by a
+    // certificate refused for it or a receiver echoing its `Host`.
+    if let Some(host) = url.host_str()
+        && let Some(keep) = secret_host(host)
+    {
+        text = text.replace(host, &format!("{HIDDEN}.{keep}"));
+    }
     text
 }
 
@@ -363,15 +370,15 @@ pub fn shown(url: &Url) -> String {
             .map_or_else(String::new, |at| format!("/{}", segments[..=at].join("/")));
         clean.set_path(&format!("{kept}/{HIDDEN}"));
     }
-    let text = clean.to_string();
-    match clean
-        .host_str()
-        .and_then(|host| secret_host(host).map(|keep| (host, keep)))
-    {
-        // The scheme comes first and never holds the host, so the first
-        // occurrence is the host's own.
-        Some((host, keep)) => text.replacen(host, &format!("{HIDDEN}.{keep}"), 1),
-        None => text,
+    match clean.host_str().and_then(secret_host) {
+        // Spliced at the host's own place: a scheme may hold dots, and so
+        // the host's very text, which a search would find first.
+        Some(keep) => format!(
+            "{}{HIDDEN}.{keep}{}",
+            &clean[..url::Position::BeforeHost],
+            &clean[url::Position::AfterHost..]
+        ),
+        None => clean.to_string(),
     }
 }
 
@@ -478,6 +485,15 @@ fn unparsed(address: &str) -> String {
                 .map_or(HIDDEN, |(literal, _)| &host[..literal.len() + 2]),
             None => host.split_once(':').map_or(host, |(name, _)| name),
         }
+    };
+    // Unless the host is itself the secret (`secret_host`).
+    let hidden;
+    let host = match secret_host(host) {
+        Some(keep) => {
+            hidden = format!("{HIDDEN}.{keep}");
+            hidden.as_str()
+        }
+        None => host,
     };
     let tail = if end < rest.len() {
         format!("/{HIDDEN}")
@@ -875,6 +891,23 @@ mod tests {
             "hooks.slack.com/..."
         );
         assert_eq!(shown_str("n8n.local"), "n8n.local");
+        // A host that is itself the secret is hidden however it came.
+        assert_eq!(
+            shown_str("eoAbC123.m.pipedream.net/hook"),
+            "....m.pipedream.net/..."
+        );
+        assert_eq!(
+            shown_str("eoAbC123.m.pipedream.net:443/x"),
+            "....m.pipedream.net/..."
+        );
+        let pipedream = Url::parse("https://eoabc123.m.pipedream.net/hook").unwrap();
+        assert_eq!(
+            without_address(
+                "certificate not valid for name \"eoabc123.m.pipedream.net\"",
+                &pipedream
+            ),
+            "certificate not valid for name \"....m.pipedream.net\""
+        );
         // What came before an `@` is somebody's credential, a `://` in the
         // path is no scheme, and a host that does not parse is still a host.
         assert_eq!(
