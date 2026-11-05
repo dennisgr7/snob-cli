@@ -374,8 +374,9 @@ with a documented reason in the same place.
   stays refused through any later login**, which lets in its own session
   only (`AccountPaths::admit_session`, before its check), a sessionid
   pasted again included. An account directory that is gone, as `purge`
-  leaves it, refuses every session, and one made again (`ensure_dirs`)
-  starts with nobody signed in; a directory with no list, as every one
+  leaves it, refuses every session, and one made again (`ensure_dirs`, or
+  the layout's move landing one whole as a login adopts the database left
+  `unclaimed`) starts with nobody signed in; a directory with no list, as every one
   made before the list existed, was never signed out of and refuses none
   until its first sign-out or login: **a login starts a missing list with
   its own session**, never reading it as "refuses none", since the
