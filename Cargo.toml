@@ -234,9 +234,8 @@ url = "2"
 # `snob-cli` also takes it wherever `std` stops short on Unix (`setsid`,
 # `geteuid`, `kill`, `flock`, the scheduler's calls), each use saying why.
 # `snob-store` takes it for `geteuid` and the `O_DIRECTORY`/`O_NOFOLLOW` flags:
-# the scratch root and the parents `create_private_root` makes private are
-# opened without following a link, made `0700` through that descriptor, and
-# the scratch root is asked who owns it (`paths.rs`).
+# the scratch root is opened without following a link, made `0700` through
+# that descriptor, and asked who owns it (`paths.rs`).
 libc = "0.2"
 base64 = "0.22"
 # The monitor's configuration file. Reading only: the file is written by hand

@@ -890,10 +890,9 @@ Platform-specific code, all of it reached only by the CI job on that OS:
 - Unix (`libc`): `dup2` of the CDP pipe ends onto fds 3 and 4, `setsid`
   for a detached start (`detach.rs`), the owner's socket with `peer_cred`,
   `geteuid` to refuse starting the browser as root (`headless::refuse_root`).
-  In `snob-store` (`paths.rs`), the scratch root and the data directory's
-  fresh parents are opened with `O_DIRECTORY | O_NOFOLLOW` and made `0700`
-  through the descriptor, and the scratch root is asked its owner
-  (`geteuid`) before it is made private or swept.
+  In `snob-store` (`paths.rs`), the scratch root is opened with
+  `O_DIRECTORY | O_NOFOLLOW`, made `0700` through the descriptor, and asked
+  its owner (`geteuid`) before it is made private or swept.
   Linux adds a logind `idle` inhibitor (`zbus`) and `SCHED_BATCH`/`uclamp_max`;
   macOS uses `caffeinate -i -w <pid>` and leaves the browser's scheduling
   alone.
