@@ -368,16 +368,34 @@ pub fn shown(url: &Url) -> String {
 
 /// Whether `host` is a receiver whose path is its credential, and if so, the
 /// segment of the path up to which it may be shown (none: no part of it).
+///
+/// Every spelling of the same receiver is one: a host written with its final
+/// dot (`hooks.slack.com.`, which the `url` crate keeps) is the host without
+/// it, and the older names still answer (Discord's on `discordapp.com` and
+/// its `canary.` and `ptb.` builds, Teams' legacy Office 365 connectors on
+/// `outlook.office.com` and `outlook.office365.com`, Make's as Integromat).
+/// A host matched here that is not such a receiver only has its path hidden,
+/// which reveals nothing, so the rules lean wide.
 fn secret_path(host: &str) -> Option<Option<&'static str>> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let on = |domain: &str| {
+        host == domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|sub| sub.ends_with('.'))
+    };
     match host {
-        "hooks.slack.com" => Some(Some("services")),
-        "discord.com" | "discordapp.com" | "canary.discord.com" | "ptb.discord.com" => {
-            Some(Some("webhooks"))
-        }
+        "hooks.slack.com" | "hooks.slack-gov.com" => Some(Some("services")),
+        _ if on("discord.com") || on("discordapp.com") => Some(Some("webhooks")),
         "hooks.zapier.com" => Some(Some("catch")),
         "maker.ifttt.com" => Some(Some("trigger")),
+        "outlook.office.com" | "outlook.office365.com" => Some(Some("webhook")),
         _ if host.ends_with(".webhook.office.com") => Some(Some("webhookb2")),
-        _ if host.starts_with("hook.") && host.ends_with(".make.com") => Some(None),
+        _ if host.starts_with("hook.")
+            && (host.ends_with(".make.com") || host.ends_with(".integromat.com")) =>
+        {
+            Some(None)
+        }
         _ => None,
     }
 }
@@ -917,6 +935,57 @@ mod tests {
         // Anybody else's path is the address, and stays.
         let own = Url::parse("https://n8n.local/webhook/snob").unwrap();
         assert_eq!(shown(&own), "https://n8n.local/webhook/snob");
+    }
+
+    /// Every spelling of the same receivers hides the same path: the host
+    /// with its final dot, the older Discord, Teams and Make names, and
+    /// GovSlack's.
+    #[test]
+    fn another_spelling_of_the_same_receiver_hides_the_same_path() {
+        for (address, expected) in [
+            (
+                "https://hooks.slack.com./services/T0/B0/XXXXsecret",
+                "https://hooks.slack.com./services/...",
+            ),
+            (
+                "https://hooks.slack-gov.com/services/T0/B0/XXXXsecret",
+                "https://hooks.slack-gov.com/services/...",
+            ),
+            (
+                "https://canary.discordapp.com/api/webhooks/123/TOKEN",
+                "https://canary.discordapp.com/api/webhooks/...",
+            ),
+            (
+                "https://ptb.discordapp.com/api/webhooks/123/TOKEN",
+                "https://ptb.discordapp.com/api/webhooks/...",
+            ),
+            (
+                "https://discord.com./api/webhooks/123/TOKEN",
+                "https://discord.com./api/webhooks/...",
+            ),
+            (
+                "https://outlook.office.com/webhook/1@2/IncomingWebhook/KEY/3",
+                "https://outlook.office.com/webhook/...",
+            ),
+            (
+                "https://outlook.office365.com/webhook/1@2/IncomingWebhook/KEY/3",
+                "https://outlook.office365.com/webhook/...",
+            ),
+            (
+                "https://hook.integromat.com/TOKEN",
+                "https://hook.integromat.com/...",
+            ),
+            (
+                "https://hook.eu1.make.com./TOKEN",
+                "https://hook.eu1.make.com./...",
+            ),
+        ] {
+            let url = Url::parse(address).unwrap();
+            assert_eq!(shown(&url), expected, "{address}");
+        }
+        // A name that only ends the same way is somebody else's.
+        let own = Url::parse("https://notdiscord.com/api/webhooks/snob").unwrap();
+        assert_eq!(shown(&own), "https://notdiscord.com/api/webhooks/snob");
     }
 
     /// A report that found nobody listening says why, and not where: the
