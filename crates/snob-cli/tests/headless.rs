@@ -2682,7 +2682,7 @@ async fn a_login_through_the_relay_is_stored() {
             .recv_timeout(std::time::Duration::from_secs(120))
             .unwrap_or_else(|_| panic!("no tunnel and link were printed:\n{}", printed.join("\n")));
         let trimmed = line.trim().to_string();
-        if trimmed.starts_with("ssh -N -L ") {
+        if trimmed.starts_with("ssh -N ") {
             tunnel = Some(trimmed.clone());
         } else if trimmed.starts_with("http://127.0.0.1:") {
             link = Some(trimmed.clone());
@@ -2690,10 +2690,11 @@ async fn a_login_through_the_relay_is_stored() {
         printed.push(line);
     }
     let (tunnel, link) = (tunnel.unwrap(), link.unwrap());
-    // `ssh -N -L 127.0.0.1:<near port>:<far end> <host>`
+    // `ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:<near port>:<far end> <host>`
     let forward = tunnel
         .split_whitespace()
-        .nth(3)
+        .skip_while(|word| *word != "-L")
+        .nth(1)
         .expect("a forward")
         .trim_matches('"')
         .strip_prefix("127.0.0.1:")

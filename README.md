@@ -163,9 +163,11 @@ can read:
   cloudflared, a VPN) to reach from elsewhere: it refuses any address that
   is not loopback and any request without the key (`Authorization: Bearer`),
   and a yes given in the chat covers only reading lists unless
-  `--confirm-in-chat all`. A client on the stateless revision of MCP has no
-  session, so a chat yes it is handed is bound to the call alone, and any
-  client with the key may redeem it once. TLS ends at the tunnel, whose
+  `--confirm-in-chat all`, though whoever holds the key can still confirm
+  the writes in a form it answers itself, since it is the client. A client
+  on the stateless revision of MCP has no session, so a chat yes it is
+  handed is bound to the call alone, and any client with the key may
+  redeem it once. TLS ends at the tunnel, whose
   provider sees the key and every answer, other people's names and lists
   included; put an access layer in front where the tunnel offers one. The
   server does not prove itself to its clients: they send the key to
@@ -177,7 +179,8 @@ can read:
   macOS, `snob mcp --listen socket` closes that gap: it serves on a socket
   in snob's private data directory (`mcp.sock`, `0600`) that only you and
   root can connect to and nobody else can take, and the tunnel reaches it
-  there (`ssh -L 8750:<path>` from the far end, or cloudflared's
+  there (`ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8750:<path>`
+  from the far end, which stops if that port is taken there, or cloudflared's
   `unix:<path>` service); startup prints the path. `snob
   mcp config codex --remote https://your-tunnel/mcp` (or any other client)
   prints what a client needs to reach that server: no command and no key.

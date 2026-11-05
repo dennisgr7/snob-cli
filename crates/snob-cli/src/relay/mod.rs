@@ -32,6 +32,15 @@
 //!   (`can_be_forwarded`) — a TCP port on `127.0.0.1`, never another address; any
 //!   account on the machine can connect to that, so the next point is what
 //!   keeps them out.
+//! - On the person's machine, the near end of the tunnel is what the link
+//!   names, and the page there cannot prove it is snob's: anything holding
+//!   that port serves whatever page it likes, a copy of Instagram's login
+//!   among them, and keeps what is typed into it. So the printed command
+//!   carries `-o ExitOnForwardFailure=yes`: `ssh` with `-N` and a near end
+//!   it cannot bind otherwise warns once and stays up as though the tunnel
+//!   were open, and the link then reaches whoever holds the port. With it,
+//!   `ssh` exits with the error, and the person is left no link that works
+//!   ([`tunnel_command`]).
 //! - Either way the printed link carries a token of 256 random bits, good for
 //!   one visit: the first request that brings it is sent to the page with a
 //!   key of another 256 bits in the address's fragment, which a browser never
@@ -286,6 +295,11 @@ async fn relay(
 /// it wherever the person's own `GatewayPorts` says, which can be every
 /// interface, and a whole network could then hold the relay's connections.
 ///
+/// **A near end that cannot be bound ends `ssh`**
+/// (`-o ExitOnForwardFailure=yes`): by default, and with `-N`, `ssh` warns
+/// and stays up, and the link would open on whatever already holds the
+/// port, which can serve a look-alike login and keep the password.
+///
 /// The far end is quoted when it holds anything a shell would split or
 /// read: a Mac's data directory is under `Application Support`. Double
 /// quotes, which the shells and Windows' `cmd` and PowerShell all take.
@@ -309,7 +323,7 @@ fn tunnel_command(local_port: u16, far_end: &str, ssh: Option<&Ssh>) -> String {
     } else {
         format!("\"{forward}\"")
     };
-    format!("ssh -N -L {forward} {user}{host}{port}")
+    format!("ssh -N -o ExitOnForwardFailure=yes -L {forward} {user}{host}{port}")
 }
 
 /// The address of the entry the tab's history is at.
@@ -1205,7 +1219,9 @@ mod tests {
         let tunnel = relay.tunnel(Some(&ssh));
         let port = relay.local_port.to_string();
         assert!(
-            tunnel.starts_with(&format!("ssh -N -L 127.0.0.1:{port}:")),
+            tunnel.starts_with(&format!(
+                "ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:{port}:"
+            )),
             "{tunnel}"
         );
         assert!(
@@ -1227,6 +1243,34 @@ mod tests {
         assert!(relay.tunnel(None).ends_with(" this-machine"));
     }
 
+    /// The near end, on the person's machine, is what the link names; when
+    /// `ssh` cannot bind it, something else holds it, so the command makes
+    /// `ssh` exit there rather than stay up and leave the link to that.
+    #[test]
+    fn a_near_end_that_cannot_be_bound_ends_the_tunnel() {
+        let ssh = Ssh {
+            server: Some(("192.168.1.50".to_string(), 2222)),
+            user: Some("someone".to_string()),
+        };
+        for tunnel in [
+            tunnel_command(51234, "127.0.0.1:40000", None),
+            tunnel_command(51234, "/home/someone/relay-1.sock", Some(&ssh)),
+            tunnel_command(
+                51234,
+                "/Users/someone/Application Support/relay-1.sock",
+                None,
+            ),
+        ] {
+            let words: Vec<&str> = tunnel.split_whitespace().collect();
+            let option = words
+                .windows(2)
+                .position(|pair| pair == ["-o", "ExitOnForwardFailure=yes"]);
+            let forward = words.iter().position(|word| *word == "-L");
+            assert!(option.is_some(), "{tunnel}");
+            assert!(option < forward, "{tunnel}");
+        }
+    }
+
     /// A far end a shell would split — a Mac's data directory is under
     /// `Application Support` — is quoted whole; a plain one is left as it is.
     #[test]
@@ -1241,7 +1285,7 @@ mod tests {
                 "/Users/someone/Library/Application Support/snob-ig/relay-1.sock",
                 Some(&ssh)
             ),
-            "ssh -N -L \"127.0.0.1:51234:/Users/someone/Library/Application Support/snob-ig/relay-1.sock\" \
+            "ssh -N -o ExitOnForwardFailure=yes -L \"127.0.0.1:51234:/Users/someone/Library/Application Support/snob-ig/relay-1.sock\" \
              someone@192.168.1.50"
         );
         assert_eq!(
@@ -1250,11 +1294,11 @@ mod tests {
                 "/home/someone/.local/share/snob-ig/relay-1.sock",
                 None
             ),
-            "ssh -N -L 127.0.0.1:51234:/home/someone/.local/share/snob-ig/relay-1.sock this-machine"
+            "ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:51234:/home/someone/.local/share/snob-ig/relay-1.sock this-machine"
         );
         assert_eq!(
             tunnel_command(51234, "127.0.0.1:40000", None),
-            "ssh -N -L 127.0.0.1:51234:127.0.0.1:40000 this-machine"
+            "ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:51234:127.0.0.1:40000 this-machine"
         );
     }
 

@@ -421,7 +421,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   word for word and hands back on the same call only on a yes. A decline, a
   dismissal or a timeout in a form is a no, never a reason to ask in the
   chat. `--confirm-in-chat none|lists|all` (`all` when not given on stdio,
-  `lists` with `--listen`) says what the chat may cover; past it the call is `cannot_confirm`. Not
+  `lists` with `--listen`) says what the chat may cover; past it the call is `cannot_confirm`.
+  **It limits the chat route only**: a client that declares a form answers
+  it as it likes, so over `--listen` whoever holds the key can confirm a
+  write whatever it says (recorded as a yes given in a form). Not
   offered, ever: `login`, `logout`, `purge`, the monitor, `--same-day`,
   downloads (outside the request budget), any flag that writes a file.
 - **The yes comes from the client, not provably from the person.** The
@@ -685,9 +688,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   mandatory** (no key, exit 1 and a hint), because loopback TCP is
   reachable by every local user, unlike the owner's pipe; startup says its
   source and fingerprint, never the key, and with `--allow-writes` warns
-  that whoever holds it can call the writes (and confirm them in the chat
-  under `--confirm-in-chat all`). **The reverse does not hold: the server
-  does not prove itself to its clients.** A client or tunnel sends the key
+  that whoever holds it can call the writes and confirm them, in a form it
+  answers itself whatever `--confirm-in-chat` says (and in the chat too
+  under `all`). **The reverse does not hold: the server does not prove
+  itself to its clients.** A client or tunnel sends the key
   to whatever answers on the port, so another local user who binds it while
   snob is not listening is handed the key; `--listen` is for a machine where
   nobody else can run code, and startup says to replace the key if the
