@@ -689,6 +689,13 @@ impl Headless {
         Arc::new(Self::new(paths.clone()))
     }
 
+    /// Where these browsers' accounts are: for a test using this process's,
+    /// which are made once with the paths of whichever test asked first.
+    #[cfg(test)]
+    pub(crate) fn paths(&self) -> &AppPaths {
+        &self.paths
+    }
+
     fn new(paths: AppPaths) -> Self {
         Self {
             paths,
@@ -902,6 +909,14 @@ impl Headless {
     /// sent yet. Not once Instagram has pushed back on it: that failure is
     /// the push-back, and nothing more is sent. The step itself runs once,
     /// whatever happens: a write would go out twice.
+    ///
+    /// **A session its account was signed out of is refused here too**
+    /// (`owner::signed_out`), once the account's browser is this request's:
+    /// a `logout` or `purge` may have begun while it waited for it, or while
+    /// the browser started, and a browser started for it would make the
+    /// profile being removed again, with the session's cookies written in
+    /// (`sync_cookies`). Asked before the browser starts and again before
+    /// the session is handed to it, closing a browser started for it.
     async fn on_ready_tab<T>(
         &self,
         session: &Session,
@@ -912,6 +927,19 @@ impl Headless {
         let mut slot = account.live.lock().await;
         let mut starts = 0;
         let ready = loop {
+            if crate::owner::signed_out(&self.paths, session) {
+                tracing::debug!(
+                    account = %session.ds_user_id,
+                    "the account was signed out of; its browser is not used for this session"
+                );
+                // One started for it goes; one already running is left to
+                // whoever else uses it, a later login's command perhaps, and
+                // to the sign-out's own release, which waits for this slot.
+                if starts > 0 {
+                    account.close(&mut slot).await;
+                }
+                return Err(PageError::LoggedOut);
+            }
             if slot.is_none() {
                 let started = self
                     .start_when_free(session, &account)
@@ -924,6 +952,8 @@ impl Headless {
                 if let Some(live) = slot.as_mut() {
                     self.keep_mode(session.ds_user_id, live);
                 }
+                // Starting takes seconds, which a sign-out may have come in.
+                continue;
             }
             let live = slot.as_mut().expect("a browser was started above");
             let ready = self.ready(live, session, origin).await;
@@ -1845,6 +1875,17 @@ mod tests {
         );
     }
 
+    /// Paths at `root` where accounts 42 and 43 have the directory a version
+    /// before the signed-in list left (`AccountPaths::signed_in`): never
+    /// signed out of, so every session of theirs is sent as.
+    fn never_signed_out(root: &std::path::Path) -> AppPaths {
+        let paths = AppPaths::rooted_at(root);
+        for pk in [42, 43] {
+            snob_store::paths::create_private_dir(&paths.account(Pk::new(pk)).dir()).unwrap();
+        }
+        paths
+    }
+
     /// A login made later than the session the browser holds replaces it; one
     /// made in the same second, or while the clock stood behind, does not.
     #[test]
@@ -1869,7 +1910,7 @@ mod tests {
     #[tokio::test]
     async fn a_push_back_is_forgotten_with_the_browser_that_heard_it() {
         let root = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(root.path()));
+        let headless = Headless::new(never_signed_out(root.path()));
         let pk = Pk::new(42);
         let shared = Arc::new(listen::Shared::default());
         assert!(shared.latch.claim(PushedBack::RateLimited));
@@ -1887,7 +1928,7 @@ mod tests {
     async fn a_navigation_sent_as_a_request_starts_no_browser() {
         let server = wiremock::MockServer::start().await;
         let root = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(root.path()));
+        let headless = Headless::new(never_signed_out(root.path()));
         let request = PageRequest {
             url: format!("{}/someone/", server.uri()),
             navigate: true,
@@ -1902,6 +1943,30 @@ mod tests {
             "{error:?}"
         );
         assert!(headless.account(Pk::new(42)).live.lock().await.is_none());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A session its account was signed out of is refused by the browsers'
+    /// holder itself, before a browser is started for it: a request that
+    /// passed the command's own look as `logout` began, and waited for the
+    /// account's browser meanwhile, makes no profile again with its session
+    /// in it. Nothing here reaches a browser, so none is needed.
+    #[tokio::test]
+    async fn a_session_signed_out_of_starts_no_browser() {
+        let server = wiremock::MockServer::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let paths = never_signed_out(root.path());
+        let headless = Headless::new(paths.clone());
+        let pk = Pk::new(42);
+        paths.account(pk).sign_out().unwrap();
+
+        let error = headless
+            .send_as(&made("42%3Asigned%3A1", 1_000), answer(&server))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PageError::LoggedOut), "{error:?}");
+        assert!(headless.account(pk).live.lock().await.is_none());
+        assert!(!paths.browser_profile_for(pk).exists());
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
@@ -1989,7 +2054,7 @@ mod tests {
     async fn a_browser_hands_back_only_the_session_it_holds() {
         let server = site(None).await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let later = made("42%3Alater%3A1", 2_000);
         let older = made("42%3Aolder%3A1", 1_000);
 
@@ -2023,7 +2088,7 @@ mod tests {
     async fn a_browser_hands_back_what_was_written_back_from_it() {
         let server = site(Some("sessionid=42%3Arotated%3A2; Path=/; HttpOnly")).await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let handed = made("42%3Ahanded%3A1", 1_000);
         let pk = Pk::new(42);
 
@@ -2177,7 +2242,7 @@ mod tests {
     /// Two accounts, each with its database, and the browsers to send as
     /// them from.
     fn two_accounts(root: &std::path::Path) -> (AppPaths, Headless) {
-        let paths = AppPaths::rooted_at(root);
+        let paths = never_signed_out(root);
         for pk in [42, 43] {
             snob_store::store::Store::open(&paths.account(Pk::new(pk))).unwrap();
         }
@@ -2383,7 +2448,7 @@ mod tests {
         let arrived = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = refusing(AnsweredSlowly(Arc::clone(&arrived)), "").await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let first = made("42%3Afirst%3A1", 1_000);
         let second = made("42%3Asecond%3A1", 2_000);
 
@@ -2425,7 +2490,7 @@ mod tests {
     async fn a_fresh_browser_that_stalls_before_sending_is_started_again() {
         let server = site(None).await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Astall%3A1", 1_000);
 
         if !started(&headless, &session, answer(&server)).await {
@@ -2454,7 +2519,7 @@ mod tests {
     async fn a_fresh_browser_pushed_back_on_before_sending_is_not_started_again() {
         let server = site(None).await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Aheard%3A1", 1_000);
 
         if !started(&headless, &session, answer(&server)).await {
@@ -2649,7 +2714,7 @@ mod tests {
             .await;
         answer_the_app(&server).await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Avalues%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;
@@ -2735,7 +2800,7 @@ mod tests {
             .await;
         answer_the_app(&server).await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Areload%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;
@@ -2824,7 +2889,7 @@ mod tests {
             .await;
         answer_the_app(&server).await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Acalls%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;
@@ -2889,7 +2954,7 @@ mod tests {
             .await;
         answer_the_app(&server).await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Arefused%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;
@@ -3067,7 +3132,7 @@ mod tests {
             .await;
         answer_the_app(&server).await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Aasks%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;
@@ -3276,7 +3341,7 @@ mod tests {
             .await;
         answer_the_app(&server).await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Afollows%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;
@@ -3375,7 +3440,7 @@ mod tests {
             .mount(&server)
             .await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Aassets%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;
@@ -3504,7 +3569,7 @@ mod tests {
         let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let _logged = tracing::subscriber::set_default(subscriber);
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Atoken%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;
@@ -3615,7 +3680,7 @@ mod tests {
         }
         answer_the_app(&server).await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Awrites%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;
@@ -3736,7 +3801,7 @@ mod tests {
             .await;
         answer_the_app(&server).await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Asettled%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;
@@ -3836,7 +3901,7 @@ mod tests {
             .await;
         answer_the_app(&server).await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Anames%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;
@@ -3929,7 +3994,7 @@ mod tests {
             .await;
         answer_the_app(&server).await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Aready%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;
@@ -4005,7 +4070,7 @@ mod tests {
                 .await;
         }
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Aheaders%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;
@@ -4150,7 +4215,7 @@ mod tests {
         let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let _logged = tracing::subscriber::set_default(subscriber);
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Aclaims%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;
@@ -4278,7 +4343,7 @@ mod tests {
             .mount(&server)
             .await;
         let tmp = tempfile::tempdir().unwrap();
-        let headless = Headless::new(AppPaths::rooted_at(tmp.path()));
+        let headless = Headless::new(never_signed_out(tmp.path()));
         let session = made("42%3Aguard%3A1", 1_000);
         if !started(&headless, &session, answer(&server)).await {
             return;

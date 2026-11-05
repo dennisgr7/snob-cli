@@ -16,10 +16,12 @@
 //! efficiently (`power::qos`): at the normal pace only while a command
 //! somebody waits on is using it ([`ToOwner::Attention`]).
 //!
-//! **Nothing is sent as an account signed out of since the session handed
-//! was made** (`owner::sign_out`), whoever hands it: the command asks before
-//! each request, and the owner asks again here, so a command that slipped
-//! a request in as `logout` began starts no browser on the profile going.
+//! **Nothing is sent as a session its account was signed out of**
+//! (`owner::sign_out`) and no login let in again since, whoever hands it:
+//! the command asks before each request, the owner asks again here, and the
+//! account's browser once it holds it (`headless::Headless`), so a command
+//! that slipped a request in as `logout` began starts no browser on the
+//! profile going.
 //!
 //! The one thing stored from here is the cooldown such a push-back earns,
 //! written by the listener (`headless::listen`) to the account's database,

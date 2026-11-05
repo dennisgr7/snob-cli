@@ -46,7 +46,8 @@ pub async fn run(
     // Then every other process still holding one of these sessions: a walk
     // typed in another terminal, the monitor's run, an agent's call. Each is
     // refused its next request, and starts no browser on the profile about
-    // to go; before the browsers close, so none is started again after.
+    // to go; before the browsers close, so none is started again after. For
+    // good: a later login lets in its own session, not these.
     crate::owner::sign_out(paths, &leaving);
     // A browser still running on a profile about to go would write into it
     // as it went, or keep Windows from removing it. Only the profiles going:
