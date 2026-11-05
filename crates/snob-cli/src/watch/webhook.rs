@@ -377,8 +377,16 @@ fn secret_path(host: &str) -> Option<Option<&'static str>> {
 /// rules cannot be applied to what has no parts, and the likeliest such
 /// address, one hand-edited without its scheme, is a Slack or Discord one
 /// whose path is the secret. Which address was meant is still the content
-/// of the line, so its host is kept, as far as the first `/`, `?`, `#` or a
-/// backslash, with what came before an `@` and after the host left out.
+/// of the line, so its host is kept, as far as the first `/`, `?`, `#`, a
+/// backslash or a port's `:`, with what came before an `@` and after the
+/// host left out.
+///
+/// **An `@` past that first `/`, `?`, `#` or backslash hides the host too.**
+/// A password holding one of those characters unencoded is what makes such
+/// an address fail to parse (`https://alice:hunter/2@n8n.local/hook`), and
+/// cut there the "host" would be the user and the start of the password;
+/// the `@` might as well be a path's, and what follows it the end of a
+/// secret path, so nothing around it is shown.
 pub fn shown_str(address: &str) -> String {
     Url::parse(address).map_or_else(|_| unparsed(address), |url| shown(&url))
 }
@@ -399,10 +407,22 @@ fn unparsed(address: &str) -> String {
         _ => (String::new(), address),
     };
     let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
-    let authority = &rest[..end];
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
+    let (authority, after) = rest.split_at(end);
+    let host = if after.contains('@') {
+        HIDDEN
+    } else {
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        // A port is no part of which address was meant, and in an address
+        // that lost its scheme what follows a colon may be a password.
+        match host.strip_prefix('[') {
+            Some(inside) => inside
+                .split_once(']')
+                .map_or(HIDDEN, |(literal, _)| &host[..literal.len() + 2]),
+            None => host.split_once(':').map_or(host, |(name, _)| name),
+        }
+    };
     let tail = if end < rest.len() {
         format!("/{HIDDEN}")
     } else {
@@ -812,6 +832,26 @@ mod tests {
         assert_eq!(
             shown_str("hooks.slack.com\\services\\XXXXYYYY"),
             "hooks.slack.com/..."
+        );
+        // A password holding a `/`, `?` or `#` unencoded is why the address
+        // does not parse, and none of it is shown, nor the user.
+        for address in [
+            "https://alice:hunter/2xyz@n8n.local/hook",
+            "https://alice:hun?ter2@n8n.local/hook",
+            "https://alice:hun#ter2@n8n.local/hook",
+        ] {
+            let shown = shown_str(address);
+            assert_eq!(shown, "https://.../...", "{address}");
+        }
+        // A port is left out, and so is whatever follows a colon in an
+        // address with no scheme; an address literal is kept whole.
+        assert_eq!(
+            shown_str("https://n8n.local:99999/hook"),
+            "https://n8n.local/..."
+        );
+        assert_eq!(
+            shown_str("https://[fd00::1]:99999/hook"),
+            "https://[fd00::1]/..."
         );
     }
 
