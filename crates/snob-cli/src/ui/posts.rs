@@ -25,6 +25,7 @@ use ratatui::Frame;
 use ratatui::layout::Constraint;
 use ratatui::text::Line;
 use ratatui::widgets::{Cell, Paragraph, Row, TableState, Wrap};
+use snob_core::model::printable;
 use snob_ig::client::IgClient;
 use snob_store::paths::AppPaths;
 
@@ -535,7 +536,13 @@ fn draw_grid(
         ""
     };
     let mut block = tui::view_block(
-        format!("Posts · @{} · {total} read{more}", grid.username),
+        // `Grid::username` is kept as Instagram spells it, for the requests
+        // that page on; on screen it goes through `printable` like every
+        // other string from another person.
+        format!(
+            "Posts · @{} · {total} read{more}",
+            printable(&grid.username)
+        ),
         colors,
         tui::list_padding(area),
     );
@@ -760,6 +767,24 @@ mod tests {
         assert!(first.contains("80"), "{first}");
         assert!(first.contains("sun"), "{first}");
         assert!(tui::row_text(&terminal, 7).contains("enter open"));
+    }
+
+    /// The grid keeps the name as Instagram spells it, for the requests; the
+    /// title it draws is the name through `printable`, so a bidirectional
+    /// override in it cannot turn the frame's text around.
+    #[test]
+    fn the_grid_title_draws_the_name_through_printable() {
+        let mut grid = grid();
+        grid.username = "some\u{202e}one".into();
+        let mut terminal = Terminal::new(TestBackend::new(100, 8)).unwrap();
+        let mut list = TableState::default();
+        list.select(Some(0));
+        let mut rows = 0usize;
+        terminal
+            .draw(|frame| draw_grid(frame, &grid, &tui::me(), &mut list, "", false, &mut rows))
+            .unwrap();
+        let title = tui::row_text(&terminal, 0);
+        assert!(title.contains("Posts · @someone · 2 read"), "{title}");
     }
 
     #[test]
