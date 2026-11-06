@@ -150,7 +150,12 @@ mod platform {
                 Ok(())
             });
         }
-        let mut child = command.spawn()?;
+        // One start at a time with the browsers' (`pipe`), so that none of
+        // their pipes is caught open across this one's `exec`.
+        let mut child = {
+            let _starting = crate::pipe::one_start_at_a_time();
+            command.spawn()?
+        };
         // Reaped by whoever is still here when it leaves: a command that
         // outlives it — a monitor — would otherwise keep a finished process
         // as a zombie until it exits itself.

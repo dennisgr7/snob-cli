@@ -17,6 +17,14 @@
 //! started beside the first does not hold the first one's. There is nothing
 //! to connect to and nothing to guess.
 //!
+//! **No other child catches an end on its way to the browser.** On Windows
+//! both ends are made not inheritable and only the browser's two are marked
+//! otherwise, just before it is created and closed just after, under
+//! [`one_start_at_a_time`]; on macOS, which has no `pipe2`, an end is
+//! close-on-exec a moment after it is opened, under the same lock. Every
+//! other start of a process in a program that starts browsers takes it too
+//! (`detach`, `power`, `browser`), so none forks or inherits in that moment.
+//!
 //! **Why this module exists at all** is that `std::process::Command` cannot
 //! start that browser. Chromium reads the protocol from file descriptor 3 and
 //! writes it to descriptor 4, and on Windows it reaches them through
@@ -66,6 +74,18 @@ const OVERSIZED_HEAD_BYTES: usize = 256;
 /// For starting the owner of the browsers the same careful way (`owner`).
 #[cfg(windows)]
 pub(crate) use windows_impl::{command_line, wide};
+
+/// Held while this process starts another, and while a pipe's ends are not
+/// yet what they will be: inheritable on Windows for the instant the browser
+/// is created, not yet close-on-exec on macOS. A start that does not take it
+/// could hand its child an end of the browser's protocol, which reads its
+/// commands and writes its answers. Never held across a wait for the child.
+pub(crate) fn one_start_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static STARTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    STARTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// How the two ends of the protocol are numbered.
 ///
@@ -405,7 +425,6 @@ mod windows_impl {
         CloseHandle, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
         SetHandleInformation, WAIT_OBJECT_0,
     };
-    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -538,31 +557,33 @@ mod windows_impl {
         anyhow::anyhow!("{what} failed: Windows error {}", unsafe { GetLastError() })
     }
 
-    /// One pipe, with the end the child gets marked inheritable and the end we
-    /// keep marked not.
+    /// One pipe, neither end inheritable.
     ///
-    /// Both matter. The child's end has to be inheritable or the handle list
-    /// below refuses it; ours has to not be, or a browser holding a copy of our
-    /// own end would keep the pipe open after it had exited and the reader
-    /// thread would never see the end of the stream.
+    /// The end we keep never is: a browser holding a copy of it would keep
+    /// the pipe open after it had exited, and the reader thread would never
+    /// see the end of the stream, and any other child holding one could send
+    /// the browser commands or read its answers. The child's end is made
+    /// inheritable only for the instant the browser is created
+    /// ([`let_the_child_have`]), since the handle list refuses one that is
+    /// not; made so at the pipe's birth, a process another thread started
+    /// meanwhile would have taken it.
     fn pipe() -> Result<(Owned, Owned)> {
         let mut read: HANDLE = std::ptr::null_mut();
         let mut write: HANDLE = std::ptr::null_mut();
-        let attributes = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: std::ptr::null_mut(),
-            bInheritHandle: 1,
-        };
-        // SAFETY: both out-parameters are valid for the call.
-        if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
+        // SAFETY: both out-parameters are valid for the call, and no security
+        // attributes means handles that are not inherited.
+        if unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) } == 0 {
             return Err(last_error("CreatePipe"));
         }
         Ok((Owned(read), Owned(write)))
     }
 
-    fn keep_out_of_the_child(handle: HANDLE) -> Result<()> {
+    /// Marks one of the child's ends inheritable, which the handle list below
+    /// requires. Called under [`super::one_start_at_a_time`], held until the
+    /// browser is created and this process's copy is closed.
+    fn let_the_child_have(handle: HANDLE) -> Result<()> {
         // SAFETY: a handle this process owns.
-        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
             return Err(last_error("SetHandleInformation"));
         }
         Ok(())
@@ -667,8 +688,11 @@ mod windows_impl {
         // from, so we hold the write end and it inherits the read end.
         let (mut to_browser_read, mut to_browser_write) = pipe()?;
         let (mut from_browser_read, mut from_browser_write) = pipe()?;
-        keep_out_of_the_child(to_browser_write.0)?;
-        keep_out_of_the_child(from_browser_read.0)?;
+        // From here until our copies of the child's ends are closed, no other
+        // process is started by this one, so none can inherit them.
+        let starting = super::one_start_at_a_time();
+        let_the_child_have(to_browser_read.0)?;
+        let_the_child_have(from_browser_write.0)?;
 
         let mut blob = inheritance_blob(to_browser_read.0, from_browser_write.0);
 
@@ -764,6 +788,7 @@ mod windows_impl {
             CloseHandle(to_browser_read.take());
             CloseHandle(from_browser_write.take());
         }
+        drop(starting);
 
         let job = match make_job() {
             Ok(job) => job,
@@ -840,6 +865,27 @@ mod windows_impl {
     mod tests {
         use super::*;
 
+        /// Neither end of a new pipe is inheritable, so no process another
+        /// thread starts can take one; the child's end becomes inheritable
+        /// only when it is handed over.
+        #[test]
+        fn no_end_of_a_pipe_is_inheritable_until_the_child_is_given_it() {
+            use windows_sys::Win32::Foundation::GetHandleInformation;
+
+            let inheritable = |handle: HANDLE| {
+                let mut flags = 0;
+                // SAFETY: a handle this test owns, and an out-parameter.
+                assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+                flags & HANDLE_FLAG_INHERIT != 0
+            };
+            let (read, write) = pipe().unwrap();
+            assert!(!inheritable(read.0));
+            assert!(!inheritable(write.0));
+            let_the_child_have(read.0).unwrap();
+            assert!(inheritable(read.0));
+            assert!(!inheritable(write.0));
+        }
+
         /// The blob is positional: five slots, the first three closed, and the
         /// two the protocol uses carrying a pipe's flags. Getting the count or
         /// the order wrong does not fail to start the browser — it starts one
@@ -910,7 +956,9 @@ mod unix_impl {
 
     /// Both ends of one pipe, as raw descriptors, close-on-exec: no child
     /// but the browser they are for gets them, and that one through `dup2`.
-    fn pipe() -> Result<(i32, i32)> {
+    /// On macOS under [`super::one_start_at_a_time`], since the flag comes a
+    /// moment after the pipe there.
+    pub(super) fn pipe() -> Result<(i32, i32)> {
         let mut ends = [0 as libc::c_int; 2];
         #[cfg(not(target_os = "macos"))]
         {
@@ -920,9 +968,11 @@ mod unix_impl {
             }
         }
         // No `pipe2` on macOS: the flag is set right after, as `std` does
-        // there.
+        // there, with every start of a process in this program held off in
+        // between, so no child forked meanwhile keeps an end.
         #[cfg(target_os = "macos")]
         {
+            let _starting = super::one_start_at_a_time();
             // SAFETY: `ends` is the two-element array the call fills in.
             if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
                 return Err(std::io::Error::last_os_error()).context("could not open a pipe");
@@ -1001,9 +1051,13 @@ mod unix_impl {
             });
         }
 
-        let child = command
-            .spawn()
-            .with_context(|| format!("could not start {}", program.display()))?;
+        // Under the lock, so that no pipe of another browser's is between
+        // its birth and its flag on macOS while this one forks.
+        let child = {
+            let _starting = super::one_start_at_a_time();
+            command.spawn()
+        }
+        .with_context(|| format!("could not start {}", program.display()))?;
 
         // Ours to close: a pipe stays open while any handle to either end is,
         // so keeping the child's ends would mean never seeing it leave.
@@ -1118,6 +1172,25 @@ mod tests {
             frames.get(1),
             Some(&Frame::Message(br#"{"id":11}"#.to_vec()))
         );
+    }
+
+    /// Both ends of a pipe are close-on-exec from the moment `pipe` hands
+    /// them over, so no child but the browser, which gets two by `dup2`,
+    /// keeps one.
+    #[cfg(unix)]
+    #[test]
+    fn both_ends_of_a_pipe_are_close_on_exec() {
+        let (read, write) = unix_impl::pipe().unwrap();
+        for end in [read, write] {
+            // SAFETY: a descriptor the call above opened; asking changes nothing.
+            let flags = unsafe { libc::fcntl(end, libc::F_GETFD) };
+            assert!(
+                flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+                "{end}: {flags}"
+            );
+            // SAFETY: opened above and closed once.
+            unsafe { libc::close(end) };
+        }
     }
 
     /// A message exactly at the ceiling is still a message.
