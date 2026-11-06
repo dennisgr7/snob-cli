@@ -57,7 +57,7 @@ use crate::report;
 use crate::ui::accounts::{self, Browsed, Picked};
 use crate::ui::browser::input::{self, Action, Raw, action_of, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
-use crate::ui::highlights::{Folder, empty_note, keep_folder, stem_of, walk_in};
+use crate::ui::highlights::{Folder, empty_note, folder_title, keep_folder, stem_of, walk_in};
 use crate::ui::people::Shelf;
 use crate::ui::tui::{self, Tui};
 
@@ -688,11 +688,11 @@ fn draw_level(
             let items = folder.items.as_deref().unwrap_or_default();
             crate::ui::stories::draw_items_view(
                 frame,
-                format!(
-                    "@{} · {} · {} items",
-                    printable(&profile.username),
-                    entry_title(&media.tray.entries[index]),
-                    items.len()
+                folder_title(
+                    &profile.username,
+                    &media.tray.entries[index],
+                    index,
+                    items.len(),
                 ),
                 crate::ui::stories::FOLDER_HINT,
                 items,

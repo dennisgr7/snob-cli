@@ -567,20 +567,9 @@ fn draw_items(
     page_rows: &mut usize,
 ) {
     let items = folder.items.as_deref().unwrap_or_default();
-    let entry = &tray.entries[index];
-    let name = if entry.title.is_empty() {
-        format!("highlight {}", index + 1)
-    } else {
-        format!("\"{}\"", entry.title)
-    };
     crate::ui::stories::draw_items_view(
         frame,
-        format!(
-            "@{} · {name} · {} {}",
-            printable(&tray.username),
-            items.len(),
-            if items.len() == 1 { "item" } else { "items" }
-        ),
+        folder_title(&tray.username, &tray.entries[index], index, items.len()),
         crate::ui::stories::FOLDER_HINT,
         items,
         false,
@@ -590,6 +579,22 @@ fn draw_items(
         colors,
         page_rows,
     );
+}
+
+/// The heading of one open folder, `@someone · "trip" · 3 items`, for this
+/// browser and for the same folder opened from the profile card, so the two
+/// cannot name it two ways. An untitled one is named by its number.
+pub(crate) fn folder_title(username: &str, entry: &Entry, index: usize, items: usize) -> String {
+    let name = if entry.title.is_empty() {
+        format!("highlight {}", index + 1)
+    } else {
+        format!("\"{}\"", entry.title)
+    };
+    format!(
+        "@{} · {name} · {items} {}",
+        printable(username),
+        if items == 1 { "item" } else { "items" }
+    )
 }
 
 /// One folder as a table row: number dim, title, the best count known
@@ -702,6 +707,20 @@ mod tests {
         assert!(second.contains('-'), "{second}");
         assert!(second.contains('3'), "{second}");
         assert!(tui::row_text(&terminal, 7).contains("save all of it"));
+    }
+
+    /// An open folder is named one way wherever it was opened from: its
+    /// title in quotes or its number, and the count in the singular for one.
+    #[test]
+    fn an_open_folder_is_named_one_way() {
+        assert_eq!(
+            folder_title("someone", &entry("trip", None), 0, 1),
+            "@someone · \"trip\" · 1 item"
+        );
+        assert_eq!(
+            folder_title("someone", &entry("", None), 2, 4),
+            "@someone · highlight 3 · 4 items"
+        );
     }
 
     /// Inside a folder Esc walks back out, as Left does; at the tray it
