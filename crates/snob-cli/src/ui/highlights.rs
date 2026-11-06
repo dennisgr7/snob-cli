@@ -533,7 +533,7 @@ fn draw_tray(
                 .enumerate()
                 .map(|(index, (entry, folder))| tray_row(index, entry, folder, colors)),
             [
-                Constraint::Length(3),
+                Constraint::Length(crate::ui::stories::number_width(total)),
                 Constraint::Length(title_w),
                 Constraint::Length(8),
                 Constraint::Length(14),
