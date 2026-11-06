@@ -24,7 +24,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Constraint;
 use ratatui::text::Line;
-use ratatui::widgets::{Cell, Paragraph, Row, TableState, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, TableState};
 use snob_core::model::printable;
 use snob_ig::client::IgClient;
 use snob_store::paths::AppPaths;
@@ -137,6 +137,7 @@ pub async fn browse_grid(
         selected: start.unwrap_or(0),
         note: String::new(),
         receipts: Vec::new(),
+        scroll_room: 0,
     };
     if let Some(index) = start {
         session.walk_in(index).await;
@@ -160,6 +161,7 @@ pub async fn browse_post(
         selected: 0,
         note: String::new(),
         receipts: Vec::new(),
+        scroll_room: 0,
     };
     let (comments, stopped) = watching_cancel_keys(
         client.pacer().cancel_token(),
@@ -191,6 +193,10 @@ struct Session<'a> {
     selected: usize,
     note: String,
     receipts: Vec<String>,
+    /// How far the open post scrolls before its last row reaches the bottom
+    /// edge, as the last frame laid it out: the rows a post takes depend on
+    /// the width it was drawn at, which only the draw knows.
+    scroll_room: usize,
 }
 
 impl Session<'_> {
@@ -325,13 +331,14 @@ impl Session<'_> {
                 }
             }
             Level::Post(index) => {
+                // The comments scroll until their last row is on screen, and
+                // no further.
+                let last_line = self.scroll_room;
                 let Some(detail) = self.details.get_mut(index).and_then(Option::as_mut) else {
                     self.level = Level::Grid;
                     return Ok(None);
                 };
                 let items = detail.post.items.len();
-                // The comments scroll no further than their last line.
-                let last_line = post_lines(detail, false).len().saturating_sub(1);
                 match key {
                     Key::Previous => detail.item = detail.item.saturating_sub(1),
                     Key::Next => detail.item = (detail.item + 1).min(items.saturating_sub(1)),
@@ -485,13 +492,14 @@ impl Session<'_> {
     }
 
     fn draw(
-        &self,
+        &mut self,
         tui: &mut Tui,
         list: &mut TableState,
         viewer: &Viewer,
         colors: bool,
         page_rows: &mut usize,
     ) -> Result<()> {
+        let mut room = self.scroll_room;
         tui.terminal.draw(|frame| match self.level {
             Level::Grid => {
                 if let Some(grid) = &self.grid {
@@ -509,10 +517,12 @@ impl Session<'_> {
                         &self.note,
                         colors,
                         page_rows,
+                        &mut room,
                     );
                 }
             }
         })?;
+        self.scroll_room = room;
         Ok(())
     }
 }
@@ -611,6 +621,12 @@ fn draw_grid(
 
 /// Draws one post: what it says, its items with the one on screen marked,
 /// and its comments when they are shown.
+///
+/// The lines are cut into rows here rather than by `Wrap`, so that how many
+/// rows there are is known: `room` is written with how far the comments may
+/// scroll, and with the comments hidden the item on screen is kept in view
+/// even under a caption longer than the screen is tall.
+#[expect(clippy::too_many_arguments, reason = "one frame's worth of state")]
 fn draw_post(
     frame: &mut Frame<'_>,
     detail: &Detail,
@@ -619,6 +635,7 @@ fn draw_post(
     note: &str,
     colors: bool,
     page_rows: &mut usize,
+    room: &mut usize,
 ) {
     let post = &detail.post;
     let area = frame.area();
@@ -638,16 +655,80 @@ fn draw_post(
     ));
     frame.render_widget(block, area);
 
-    let lines = post_lines(detail, colors);
+    let viewport = inner.height as usize;
+    // The item lines start after what `about` says and the blank under it.
+    let item_line = about(post).len() + 1 + detail.item;
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut item_row = 0usize;
+    for (index, line) in post_lines(detail, colors).into_iter().enumerate() {
+        if index == item_line {
+            item_row = rows.len();
+        }
+        rows.extend(wrapped_line(line, inner.width as usize));
+    }
+    *room = rows.len().saturating_sub(viewport);
     let scroll = if detail.showing_comments {
-        detail.scroll.min(lines.len().saturating_sub(1))
+        detail.scroll.min(*room)
     } else {
-        0
+        item_row
+            .saturating_sub(viewport.saturating_sub(1))
+            .min(*room)
     };
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0));
+    let paragraph = Paragraph::new(rows).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0));
     frame.render_widget(paragraph, inner);
+}
+
+/// One line of a post as the rows it takes at `width` columns, each in the
+/// line's own style: broken at spaces, and inside a word only when the word
+/// alone is wider than a row. Widths are display columns.
+fn wrapped_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let style = line.style;
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    wrapped_text(&text, width)
+        .into_iter()
+        .map(|row| Line::from(row).style(style))
+        .collect()
+}
+
+/// The rows of [`wrapped_line`], as text. An empty line is one empty row.
+fn wrapped_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let columns = |text: &str| console::measure_text_width(text);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0usize;
+    for piece in text.split_inclusive(' ') {
+        // A space at the end of a row costs nothing: it is not drawn.
+        let shown = columns(piece.trim_end_matches(' '));
+        if used + shown > width && !row.is_empty() {
+            rows.push(row.trim_end_matches(' ').to_string());
+            row.clear();
+            used = 0;
+        }
+        if shown <= width {
+            row.push_str(piece);
+            used += columns(piece);
+            continue;
+        }
+        // A word wider than a row is cut where the row ends.
+        for c in piece.chars() {
+            let wide = columns(c.encode_utf8(&mut [0u8; 4]));
+            if used + wide > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            row.push(c);
+            used += wide;
+        }
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row.trim_end_matches(' ').to_string());
+    }
+    rows
 }
 
 /// The lines of one post as [`draw_post`] shows it.
@@ -835,10 +916,88 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         let mut rows = 0usize;
         terminal
-            .draw(|frame| draw_post(frame, &detail, true, &tui::me(), "", false, &mut rows))
+            .draw(|frame| {
+                draw_post(
+                    frame,
+                    &detail,
+                    true,
+                    &tui::me(),
+                    "",
+                    false,
+                    &mut rows,
+                    &mut 0,
+                );
+            })
             .unwrap();
         assert!(tui::row_text(&terminal, 0).contains("@someone · DdzEShhEWCR"));
         assert!(tui::row_text(&terminal, 19).contains("esc back"));
+    }
+
+    /// Rows break at spaces, a word wider than a row is cut, indentation
+    /// stays, and an empty line is still a row.
+    #[test]
+    fn a_line_is_cut_into_rows_at_spaces() {
+        assert_eq!(wrapped_text("one two three", 7), ["one two", "three"]);
+        assert_eq!(wrapped_text("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        assert_eq!(wrapped_text("    ↳ a reply", 40), ["    ↳ a reply"]);
+        assert_eq!(wrapped_text("", 10), [""]);
+        assert_eq!(wrapped_text("大大大", 4), ["大大", "大"]);
+    }
+
+    /// With the comments hidden the item on screen stays in view under a
+    /// caption taller than the screen; with them shown the scroll stops
+    /// once the last row is on screen.
+    #[test]
+    fn the_item_on_screen_stays_in_view_and_the_scroll_stops_at_the_end() {
+        let mut long = post();
+        long.caption = (0..40).map(|i| format!("caption line {i}")).collect();
+        let mut detail = Detail::new(long, None);
+        detail.item = 1;
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        let mut rows = 0usize;
+        let mut room = 0usize;
+        terminal
+            .draw(|frame| {
+                draw_post(
+                    frame,
+                    &detail,
+                    true,
+                    &tui::me(),
+                    "",
+                    false,
+                    &mut rows,
+                    &mut room,
+                );
+            })
+            .unwrap();
+        let screen: String = (0..16).map(|y| tui::row_text(&terminal, y)).collect();
+        assert!(screen.contains("> 2. video 720×1280"), "{screen}");
+        assert!(
+            room > 0,
+            "forty lines of caption do not fit in sixteen rows"
+        );
+
+        detail.showing_comments = true;
+        detail.scroll = usize::MAX;
+        terminal
+            .draw(|frame| {
+                draw_post(
+                    frame,
+                    &detail,
+                    true,
+                    &tui::me(),
+                    "",
+                    false,
+                    &mut rows,
+                    &mut room,
+                );
+            })
+            .unwrap();
+        let screen: String = (0..16).map(|y| tui::row_text(&terminal, y)).collect();
+        assert!(
+            screen.contains("The comments could not be read"),
+            "the last row is on screen: {screen}"
+        );
     }
 
     #[test]
