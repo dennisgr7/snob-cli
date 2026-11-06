@@ -4300,8 +4300,9 @@ mod tests {
     /// judged before it leaves, whatever its address. A Relay call the
     /// registry does not name, a follow snob did not send, a POST off the
     /// API's paths, a beacon, the view-count, sync and event-log paths and the
-    /// app's beacons (a GET of them included) and a piece of video never
-    /// reach the site; a query of the registry's and a REST read do.
+    /// app's beacons (a GET of them included), a piece of video and the
+    /// page's report of its content security policy never reach the site; a
+    /// query of the registry's and a REST read do.
     #[tokio::test]
     async fn the_tab_lets_out_only_what_the_allowlist_names() {
         use wiremock::matchers::{method, path};
@@ -4359,8 +4360,10 @@ mod tests {
             ),
             "['/api/v1/probe/', {}]".to_string(),
         ];
+        // The picture its policy refuses makes the page report it.
         let page = format!(
-            "<!doctype html><title>site</title><script>(async () => {{ \
+            "<!doctype html><title>site</title><img src=\"/refused.png\">\
+             <script>(async () => {{ \
              for (const [to, how] of [{}]) {{ try {{ \
              if (how === 'beacon') navigator.sendBeacon(to, 'a=b'); else await fetch(to, how); \
              }} catch (e) {{}} }} \
@@ -4370,7 +4373,14 @@ mod tests {
         let server = site(None).await;
         Mock::given(method("GET"))
             .and(path("/"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(page, "text/html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(page, "text/html")
+                    .insert_header(
+                        "Content-Security-Policy",
+                        "img-src 'none'; report-uri /csp-report",
+                    ),
+            )
             .with_priority(1)
             .mount(&server)
             .await;
@@ -4432,6 +4442,7 @@ mod tests {
             "GET /ajax/bz",
             "GET /ajax/qm/",
             "GET /clip.mp4",
+            "POST /csp-report",
         ] {
             assert!(
                 !reached.iter().any(|r| r == kept),

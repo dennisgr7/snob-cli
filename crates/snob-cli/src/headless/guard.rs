@@ -64,6 +64,16 @@
 //! takes inside the page, which is not a request. snob never clicks, and the
 //! tab goes only where the allowlist lets it.
 //!
+//! **Nor what the network service sends on its own.** A report under the
+//! Reporting API (`report-to`, the `Reporting-Endpoints` header, deprecation
+//! and intervention reports among them) and a Network Error Logging upload
+//! (`NEL`) are queued and uploaded by the browser's network service, not by
+//! the page, so no `Fetch.requestPaused` is ever raised for them. What a page
+//! does send of that kind, a Content Security Policy report under the older
+//! `report-uri`, is a request of its own kind (`CSPViolationReport`), paused
+//! by that kind and failed whatever the method: snob sends none, and it says
+//! what the page loaded and when.
+//!
 //! **And no video reaches the page.** The feed plays a video that scrolls
 //! into view, muted, on its own, and Instagram counts a play of a reel from
 //! its start. Measured on Chromium 153, a muted video plays under every
@@ -124,7 +134,20 @@ pub(super) fn video_patterns() -> Vec<Value> {
 /// `Fetch`, `navigator.sendBeacon` is `Ping`), and the documents, where a
 /// form is posted. `Other` is what the browser files a request under when it
 /// is none of its kinds, which is where a new way of sending would land.
-const SENT_BY_A_PAGE: [&str; 6] = ["Document", "XHR", "Fetch", "EventSource", "Ping", "Other"];
+/// `CSPViolationReport` is a page's report of what its Content Security
+/// Policy refused, which [`judge`] fails whatever it is.
+const SENT_BY_A_PAGE: [&str; 7] = [
+    "Document",
+    "XHR",
+    "Fetch",
+    "EventSource",
+    "Ping",
+    "CSPViolationReport",
+    "Other",
+];
+
+/// Why a page's report of its Content Security Policy is refused.
+const CSP_REPORT: &str = "a page's report of its content security policy";
 
 /// The one `Fetch.enable` a target gets: a second would replace it. A
 /// request is paused when any one pattern matches it.
@@ -257,6 +280,9 @@ pub(super) fn judge(params: &Value, found: &Rediscovered, armed: &Armed) -> Paus
     let url = request["url"].as_str().unwrap_or_default();
     if params["resourceType"] == "Media" || is_video(url) {
         return Paused::Fail(Paused::VIDEO.to_string());
+    }
+    if params["resourceType"] == "CSPViolationReport" {
+        return Paused::Fail(CSP_REPORT.to_string());
     }
     let parsed = Url::parse(url).ok();
     if parsed
@@ -848,6 +874,29 @@ mod tests {
         assert_eq!(judge(&media), Paused::Fail(Paused::VIDEO.to_string()));
     }
 
+    /// A page's report of its Content Security Policy fails, whatever its
+    /// address and method: snob sends none.
+    #[test]
+    fn a_content_security_policy_report_fails() {
+        for (method, url) in [
+            ("POST", format!("{SITE}/csp-report")),
+            ("POST", "https://example.com/r".to_string()),
+            ("GET", format!("{SITE}/api/v1/x/")),
+        ] {
+            let mut report = paused(
+                method,
+                &url,
+                json!({ "hasPostData": true, "postData": "{}" }),
+            );
+            report["resourceType"] = json!("CSPViolationReport");
+            assert_eq!(
+                judge(&report),
+                Paused::Fail(CSP_REPORT.to_string()),
+                "{method} {url}"
+            );
+        }
+    }
+
     #[test]
     fn a_method_other_than_get_or_post_fails() {
         let put = paused("PUT", &format!("{SITE}/api/v1/x/"), json!({}));
@@ -902,7 +951,15 @@ mod tests {
             .filter(|p| p.get("urlPattern").is_none())
             .filter_map(|p| p["resourceType"].as_str())
             .collect();
-        for kind in ["Document", "XHR", "Fetch", "EventSource", "Ping", "Other"] {
+        for kind in [
+            "Document",
+            "XHR",
+            "Fetch",
+            "EventSource",
+            "Ping",
+            "CSPViolationReport",
+            "Other",
+        ] {
             assert!(kinds.contains(&kind), "{kind}: {kinds:?}");
         }
         for kind in ["Script", "Stylesheet", "Image", "Font", "Preflight"] {
