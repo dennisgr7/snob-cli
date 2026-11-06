@@ -198,7 +198,7 @@ fn draw(
             printable(&stories.username),
             stories.items.len()
         ),
-        "↑↓ move · enter open · d download · a account · q quit",
+        "↑↓ move · enter open · d save · a account · q quit",
         &stories.items,
         true,
         viewer,
@@ -211,8 +211,7 @@ fn draw(
 
 /// The hints of a list of items inside something: a highlight folder, and
 /// the profile card's stories and folders, which `←` leaves.
-pub(crate) const FOLDER_HINT: &str =
-    "↑↓ move · enter open · d download · ← back · a account · q quit";
+pub(crate) const FOLDER_HINT: &str = "↑↓ move · enter open · d save · ← back · a account · q quit";
 
 /// The one items view, drawn under whatever title and hints its owner gives
 /// it. The story browser, the inside of a highlight folder, and the profile

@@ -1518,7 +1518,7 @@ fn counted(n: Option<u64>) -> String {
 fn card_footer_line(here: CardRow, note: &str, colors: bool) -> Line<'static> {
     let mut hint = String::from("↑↓ move · ←→ pick · enter open");
     if here == CardRow::Highlights {
-        hint.push_str(" · d save all of it");
+        hint.push_str(" · d save all");
     }
     hint.push_str(" · a account · q quit");
     tui::footer(note, &hint, colors)
@@ -1650,7 +1650,7 @@ fn draw_actions_panel(
         )
         .title_bottom(tui::footer(
             note,
-            "enter open · d save the picture here · esc back",
+            "enter open · d save the picture · esc back",
             colors,
         ));
     let inner = tui::open_modal(frame, area, block);

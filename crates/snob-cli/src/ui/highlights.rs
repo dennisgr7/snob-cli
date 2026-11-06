@@ -511,7 +511,7 @@ fn draw_tray(
     );
     block = block.title_bottom(tui::footer(
         note,
-        "↑↓ move · enter open · d save all of it · a account · q quit",
+        "↑↓ move · enter open · d save all · a account · q quit",
         colors,
     ));
     frame.render_widget(block, area);
@@ -706,7 +706,7 @@ mod tests {
         assert!(second.contains("2."), "{second}");
         assert!(second.contains('-'), "{second}");
         assert!(second.contains('3'), "{second}");
-        assert!(tui::row_text(&terminal, 7).contains("save all of it"));
+        assert!(tui::row_text(&terminal, 7).contains("d save all"));
     }
 
     /// An open folder is named one way wherever it was opened from: its

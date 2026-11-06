@@ -557,7 +557,7 @@ fn draw_grid(
     );
     block = block.title_bottom(tui::footer(
         note,
-        "↑↓ move · enter open · d save all of it · q quit",
+        "↑↓ move · enter open · d save all · q quit",
         colors,
     ));
     frame.render_widget(block, area);
@@ -633,7 +633,7 @@ fn draw_post(
     let back = if from_a_grid { "esc back" } else { "esc leave" };
     block = block.title_bottom(tui::footer(
         note,
-        &format!("←→ item · o open · d save it · D save the post · c comments · n more · {back}"),
+        &format!("←→ item · o open · d save · D save all · c comments · n more · {back}"),
         colors,
     ));
     frame.render_widget(block, area);
