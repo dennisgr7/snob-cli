@@ -920,7 +920,10 @@ async fn followed_by_open(
         let _ = tui.suspend();
         // No bar draws for this walk, so one line says why the terminal is
         // quiet while the pacer spaces the pages out.
-        eprintln!("walking the accounts you follow that follow them...");
+        eprintln!(
+            "Walking the accounts you follow that follow @{}...",
+            printable(&profile.username)
+        );
         let walked = crate::commands::profile::mutuals(
             app.client(),
             profile.pk,
