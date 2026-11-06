@@ -13,7 +13,8 @@
 //! reopening a folder is free, like reopening a story. Inside, a row is a
 //! story in all but expiry: Enter hands it to the system viewer, D keeps it
 //! under the very name `snob highlights someone 2 -d 3` would write, and
-//! Left or Backspace walks back out with the folder's selection remembered.
+//! Left, Backspace or Esc walks back out with the folder's selection
+//! remembered; Esc leaves only from the tray.
 //!
 //! Fetching inside the loop blocks the keys, deliberately: the story browser
 //! already sits on the CDN for megabytes between keystrokes, one `reels_media`
@@ -23,6 +24,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Constraint;
 use ratatui::text::Line;
@@ -38,7 +40,7 @@ use crate::exit::ExitCode;
 use crate::media::{Saved, Story, save_story};
 use crate::report;
 use crate::ui::accounts::{self, Browsed, Picked};
-use crate::ui::browser::input::{self, Action, next, page, watching_cancel_keys};
+use crate::ui::browser::input::{self, Action, Raw, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::tui::{self, Tui};
 
@@ -154,7 +156,7 @@ pub async fn browse(
                 }
             })?;
 
-            let Some(action) = next(input::tick()).map_err(input::unreadable)? else {
+            let Some(action) = next_at(level).map_err(input::unreadable)? else {
                 continue;
             };
             note.clear();
@@ -312,6 +314,27 @@ pub async fn browse(
     drop(tui);
     tui::print_receipts(&receipts);
     outcome.map(|code| Browsed::of(code, switch_to))
+}
+
+/// The next key, bound for the level the browser is at: `input::next`, but
+/// inside a folder Esc walks back out to the tray, as it does from the same
+/// folder opened from the profile card and from a post to its grid. At the
+/// tray, the top level, it leaves.
+fn next_at(level: Level) -> std::io::Result<Option<Action>> {
+    Ok(match input::read(input::tick())? {
+        Raw::Tick | Raw::Resized => None,
+        // Swallowed whole, as `input::next` does: a paste is no command.
+        Raw::Paste(_) => Some(Action::None),
+        Raw::Key(key) => Some(bound_at(level, key)),
+    })
+}
+
+/// One key at `level`. See [`next_at`].
+fn bound_at(level: Level, key: KeyEvent) -> Action {
+    match (level, input::action_of(key)) {
+        (Level::Inside(_), Action::Quit) if key.code == KeyCode::Esc => Action::Back,
+        (_, action) => action,
+    }
 }
 
 /// `someone-2` for the entry at `index`: the command's own stem, so the
@@ -679,6 +702,21 @@ mod tests {
         assert!(second.contains('-'), "{second}");
         assert!(second.contains('3'), "{second}");
         assert!(tui::row_text(&terminal, 7).contains("save all of it"));
+    }
+
+    /// Inside a folder Esc walks back out, as Left does; at the tray it
+    /// leaves, and `q` leaves from anywhere.
+    #[test]
+    fn esc_walks_out_of_a_folder_and_leaves_from_the_tray() {
+        use crossterm::event::KeyModifiers;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(bound_at(Level::Inside(0), key(KeyCode::Esc)), Action::Back);
+        assert_eq!(bound_at(Level::Inside(0), key(KeyCode::Left)), Action::Back);
+        assert_eq!(bound_at(Level::Tray, key(KeyCode::Esc)), Action::Quit);
+        assert_eq!(
+            bound_at(Level::Inside(0), key(KeyCode::Char('q'))),
+            Action::Quit
+        );
     }
 
     #[test]
