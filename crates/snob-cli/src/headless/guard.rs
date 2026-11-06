@@ -53,10 +53,12 @@
 //! under them: the view-count path (`/video/`, never spelled out here), the
 //! app's event log, and the sync it runs with Facebook, whose hosts are the
 //! only ones the patterns name. Everything else has no host, so a sandbox's
-//! fake is judged the same way. **These fail whatever the method** (`EVENTS`):
-//! a GET carries a signal in its query, or as a pixel, as well as a POST does
-//! in its form. The one GET that goes on is the tab's own navigation to a
-//! profile whose name happens to be one of them (`/video/` is somebody's).
+//! fake is judged the same way. **These, and the app's two beacons under the
+//! API (`/ajax/bz`, `/ajax/qm/`), fail whatever the method** (`EVENTS`): a
+//! GET carries a signal in its query, or as a pixel, as well as a POST does
+//! in its form, and snob never sends either beacon, so a GET of one is the
+//! app's. The one GET that goes on is the tab's own navigation to a profile
+//! whose name happens to be one of them (`/video/` is somebody's).
 //!
 //! **What it cannot see**: the app's realtime socket, and a route the app
 //! takes inside the page, which is not a request. snob never clicks, and the
@@ -91,11 +93,20 @@ const CLAIM_HANDED_OUT: &str = "/api/v1/web/fxcal/ig_sso_users/";
 /// Why a call to Facebook is refused.
 const FACEBOOK: &str = "the app's sync with Facebook";
 
-/// Where the app reports, outside the API, what was seen and done: the view
-/// count, its event log and the sync with Facebook. Each is paused wherever
-/// it appears in an address ([`patterns`]) and failed whatever the method
-/// when a path starts with it ([`judge`]); no call snob makes is under any.
-const EVENTS: [&str; 3] = ["/video/", "/logging_client_events", "/sync/instagram"];
+/// Where the app reports what was seen and done: the view count, its event
+/// log and the sync with Facebook outside the API, and its two beacons under
+/// it (`/ajax/bz` batches its events, impressions among them; `/ajax/qm/` is
+/// the other, whose payload was never recorded; `snob_ig::allowlist`, at
+/// `APP_READS`). Each is paused wherever it appears in an address
+/// ([`patterns`]) and failed whatever the method when a path starts with it
+/// ([`judge`]); no call snob makes is under any.
+const EVENTS: [&str; 5] = [
+    "/video/",
+    "/logging_client_events",
+    "/sync/instagram",
+    "/ajax/bz",
+    "/ajax/qm/",
+];
 
 /// Every piece of video the site would load, feed and reels and stories
 /// alike.
@@ -469,7 +480,7 @@ mod tests {
         for url in [
             format!("{SITE}/api/v1/friendships/2345678901/followers/?count=12"),
             format!("{SITE}/api/graphql"),
-            format!("{SITE}/ajax/bz"),
+            format!("{SITE}/ajax/bulk-route-definitions/"),
         ] {
             assert_eq!(judge(&paused("GET", &url, json!({}))), Paused::Continue);
         }
@@ -709,16 +720,21 @@ mod tests {
         assert!(fails(&judge(&paused("POST", &beside, json!({})))));
     }
 
-    /// The view count, the event log and the sync fail as a GET too, a
-    /// pixel or a query string being as good a carrier as a form.
+    /// The view count, the event log, the sync and the app's beacons fail as
+    /// a GET too, a pixel or a query string being as good a carrier as a
+    /// form.
     #[test]
-    fn the_paths_outside_the_api_fail_whatever_the_method() {
+    fn the_event_paths_fail_whatever_the_method() {
         for path in [
             "/video/x/",
             "/video/x/?media=1",
             "/sync/instagram/",
             "/logging_client_events",
             "/logging_client_events?e=1",
+            "/ajax/bz",
+            "/ajax/bz?__a=1&q=x",
+            "/ajax/qm/",
+            "/ajax/qm/?__a=1",
         ] {
             let url = format!("{SITE}{path}");
             let post = paused(

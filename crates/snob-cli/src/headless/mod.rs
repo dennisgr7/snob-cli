@@ -4299,9 +4299,9 @@ mod tests {
     /// The guard on the wire: what the page's own script sends is paused and
     /// judged before it leaves, whatever its address. A Relay call the
     /// registry does not name, a follow snob did not send, a POST off the
-    /// API's paths, a beacon, the view-count, sync and event-log paths (a GET
-    /// of them included) and a piece of video never reach the site; a query
-    /// of the registry's and a REST read do.
+    /// API's paths, a beacon, the view-count, sync and event-log paths and the
+    /// app's beacons (a GET of them included) and a piece of video never
+    /// reach the site; a query of the registry's and a REST read do.
     #[tokio::test]
     async fn the_tab_lets_out_only_what_the_allowlist_names() {
         use wiremock::matchers::{method, path};
@@ -4349,6 +4349,8 @@ mod tests {
             post("/logging_client_events", "", "a=b"),
             "['/logging_client_events?e=1', {}]".to_string(),
             "['/video/x/?m=1', {}]".to_string(),
+            "['/ajax/bz?__a=1', {}]".to_string(),
+            "['/ajax/qm/?__a=1', {}]".to_string(),
             "['/clip.mp4?part=1', {}]".to_string(),
             post(
                 "/api/graphql",
@@ -4427,6 +4429,8 @@ mod tests {
             "POST /logging_client_events",
             "GET /logging_client_events",
             "GET /video/x/",
+            "GET /ajax/bz",
+            "GET /ajax/qm/",
             "GET /clip.mp4",
         ] {
             assert!(
