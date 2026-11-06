@@ -379,7 +379,15 @@ pub async fn browse(
                                 }
                             }
                             CardRow::Counts => match state.counts_col {
-                                0 => note = "Posts are not browsable yet".to_string(),
+                                // Not from here yet; the command that browses
+                                // them is named, without an `@` (see AGENTS.md,
+                                // "Output contract").
+                                0 => {
+                                    note = format!(
+                                        "Posts open in \"snob posts {}\"",
+                                        profile.username
+                                    );
+                                }
                                 col => {
                                     let kind = if col == 1 {
                                         ListKind::Followers
@@ -790,8 +798,8 @@ async fn list_open(
             return Ok(After::Leave(code));
         }
         return Ok(After::Stay(format!(
-            "{} accounts, from the stored list",
-            people.len()
+            "{}, from the stored list",
+            report::accounts(people.len())
         )));
     }
     state.ask = Ask::List(kind);
@@ -833,8 +841,8 @@ async fn walk_and_open(
         return Ok(After::Leave(code));
     }
     Ok(After::Stay(format!(
-        "{} accounts - {}",
-        people.len(),
+        "{} · {}",
+        report::accounts(people.len()),
         report::requests(outcome.requests)
     )))
 }
@@ -891,7 +899,7 @@ async fn scan_and_open(
         return Ok(After::Leave(code));
     }
     Ok(After::Stay(format!(
-        "Scanned - {}",
+        "Scanned · {}",
         report::requests(followers_outcome.requests + following_outcome.requests)
     )))
 }
@@ -944,7 +952,10 @@ async fn followed_by_open(
     if code == ExitCode::Interrupted {
         return Ok(After::Leave(code));
     }
-    Ok(After::Stay(format!("{} accounts you follow", people.len())))
+    Ok(After::Stay(format!(
+        "{} you follow",
+        report::accounts(people.len())
+    )))
 }
 
 /// A failure while suspended: back on the card with the reason in the note —
