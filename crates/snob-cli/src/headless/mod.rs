@@ -4452,6 +4452,72 @@ mod tests {
         headless.release(None).await;
     }
 
+    /// The realtime host is out of reach of the tab and of every worker it
+    /// starts, by WebSocket and by HTTP alike: the browser is started unable
+    /// to resolve it (`cdp`, `--host-resolver-rules`), since a handshake is
+    /// not a request `Fetch` pauses. `edge-chat.localhost` is loopback to
+    /// Chromium without the rule, so an attempt not refused would reach this
+    /// site; the reads made after each attempt do, so the attempts were made.
+    #[tokio::test]
+    async fn the_realtime_host_is_out_of_reach_of_the_tab_and_its_workers() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let page = r#"<!doctype html><title>site</title><script>
+            const realtime = `ws://edge-chat.localhost:${location.port}/realtime`;
+            const fallback = `http://edge-chat.localhost:${location.port}/edge-chat`;
+            const attempts = (who) => `(async () => {
+                const socket = new WebSocket('${realtime}/' + '${who}');
+                await new Promise((done) => {
+                    socket.onerror = socket.onclose = socket.onopen = done;
+                    setTimeout(done, 2000);
+                });
+                try { await fetch('${fallback}/' + '${who}'); } catch (e) {}
+                await fetch('${location.origin}/api/v1/probe/${who}/');
+            })()`;
+            const code = new Blob([attempts('worker')], { type: 'text/javascript' });
+            new Worker(URL.createObjectURL(code));
+            eval(attempts('page'));
+        </script>"#;
+        let server = site(None).await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(page, "text/html"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let headless = Headless::new(never_signed_out(tmp.path()));
+        let session = made("42%3Asocket%3A1", 1_000);
+        if !started(&headless, &session, answer(&server)).await {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let received = loop {
+            let received = server.received_requests().await.unwrap_or_default();
+            let arrived = |probe: &str| received.iter().any(|r| r.url.path() == probe);
+            if arrived("/api/v1/probe/page/") && arrived("/api/v1/probe/worker/") {
+                break received;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the reads after the sockets never arrived: {:?}",
+                received.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let sockets: Vec<&str> = received
+            .iter()
+            .map(|r| r.url.path())
+            .filter(|path| path.starts_with("/realtime/") || path.starts_with("/edge-chat/"))
+            .collect();
+        assert!(
+            sockets.is_empty(),
+            "the realtime host was reached: {sockets:?}"
+        );
+        headless.release(None).await;
+    }
+
     /// How many times the site's page was loaded.
     async fn loads(server: &wiremock::MockServer) -> usize {
         server

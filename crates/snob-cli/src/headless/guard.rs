@@ -60,8 +60,19 @@
 //! app's. The one GET that goes on is the tab's own navigation to a profile
 //! whose name happens to be one of them (`/video/` is somebody's).
 //!
-//! **What it cannot see**: the app's realtime socket, and a route the app
-//! takes inside the page, which is not a request. snob never clicks, and the
+//! **The realtime host is never reached.** The app keeps a connection to
+//! Meta (MQTT over a WebSocket to `edge-chat`), which can publish presence
+//! and receipts, and a WebSocket's handshake is never paused by `Fetch`, so
+//! the guard cannot judge it; `Network.setBlockedURLs` does not refuse one
+//! either, nor anything a worker sends (measured on Chrome 156, both
+//! reached the site). So the browser is started unable to resolve any host
+//! named `edge-chat` (`cdp`, `--host-resolver-rules`), which holds for every
+//! page and worker and for the HTTP fallback too. snob sends nothing there.
+//!
+//! **What it cannot see**: a WebSocket to any other host, or to `edge-chat`
+//! from a browser that goes through a proxy, since the rule above holds only
+//! where the browser resolves names itself; and a route the app takes inside
+//! the page, which is not a request. snob never clicks, and the
 //! tab goes only where the allowlist lets it.
 //!
 //! **Nor what the network service sends on its own.** A report under the

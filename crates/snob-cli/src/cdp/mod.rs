@@ -70,6 +70,11 @@ const POLL_QUICKLY_FOR: Duration = Duration::from_secs(30);
 /// that is not to sit out the startup timeout first.
 const POLL_FOR_READY: Duration = Duration::from_millis(100);
 
+/// Every host the browser is kept from resolving, as a pattern of
+/// `--host-resolver-rules`, where `*` is any run of characters: Instagram's
+/// realtime host and anything else named like it.
+const REALTIME_HOSTS: &str = "*edge-chat*";
+
 /// How long an ordinary browser command may take before the call gives up.
 pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -210,6 +215,16 @@ fn launch_in(
         // types, PDF viewer and `window.chrome` with or without these two.
         "--disable-extensions".to_string(),
         "--disable-default-apps".to_string(),
+        // **Instagram's realtime host does not resolve.** The app keeps a
+        // socket to it (MQTT over a WebSocket to `edge-chat.instagram.com`)
+        // that can publish presence and receipts, and the tab's guard never
+        // sees a WebSocket: `Fetch` does not pause its handshake and
+        // `Network.setBlockedURLs` does not refuse it. Measured in November
+        // 2026 on Chrome 156, a page's and a worker's both reached the site
+        // without this, and neither does with it (`headless`'s
+        // `the_realtime_host_is_out_of_reach_of_the_tab_and_its_workers`).
+        // The login window gets it too: signing in needs no realtime.
+        format!("--host-resolver-rules=MAP {REALTIME_HOSTS} ~NOTFOUND"),
     ];
     arguments.extend(flags.iter().cloned());
     arguments.push(start_at.to_string());
