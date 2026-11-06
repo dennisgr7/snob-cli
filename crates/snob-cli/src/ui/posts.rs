@@ -405,7 +405,10 @@ impl Session<'_> {
                         }
                     }
                     Key::MoreComments => {
+                        // Said, as `c` says it: a key that answers nothing
+                        // reads as one that did not arrive.
                         let Some(comments) = detail.comments.as_mut() else {
+                            self.note = "The comments could not be read when it opened".into();
                             return Ok(None);
                         };
                         if comments.next.is_none() {
