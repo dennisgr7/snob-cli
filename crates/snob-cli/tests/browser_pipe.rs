@@ -109,6 +109,31 @@ async fn the_browser_answers_on_the_pipe_and_opens_no_port() {
     cdp.close().await;
 }
 
+/// The password manager stays off in the profile the browser ran on: the
+/// preferences seeded before it started are the ones it read, and it wrote
+/// them back as they were when it closed.
+#[tokio::test]
+async fn the_browser_keeps_the_password_manager_off() {
+    let Some((_temporary, profile, cdp)) = started(true).await else {
+        return;
+    };
+    cdp.user_agent().await.expect("it answers");
+    cdp.close().await;
+
+    let file = profile.join("Default").join("Preferences");
+    let preferences: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).expect("the profile's preferences"))
+            .expect("JSON");
+    assert_eq!(
+        preferences["credentials_enable_service"], false,
+        "{preferences}"
+    );
+    assert_eq!(
+        preferences["profile"]["password_manager_enabled"], false,
+        "{preferences}"
+    );
+}
+
 /// Closing the browser waits for every process it started, not only its own:
 /// a helper left running holds the profile, and a browser started next on it
 /// can stall.

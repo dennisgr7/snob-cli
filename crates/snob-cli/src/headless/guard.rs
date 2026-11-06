@@ -53,14 +53,37 @@
 //! under them: the view-count path (`/video/`, never spelled out here), the
 //! app's event log, and the sync it runs with Facebook, whose hosts are the
 //! only ones the patterns name. Everything else has no host, so a sandbox's
-//! fake is judged the same way. **These fail whatever the method** (`EVENTS`):
-//! a GET carries a signal in its query, or as a pixel, as well as a POST does
-//! in its form. The one GET that goes on is the tab's own navigation to a
-//! profile whose name happens to be one of them (`/video/` is somebody's).
+//! fake is judged the same way. **These, and the app's two beacons under the
+//! API (`/ajax/bz`, `/ajax/qm/`), fail whatever the method** (`EVENTS`): a
+//! GET carries a signal in its query, or as a pixel, as well as a POST does
+//! in its form, and snob never sends either beacon, so a GET of one is the
+//! app's. The one GET that goes on is the tab's own navigation to a profile
+//! whose name happens to be one of them (`/video/` is somebody's).
 //!
-//! **What it cannot see**: the app's realtime socket, and a route the app
-//! takes inside the page, which is not a request. snob never clicks, and the
+//! **The realtime host is never reached.** The app keeps a connection to
+//! Meta (MQTT over a WebSocket to `edge-chat`), which can publish presence
+//! and receipts, and a WebSocket's handshake is never paused by `Fetch`, so
+//! the guard cannot judge it; `Network.setBlockedURLs` does not refuse one
+//! either, nor anything a worker sends (measured on Chrome 156, both
+//! reached the site). So the browser is started unable to resolve any host
+//! named `edge-chat` (`cdp`, `--host-resolver-rules`), which holds for every
+//! page and worker and for the HTTP fallback too. snob sends nothing there.
+//!
+//! **What it cannot see**: a WebSocket to any other host, or to `edge-chat`
+//! from a browser that goes through a proxy, since the rule above holds only
+//! where the browser resolves names itself; and a route the app takes inside
+//! the page, which is not a request. snob never clicks, and the
 //! tab goes only where the allowlist lets it.
+//!
+//! **Nor what the network service sends on its own.** A report under the
+//! Reporting API (`report-to`, the `Reporting-Endpoints` header, deprecation
+//! and intervention reports among them) and a Network Error Logging upload
+//! (`NEL`) are queued and uploaded by the browser's network service, not by
+//! the page, so no `Fetch.requestPaused` is ever raised for them. What a page
+//! does send of that kind, a Content Security Policy report under the older
+//! `report-uri`, is a request of its own kind (`CSPViolationReport`), paused
+//! by that kind and failed whatever the method: snob sends none, and it says
+//! what the page loaded and when.
 //!
 //! **And no video reaches the page.** The feed plays a video that scrolls
 //! into view, muted, on its own, and Instagram counts a play of a reel from
@@ -91,11 +114,20 @@ const CLAIM_HANDED_OUT: &str = "/api/v1/web/fxcal/ig_sso_users/";
 /// Why a call to Facebook is refused.
 const FACEBOOK: &str = "the app's sync with Facebook";
 
-/// Where the app reports, outside the API, what was seen and done: the view
-/// count, its event log and the sync with Facebook. Each is paused wherever
-/// it appears in an address ([`patterns`]) and failed whatever the method
-/// when a path starts with it ([`judge`]); no call snob makes is under any.
-const EVENTS: [&str; 3] = ["/video/", "/logging_client_events", "/sync/instagram"];
+/// Where the app reports what was seen and done: the view count, its event
+/// log and the sync with Facebook outside the API, and its two beacons under
+/// it (`/ajax/bz` batches its events, impressions among them; `/ajax/qm/` is
+/// the other, whose payload was never recorded; `snob_ig::allowlist`, at
+/// `APP_READS`). Each is paused wherever it appears in an address
+/// ([`patterns`]) and failed whatever the method when a path starts with it
+/// ([`judge`]); no call snob makes is under any.
+const EVENTS: [&str; 5] = [
+    "/video/",
+    "/logging_client_events",
+    "/sync/instagram",
+    "/ajax/bz",
+    "/ajax/qm/",
+];
 
 /// Every piece of video the site would load, feed and reels and stories
 /// alike.
@@ -113,7 +145,20 @@ pub(super) fn video_patterns() -> Vec<Value> {
 /// `Fetch`, `navigator.sendBeacon` is `Ping`), and the documents, where a
 /// form is posted. `Other` is what the browser files a request under when it
 /// is none of its kinds, which is where a new way of sending would land.
-const SENT_BY_A_PAGE: [&str; 6] = ["Document", "XHR", "Fetch", "EventSource", "Ping", "Other"];
+/// `CSPViolationReport` is a page's report of what its Content Security
+/// Policy refused, which [`judge`] fails whatever it is.
+const SENT_BY_A_PAGE: [&str; 7] = [
+    "Document",
+    "XHR",
+    "Fetch",
+    "EventSource",
+    "Ping",
+    "CSPViolationReport",
+    "Other",
+];
+
+/// Why a page's report of its Content Security Policy is refused.
+const CSP_REPORT: &str = "a page's report of its content security policy";
 
 /// The one `Fetch.enable` a target gets: a second would replace it. A
 /// request is paused when any one pattern matches it.
@@ -246,6 +291,9 @@ pub(super) fn judge(params: &Value, found: &Rediscovered, armed: &Armed) -> Paus
     let url = request["url"].as_str().unwrap_or_default();
     if params["resourceType"] == "Media" || is_video(url) {
         return Paused::Fail(Paused::VIDEO.to_string());
+    }
+    if params["resourceType"] == "CSPViolationReport" {
+        return Paused::Fail(CSP_REPORT.to_string());
     }
     let parsed = Url::parse(url).ok();
     if parsed
@@ -469,7 +517,7 @@ mod tests {
         for url in [
             format!("{SITE}/api/v1/friendships/2345678901/followers/?count=12"),
             format!("{SITE}/api/graphql"),
-            format!("{SITE}/ajax/bz"),
+            format!("{SITE}/ajax/bulk-route-definitions/"),
         ] {
             assert_eq!(judge(&paused("GET", &url, json!({}))), Paused::Continue);
         }
@@ -709,16 +757,21 @@ mod tests {
         assert!(fails(&judge(&paused("POST", &beside, json!({})))));
     }
 
-    /// The view count, the event log and the sync fail as a GET too, a
-    /// pixel or a query string being as good a carrier as a form.
+    /// The view count, the event log, the sync and the app's beacons fail as
+    /// a GET too, a pixel or a query string being as good a carrier as a
+    /// form.
     #[test]
-    fn the_paths_outside_the_api_fail_whatever_the_method() {
+    fn the_event_paths_fail_whatever_the_method() {
         for path in [
             "/video/x/",
             "/video/x/?media=1",
             "/sync/instagram/",
             "/logging_client_events",
             "/logging_client_events?e=1",
+            "/ajax/bz",
+            "/ajax/bz?__a=1&q=x",
+            "/ajax/qm/",
+            "/ajax/qm/?__a=1",
         ] {
             let url = format!("{SITE}{path}");
             let post = paused(
@@ -832,6 +885,29 @@ mod tests {
         assert_eq!(judge(&media), Paused::Fail(Paused::VIDEO.to_string()));
     }
 
+    /// A page's report of its Content Security Policy fails, whatever its
+    /// address and method: snob sends none.
+    #[test]
+    fn a_content_security_policy_report_fails() {
+        for (method, url) in [
+            ("POST", format!("{SITE}/csp-report")),
+            ("POST", "https://example.com/r".to_string()),
+            ("GET", format!("{SITE}/api/v1/x/")),
+        ] {
+            let mut report = paused(
+                method,
+                &url,
+                json!({ "hasPostData": true, "postData": "{}" }),
+            );
+            report["resourceType"] = json!("CSPViolationReport");
+            assert_eq!(
+                judge(&report),
+                Paused::Fail(CSP_REPORT.to_string()),
+                "{method} {url}"
+            );
+        }
+    }
+
     #[test]
     fn a_method_other_than_get_or_post_fails() {
         let put = paused("PUT", &format!("{SITE}/api/v1/x/"), json!({}));
@@ -886,7 +962,15 @@ mod tests {
             .filter(|p| p.get("urlPattern").is_none())
             .filter_map(|p| p["resourceType"].as_str())
             .collect();
-        for kind in ["Document", "XHR", "Fetch", "EventSource", "Ping", "Other"] {
+        for kind in [
+            "Document",
+            "XHR",
+            "Fetch",
+            "EventSource",
+            "Ping",
+            "CSPViolationReport",
+            "Other",
+        ] {
             assert!(kinds.contains(&kind), "{kind}: {kinds:?}");
         }
         for kind in ["Script", "Stylesheet", "Image", "Font", "Preflight"] {

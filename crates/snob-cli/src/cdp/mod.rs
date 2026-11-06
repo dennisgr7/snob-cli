@@ -70,6 +70,11 @@ const POLL_QUICKLY_FOR: Duration = Duration::from_secs(30);
 /// that is not to sit out the startup timeout first.
 const POLL_FOR_READY: Duration = Duration::from_millis(100);
 
+/// Every host the browser is kept from resolving, as a pattern of
+/// `--host-resolver-rules`, where `*` is any run of characters: Instagram's
+/// realtime host and anything else named like it.
+const REALTIME_HOSTS: &str = "*edge-chat*";
+
 /// How long an ordinary browser command may take before the call gives up.
 pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -180,6 +185,7 @@ fn launch_in(
     // removed rather than ignored, so nothing reading the profile concludes
     // that a port is open.
     let _ = std::fs::remove_file(profile.join("DevToolsActivePort"));
+    keep_passwords_unsaved(profile);
 
     let mut arguments = vec![
         format!("--user-data-dir={}", profile.display()),
@@ -210,6 +216,25 @@ fn launch_in(
         // types, PDF viewer and `window.chrome` with or without these two.
         "--disable-extensions".to_string(),
         "--disable-default-apps".to_string(),
+        // The profile is never tied to a Google account's sync, so nothing it
+        // holds, a password typed into the login window included, can be
+        // uploaded from it. Sync runs in the browser, not in the page, which
+        // sees nothing of it. `--disable-background-networking` is left off on
+        // purpose: Chromium describes it as a switch for network performance
+        // testing and does not list the services it stops, Safe Browsing's
+        // updates for the window a password is typed into among them, so it
+        // changes more than this program can say Instagram cannot see.
+        "--disable-sync".to_string(),
+        // **Instagram's realtime host does not resolve.** The app keeps a
+        // socket to it (MQTT over a WebSocket to `edge-chat.instagram.com`)
+        // that can publish presence and receipts, and the tab's guard never
+        // sees a WebSocket: `Fetch` does not pause its handshake and
+        // `Network.setBlockedURLs` does not refuse it. Measured in November
+        // 2026 on Chrome 156, a page's and a worker's both reached the site
+        // without this, and neither does with it (`headless`'s
+        // `the_realtime_host_is_out_of_reach_of_the_tab_and_its_workers`).
+        // The login window gets it too: signing in needs no realtime.
+        format!("--host-resolver-rules=MAP {REALTIME_HOSTS} ~NOTFOUND"),
     ];
     arguments.extend(flags.iter().cloned());
     arguments.push(start_at.to_string());
@@ -226,6 +251,81 @@ fn launch_in(
         profile: profile.to_path_buf(),
         windowless,
     })
+}
+
+/// Turns the password manager off in the profile before the browser reads
+/// it, so the login window never offers to keep the Instagram password in the
+/// profile's own store on disk, where snob never wants it.
+///
+/// There is no flag for either preference, so they are written into
+/// `Default/Preferences`, the file Chromium reads them from: created on a
+/// fresh profile, merged into one that exists, and only when one of them is
+/// not already off, so a profile seeded once is never written again. A file
+/// that is not a JSON object is the browser's, and is left as it is. Written
+/// to a file beside it and renamed over it, so a browser starting on it reads
+/// the old file or the new one, never half of one. A failure is said and is
+/// not fatal: the window still logs in, and only offers to save.
+fn keep_passwords_unsaved(profile: &Path) {
+    if let Err(e) = seed_preferences(profile) {
+        tracing::warn!(
+            error = format!("{e:#}"),
+            "could not turn the password manager off in the browser's profile"
+        );
+    }
+}
+
+fn seed_preferences(profile: &Path) -> Result<()> {
+    let dir = profile.join("Default");
+    snob_store::paths::create_private_dir(&dir)
+        .with_context(|| format!("could not create {}", dir.display()))?;
+    let file = dir.join("Preferences");
+    let mut preferences = match std::fs::read(&file) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(preferences @ Value::Object(_)) => preferences,
+            _ => return Ok(()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(e).with_context(|| format!("could not read {}", file.display())),
+    };
+    if !without_saved_passwords(&mut preferences) {
+        return Ok(());
+    }
+    let beside = dir.join("Preferences.snob");
+    std::fs::write(&beside, serde_json::to_vec(&preferences)?)
+        .with_context(|| format!("could not write {}", beside.display()))?;
+    std::fs::rename(&beside, &file)
+        .with_context(|| format!("could not replace {}", file.display()))?;
+    Ok(())
+}
+
+/// Turns off, in a profile's preferences (a JSON object), the offer to save
+/// passwords and the password manager itself. Whether anything changed.
+fn without_saved_passwords(preferences: &mut Value) -> bool {
+    let Some(top) = preferences.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    let offer = top
+        .entry("credentials_enable_service")
+        .or_insert(Value::Null);
+    if *offer != false {
+        *offer = Value::Bool(false);
+        changed = true;
+    }
+    let profile = top.entry("profile").or_insert_with(|| json!({}));
+    if !profile.is_object() {
+        *profile = json!({});
+    }
+    if let Some(profile) = profile.as_object_mut() {
+        let manager = profile
+            .entry("password_manager_enabled")
+            .or_insert(Value::Null);
+        if *manager != false {
+            *manager = Value::Bool(false);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Chromium's exit code for "another instance holds this profile and would not
@@ -646,6 +746,63 @@ fn poll_interval(elapsed: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh profile gets both preferences off; one that has preferences
+    /// keeps them, with the two turned off; one already off is not written
+    /// again; and a file that is not a JSON object is left alone.
+    #[test]
+    fn the_password_manager_is_off_before_the_browser_reads_the_profile() {
+        let read = |file: &Path| -> Value {
+            serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap()
+        };
+        let off = |preferences: &Value| {
+            preferences["credentials_enable_service"] == false
+                && preferences["profile"]["password_manager_enabled"] == false
+        };
+
+        let temporary = tempfile::tempdir().unwrap();
+        let profile = temporary.path().join("profile");
+        let file = profile.join("Default").join("Preferences");
+        keep_passwords_unsaved(&profile);
+        assert!(off(&read(&file)), "{}", read(&file));
+
+        std::fs::write(
+            &file,
+            r#"{"credentials_enable_service":true,"profile":{"name":"Person 1","password_manager_enabled":true},"intl":{"accept_languages":"es"}}"#,
+        )
+        .unwrap();
+        keep_passwords_unsaved(&profile);
+        let merged = read(&file);
+        assert!(off(&merged), "{merged}");
+        assert_eq!(merged["profile"]["name"], "Person 1");
+        assert_eq!(merged["intl"]["accept_languages"], "es");
+
+        let seeded = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        keep_passwords_unsaved(&profile);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            seeded,
+            "written again"
+        );
+        assert!(!profile.join("Default").join("Preferences.snob").exists());
+
+        for foreign in ["not json", "[1, 2]"] {
+            std::fs::write(&file, foreign).unwrap();
+            keep_passwords_unsaved(&profile);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), foreign);
+        }
+    }
+
+    /// A `profile` that is not an object is replaced by one, rather than
+    /// indexed into, which would panic.
+    #[test]
+    fn a_profile_entry_of_the_wrong_shape_does_not_panic() {
+        let mut preferences = json!({ "profile": 3 });
+        assert!(without_saved_passwords(&mut preferences));
+        assert_eq!(preferences["profile"]["password_manager_enabled"], false);
+        assert!(!without_saved_passwords(&mut json!([])));
+    }
 
     /// The first half minute polls quickly; after that, at a pace a person
     /// finding their phone will not notice.

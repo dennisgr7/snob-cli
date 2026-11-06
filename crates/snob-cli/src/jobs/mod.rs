@@ -85,7 +85,8 @@ pub const GRACE: Duration = Duration::from_secs(30);
 /// over the network, the server's and a client's copy (`commands::mcp::key`):
 /// no command a call runs reads either, and every process it starts would
 /// carry them on, the browser owner and its browsers among them, which keep
-/// the environment they were started with. The rest of the environment is
+/// the environment they were started with; `detach` and `pipe` leave them out
+/// of those too, whoever starts them. The rest of the environment is
 /// the person's own machine (`SNOB_NO_BROWSER`, the proxy, the locale) and
 /// is passed on.
 pub const NEVER_INHERITED: &[&str] = &["SNOB_IGNORE_COOLDOWN", "SNOB_MCP_KEY", "SNOB_MCP_TOKEN"];
