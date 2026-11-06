@@ -271,12 +271,15 @@ pub enum LoginMethod {
 /// The methods the menu offers, in its order, for someone sitting at `seat`:
 /// the window first where it opens in front of them, the tunnel first where
 /// it would not, and the window left out where it cannot open at all.
+///
+/// **Every label fits an 80-column terminal** with the menu's pointer in
+/// front of it: the menu clips a row at the edge, and the words a long label
+/// loses there are its last ones, which is where "(recommended)" is.
 pub fn login_methods(seat: &crate::seat::Seat) -> Vec<(LoginMethod, &'static str)> {
     use crate::seat::Window;
-    const REMOTE: &str =
-        "Log in from the browser of the computer you are at, through an SSH tunnel";
-    const REMOTE_FIRST: &str = "Log in from the browser of the computer you are at, through an \
-                                SSH tunnel  (recommended)";
+    const REMOTE: &str = "Log in from the browser of the computer you are at, over SSH";
+    const REMOTE_FIRST: &str =
+        "Log in from the browser of the computer you are at, over SSH  (recommended)";
     const PASTE: &str = "Paste the sessionid from the developer tools";
     match seat.window {
         Window::Seen => vec![
@@ -479,6 +482,13 @@ mod tests {
                 .filter(|(_, label)| label.contains("recommended"))
                 .collect();
             assert_eq!(recommended, [&methods[0]], "{window:?}");
+            // The pointer and its space, then the label, inside 80 columns.
+            for (_, label) in &methods {
+                assert!(
+                    2 + console::measure_text_width(label) <= 80,
+                    "{label:?} is cut on an 80-column terminal"
+                );
+            }
         }
     }
 
