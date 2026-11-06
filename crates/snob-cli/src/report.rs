@@ -855,6 +855,14 @@ pub fn answers(n: u32) -> String {
     }
 }
 
+/// "1 account" / "12 accounts", for the headings and notes of the views.
+pub fn accounts(n: usize) -> String {
+    match n {
+        1 => "1 account".to_string(),
+        n => format!("{n} accounts"),
+    }
+}
+
 /// "1 request" / "7 requests".
 pub fn requests(n: u32) -> String {
     if n == 1 {
