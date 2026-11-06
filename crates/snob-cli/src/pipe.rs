@@ -433,11 +433,11 @@ mod windows_impl {
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
-        CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
-        EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
-        LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
-        ResumeThread, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-        WaitForSingleObject,
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW,
+        TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     use super::{CHILD_READ_FD, CHILD_WRITE_FD, Ended};
@@ -744,6 +744,9 @@ mod windows_impl {
         startup.lpAttributeList = attributes;
 
         let mut command_line = command_line(program, args);
+        // This process's environment without what no child of snob's gets
+        // (`detach`): the browser would keep it for its whole life.
+        let environment = crate::detach::environment_block(std::env::vars_os());
 
         // SAFETY: an out parameter. `CreateProcessW` fills it, and all-zero is
         // what it is documented to be handed.
@@ -762,8 +765,8 @@ mod windows_impl {
                 std::ptr::null(),
                 std::ptr::null(),
                 1,
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
-                std::ptr::null(),
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                environment.as_ptr().cast(),
                 std::ptr::null(),
                 &startup.StartupInfo,
                 &mut information,
@@ -1028,6 +1031,9 @@ mod unix_impl {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        // Nothing of what no child of snob's gets (`detach`): the browser
+        // would keep it for its whole life.
+        crate::detach::without_what_is_never_inherited(&mut command);
 
         // SAFETY: `onto` is async-signal-safe, which is the whole contract
         // of `pre_exec`, and it is why the descriptor numbers are computed
