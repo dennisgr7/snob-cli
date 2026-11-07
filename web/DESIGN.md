@@ -154,6 +154,10 @@ macOS command. "Other ways ↓" always leads to the install section.
   the portfolio shows, inert anywhere else.
   Astro bundles them and writes their hashes into the Content Security Policy. Executable code is never `is:inline`, which the policy
   would not cover, and nothing carries a `style` attribute.
+- **One piece of server code, for the videos alone** (`worker/index.ts`):
+  Safari plays a video only from byte ranges, and Cloudflare's static assets
+  answer a range with the whole file, so `/video/*` (not its poster) runs a few
+  lines that cut the range. Everything else is the static build, untouched.
 - **Everything works without JavaScript**: the hero shows macOS, the install
   section shows every platform one after another, and the copy buttons stay hidden
   because they could not work.

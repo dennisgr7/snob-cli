@@ -975,6 +975,10 @@ push-back (`headless/listen.rs`), the prefix of `CLAIM_HANDED_OUT`
 
 A static Astro site (`output: 'static'`, Tailwind 4) served by Cloudflare
 Workers from `dist/` (`wrangler.jsonc`, custom domain `snob.dennisgr7.dev`).
+The one piece of Worker code, `web/worker/index.ts`, runs for the hero's
+videos alone (`run_worker_first`) and answers byte ranges, which static assets
+do not and Safari needs to play a video; it sets its own headers, since
+`_headers` does not reach a Worker's answers.
 Workers Builds deploys `main` and uploads a preview for every other branch.
 Node `24.21.0` (`web/.node-version`), pnpm `12.9.1` via Corepack; exact
 versions only, a 24 h release quarantine and an install-script allowlist in

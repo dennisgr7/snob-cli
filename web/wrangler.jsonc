@@ -1,15 +1,22 @@
-// The site is a Worker with static assets and no Worker code: Cloudflare serves
-// `dist/` as built, applying `public/_headers`. Workers Builds runs the build
-// from `web/` on every push that touches `web/` (its build watch path, set in
-// the dashboard): `main` deploys, any other branch uploads a version with a
-// preview URL named after the branch, such as
+// The site is a Worker with static assets: Cloudflare serves `dist/` as built,
+// applying `public/_headers`, with no code, except `/video/*`, which runs
+// `worker/index.ts` first so the hero's recording answers byte ranges (Safari
+// plays a video from nothing else; its header says why). Workers Builds runs
+// the build from `web/` on every push that touches `web/` (its build watch
+// path, set in the dashboard): `main` deploys, any other branch uploads a
+// version with a preview URL named after the branch, such as
 // `dev-snob-web.cheseydennis.workers.dev`.
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "snob-web",
   "compatibility_date": "2026-10-05",
+  "main": "./worker/index.ts",
   "assets": {
     "directory": "./dist",
+    // What the Worker reads the files through, and the only paths it sees:
+    // the videos, not their poster, which is an image like any other.
+    "binding": "ASSETS",
+    "run_worker_first": ["/video/*", "!/video/*.webp"],
     // `/page` and `/page/` both answer, the second redirected to the first form
     // Astro writes (`page/index.html`).
     "html_handling": "auto-trailing-slash",

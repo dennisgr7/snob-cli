@@ -168,3 +168,37 @@ test.describe('motion', () => {
     expect(media).toEqual([]);
   });
 });
+
+/**
+ * Safari plays a video only from byte ranges, which static assets do not
+ * serve: `worker/index.ts` cuts them, for `/video/*` alone.
+ */
+test.describe('the recording over byte ranges', () => {
+  test('a range is answered with 206 and those bytes', async ({ request }) => {
+    const whole = await request.get(HERO_VIDEO.mp4);
+    expect(whole.status()).toBe(200);
+    expect(whole.headers()['accept-ranges']).toBe('bytes');
+    const bytes = await whole.body();
+
+    // What Safari asks first.
+    const first = await request.get(HERO_VIDEO.mp4, { headers: { Range: 'bytes=0-1' } });
+    expect(first.status()).toBe(206);
+    expect(first.headers()['content-range']).toBe(`bytes 0-1/${bytes.length}`);
+    expect(first.headers()['content-type']).toBe('video/mp4');
+    expect(await first.body()).toEqual(bytes.subarray(0, 2));
+
+    const tail = await request.get(HERO_VIDEO.webm, { headers: { Range: 'bytes=-10' } });
+    expect(tail.status()).toBe(206);
+    expect((await tail.body()).length).toBe(10);
+  });
+
+  test('a range past the end is refused, and the rest of the site is untouched', async ({ request }) => {
+    const past = await request.get(HERO_VIDEO.mp4, { headers: { Range: 'bytes=999999999-' } });
+    expect(past.status()).toBe(416);
+    expect(past.headers()['content-range']).toMatch(/^bytes \*\/\d+$/);
+    // Anything else is the static assets', with the headers of _headers.
+    const poster = await request.get(HERO_VIDEO.poster, { headers: { Range: 'bytes=0-1' } });
+    expect(poster.status()).toBe(200);
+    expect(poster.headers()['strict-transport-security']).toBeTruthy();
+  });
+});
