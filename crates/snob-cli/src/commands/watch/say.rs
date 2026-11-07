@@ -215,9 +215,17 @@ pub(super) fn describe(report: &WatchReport, refused: bool) -> Vec<String> {
                 .flatten()
                 .all(|r| matches!(r.basis, Basis::Unchanged { .. }));
 
-            lines.push(format!(
-                "Nothing has changed for {who} since the last report."
-            ));
+            // With a list not compared, the headline says so itself: read
+            // on its own, as a notification's first line is, "nothing has
+            // changed" was an all-clear for a list nobody compared.
+            lines.push(if refused {
+                format!(
+                    "Nothing has changed for {who} in the list that was compared since the \
+                     last report."
+                )
+            } else {
+                format!("Nothing has changed for {who} since the last report.")
+            });
             if refused {
                 lines.push(
                     "One of the lists could not be read this time, so this speaks only for \
