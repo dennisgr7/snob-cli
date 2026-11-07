@@ -32,7 +32,13 @@ use snob_store::secrets::SecretStore;
 /// to go.
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) if e.kind() == clap::error::ErrorKind::MissingSubcommand => {
+            return no_command();
+        }
+        Err(e) => e.exit(),
+    };
     if let Err(refused) = cli.refuse_a_named_account() {
         refused.exit();
     }
@@ -47,6 +53,41 @@ async fn main() -> std::process::ExitCode {
             snob_cli::exit::exit_code_for(&e)
         }
     };
+    std::process::ExitCode::from(snob_cli::exit::code(code))
+}
+
+/// `snob` typed with no command.
+///
+/// On a terminal, where to start (`commands::start`). Anywhere else, the
+/// error and exit 2 of any other mistake on the command line, but with
+/// clap's list of commands left out: clap lists every one, the hidden
+/// plumbing included, and `snob --help` lists those a person types.
+///
+/// The global flags typed are read by parsing the same line again with a
+/// command that takes no argument of its own, so the screen finds the
+/// sandbox and the account a real command would. A line that does not parse
+/// even then is reported as clap reports it.
+fn no_command() -> std::process::ExitCode {
+    use clap::CommandFactory;
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::MissingSubcommand,
+                "snob needs a command; \"snob --help\" lists them",
+            )
+            .exit();
+    }
+    let line = std::env::args_os().chain(std::iter::once("status".into()));
+    let cli = Cli::try_parse_from(line).unwrap_or_else(|e| e.exit());
+    let env = std::env::var("SNOB_ACCOUNT").ok();
+    let shown = wiring(&cli).and_then(|(paths, _, _)| {
+        commands::start::run(&paths, cli.account.as_deref(), env.as_deref())
+    });
+    let code = shown.unwrap_or_else(|e| {
+        snob_cli::report::print_error(&e, snob_cli::report::Wording::Prose);
+        snob_cli::exit::exit_code_for(&e)
+    });
     std::process::ExitCode::from(snob_cli::exit::code(code))
 }
 
