@@ -703,6 +703,44 @@ pub fn refuse_declined(shown: &str) -> anyhow::Error {
     .into()
 }
 
+/// A stored following list handed out with the account's own writes since
+/// its walk applied (`engine::serve_stored`): what was applied, by name, and
+/// that the list was not read again. Never "updated": nothing was walked.
+pub fn own_writes_applied(
+    taken_at: Epoch,
+    applied: &[snob_store::store::own_writes::Applied],
+) -> String {
+    use snob_store::store::own_writes::Verb;
+    let named = |verb: Verb| -> Vec<String> {
+        applied
+            .iter()
+            .filter(|change| change.verb == verb)
+            .map(|change| match &change.username {
+                Some(name) => format!("@{}", printable(name)),
+                None => format!("account {}", change.pk),
+            })
+            .collect()
+    };
+    let mut done = Vec::new();
+    if let Some(names) = and_list(&named(Verb::Unfollow)) {
+        done.push(format!("unfollowed {names}"));
+    }
+    if let Some(names) = and_list(&named(Verb::Follow)) {
+        done.push(format!("followed {names}"));
+    }
+    let changes = if applied.len() == 1 {
+        "1 change".to_string()
+    } else {
+        format!("{} changes", applied.len())
+    };
+    format!(
+        "the following list stored on {} is shown with {changes} you made through snob \
+         since ({}); it was not read again",
+        stored_on(taken_at),
+        done.join(" and ")
+    )
+}
+
 /// Serving a stored list because nothing may be spent.
 ///
 /// The list is named because a crossing serves two of them, and two identical

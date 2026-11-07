@@ -170,14 +170,38 @@ pub async fn run(
         Verb::Follow => client.follow(pk, username, &ids).await?,
         Verb::Unfollow => client.unfollow(pk, username, &ids).await?,
     };
-    tell(
-        &args,
-        verb,
-        &profile,
-        &name,
-        outcome(verb, &status),
-        Some(&status),
-    )
+    let outcome = outcome(verb, &status);
+    remember_own_write(&app, &profile, outcome);
+    tell(&args, verb, &profile, &name, outcome, Some(&status))
+}
+
+/// Writes down a write that changed the account's following, so a stored
+/// following list is handed out with it applied until the next walk reads
+/// it (`own_writes`, `engine::serve_stored`). A request a private account
+/// has still to accept changes no list, and nor does a write Instagram
+/// answered as already so.
+///
+/// **Not a reason to fail the run**: the write has happened, and saying it
+/// failed would invite sending it again. A record that could not be written
+/// leaves the stored list as its walk read it, which is what it was before.
+fn remember_own_write(
+    app: &crate::app::App,
+    profile: &snob_ig::model::WebProfileInfo,
+    outcome: Outcome,
+) {
+    use snob_store::store::own_writes::{self, Verb as Written};
+    let verb = match outcome {
+        Outcome::Followed => Written::Follow,
+        Outcome::Unfollowed => Written::Unfollow,
+        _ => return,
+    };
+    let conn = app.db().conn();
+    let user = snob_core::model::User::named(profile.id, profile.username.clone());
+    let recorded = snob_store::store::users::upsert(conn, &user)
+        .and_then(|_| own_writes::record(conn, profile.id, verb, snob_core::clock::now()));
+    if let Err(e) = recorded {
+        tracing::debug!(error = %e, "the write could not be written down for the stored lists");
+    }
 }
 
 /// What a write refused in a cooldown says it did not do.

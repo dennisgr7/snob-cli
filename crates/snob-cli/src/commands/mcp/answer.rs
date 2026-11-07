@@ -248,6 +248,9 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
                     "from": said.get("from"),
                     "taken_at": said.get("taken_at"),
                 });
+                if let Some(own) = said.get("own_changes").filter(|n| n.is_u64()) {
+                    told["own_changes"] = own.clone();
+                }
                 if let Some(reason) = said
                     .get("reason")
                     .and_then(Value::as_str)
@@ -531,13 +534,33 @@ pub fn not_read_now(body: &Value) -> Option<String> {
             recent.join(" and ")
         ));
     }
+    let own: u64 = served
+        .iter()
+        .filter_map(|said| said.get("own_changes")?.as_u64())
+        .sum();
     if said.is_empty() {
-        return None;
+        return (own > 0).then(|| own_changes(own));
     }
-    Some(format!(
+    let mut told = format!(
         "{}, however old that is. Say so, with that date, when you present it.",
         said.join("; ")
-    ))
+    );
+    if own > 0 {
+        told.push(' ');
+        told.push_str(&own_changes(own));
+    }
+    Some(told)
+}
+
+/// The sentence for a stored following list handed out with the account's
+/// own follows and unfollows since its walk applied (`own_changes`).
+fn own_changes(n: u64) -> String {
+    let changes = if n == 1 { "change" } else { "changes" };
+    format!(
+        "The following list includes {n} {changes} the person made through snob since it \
+         was read (own_changes); those are known, having been sent, but the list was not \
+         read again."
+    )
 }
 
 /// What an agent is told beside a list its `limit` cut, which then has no

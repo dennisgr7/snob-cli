@@ -596,7 +596,10 @@ impl Progress {
     /// on (`jobs::show::finished`), and so does `snob mcp` for a call it ran
     /// with this flag, so an agent is told a stored list is one, and how old,
     /// and a short one is short, as a person is told in the warning and the
-    /// summary; nothing is drawn for it.
+    /// summary; nothing is drawn for it. `own_changes`, only when there are
+    /// some, is how many of the account's own follows and unfollows a stored
+    /// following list was handed out with (`engine::ListOutcome::
+    /// own_changes`).
     pub fn served(
         &self,
         list: snob_core::model::ListKind,
@@ -604,18 +607,19 @@ impl Progress {
         taken_at: snob_core::Epoch,
         cooldown_until: Option<snob_core::Epoch>,
         reason: snob_core::model::StopReason,
+        own_changes: usize,
     ) {
-        self.tell(
-            "served",
-            |_| {},
-            serde_json::json!({
-                "list": list.as_str(),
-                "from": from,
-                "taken_at": taken_at,
-                "cooldown_until": cooldown_until,
-                "reason": reason.as_str(),
-            }),
-        );
+        let mut said = serde_json::json!({
+            "list": list.as_str(),
+            "from": from,
+            "taken_at": taken_at,
+            "cooldown_until": cooldown_until,
+            "reason": reason.as_str(),
+        });
+        if own_changes > 0 {
+            said["own_changes"] = serde_json::json!(own_changes);
+        }
+        self.tell("served", |_| {}, said);
     }
 
     /// Ends the stack, frozen lines included, and leaves it ready for the

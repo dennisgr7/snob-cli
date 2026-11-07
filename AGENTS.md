@@ -341,6 +341,13 @@ with a documented reason in the same place.
   the data directory, and falls back to a TCP port on `127.0.0.1` only on
   Windows or where the socket path cannot be forwarded by `ssh -L`
   (`relay::can_be_forwarded`).
+- **The account's own writes reach its stored following list**
+  (`snob_store::store::own_writes`, `engine::serve_stored`): a follow or an
+  unfollow Instagram took is written down, and a stored following list of
+  the account's own is handed out with the writes made since its walk
+  applied, said in a warning and, to an agent, as `own_changes` in
+  `served`; never as a walk. The monitor compares captures by id, so it
+  reports what was walked.
 - **Rotated cookies are written back** from the browser to the store when a
   command leaves it (`headless/write_back.rs`); a login is authoritative.
 - **Local data is per user, never per directory** (`snob-store/src/paths.rs`,
