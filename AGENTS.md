@@ -542,7 +542,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   stored to serve), and a write through `follow --check-ahead` (a job
   walking or `spend.lock` held, `busy`; no CSRF token; the cooldown, with
   `cooldown_until`; `mcp_write_cap`; a wait for the write bucket past
-  `--max-wait`, `budget_wait`). In a cooldown a stored list is still asked
+  `--max-wait`, `budget_wait`), and a follow of an account the following
+  list walked in the last hour holds is answered `already_following` with
+  no question (`follow::followed_as_stored`; never an unfollow, since no
+  list shows a pending request it would withdraw). In a cooldown a stored list is still asked
   about: the command carries `-y`, which a question skipped would hand a
   walk with no yes once the cooldown lifts. What can still refuse after the
   yes: what changes between the check and the yes (another process taking

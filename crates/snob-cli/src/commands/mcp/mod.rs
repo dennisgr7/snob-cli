@@ -714,6 +714,10 @@ impl Server {
     ///   (`mcp_write_cap`), and a wait for the budget past `--max-wait`
     ///   (`budget_wait`).
     ///
+    /// And a follow it finds would change nothing, answered as it is with no
+    /// question asked (`already_following`, from a following list walked in
+    /// the last hour).
+    ///
     /// **Still refused after the yes**: what changes between the check and
     /// the yes (another process taking the account, which the child refuses
     /// as `busy`; a cooldown starting; the budget or the cap taken by another
@@ -743,7 +747,17 @@ impl Server {
             .run(&line, stop, HEARTBEAT, |_| std::future::ready(()))
             .await
             .map_err(|e| McpError::internal_error(format!("snob could not be run: {e}"), None))?;
-        if finished.code != ExitCode::Ok {
+        // A write the check found would change nothing (`follow::
+        // check_ahead`, a follow of an account a just-walked following list
+        // holds) is answered with what it found, and nobody is asked a
+        // question whose yes could do nothing.
+        let nothing_to_do = finished
+            .json
+            .as_ref()
+            .and_then(|said| said.get("would"))
+            .and_then(Value::as_str)
+            == Some("nothing");
+        if finished.code != ExitCode::Ok || nothing_to_do {
             return Ok(Some(result(answer::from(plan, finished), tool)));
         }
         Ok(None)
