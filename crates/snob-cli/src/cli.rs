@@ -1469,6 +1469,21 @@ pub struct WatchCheckArgs {
     /// Do not post anything to the webhook
     #[arg(long)]
     pub no_webhook: bool,
+
+    /// Sign the check's message with this secret, as a run given it signs
+    /// its reports. SNOB_SIGNING_KEY is read when it is set.
+    // The same flag and variable as a run's (`WebhookArgs::sign_with`): a
+    // check that ignored the variable a scheduled run signs with posted an
+    // unsigned message and said "ok", so the one path a headless machine
+    // signs by was the one it could not probe.
+    #[arg(
+        long,
+        value_name = "SECRET",
+        value_parser = signing_secret,
+        env = "SNOB_SIGNING_KEY",
+        hide_env_values = true
+    )]
+    pub sign_with: Option<String>,
 }
 
 #[derive(Args, Debug)]

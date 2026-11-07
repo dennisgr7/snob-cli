@@ -243,15 +243,32 @@ fn plan(
 
     // Said whatever the file asks for, because the file is what says a
     // credential was ever meant to travel. It cannot be asked whether one was
-    // stored -- that is the question that could not be answered.
+    // stored -- that is the question that could not be answered. **It names
+    // only what is really missing**: a key from `--sign-with` or
+    // `SNOB_SIGNING_KEY` still signs, and a header still authenticates, and a
+    // warning that said otherwise sent somebody looking for a fault there
+    // was not.
+    let authenticated = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
     if store_unreadable && from_file.is_some() {
-        warnings.push(
-            "the system keyring could not be read, so any token or signing key stored by \
-             \"snob watch setup\" is not being used: this report goes out unauthenticated and \
-             unsigned. Pass them with --header and --sign-with, or run where the keyring is \
-             reachable."
-                .to_string(),
-        );
+        let (stored, goes_out, pass) = match (authenticated, key.is_some()) {
+            (true, true) => (None, "", ""),
+            (true, false) => (Some("signing key"), "unsigned", "it with --sign-with"),
+            (false, true) => (Some("token"), "unauthenticated", "it with --header"),
+            (false, false) => (
+                Some("token or signing key"),
+                "unauthenticated and unsigned",
+                "them with --header and --sign-with",
+            ),
+        };
+        if let Some(stored) = stored {
+            warnings.push(format!(
+                "the system keyring could not be read, so any {stored} stored by \
+                 \"snob watch setup\" is not being used: this report goes out {goes_out}. \
+                 Pass {pass}, or run where the keyring is reachable."
+            ));
+        }
     }
 
     Ok((
@@ -877,6 +894,42 @@ mod tests {
         // And the answer that really does mean "nothing was stored" still says
         // nothing, because there is nothing to say.
         let (_, quiet) = plan(&args, Some(&file), Stored::Nothing, Stored::Nothing).unwrap();
+        assert!(quiet.is_empty(), "{quiet:?}");
+    }
+
+    /// A key given with `--sign-with`, or `SNOB_SIGNING_KEY`, still signs when
+    /// the keyring cannot be read, and the warning says only what is really
+    /// missing: the token. It used to say "unsigned" about a report that a
+    /// receiver then verified.
+    #[test]
+    fn an_unreadable_keyring_with_a_key_given_warns_only_about_the_token() {
+        let file = configured("https://n8n.local/webhook/snob", &[]);
+        let args = WebhookArgs {
+            sign_with: Some("k".repeat(40)),
+            ..Default::default()
+        };
+
+        let (planned, warnings) =
+            plan(&args, Some(&file), Stored::Unreachable, Stored::Unreachable).unwrap();
+        assert!(
+            planned
+                .expect("the file names an address")
+                .webhook
+                .key
+                .is_some()
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("unauthenticated"), "{warnings:?}");
+        assert!(!warnings[0].contains("unsigned"), "{warnings:?}");
+
+        // With an Authorization header too, nothing is missing to warn about.
+        let args = WebhookArgs {
+            sign_with: Some("k".repeat(40)),
+            header: vec!["Authorization: Bearer x".into()],
+            ..Default::default()
+        };
+        let (_, quiet) =
+            plan(&args, Some(&file), Stored::Unreachable, Stored::Unreachable).unwrap();
         assert!(quiet.is_empty(), "{quiet:?}");
     }
 

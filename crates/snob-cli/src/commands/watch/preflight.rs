@@ -54,7 +54,11 @@ pub(super) async fn preflight(
 
     // Before the session, like `once` does, so an address that could never work
     // is reported even on a machine that cannot log in.
-    let delivery = match delivery_from(&WebhookArgs::default(), configured.as_ref(), secrets) {
+    let webhook = WebhookArgs {
+        sign_with: args.sign_with.clone(),
+        ..WebhookArgs::default()
+    };
+    let delivery = match delivery_from(&webhook, configured.as_ref(), secrets) {
         Ok(delivery) => delivery,
         Err(e) => {
             report.checked.push(check::Checked {
