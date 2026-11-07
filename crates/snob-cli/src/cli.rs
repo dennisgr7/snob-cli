@@ -246,6 +246,22 @@ pub(crate) fn signing_secret(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+/// An account named on the command line, refused by clap (exit 2) when it
+/// cannot be a username (`snob_core::model::possible_username`), so the
+/// mistake is told before the consent question and before anything is spent.
+/// The value is kept as typed; the commands take the at sign off themselves.
+pub(crate) fn username(value: &str) -> Result<String, String> {
+    if snob_core::model::possible_username(value) {
+        Ok(value.to_string())
+    } else {
+        Err(format!(
+            "\"{}\" cannot be an Instagram username: letters, digits, '.' and '_', at most {}",
+            snob_core::model::printable(value),
+            snob_core::model::USERNAME_MAX
+        ))
+    }
+}
+
 /// The line of [`EXAMPLES`] that announces `SNOB_MCP_KEY`, in a build that
 /// reads it (`commands::mcp::key`, feature `mcp-http`) and in no other: a
 /// build without the HTTP half has no key to read.
@@ -462,7 +478,7 @@ pub enum Command {
                       It walks neither of its lists and stores nothing.\n\n\
                       From the browser, finding another account's id costs one more until snob \
                       has walked its lists or a list that names it; your own is the session's. A \
-                      name that cannot be an Instagram username is not found, for no request. \
+                      name that cannot be an Instagram username is refused before any request. \
                       With SNOB_NO_BROWSER the name is asked about as typed, for no extra \
                       request.\n\n\
                       \"snob scan\" is the crossing, and costs both lists."
@@ -1001,6 +1017,7 @@ pub struct PurgeArgs {
 #[derive(Args, Debug)]
 pub struct ListArgs {
     /// Account to analyze. Defaults to your own.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     #[command(flatten)]
@@ -1029,6 +1046,7 @@ pub struct ListArgs {
 #[derive(Args, Debug)]
 pub struct ScanArgs {
     /// Account to summarize. Defaults to your own.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     #[command(flatten)]
@@ -1306,6 +1324,7 @@ pub struct WatchArgs {
 #[derive(Args, Debug, Default)]
 pub struct WatchRunArgs {
     /// Account to watch. Defaults to your own.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     /// How often to run: 6h, 2d, 2w
@@ -1502,6 +1521,7 @@ pub struct WatchStatusArgs {
 #[derive(Args, Debug)]
 pub struct WatchDiffArgs {
     /// Account to report on. Defaults to your own.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     #[command(flatten)]
@@ -1520,6 +1540,7 @@ pub struct WatchOnceArgs {
     // entry. Reading another account needs a terminal to ask at, or an
     // `[[account]]` in `watch.toml` carrying the answer somebody gave once,
     // which is the only thing an unattended run accepts.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     #[command(flatten)]
@@ -1532,6 +1553,7 @@ pub struct WatchOnceArgs {
 #[derive(Args, Debug)]
 pub struct ProfileArgs {
     /// Account to show. Defaults to your own.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     /// Output format. Defaults to a table on a terminal and JSON in a pipe.
@@ -1573,6 +1595,7 @@ impl ProfileArgs {
 #[derive(Args, Debug)]
 pub struct PfpArgs {
     /// Account whose profile picture to download
+    #[arg(value_parser = username)]
     pub target: String,
 
     /// Destination file; "-" for standard output
@@ -1777,6 +1800,7 @@ pub struct MediaListArgs {
 #[derive(Args, Debug)]
 pub struct StoriesArgs {
     /// Account whose stories to show. Defaults to your own.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     #[command(flatten)]
@@ -1791,6 +1815,7 @@ pub struct HighlightsArgs {
     /// Account whose highlights to show. Defaults to your own — but the first
     /// bare word is always read as an account, so picking a highlight of your
     /// own takes your username in front of the number.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     /// A highlight's number from the tray listing: what -d and -i then act on
@@ -1810,6 +1835,7 @@ pub struct PostsArgs {
     /// Account whose posts to show. Defaults to your own, but the first bare
     /// word is always read as an account, so picking a post of your own takes
     /// your username in front of the number.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     /// A post's number from the grid listing: what -d and -i then act on is
@@ -1861,6 +1887,7 @@ pub struct PostArgs {
 ))]
 pub struct FollowArgs {
     /// The one account to follow or unfollow
+    #[arg(value_parser = username)]
     pub target: String,
 
     #[command(flatten)]

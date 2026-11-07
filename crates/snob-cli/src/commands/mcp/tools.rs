@@ -1028,8 +1028,7 @@ fn account(args: &Map<String, Value>, required: bool) -> Result<Option<String>, 
         Some(Value::String(name)) => name.strip_prefix('@').unwrap_or(name),
         Some(other) => return Err(format!("account {other} is not a username")),
     };
-    let allowed = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_';
-    if name.is_empty() || name.len() > 30 || !name.chars().all(allowed) {
+    if !snob_core::model::possible_username(name) || name.starts_with('@') {
         return Err(format!(
             "\"{}\" cannot be an Instagram username: letters, digits, '.' and '_', at most 30",
             snob_core::model::printable(name)

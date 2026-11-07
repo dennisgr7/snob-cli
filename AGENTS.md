@@ -791,8 +791,14 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   (`ExitError::with_reason`, e.g. `busy`, `mcp_write_cap`,
   `walked_elsewhere`, `nothing_stored`, `stored_moments` for a crossing of
   two stored lists too far apart under `--offline`, `budget_wait` for a
-  wait past `--max-wait`, and a job's `too_many_jobs`, `job_stopping`,
-  `no_such_job`, `refused_argv`).
+  wait past `--max-wait`, `consent_required` when nobody could be asked
+  and `declined` when the answer was no (both exit 130, as Ctrl+C is),
+  `no_such_account` for a name Instagram says is nobody's, `not_delivered`
+  for a `watch once` whose report did not reach the webhook, and a job's
+  `too_many_jobs`, `job_stopping`, `no_such_job`, `refused_argv`). A name
+  that cannot be a username is refused by clap, exit 2, before anything is
+  asked or spent (`snob_core::model::possible_username`, the rule `snob
+  mcp` checks its `account` with too).
   `cooldown_until` is when a cooldown that refused the run lifts
   (`ExitError::with_cooldown_until`), and `retry_at` when a refusal that is
   no cooldown stops applying (`ExitError::with_retry_at`: `mcp_write_cap`,
