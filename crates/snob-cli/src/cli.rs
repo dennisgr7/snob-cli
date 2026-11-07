@@ -493,6 +493,31 @@ pub enum Command {
     /// Summary of the whole account: followers, following, and how they cross
     Scan(ScanArgs),
 
+    /// Who joined, left or was renamed between two stored captures of a list
+    #[command(
+        after_help = "Reads what earlier walks stored and sends nothing to Instagram, \
+                      so it answers in a cooldown too. Without --since, --from or --to, it \
+                      compares the two newest whole captures of each list. A walk that \
+                      stopped short is never one of the two: the accounts it missed would \
+                      read as departures. \"snob snapshots\" lists the captures and their \
+                      ids.\n\n\
+                      Examples:\n  snob changes\n  snob changes --list followers --since 7d\n  \
+                      snob changes --since 2026-11-01\n  snob changes --from 12 --to 31 \
+                      --format csv -o changes.csv"
+    )]
+    Changes(ChangesArgs),
+
+    /// The captures of an account's lists stored here, and how each walk ended
+    #[command(
+        after_help = "Reads only what is stored, and sends nothing to Instagram. One \
+                      row per capture: its id (what \"snob changes --from\" takes), the \
+                      list, when the walk ended (or began, for one still open), where it came \
+                      from (a walk, or Instagram's own export through \"snob import dyi\"), \
+                      how many accounts it holds and how many Instagram said the list had, \
+                      and why it stopped."
+    )]
+    Snapshots(SnapshotsArgs),
+
     /// Accounts you follow that do not follow you back, or another account's
     Unfollowers(ListArgs),
 
@@ -1183,6 +1208,99 @@ pub struct OutputArgs {
     /// standard output)
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     pub path: Option<PathBuf>,
+}
+
+/// Which of the two lists a command is about, when it may be either.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListChoice {
+    Followers,
+    Following,
+}
+
+impl From<ListChoice> for snob_core::model::ListKind {
+    fn from(choice: ListChoice) -> Self {
+        match choice {
+            ListChoice::Followers => Self::Followers,
+            ListChoice::Following => Self::Following,
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct SnapshotsArgs {
+    /// Account whose captures to list. Defaults to your own.
+    #[arg(value_parser = username)]
+    pub target: Option<String>,
+
+    /// Only the captures of this list
+    #[arg(long, value_enum)]
+    pub list: Option<ListChoice>,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct ChangesArgs {
+    /// Account whose lists to compare. Defaults to your own.
+    #[arg(value_parser = username)]
+    pub target: Option<String>,
+
+    /// Only this list
+    #[arg(long, value_enum)]
+    pub list: Option<ListChoice>,
+
+    /// Compare against the newest capture from before this moment: a date
+    /// (2026-11-01) or how long ago (7d, 12h)
+    #[arg(long, value_name = "WHEN", value_parser = since, conflicts_with_all = ["from", "to"])]
+    pub since: Option<Since>,
+
+    /// The earlier capture, by its id in "snob snapshots"
+    #[arg(long, value_name = "ID")]
+    pub from: Option<i64>,
+
+    /// The later capture, by its id; the newest of the same list when left out
+    #[arg(long, value_name = "ID")]
+    pub to: Option<i64>,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+/// The moment `--since` names, kept as typed until the run reads the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Since {
+    /// How long before now.
+    Ago(std::time::Duration),
+    /// The start of a day, in the local zone.
+    Day(chrono::NaiveDate),
+}
+
+impl Since {
+    /// The moment, against `now`.
+    pub fn at(self, now: snob_core::Epoch) -> snob_core::Epoch {
+        match self {
+            Self::Ago(ago) => now - ago,
+            Self::Day(day) => {
+                use chrono::TimeZone;
+                let midnight = day.and_hms_opt(0, 0, 0).unwrap_or_default();
+                let at = chrono::Local
+                    .from_local_datetime(&midnight)
+                    .earliest()
+                    .map_or_else(|| midnight.and_utc().timestamp(), |t| t.timestamp());
+                snob_core::Epoch::new(at)
+            }
+        }
+    }
+}
+
+fn since(text: &str) -> Result<Since, String> {
+    if let Ok(day) = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        return Ok(Since::Day(day));
+    }
+    snob_core::duration::parse(text)
+        .map(Since::Ago)
+        .map_err(|_| format!("\"{text}\" is neither a date (2026-11-01) nor a duration (7d, 12h)"))
 }
 
 /// The one question a command asks, answered in advance.
@@ -2953,5 +3071,33 @@ mod tests {
         // Off unless asked, which is the default the audit settled on.
         let plain = Cli::try_parse_from(["snob", "whoami"]).unwrap();
         assert!(!plain.strict_roots);
+    }
+
+    #[test]
+    fn changes_takes_a_date_or_a_duration_and_not_both_ways_of_choosing() {
+        let Command::Changes(by_day) =
+            Cli::try_parse_from(["snob", "changes", "--since", "2026-11-01"])
+                .unwrap()
+                .command
+        else {
+            panic!("not changes");
+        };
+        assert!(matches!(by_day.since, Some(Since::Day(_))));
+        let Command::Changes(ago) = Cli::try_parse_from(["snob", "changes", "--since", "7d"])
+            .unwrap()
+            .command
+        else {
+            panic!("not changes");
+        };
+        assert_eq!(
+            ago.since
+                .map(|since| since.at(snob_core::Epoch::new(700_000))),
+            Some(snob_core::Epoch::new(700_000 - 7 * 86_400))
+        );
+        assert!(Cli::try_parse_from(["snob", "changes", "--since", "soon"]).is_err());
+        assert!(
+            Cli::try_parse_from(["snob", "changes", "--since", "7d", "--from", "3"]).is_err(),
+            "a moment and an id are two answers to one question"
+        );
     }
 }

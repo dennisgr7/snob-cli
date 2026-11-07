@@ -18,7 +18,8 @@ that span files; it does not repeat what a header already says.
 `[workspace.package]` of `Cargo.toml`). It walks followers and following lists
 and crosses them (`unfollowers`, `fans`, `friends`, `scan`), shows profiles,
 stories, highlights, posts and reels and downloads their media, imports
-Instagram's own data export (`import dyi`, no network at all), and monitors
+Instagram's own data export (`import dyi`, no network at all), compares the
+lists it stored (`snapshots`, `changes`, no network either), and monitors
 accounts over time (`watch`, with webhooks). It signs in as the user, through
 Instagram's own **web** API (`www.instagram.com`, never the mobile API), and by
 default sends every request from a Chromium-based browser installed on the
@@ -67,7 +68,8 @@ Layering rules inside `snob-cli`:
 
 - **Commands take an `App`** and orchestrate; they never build a client or
   open a database themselves. The exceptions say so in their header
-  (`status`, `--dry-run`, `fetch`).
+  (`status`, `--dry-run`, `fetch`, and `snapshots` and `changes`, which read
+  the stored captures with `Store::read_existing` and send nothing).
 - **`engine` returns data and where it came from; it never decides how
   anything looks.** Wording and exit codes for those outcomes live in
   `commands` and `report.rs`. `engine::list` is the one place every list comes
@@ -803,7 +805,9 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   two stored lists too far apart under `--offline`, `budget_wait` for a
   wait past `--max-wait`, `consent_required` when nobody could be asked
   and `declined` when the answer was no (both exit 130, as Ctrl+C is),
-  `no_such_account` for a name Instagram says is nobody's, `not_delivered`
+  `no_such_account` for a name Instagram says is nobody's,
+  `no_such_snapshot` for a `changes --from/--to` that names no whole capture
+  of the account, `not_delivered`
   for a `watch once` whose report did not reach the webhook, and a job's
   `too_many_jobs`, `job_stopping`, `no_such_job`, `refused_argv`). A name
   that cannot be a username is refused by clap, exit 2, before anything is

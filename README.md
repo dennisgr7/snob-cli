@@ -88,6 +88,8 @@ snob follow someone
 snob unfollow someone
 snob watch                       # keep watching on a schedule, report changes
 snob status                      # budget left, cooldown, stored lists, agents; sends nothing
+snob snapshots                   # the captures of your lists stored here; sends nothing
+snob changes --since 7d          # who joined, left or was renamed between two of them
 snob jobs                        # walks an agent left running, and "snob jobs cancel <id>"
 ```
 

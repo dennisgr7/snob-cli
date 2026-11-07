@@ -48,6 +48,22 @@ pub(crate) fn single_row(header: &[&str], row: &[String]) -> Result<String> {
     finish(writer)
 }
 
+/// A header and any number of rows, for what is not accounts
+/// (`output::grid`).
+pub(crate) fn many_rows(header: &[&str], rows: &[Vec<String>]) -> Result<String> {
+    let mut writer = csv::WriterBuilder::new().from_writer(Vec::new());
+    writer
+        .write_record(header)
+        .context("could not write the csv header")?;
+    for row in rows {
+        let fields: Vec<String> = row.iter().map(|field| clean(field)).collect();
+        writer
+            .write_record(&fields)
+            .context("could not write a csv row")?;
+    }
+    finish(writer)
+}
+
 fn finish(writer: csv::Writer<Vec<u8>>) -> Result<String> {
     let bytes = writer
         .into_inner()

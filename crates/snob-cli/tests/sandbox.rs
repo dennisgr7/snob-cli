@@ -531,6 +531,73 @@ async fn a_change_reaches_the_receiver_signed_and_only_once() {
     );
 }
 
+/// Two stored captures are compared with nothing sent: who left, and who
+/// changed their name, which is no departure and arrival.
+#[tokio::test]
+async fn changes_between_two_captures_name_who_left_and_who_was_renamed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &first);
+    let out = snob(tmp.path(), Some(&first), &["followers", "--format", "json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    a_day_passes(tmp.path());
+
+    // A day later user2 is gone and user0 goes by another name.
+    let second = fake_instagram(2, 2).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"users":[{"pk":1000,"username":"renamed0"},{"pk":1001,"username":"user1"}]}"#,
+        ))
+        .with_priority(1)
+        .mount(&second)
+        .await;
+    let out = snob(
+        tmp.path(),
+        Some(&second),
+        &["followers", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let out = snob(tmp.path(), None, &["snapshots", "--list", "followers"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let listed = json(&out);
+    assert_eq!(listed.as_array().map(Vec::len), Some(2), "{listed}");
+    assert_eq!(listed[0]["accounts"], 2, "newest first: {listed}");
+
+    let out = snob(tmp.path(), None, &["changes", "--list", "followers"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let changes = json(&out);
+    let list = &changes["lists"][0];
+    assert_eq!(list["list"], "followers", "{changes}");
+    assert_eq!(
+        list["gained"].as_array().map(Vec::len),
+        Some(0),
+        "{changes}"
+    );
+    assert_eq!(list["lost"][0]["username"], "user2", "{changes}");
+    assert_eq!(list["renamed"][0]["from"], "user0", "{changes}");
+    assert_eq!(list["renamed"][0]["to"], "renamed0", "{changes}");
+    assert!(
+        stderr(&out).contains("0 gained, 1 lost, 1 renamed"),
+        "{}",
+        stderr(&out)
+    );
+
+    // An id that is no whole capture is refused, not stepped over.
+    let out = snob(
+        tmp.path(),
+        None,
+        &["changes", "--from", "99", "--format", "json"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("no_such_snapshot"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 /// A receiver that is down costs nothing, and the next run picks it up.
 ///
 /// The queue is the reason a restarting receiver does not lose a change, and

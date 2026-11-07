@@ -113,6 +113,8 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
         | Command::Fans(args)
         | Command::Friends(args) => document(args.output.format, args.output.path.as_deref()),
         Command::Scan(args) => document(args.output.format, args.output.path.as_deref()),
+        Command::Snapshots(args) => document(args.output.format, args.output.path.as_deref()),
+        Command::Changes(args) => document(args.output.format, args.output.path.as_deref()),
         // `-o` is where the listing goes only when listing; with `-d` it is
         // where the download goes, and names no format.
         Command::Stories(args) => {
@@ -527,6 +529,8 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
         }
         Command::Profile(args) => commands::profile::run(args, store, &required()?).await,
         Command::Scan(args) => commands::scan::run(args, store, &required()?).await,
+        Command::Snapshots(args) => commands::snapshots::run(args, &required()?),
+        Command::Changes(args) => commands::changes::run(args, &required()?),
         Command::Unfollowers(args) => {
             commands::sets::run(args, store, &required()?, SetOp::Unfollowers).await
         }
