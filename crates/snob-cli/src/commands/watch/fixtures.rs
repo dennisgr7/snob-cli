@@ -124,6 +124,7 @@ pub(in crate::commands::watch) fn delivery_to(server: &wiremock::MockServer) -> 
         })
         .unwrap(),
         heartbeat: false,
+        undelivered: Default::default(),
     }
 }
 

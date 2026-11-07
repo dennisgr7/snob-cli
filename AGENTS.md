@@ -875,7 +875,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
 - The monitor: a run compares against what was last **reported**
   (`watch_marks`), not against the newest capture; a report is queued before
   its mark moves; the delivery queue is drained once per run, after every
-  account (`commands/watch/run.rs`); what a run reports as spent is what the
+  account (`commands/watch/run.rs`), and a report is owed for a week
+  (`deliveries::MAX_AGE_SECS`), so a daily run's single retry is never too
+  late; `watch once` exits 1 (`not_delivered`) when a report it tried did
+  not arrive; what a run reports as spent is what the
   pacer was charged, measured around the tick. Schedules: `--every` is a floor
   from the previous run and `--on/--at` or `--cron` a calendar; the next run
   is on the calendar and past the floor, both (`--every 2w --on mon` is legal

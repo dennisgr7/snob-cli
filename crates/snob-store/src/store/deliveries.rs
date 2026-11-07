@@ -36,10 +36,11 @@ const MAX_BACKOFF_SECS: i64 = 3_600;
 /// report queued while a receiver was down for an afternoon, and leave
 /// `MAX_AGE_SECS` nothing to judge.
 ///
-/// Thirty-two is what it takes for the age to win: seven doubling waits and
-/// then hourly, which passes a day before this is reached. Every attempt waits,
+/// A hundred and eighty is what it takes for the age to win: six doubling
+/// waits (about an hour together) and then hourly, which passes the week of
+/// [`MAX_AGE_SECS`] (168 hours) before this is reached. Every attempt waits,
 /// so this cannot be burned through quickly by an endpoint that answers fast.
-const MAX_ATTEMPTS: i64 = 32;
+const MAX_ATTEMPTS: i64 = 180;
 
 /// How old a report may get before it is given up on whatever its attempt
 /// count says.
@@ -49,7 +50,15 @@ const MAX_ATTEMPTS: i64 = 32;
 /// and a report about who unfollowed you last Tuesday is no longer news; the
 /// attempt count catches a queue that somehow keeps being tried without the
 /// clock moving. In ordinary running it is the age that decides.
-pub const MAX_AGE_SECS: i64 = 24 * 3_600;
+///
+/// **A week, not a day.** The queue is drained only by a run, and the
+/// schedule people pick most is daily: the next run comes 24 hours later
+/// plus its jitter, so with a day here a report that failed once was given
+/// up on just before the one run that could have sent it, and since its mark
+/// had moved, the unfollowers it named were reported nowhere. A week rides
+/// out a weekly schedule's single retry too, and is how long a settled
+/// delivery is kept anyway ([`KEEP_SETTLED_FOR_SECS`]).
+pub const MAX_AGE_SECS: i64 = 7 * 24 * 3_600;
 
 /// A report waiting to be sent.
 ///
@@ -318,7 +327,7 @@ fn backoff(attempts: i64) -> i64 {
 /// another, one count would have `status` say reports are waiting about rows
 /// `due` can never return, and fail the health verdict over them. Nothing is
 /// lost by refusing an old-destination row — that is the settled rule, and
-/// `store::watch::prune` expires it at a day — but a probe told the wrong
+/// `store::watch::prune` expires it at a week — but a probe told the wrong
 /// number in the alarming direction is one people switch off.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Owed {
@@ -427,7 +436,7 @@ mod tests {
     /// are either given up on within the hour or kept for a year.
     #[test]
     fn the_age_a_report_stops_being_news_at_is_the_documented_one() {
-        assert_eq!(MAX_AGE_SECS, 24 * 3_600);
+        assert_eq!(MAX_AGE_SECS, 7 * 24 * 3_600);
     }
 
     fn queued(db: &Store, run_id: &str, at: Epoch) -> i64 {
@@ -554,7 +563,7 @@ mod tests {
 
         assert!(
             now - queued_at >= MAX_AGE_SECS,
-            "it gave up after {}s, and a day is what the age bound names",
+            "it gave up after {}s, and a week is what the age bound names",
             now - queued_at
         );
         assert!(

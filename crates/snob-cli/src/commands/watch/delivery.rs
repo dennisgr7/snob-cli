@@ -22,8 +22,8 @@ use url::Url;
 
 use crate::cli::WebhookArgs;
 use crate::engine::watch::TickReport;
-use crate::ui;
 use crate::watch::webhook::{self, Attempt, Webhook, WebhookClient};
+use crate::{report, ui};
 
 use super::wire::{event, payload};
 
@@ -40,6 +40,18 @@ pub(super) struct Delivery {
     /// read back by `snob watch status`, which has to ask the queue the same
     /// question a run would.
     pub(super) destination: String,
+    /// Whether a report this run tried was left undelivered, queued or given
+    /// up on. Set by [`send_one`] and read by `once`, which exits 1 for it:
+    /// a run on a timer that said 0 while its report sat in the queue left
+    /// nobody to notice, since nothing tries it again before the next run.
+    pub(super) undelivered: std::sync::atomic::AtomicBool,
+}
+
+impl Delivery {
+    /// Whether a report this run tried is not at its receiver.
+    pub(super) fn left_undelivered(&self) -> bool {
+        self.undelivered.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// What this run would send, worked out without touching the keyring or the
@@ -314,6 +326,7 @@ pub(super) fn delivery_from(
         signed: planned.webhook.key.is_some(),
         client: WebhookClient::new(planned.webhook)?,
         heartbeat: planned.heartbeat,
+        undelivered: std::sync::atomic::AtomicBool::new(false),
     }))
 }
 
@@ -443,6 +456,11 @@ async fn send_one(
             deliveries::failed(db.conn(), id, None, error, true, now).map(Some)
         }
     };
+    if !matches!(outcome, Attempt::Delivered { .. }) {
+        delivery
+            .undelivered
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let settled = match recorded {
         Ok(settled) => settled,
         Err(e) => {
@@ -458,8 +476,12 @@ async fn send_one(
     // must not be announced as "it is queued and will be tried again".
     match (&outcome, settled) {
         (Attempt::Delivered { .. }, _) => {}
+        // Not "in 1m": the queue is drained once per run, so nothing tries
+        // it before the next run, however soon its backoff ends. Said as the
+        // moment from which a run will, which holds on a timer and in the
+        // scheduled mode alike.
         (_, Some(deliveries::Outcome::Retrying(at))) => ui::warn(&format!(
-            "the report could not be delivered ({}); it is queued and will be tried again {}",
+            "the report could not be delivered ({}); it is queued, and {}",
             outcome.error(),
             describe_when(at, now)
         )),
@@ -483,14 +505,15 @@ async fn send_one(
     }
 }
 
-/// "in 4m", for a moment in the near future.
+/// Which run tries a queued report again, given when its backoff ends.
 fn describe_when(at: Epoch, now: Epoch) -> String {
-    match at - now {
-        seconds if seconds > 0 => format!(
-            "in {}",
-            snob_core::duration::format(std::time::Duration::from_secs(seconds as u64))
-        ),
-        _ => "on the next run".to_string(),
+    if at > now {
+        format!(
+            "the first run after {} tries it again",
+            report::stored_on(at)
+        )
+    } else {
+        "the next run tries it again".to_string()
     }
 }
 
@@ -765,6 +788,7 @@ mod tests {
             })
             .unwrap(),
             heartbeat: false,
+            undelivered: Default::default(),
         };
 
         let id = deliveries::enqueue(

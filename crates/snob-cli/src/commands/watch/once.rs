@@ -80,6 +80,19 @@ pub(super) async fn once(
     if let Some(e) = outcome.failed {
         return Err(e);
     }
+    // A run whose own verdict is good but whose report did not arrive is not
+    // a 0: on a timer nothing tries the report again before the next run, and
+    // a status that said all was well left nobody to look. Its own reason, so
+    // a script can tell it from a run that read nothing.
+    if outcome.code == ExitCode::Ok && delivery.as_ref().is_some_and(|d| d.left_undelivered()) {
+        return Err(crate::exit::ExitError::new(
+            ExitCode::Error,
+            "the run went through, but a report did not reach the webhook; it stays queued \
+             for the next run, unless it was given up on as said above",
+        )
+        .with_reason("not_delivered")
+        .into());
+    }
 
     // The run's own verdict, as written into `watch_runs`. The exit codes exist
     // so a caller on a timer can tell "wait" from "log in again" without

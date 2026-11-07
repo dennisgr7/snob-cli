@@ -549,9 +549,18 @@ async fn a_report_a_receiver_refused_is_owed_and_then_delivered() {
     a_day_passes(tmp.path());
     let second = fake_instagram(2, 2).await;
     let out = snob(tmp.path(), Some(&second), &["watch", "once"]);
+    // The run went through and its report is owed, but on a timer nothing
+    // tries it again before the next run, so the run says so: exit 1, with a
+    // reason of its own.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a report left undelivered is not a 0: {}",
+        stderr(&out)
+    );
     assert!(
-        out.status.success(),
-        "a receiver that is down does not fail the run: {}",
+        stderr(&out).contains("did not reach the webhook"),
+        "{}",
         stderr(&out)
     );
     let refused = posted(&down).await;
