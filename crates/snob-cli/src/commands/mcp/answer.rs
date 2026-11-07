@@ -150,6 +150,9 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
         match finished.json {
             Some(Value::Array(items)) => {
                 let items = compact(&items);
+                if let Some(refused) = past_the_end(items.len(), offset, limit) {
+                    return refused;
+                }
                 // A call that takes no offset has no next page to offer.
                 let body = page(&items, offset, limit, plan.page.is_some());
                 if !body["next_offset"].is_null() {
@@ -299,6 +302,9 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
 /// answer of a call that ran nothing, saying what the first page said of
 /// the whole list.
 pub fn held(whole: &Whole, offset: usize, limit: Option<usize>) -> Answer {
+    if let Some(refused) = past_the_end(whole.items.len(), offset, limit) {
+        return refused;
+    }
     let mut body = page(&whole.items, offset, limit, true);
     if let Some(fields) = body.as_object_mut() {
         fields.extend(whole.about.clone());
@@ -308,6 +314,50 @@ pub fn held(whole: &Whole, offset: usize, limit: Option<usize>) -> Answer {
         body: cleaned(body),
         whole: None,
     }
+}
+
+/// The refusal of an `offset` at or past the end of what the call hands
+/// back, `offset_past_end`, with `count` and `total` beside it.
+///
+/// **Refused, not an empty page.** An empty page beside `count: 5` read as a
+/// contradiction, and an empty page at all read as "no more accounts" when
+/// the likelier mistake was taking `limit` for the size of one page: it caps
+/// the whole answer. An agent that follows `next_offset` never gets here,
+/// since the last page has none. An offset of 0 is a page however short
+/// the list, an empty one included.
+fn past_the_end(total: usize, offset: usize, limit: Option<usize>) -> Option<Answer> {
+    let count = limit.map_or(total, |limit| limit.min(total));
+    if offset == 0 || offset < count {
+        return None;
+    }
+    let capped = if count < total {
+        format!(
+            " (limit caps the whole answer, not one page: the list has {total}; call with a \
+             higher limit, or none, for the rest)"
+        )
+    } else {
+        String::new()
+    };
+    let message = format!(
+        "offset {offset} is past the end: this call hands back {count} accounts in all, at \
+         offsets 0 to {last}{capped}. Follow next_offset for the next page; the last page \
+         has none.",
+        last = count.saturating_sub(1),
+    );
+    Some(Answer {
+        failed: true,
+        // Shaped as the server's other refusals of an argument (`mod.rs`,
+        // `refusal`): nothing ran, so there is no exit to report.
+        body: cleaned(json!({
+            "error": {
+                "code": "offset_past_end",
+                "message": message,
+                "count": count,
+                "total": total,
+            },
+        })),
+        whole: None,
+    })
 }
 
 /// What an agent is not handed of an account: its picture's address, a
@@ -340,9 +390,11 @@ fn compact(items: &[Value]) -> Vec<String> {
 /// which `complete: false` says), `count` how many of them the call hands
 /// back across its pages (`total`, or `limit` when that is fewer), and
 /// `next_offset` is null on the last page, or always when the call cannot
-/// be made again for another (`pages` false). An offset past the
-/// end is an empty page. **Sliced with `get`, never by indexing**: the offset
-/// is the client's number, and a panic here is the whole server gone.
+/// be made again for another (`pages` false). An offset past the end is
+/// refused before this ([`past_the_end`]) on a success, and an empty page
+/// for what a failed walk kept. **Sliced with `get`, never by indexing**:
+/// the offset is the client's number, and a panic here is the whole server
+/// gone.
 pub fn page(items: &[String], offset: usize, limit: Option<usize>, pages: bool) -> Value {
     let total = items.len();
     let count = limit.map_or(total, |limit| limit.min(total));
@@ -833,26 +885,39 @@ mod tests {
     }
 
     #[test]
-    fn an_offset_past_the_end_is_an_empty_page() {
+    fn an_offset_past_the_end_is_refused_with_the_count_and_the_total() {
         for offset in [450, 451, usize::MAX] {
             let told = from(
                 &list_at(offset),
                 finished(ExitCode::Ok, Some(accounts(450)), None),
             );
-            assert!(!told.failed, "{offset}");
-            assert_eq!(told.body["items"], json!([]), "{offset}");
-            assert_eq!(told.body["count"], 450, "{offset}");
-            assert!(told.body["next_offset"].is_null(), "{offset}");
+            assert!(told.failed, "{offset}");
+            assert_eq!(told.body["error"]["code"], "offset_past_end", "{offset}");
+            assert_eq!(told.body["error"]["count"], 450, "{offset}");
             let none = Whole {
                 items: vec![],
                 about: serde_json::Map::new(),
             };
-            assert_eq!(
-                held(&none, offset, None).body["items"],
-                json!([]),
-                "{offset}"
-            );
+            assert!(held(&none, offset, None).failed, "{offset}");
         }
+        // The first page of an empty list is a page, not a refusal.
+        let empty = from(&list_at(0), finished(ExitCode::Ok, Some(accounts(0)), None));
+        assert!(!empty.failed);
+        assert_eq!(empty.body["items"], json!([]));
+    }
+
+    #[test]
+    fn an_offset_past_a_limit_says_the_limit_is_not_a_page_size() {
+        // limit 5, offset 5: once a page of nothing beside count 5.
+        let told = from(
+            &limited_at(5, Some(5)),
+            finished(ExitCode::Ok, Some(accounts(25)), None),
+        );
+        assert!(told.failed);
+        assert_eq!(told.body["error"]["count"], 5);
+        assert_eq!(told.body["error"]["total"], 25);
+        let message = told.body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("not one page"), "{message}");
     }
 
     #[test]

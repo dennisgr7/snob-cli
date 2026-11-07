@@ -221,10 +221,11 @@ pub fn specs(writes: bool) -> Vec<Spec> {
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Hand back at most this many accounts, the first \
-                                        ones; count is then at most this, and total still \
-                                        says how many the list has. Saves no requests: \
-                                        max_pages is what does that."
+                        "description": "Hand back at most this many accounts in all, the \
+                                        first ones, across every page: a cap on the whole \
+                                        answer, not a page size. count is then at most this, \
+                                        and total still says how many the list has. Saves no \
+                                        requests: max_pages is what does that."
                     },
                     "max_pages": {
                         "type": "integer",
@@ -248,7 +249,8 @@ pub fn specs(writes: bool) -> Vec<Spec> {
                                         answer gave. A later page walks nothing and needs no \
                                         confirmation, whatever the mode: it is handed back \
                                         from what the call without an offset read, or else \
-                                        from what is stored. Not with dry_run."
+                                        from what is stored. An offset at or past count is \
+                                        refused (offset_past_end). Not with dry_run."
                     },
                     "wait_seconds": wait_seconds_property("a walk to end"),
                     "confirmation": confirmation()
@@ -1046,8 +1048,9 @@ fn count(args: &Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
     }
 }
 
-/// The `offset` argument: 0 when not given. One past the end of the list is
-/// an empty page, not a refusal (`answer::page`).
+/// The `offset` argument: 0 when not given. One at or past the end of what
+/// the call hands back is refused once the list is known
+/// (`answer::past_the_end`), not here, where it is not.
 fn offset(args: &Map<String, Value>) -> Result<usize, String> {
     match args.get("offset") {
         None | Some(Value::Null) => Ok(0),

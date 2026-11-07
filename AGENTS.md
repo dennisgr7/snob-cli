@@ -582,10 +582,11 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   bytes that answers nothing an agent is asked, and with it a page held
   some 65 accounts. `{total, count, offset, items, next_offset}`: `total`
   the list's, `count` what the call hands back across its pages, at most
-  `limit`. **The server applies `limit`** (`tools::Page::limit`), never the
-  command's `--limit`, so a call given one still says the whole list's
-  `total`, and one it cut to a single page says so in a sentence
-  (`answer::limited`); the limit stays out of `Plan.args`, so a yes is to
+  `limit`; an `offset` at or past `count` is refused as `offset_past_end`,
+  never answered with an empty page. **The server applies `limit`**
+  (`tools::Page::limit`), never the command's `--limit`, so a call given
+  one still says the whole list's `total`, and one it cut to a single page
+  says so in a sentence (`answer::limited`); the limit stays out of `Plan.args`, so a yes is to
   the walk whatever it trims, and every limit pages from the same list held.
   A failure's `partial` is one page with no `next_offset`, since what a walk
   stopped short read is not stored as a whole list. **A list is never
