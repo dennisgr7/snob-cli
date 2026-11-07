@@ -79,39 +79,43 @@ pub struct Cli {
     // Ordered last, with `verbose`. Both are global, so without this they are
     // propagated into every subcommand and land in the middle of its own
     // options, splitting a list that reads in a deliberate order.
-    #[arg(long, global = true, display_order = 900)]
+    //
+    // **Left out of `-h`** (`hide_short_help`), as `verbose` and the two TLS
+    // flags are: they are in every command's help, and in `-h` they were a
+    // third of each one's options, none of them about the command. `--help`
+    // still lists them, and `-h` says it shows more.
+    #[arg(long, global = true, display_order = 900, hide_short_help = true)]
     pub no_keyring: bool,
 
     /// Show diagnostic traces
     ///
     /// The browsers' own go to browser-owner.log in the data directory, at the
     /// level of the command that started the process that runs them.
-    #[arg(long, global = true, display_order = 901)]
+    #[arg(long, global = true, display_order = 901, hide_short_help = true)]
     pub verbose: bool,
 
     /// Check Instagram's certificate against Mozilla's roots only
     ///
-    /// Off by default, and that default is deliberate rather than lazy.
-    /// reqwest 0.13 made the platform verifier the default, so snob honors
-    /// whatever roots an administrator has installed — which is what makes it
-    /// work on a managed machine, and is also how a laptop carrying a
-    /// TLS-inspecting root lets that middlebox read the session in transit.
-    /// This ends the second at the cost of the first, which is a trade only the
-    /// person running it can make.
-    ///
-    /// It refuses on Windows for ARM64, where the TLS backend is schannel and
-    /// has no way to express "these roots and no others". A security flag that
-    /// silently does nothing is worse than one that is not offered.
-    ///
-    /// **Never applied to the webhook.** A private CA in front of somebody's
-    /// own receiver is legitimate, and `snob_ig::http::plain` has no argument
-    /// for this — the same shape that stops the session reaching a webhook.
-    #[arg(long, global = true, display_order = 904)]
+    /// Off by default: the roots installed on this computer are trusted,
+    /// which is what makes snob work on a managed machine, and also what lets
+    /// a TLS-inspecting root installed there read the session in transit.
+    /// This trusts Mozilla's roots alone instead. Refused on Windows for
+    /// ARM64, where it cannot be done, and never applied to the webhook.
+    // Why each of those, in full: reqwest 0.13 made the platform verifier the
+    // default, and the trade between a managed machine and a middlebox is
+    // only the person running it can make. On Windows ARM64 the TLS backend
+    // is schannel, which has no way to express "these roots and no others",
+    // and a security flag that silently does nothing is worse than one that
+    // is not offered. A private CA in front of somebody's own webhook
+    // receiver is legitimate, and `snob_ig::http::plain` has no argument for
+    // this -- the same shape that stops the session reaching a webhook. That
+    // reasoning was the flag's help once, in every command's `--help`.
+    #[arg(long, global = true, display_order = 904, hide_short_help = true)]
     pub strict_roots: bool,
 
     /// Also trust the certificates in this PEM file
     ///
-    /// The way back out of `--strict-roots`, and it requires it: on the
+    /// The way back out of --strict-roots, and it requires it: on the
     /// platform store there is nothing to add to, because whatever an
     /// administrator installed is already trusted. Repeatable.
     #[arg(
@@ -119,7 +123,8 @@ pub struct Cli {
         global = true,
         display_order = 905,
         requires = "strict_roots",
-        value_name = "PEM"
+        value_name = "PEM",
+        hide_short_help = true
     )]
     pub tls_extra_root: Vec<PathBuf>,
 
@@ -488,22 +493,22 @@ pub enum Command {
     /// Summary of the whole account: followers, following, and how they cross
     Scan(ScanArgs),
 
-    /// Accounts you follow that do not follow you back
+    /// Accounts you follow that do not follow you back, or another account's
     Unfollowers(ListArgs),
 
-    /// Accounts that follow you and you do not follow
+    /// Accounts that follow you that you do not follow back, or another account's
     Fans(ListArgs),
 
-    /// Accounts you and they follow each other
+    /// Accounts that you follow and that follow you back, or another account's
     // `mutuals` is the earlier name, kept as a hidden alias so anything written
     // against it still runs rather than failing at the shell.
     #[command(alias = "mutuals")]
     Friends(ListArgs),
 
-    /// Your followers
+    /// Your followers, or another account's
     Followers(ListArgs),
 
-    /// The accounts you follow
+    /// The accounts you follow, or another account's
     Following(ListArgs),
 
     /// Download a profile picture in high resolution
