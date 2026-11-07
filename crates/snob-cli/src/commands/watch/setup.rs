@@ -76,6 +76,13 @@ pub async fn setup(
         url: url.clone(),
         headers: answers.headers.iter().cloned().collect(),
         heartbeat: answers.heartbeat,
+        // The format the address was given, kept when the same address is
+        // set up again; else the one its host is known to want.
+        format: existing
+            .as_ref()
+            .and_then(|e| e.webhook.as_ref())
+            .filter(|w| &w.url == url)
+            .map_or_else(|| format_for(url), |w| w.format),
     });
     // A dry run did not read the file to replace it; what it prints still
     // keeps the entries a real run would.
@@ -764,6 +771,24 @@ fn consent_question(name: &str, webhook: Option<&str>) -> String {
     }
 }
 
+/// The format an address's host is known to take: Slack's and Discord's
+/// incoming webhooks refuse snob's JSON, and ntfy.sh shows it as braces.
+/// Anything else is somebody's own receiver, which reads the report.
+fn format_for(url: &str) -> config::WebhookFormat {
+    use config::WebhookFormat;
+    let Ok(url) = url::Url::parse(url) else {
+        return WebhookFormat::Json;
+    };
+    match url.host_str().unwrap_or_default() {
+        "hooks.slack.com" => WebhookFormat::Slack,
+        "discord.com" | "discordapp.com" if url.path().starts_with("/api/webhooks/") => {
+            WebhookFormat::Discord
+        }
+        "ntfy.sh" => WebhookFormat::Ntfy,
+        _ => WebhookFormat::Json,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1300,5 +1325,25 @@ viewer = 1
             .map(|entry| (entry.target.as_str(), entry.viewer))
             .collect();
         assert_eq!(shape, [("self", None), ("friend", None)]);
+    }
+
+    #[test]
+    fn an_address_on_a_known_service_is_set_up_in_its_format() {
+        use config::WebhookFormat;
+        for (url, format) in [
+            (
+                "https://hooks.slack.com/services/T0/B0/x",
+                WebhookFormat::Slack,
+            ),
+            (
+                "https://discord.com/api/webhooks/1/abc",
+                WebhookFormat::Discord,
+            ),
+            ("https://ntfy.sh/my-topic", WebhookFormat::Ntfy),
+            ("https://n8n.local/webhook/snob", WebhookFormat::Json),
+            ("https://discord.com/channels/1", WebhookFormat::Json),
+        ] {
+            assert_eq!(format_for(url), format, "{url}");
+        }
     }
 }

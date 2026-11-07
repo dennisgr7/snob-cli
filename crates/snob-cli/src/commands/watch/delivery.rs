@@ -15,7 +15,7 @@ use snob_core::secret::Secret;
 use snob_core::watch::Changes;
 use snob_core::{Epoch, Pk};
 use snob_ig::pace::CancelToken;
-use snob_store::config::{WatchConfig, WebhookConfig};
+use snob_store::config::{WatchConfig, WebhookConfig, WebhookFormat};
 use snob_store::secrets::{Kind, SecretStore, Stored};
 use snob_store::store::{Store, deliveries, watch::Queued};
 use url::Url;
@@ -25,12 +25,14 @@ use crate::engine::watch::TickReport;
 use crate::watch::webhook::{self, Attempt, Webhook, WebhookClient};
 use crate::{report, ui};
 
-use super::wire::{event, payload};
+use super::wire::{event, outgoing, payload};
 
 /// Where reports go, once the arguments have been checked.
 pub(super) struct Delivery {
     pub(super) client: WebhookClient,
     pub(super) heartbeat: bool,
+    /// What a report this run queues is made into (`wire::outgoing`).
+    pub(super) format: WebhookFormat,
     /// Whether the body will carry `X-Snob-Signature`. Held so `check` can say
     /// what it just sent rather than guessing at what the client did.
     pub(super) signed: bool,
@@ -63,6 +65,7 @@ impl Delivery {
 struct Planned {
     webhook: Webhook,
     heartbeat: bool,
+    format: WebhookFormat,
 }
 
 /// Decides what to send, and what to say about it.
@@ -103,7 +106,11 @@ fn plan(
         .clone()
         .or_else(|| from_file.map(|w| w.url.clone()))
     else {
-        if !args.header.is_empty() || args.sign_with.is_some() || args.heartbeat {
+        if !args.header.is_empty()
+            || args.sign_with.is_some()
+            || args.heartbeat
+            || args.webhook_format.is_some()
+        {
             warnings.push(
                 "there is no webhook, so nothing is sent and those options do nothing".to_string(),
             );
@@ -287,6 +294,16 @@ fn plan(
         Some(Planned {
             webhook: Webhook { url, headers, key },
             heartbeat: args.heartbeat || from_file.is_some_and(|w| w.heartbeat),
+            // The file's format is the file's address's: Slack's shape posted
+            // to another address given with --webhook would be refused there.
+            format: args
+                .webhook_format
+                .or_else(|| {
+                    from_file
+                        .filter(|w| args.webhook.as_deref().is_none_or(|given| given == w.url))
+                        .map(|w| w.format)
+                })
+                .unwrap_or_default(),
         }),
         warnings,
     ))
@@ -326,6 +343,7 @@ pub(super) fn delivery_from(
         signed: planned.webhook.key.is_some(),
         client: WebhookClient::new(planned.webhook)?,
         heartbeat: planned.heartbeat,
+        format: planned.format,
         undelivered: std::sync::atomic::AtomicBool::new(false),
     }))
 }
@@ -367,16 +385,25 @@ pub(super) async fn deliver(
     // An automation where every message means something is the point of that;
     // a heartbeat is for the opposite case, where the absence of messages is
     // the signal and "quiet" has to be told from "stopped".
-    let body = match delivery.and_then(|d| event_for(&changes, d.heartbeat)) {
-        Some(event) => {
+    let body = match delivery.and_then(|d| Some((d, event_for(&changes, d.heartbeat)?))) {
+        Some((delivery, event)) => {
             let run_id = run_id(snob_core::clock::now(), tick.report.account_pk);
-            // Serialized once, here, and stored as the string that goes on the
+            // What a person reads of it, as the terminal prints it: the
+            // summary a chat service is sent, and `summary` in the JSON.
+            let refused = tick.lists.iter().any(|list| list.skipped.is_some());
+            let summary = super::say::describe(&tick.report, refused).join("\n");
+            // Made once, here, and stored as the string that goes on the
             // wire. `serde_json` may render one value two ways, and the
             // signature covers bytes — so a retry that rendered it again could
             // be rejected after the first attempt was accepted.
+            let made = outgoing(delivery.format, payload(tick, &run_id, event), &summary);
             Some((
-                run_id.clone(),
-                serde_json::to_string(&payload(tick, &run_id, event))?,
+                run_id,
+                made.body,
+                deliveries::Form {
+                    event: event.to_string(),
+                    content_type: made.content_type.to_string(),
+                },
             ))
         }
         None => None,
@@ -391,10 +418,11 @@ pub(super) async fn deliver(
         // to come back empty.
         delivery
             .zip(body.as_ref())
-            .map(|(to, (run_id, body))| Queued {
+            .map(|(to, (run_id, body, form))| Queued {
                 run_id,
                 body,
                 destination: to.destination.as_str(),
+                form: Some(form),
             }),
     )?;
 
@@ -403,8 +431,8 @@ pub(super) async fn deliver(
     };
 
     // This run's report, when it made one.
-    if let (Some(id), Some((run_id, body))) = (queued, body.as_ref()) {
-        send_one(app.db(), delivery, id, run_id, body, 1).await;
+    if let (Some(id), Some((run_id, body, form))) = (queued, body.as_ref()) {
+        send_one(app.db(), delivery, id, run_id, body, Some(form), 1).await;
     }
 
     // Whatever is still owed from earlier runs is NOT drained here but once
@@ -429,12 +457,18 @@ async fn send_one(
     id: i64,
     run_id: &str,
     body: &str,
+    form: Option<&deliveries::Form>,
     attempt: i64,
 ) {
     let now = snob_core::clock::now();
+    // As it was queued: a row from before the form was kept is snob's JSON.
+    let (content_type, event) = match form {
+        Some(form) => (form.content_type.as_str(), form.event.as_str()),
+        None => (webhook::JSON, event_of(body)),
+    };
     let outcome = delivery
         .client
-        .post(body, event_of(body), run_id, attempt)
+        .post(body, content_type, event, run_id, attempt)
         .await;
 
     // Failing to write down what happened is not worth failing the run over:
@@ -581,6 +615,7 @@ pub(super) async fn drain(db: &Store, cancel: &CancelToken, delivery: &Delivery)
             report.id,
             &report.run_id,
             &report.body,
+            report.form.as_ref(),
             report.attempts + 1,
         )
         .await;
@@ -788,6 +823,7 @@ mod tests {
             })
             .unwrap(),
             heartbeat: false,
+            format: WebhookFormat::Json,
             undelivered: Default::default(),
         };
 
@@ -800,7 +836,7 @@ mod tests {
             &delivery.destination,
         )
         .unwrap();
-        send_one(app.db(), &delivery, id, "run-1", "{}", 1).await;
+        send_one(app.db(), &delivery, id, "run-1", "{}", None, 1).await;
 
         assert!(
             server.received_requests().await.unwrap().is_empty(),
@@ -877,6 +913,7 @@ mod tests {
                 .map(|(n, v)| (n.to_string(), v.to_string()))
                 .collect(),
             heartbeat: false,
+            format: WebhookFormat::Json,
         }
     }
 

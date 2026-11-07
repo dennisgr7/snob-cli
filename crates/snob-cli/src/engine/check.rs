@@ -622,12 +622,16 @@ pub async fn webhook_of(
     signed: bool,
     run_id: &str,
     body: &str,
+    content_type: &str,
 ) -> Checked {
     use crate::watch::webhook::Attempt;
 
     // Built inside each arm, because the status differs; `describe_check`
     // builds its "{destination} answered {code}" sentence out of both fields.
-    match client.post(body, PREFLIGHT_EVENT, run_id, 1).await {
+    match client
+        .post(body, content_type, PREFLIGHT_EVENT, run_id, 1)
+        .await
+    {
         Attempt::Delivered { status } => Checked {
             what: What::Webhook {
                 destination,

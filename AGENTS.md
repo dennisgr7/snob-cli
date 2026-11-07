@@ -322,7 +322,14 @@ with a documented reason in the same place.
   `User-Agent: snob`, refuses `http://` outside private networks, signs with
   `X-Snob-Signature: sha256=<hex>`, and its token and key live in the
   keyring, never in `watch.toml`. Retries are allowed there (it is the user's
-  server), never against Instagram.
+  server), never against Instagram. What it is sent is `format` under
+  `[webhook]` (or `--webhook-format`), made in `wire::outgoing`: snob's JSON
+  by default, with `summary` and `*_iso` dates beside the epochs (additive,
+  so `SENT_SCHEMA` stays 1), or the summary alone as Slack, Discord, ntfy or
+  plain text take it. The signature covers the bytes sent, which are the
+  bytes queued; each row keeps its event and content type (migration 017),
+  so a retry goes in the shape it was queued in, whatever the file says by
+  then. `watch setup` picks the format a known host takes.
 - **API redirects**: the API client's policy is `none()`; the transport
   follows redirects itself, pays for every hop, and never leaves
   instagram.com.

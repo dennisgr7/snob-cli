@@ -13,7 +13,7 @@ use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use snob_cli::watch::webhook::{Attempt, Webhook, WebhookClient};
+use snob_cli::watch::webhook::{self, Attempt, Webhook, WebhookClient};
 
 mod common;
 use common::{app, open_db};
@@ -62,7 +62,9 @@ async fn a_report_that_is_accepted_is_delivered() {
 
     let client = client_at(&server.uri(), None, vec![]);
     assert_eq!(
-        client.post(BODY, "watch.changes", "7", 1).await,
+        client
+            .post(BODY, webhook::JSON, "watch.changes", "7", 1)
+            .await,
         Attempt::Delivered { status: 200 }
     );
 }
@@ -76,7 +78,7 @@ async fn the_body_arrives_byte_for_byte() {
     mount_hook(&server, 200).await;
 
     client_at(&server.uri(), None, vec![])
-        .post(BODY, "watch.changes", "7", 1)
+        .post(BODY, webhook::JSON, "watch.changes", "7", 1)
         .await;
 
     let requests = server.received_requests().await.unwrap();
@@ -95,7 +97,7 @@ async fn the_signature_checks_out_against_the_bytes_that_arrived() {
     mount_hook(&server, 200).await;
 
     client_at(&server.uri(), Some("a shared secret"), vec![])
-        .post(BODY, "watch.changes", "7", 1)
+        .post(BODY, webhook::JSON, "watch.changes", "7", 1)
         .await;
 
     let requests = server.received_requests().await.unwrap();
@@ -114,7 +116,7 @@ async fn without_a_secret_nothing_is_signed() {
     mount_hook(&server, 200).await;
 
     client_at(&server.uri(), None, vec![])
-        .post(BODY, "watch.changes", "7", 1)
+        .post(BODY, webhook::JSON, "watch.changes", "7", 1)
         .await;
 
     let requests = server.received_requests().await.unwrap();
@@ -129,7 +131,7 @@ async fn the_receiver_is_told_what_this_is_and_which_attempt() {
     mount_hook(&server, 200).await;
 
     client_at(&server.uri(), None, vec![])
-        .post(BODY, "watch.changes", "41", 3)
+        .post(BODY, webhook::JSON, "watch.changes", "41", 3)
         .await;
 
     let requests = server.received_requests().await.unwrap();
@@ -154,6 +156,7 @@ async fn a_heartbeat_says_so_in_the_header_too() {
     client_at(&server.uri(), None, vec![])
         .post(
             r#"{"schema":1,"event":"watch.heartbeat"}"#,
+            webhook::JSON,
             "watch.heartbeat",
             "7",
             1,
@@ -177,7 +180,7 @@ async fn a_configured_header_is_sent() {
         None,
         vec![("Authorization".into(), "Bearer secret".into())],
     )
-    .post(BODY, "watch.changes", "7", 1)
+    .post(BODY, webhook::JSON, "watch.changes", "7", 1)
     .await;
 
     let requests = server.received_requests().await.unwrap();
@@ -209,7 +212,7 @@ async fn a_configured_header_replaces_the_one_snob_would_have_sent() {
             "application/json; charset=utf-8".into(),
         )],
     )
-    .post(BODY, "watch.changes", "7", 1)
+    .post(BODY, webhook::JSON, "watch.changes", "7", 1)
     .await;
 
     let requests = server.received_requests().await.unwrap();
@@ -230,7 +233,7 @@ async fn the_session_never_reaches_the_webhook() {
     mount_hook(&server, 200).await;
 
     client_at(&server.uri(), None, vec![])
-        .post(BODY, "watch.changes", "7", 1)
+        .post(BODY, webhook::JSON, "watch.changes", "7", 1)
         .await;
 
     let requests = server.received_requests().await.unwrap();
@@ -264,7 +267,7 @@ async fn every_answer_from_the_far_end_is_worth_another_try() {
         mount_hook(&server, status).await;
 
         let outcome = client_at(&server.uri(), None, vec![])
-            .post(BODY, "watch.changes", "7", 1)
+            .post(BODY, webhook::JSON, "watch.changes", "7", 1)
             .await;
         assert!(
             matches!(outcome, Attempt::Failed { .. }),
@@ -290,7 +293,7 @@ async fn a_redirect_is_not_followed() {
         .await;
 
     client_at(&server.uri(), None, vec![])
-        .post(BODY, "watch.changes", "7", 1)
+        .post(BODY, webhook::JSON, "watch.changes", "7", 1)
         .await;
 
     assert!(
@@ -305,7 +308,7 @@ async fn a_redirect_is_not_followed() {
 async fn an_unreachable_address_is_a_temporary_failure() {
     assert!(matches!(
         client_at(UNREACHABLE, None, vec![])
-            .post(BODY, "watch.changes", "7", 1)
+            .post(BODY, webhook::JSON, "watch.changes", "7", 1)
             .await,
         Attempt::Failed { status: None, .. }
     ));
@@ -340,7 +343,7 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
     let down = MockServer::start().await;
     mount_hook(&down, 503).await;
     let outcome = client_at(&down.uri(), None, vec![])
-        .post(BODY, "watch.changes", &id.to_string(), 1)
+        .post(BODY, webhook::JSON, "watch.changes", &id.to_string(), 1)
         .await;
     assert!(matches!(outcome, Attempt::Failed { .. }));
     deliveries::failed(app.db().conn(), id, Some(503), "busy", false, queued_at).unwrap();
@@ -362,6 +365,7 @@ async fn a_failed_report_is_queued_and_the_same_bytes_go_out_next_time() {
     let outcome = client_at(&up.uri(), None, vec![])
         .post(
             &owed[0].body,
+            webhook::JSON,
             "watch.changes",
             &id.to_string(),
             owed[0].attempts + 1,
@@ -420,6 +424,7 @@ async fn the_preflight_posts_a_signed_message_and_reports_the_answer() {
         true,
         "preflight-1",
         body,
+        webhook::JSON,
     )
     .await;
 
@@ -485,6 +490,7 @@ async fn a_webhook_that_answers_404_reports_the_code_it_answered() {
         false,
         "preflight-404",
         r#"{"event":"watch.preflight"}"#,
+        webhook::JSON,
     )
     .await;
 
@@ -524,6 +530,7 @@ async fn a_preflight_that_cannot_be_delivered_fails_the_check() {
         false,
         "preflight-2",
         r#"{"event":"watch.preflight"}"#,
+        webhook::JSON,
     )
     .await;
 

@@ -123,8 +123,11 @@ can read:
   again, 4 the account needs verifying, 5 rate limited or cooling down, 130
   stopped. When the output was going to be JSON, a failure is also one JSON
   object on the last line of standard error.
-- `snob watch --webhook <url>` posts each report as JSON; `--json` writes them
-  as lines instead.
+- `snob watch --webhook <url>` posts each report as JSON, with a `summary`
+  sentence and ISO dates beside the epoch seconds; `format = "slack"` (or
+  `discord`, `ntfy`, `text`) under `[webhook]` in `watch.toml`, or
+  `--webhook-format`, sends the summary alone, in the shape that service
+  takes. `--json` writes the reports as lines instead.
 - `snob mcp` is an MCP server for AI agents, on standard input and output:
   the status, the lists and profiles, and with `--allow-writes` follow and
   unfollow. Those, and walking another account's lists, run only after a yes

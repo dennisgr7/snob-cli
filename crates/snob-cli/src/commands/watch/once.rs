@@ -130,6 +130,7 @@ mod tests {
                 header: vec!["X-Snob-Source: homelab".to_string()],
                 sign_with: None,
                 heartbeat: false,
+                webhook_format: None,
             },
             target: None,
             output: crate::cli::StatusOutputArgs { json: false },

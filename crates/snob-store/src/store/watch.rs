@@ -502,6 +502,9 @@ pub struct Queued<'a> {
     ///
     /// **Not an `Option`.** A report with nowhere to go is never queued at all.
     pub destination: &'a str,
+    /// The event and the type it goes as; `None` is snob's JSON, its event
+    /// read from the body.
+    pub form: Option<&'a super::deliveries::Form>,
 }
 
 /// Commits a report: queues it, and moves the marks it makes stale.
@@ -531,13 +534,14 @@ pub fn commit_report(
     let tx = store.conn_mut().transaction()?;
 
     let queued = match delivery {
-        Some(queued) => Some(super::deliveries::enqueue(
+        Some(queued) => Some(super::deliveries::enqueue_as(
             &tx,
             queued.run_id,
             account_pk,
             queued.body,
             at,
             queued.destination,
+            queued.form,
         )?),
         None => None,
     };
@@ -931,6 +935,7 @@ mod tests {
                 run_id: "run-1",
                 body: "{}",
                 destination: HERE,
+                form: None,
             }),
         )
         .unwrap();

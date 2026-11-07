@@ -1534,6 +1534,24 @@ pub struct WebhookArgs {
     /// silence can tell "nothing happened" from "it stopped running"
     #[arg(long)]
     pub heartbeat: bool,
+
+    /// What the body is: json (the report, for a program), or the summary as
+    /// slack, discord, ntfy or text want it posted. The address in watch.toml
+    /// takes its "format" from there.
+    #[arg(long, value_name = "FORMAT", value_parser = webhook_format)]
+    pub webhook_format: Option<snob_store::config::WebhookFormat>,
+}
+
+/// One of the five words `format` under `[webhook]` takes, read as the file
+/// reads it so the two cannot disagree.
+fn webhook_format(text: &str) -> Result<snob_store::config::WebhookFormat, String> {
+    #[derive(serde::Deserialize)]
+    struct One {
+        format: snob_store::config::WebhookFormat,
+    }
+    serde_json::from_value::<One>(serde_json::json!({ "format": text }))
+        .map(|one| one.format)
+        .map_err(|_| format!("\"{text}\" is not json, slack, discord, ntfy or text"))
 }
 
 /// The monitor.

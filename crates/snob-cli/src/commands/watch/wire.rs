@@ -166,6 +166,7 @@ fn report_json(
 fn run_json(at: Epoch, looked: bool, requests: u32, lists: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "at": at,
+        "at_iso": iso(at),
         "looked": looked,
         "requests": requests,
         "lists": lists,
@@ -444,6 +445,11 @@ pub(super) fn preflight_body(run_id: &str, at: Epoch) -> serde_json::Value {
     })
 }
 
+/// What a preflight says to a person, in every format: in `json` beside
+/// `note`, and alone where the format is the summary.
+pub(super) const PREFLIGHT_SUMMARY: &str =
+    "snob watch check: this address works. This is a test, not a report.";
+
 /// One account, as an automation wants it.
 ///
 /// **Both names through `printable`, as `snob followers --format json` has
@@ -490,7 +496,9 @@ fn list_json(report: Option<&ListReport>) -> serde_json::Value {
         // the first look" without reading a sentence.
         "basis": basis_token(report.basis),
         "since": report.since,
+        "since_iso": report.since.and_then(iso),
         "until": report.until,
+        "until_iso": iso(report.until),
         "count": report.total,
     })
 }
@@ -503,7 +511,129 @@ fn rename_json(rename: &Rename) -> serde_json::Value {
         "from": printable(&rename.from),
         "to": printable(&rename.to),
         "changed_at": rename.at,
+        "changed_at_iso": iso(rename.at),
     })
+}
+
+/// A moment as RFC 3339 in UTC, beside the epoch seconds every moment here is
+/// already given in: a receiver building a message or a spreadsheet row
+/// wants a date it can show, and converting an epoch is the step a no-code
+/// tool makes hard. Additive, so neither schema moves. `None` only for a
+/// moment `chrono` cannot represent, which no clock gives.
+fn iso(at: Epoch) -> Option<String> {
+    chrono::DateTime::from_timestamp(at.get(), 0)
+        .map(|moment| moment.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+/// A body ready to be signed and sent, and the type it is sent as.
+pub(super) struct Outgoing {
+    pub(super) body: String,
+    pub(super) content_type: &'static str,
+}
+
+/// The longest summary each service shows whole, in characters for the chat
+/// services and bytes for ntfy, from their documentation: Discord refuses
+/// `content` over 2,000 characters; Slack truncates `text` past 40,000 and
+/// recommends staying under 4,000; ntfy turns a message over 4,096 bytes into
+/// an attachment. A little under each, for the line that says what was cut.
+const DISCORD_MOST: usize = 1_900;
+const SLACK_MOST: usize = 3_900;
+const NTFY_MOST_BYTES: usize = 3_900;
+
+/// What a webhook in `format` is sent, from the JSON a report or a preflight
+/// is and the summary a person reads.
+///
+/// **This is protocol**: what comes out is the exact string that is signed,
+/// queued and sent again on a retry. `json` is the body it always was, plus
+/// `summary` (additive: [`SENT_SCHEMA`] does not move). The others carry the
+/// summary alone, in the shape the service's incoming webhook takes:
+///
+/// - `slack`: `{"text": ...}`, with `&`, `<` and `>` escaped, which Slack
+///   reads as markup otherwise;
+/// - `discord`: `{"content": ..., "allowed_mentions": {"parse": []}}`, so a
+///   name that reads as `@everyone` notifies nobody;
+/// - `ntfy` and `text`: the summary as plain UTF-8.
+///
+/// A summary longer than the service shows is cut at a line, and says so.
+pub(super) fn outgoing(
+    format: snob_store::config::WebhookFormat,
+    mut json: serde_json::Value,
+    summary: &str,
+) -> Outgoing {
+    use snob_store::config::WebhookFormat;
+
+    const PLAIN: &str = "text/plain; charset=utf-8";
+    let summary = printable_lines(summary);
+    match format {
+        WebhookFormat::Json => {
+            json["summary"] = serde_json::Value::String(summary);
+            Outgoing {
+                body: json_line(&json),
+                content_type: crate::watch::webhook::JSON,
+            }
+        }
+        WebhookFormat::Slack => {
+            let text = fit(&summary, SLACK_MOST, chars)
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            Outgoing {
+                body: json_line(&serde_json::json!({ "text": text })),
+                content_type: crate::watch::webhook::JSON,
+            }
+        }
+        WebhookFormat::Discord => Outgoing {
+            body: json_line(&serde_json::json!({
+                "content": fit(&summary, DISCORD_MOST, chars),
+                "allowed_mentions": { "parse": [] },
+            })),
+            content_type: crate::watch::webhook::JSON,
+        },
+        WebhookFormat::Ntfy => Outgoing {
+            body: fit(&summary, NTFY_MOST_BYTES, str::len),
+            content_type: PLAIN,
+        },
+        WebhookFormat::Text => Outgoing {
+            body: summary,
+            content_type: PLAIN,
+        },
+    }
+}
+
+/// Every line through `printable`, the line breaks kept: the summary is made
+/// of snob's sentences and names already filtered, and this is the last
+/// look before a chat service draws it.
+fn printable_lines(text: &str) -> String {
+    text.lines().map(printable).collect::<Vec<_>>().join("\n")
+}
+
+/// The whole lines of `text` that fit in `most`, as `size` measures, and a
+/// line saying how many were left out.
+fn fit(text: &str, most: usize, size: fn(&str) -> usize) -> String {
+    if size(text) <= most {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept = String::new();
+    let mut count = 0;
+    for line in &lines {
+        if size(&kept) + size(line) + 1 > most {
+            break;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+        count += 1;
+    }
+    kept.push_str(&format!(
+        "... and {} more lines, left out here; the json format carries every account.",
+        lines.len() - count
+    ));
+    kept
+}
+
+/// What a chat service counts.
+fn chars(text: &str) -> usize {
+    text.chars().count()
 }
 
 /// The stable name of what a list's report is. Written out here rather than on
@@ -544,6 +674,71 @@ mod tests {
         ] {
             assert_eq!(basis_token(basis), token);
         }
+    }
+
+    fn a_body() -> serde_json::Value {
+        payload(
+            &TickReport::for_test(report_with(None, vec![]), 14, Epoch::new(1_700_000_000)),
+            "run-1",
+            "watch.changes",
+        )
+    }
+
+    /// The JSON a receiver already reads, with the sentence and the dates
+    /// added beside it and nothing taken away.
+    #[test]
+    fn the_json_format_is_the_report_with_a_summary_and_dates_beside_the_epochs() {
+        use snob_store::config::WebhookFormat;
+        let made = outgoing(WebhookFormat::Json, a_body(), "Changes for @me\n  one");
+        assert_eq!(made.content_type, "application/json");
+        let sent: serde_json::Value = serde_json::from_str(&made.body).unwrap();
+        assert_eq!(sent["schema"], SENT_SCHEMA);
+        assert_eq!(sent["summary"], "Changes for @me\n  one");
+        assert_eq!(sent["run"]["at"], 1_700_000_000);
+        assert_eq!(sent["run"]["at_iso"], "2023-11-14T22:13:20Z");
+    }
+
+    /// Each chat service gets the summary in the one shape its incoming
+    /// webhook takes, and none of them is handed a way to notify anybody.
+    #[test]
+    fn the_chat_formats_carry_the_summary_in_each_services_shape() {
+        use snob_store::config::WebhookFormat;
+        let summary = "@everyone <b> & co\u{202e}";
+
+        let slack = outgoing(WebhookFormat::Slack, a_body(), summary);
+        let slack: serde_json::Value = serde_json::from_str(&slack.body).unwrap();
+        assert_eq!(slack["text"], "@everyone &lt;b&gt; &amp; co", "{slack}");
+        assert_eq!(slack.as_object().map(|o| o.len()), Some(1));
+
+        let discord = outgoing(WebhookFormat::Discord, a_body(), summary);
+        let discord: serde_json::Value = serde_json::from_str(&discord.body).unwrap();
+        assert_eq!(discord["content"], "@everyone <b> & co");
+        assert_eq!(discord["allowed_mentions"]["parse"], serde_json::json!([]));
+
+        for format in [WebhookFormat::Ntfy, WebhookFormat::Text] {
+            let made = outgoing(format, a_body(), summary);
+            assert_eq!(made.body, "@everyone <b> & co", "filtered, and plain");
+            assert!(made.content_type.starts_with("text/plain"));
+        }
+    }
+
+    /// Past what the service shows, the summary is cut at a line, and says
+    /// how much was left out rather than ending mid-name.
+    #[test]
+    fn a_summary_too_long_for_discord_is_cut_at_a_line_and_says_so() {
+        use snob_store::config::WebhookFormat;
+        let summary = (0..400)
+            .map(|n| format!("    @user{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let made = outgoing(WebhookFormat::Discord, a_body(), &summary);
+        let content = serde_json::from_str::<serde_json::Value>(&made.body).unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(content.chars().count() <= 2_000, "{}", content.len());
+        assert!(content.ends_with("the json format carries every account."));
+        assert!(content.lines().all(|line| !line.ends_with("@use")));
     }
 
     /// Where the README publishes the body, it has to be the body: a receiver is
@@ -986,6 +1181,7 @@ mod tests {
                 "run": {
                     "id": "run-1",
                     "at": 1_700_000_000,
+                    "at_iso": "2023-11-14T22:13:20Z",
                     "looked": false,
                     "requests": 14,
                     "lists": [],
@@ -997,7 +1193,9 @@ mod tests {
                     "followers": {
                         "basis": "compared",
                         "since": 1_000,
+                        "since_iso": "1970-01-01T00:16:40Z",
                         "until": 2_000,
+                        "until_iso": "1970-01-01T00:33:20Z",
                         "count": 10,
                     },
                     "following": null,
@@ -1028,6 +1226,7 @@ mod tests {
                         "from": "before",
                         "to": "after",
                         "changed_at": 1_500,
+                        "changed_at_iso": "1970-01-01T00:25:00Z",
                     }],
                 },
             })

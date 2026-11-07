@@ -678,6 +678,49 @@ async fn a_report_a_receiver_refused_is_owed_and_then_delivered() {
     );
 }
 
+/// A webhook given another `format` is sent the summary, as plain text for
+/// ntfy, and the header still says which event it is.
+#[tokio::test]
+async fn an_ntfy_webhook_is_sent_the_summary_as_plain_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ntfy = receiver(200).await;
+    let first = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &first);
+    configure(
+        tmp.path(),
+        &format!(
+            "schema = 1\nevery = \"6h\"\n\n[webhook]\nurl = \"{}/webhook/snob\"\nformat = \"ntfy\"\n",
+            ntfy.uri()
+        ),
+    );
+    let out = snob(tmp.path(), Some(&first), &["watch", "once"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    a_day_passes(tmp.path());
+    let second = fake_instagram(2, 2).await;
+    let out = snob(tmp.path(), Some(&second), &["watch", "once"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let sent = posted(&ntfy).await;
+    assert_eq!(sent.len(), 1);
+    let header = |name: &str| {
+        sent[0]
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(
+        header("content-type").starts_with("text/plain"),
+        "{}",
+        header("content-type")
+    );
+    assert_eq!(header("x-snob-event"), "watch.changes");
+    let body = String::from_utf8_lossy(&sent[0].body);
+    assert!(body.starts_with("Changes for"), "{body}");
+    assert!(body.contains("followers lost: 1"), "{body}");
+}
+
 /// A stranger's lists are not read on an answer nobody gave.
 ///
 /// The domain rule, asserted of the program rather than of a function: an

@@ -74,9 +74,23 @@ pub struct Delivery {
     /// The exact bytes to send, and the ones the signature covers.
     pub body: String,
     pub attempts: i64,
+    /// The event and the type it was queued with; `None` for a row queued
+    /// before they were kept, which is snob's JSON (`017_delivery_form.sql`).
+    pub form: Option<Form>,
 }
 
-/// Queues a report.
+/// What a body is, kept beside it because the body itself may not say:
+/// the summary posted to Slack names no event, and plain text is no JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Form {
+    /// What the `X-Snob-Event` header says.
+    pub event: String,
+    /// What the `Content-Type` header says.
+    pub content_type: String,
+}
+
+/// Queues a report of snob's JSON, its event read back from the body when it
+/// is sent. [`enqueue_as`] queues one with its form.
 ///
 /// Takes a `&Connection` rather than opening its own transaction on purpose:
 /// the caller has to be able to put this and the mark it makes stale in **one**
@@ -90,11 +104,33 @@ pub fn enqueue(
     at: Epoch,
     destination: &str,
 ) -> Result<i64, StoreError> {
+    enqueue_as(conn, run_id, account_pk, body, at, destination, None)
+}
+
+/// Queues a report with the event and the type it is to be sent as.
+pub fn enqueue_as(
+    conn: &Connection,
+    run_id: &str,
+    account_pk: Pk,
+    body: &str,
+    at: Epoch,
+    destination: &str,
+    form: Option<&Form>,
+) -> Result<i64, StoreError> {
     conn.execute(
         "INSERT INTO watch_deliveries
-            (run_id, account_pk, created_at, body, next_try_at, destination)
-         VALUES (?1, ?2, ?3, ?4, ?3, ?5)",
-        params![run_id, pk_to_sql(account_pk), at.get(), body, destination],
+            (run_id, account_pk, created_at, body, next_try_at, destination,
+             event, content_type)
+         VALUES (?1, ?2, ?3, ?4, ?3, ?5, ?6, ?7)",
+        params![
+            run_id,
+            pk_to_sql(account_pk),
+            at.get(),
+            body,
+            destination,
+            form.map(|form| form.event.as_str()),
+            form.map(|form| form.content_type.as_str()),
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -188,7 +224,7 @@ pub fn due(
     destination: &str,
 ) -> Result<Vec<Delivery>, StoreError> {
     let mut stmt = conn.prepare(
-        "SELECT id, run_id, body, attempts
+        "SELECT id, run_id, body, attempts, event, content_type
          FROM watch_deliveries
          WHERE state = 'pending' AND next_try_at IS NOT NULL AND next_try_at <= ?1
            AND created_at > ?3
@@ -209,6 +245,13 @@ pub fn due(
                 run_id: row.get(1)?,
                 body: row.get(2)?,
                 attempts: row.get(3)?,
+                form: match (row.get(4)?, row.get(5)?) {
+                    (Some(event), Some(content_type)) => Some(Form {
+                        event,
+                        content_type,
+                    }),
+                    _ => None,
+                },
             })
         },
     )?;
@@ -453,6 +496,31 @@ mod tests {
 
         let waiting = due(db.conn(), Epoch::new(1_000), 10, HERE).unwrap();
         assert_eq!(waiting[0].body, body);
+    }
+
+    /// A summary posted as plain text cannot say what it is, so the row does.
+    #[test]
+    fn a_report_queued_with_its_form_comes_back_with_it_and_an_old_one_without() {
+        let db = store();
+        let form = Form {
+            event: "watch.changes".into(),
+            content_type: "text/plain; charset=utf-8".into(),
+        };
+        enqueue_as(
+            db.conn(),
+            "run-1",
+            ME,
+            "Changes for @me",
+            Epoch::new(1_000),
+            HERE,
+            Some(&form),
+        )
+        .unwrap();
+        queued(&db, "run-2", Epoch::new(1_001));
+
+        let waiting = due(db.conn(), Epoch::new(1_001), 10, HERE).unwrap();
+        assert_eq!(waiting[0].form.as_ref(), Some(&form));
+        assert_eq!(waiting[1].form, None, "queued as snob's JSON");
     }
 
     #[test]
