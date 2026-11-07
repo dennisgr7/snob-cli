@@ -160,7 +160,10 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
                 }
                 body
             }
-            Some(document @ Value::Object(_)) => document,
+            Some(mut document @ Value::Object(_)) => {
+                leave_out_of_accounts(&mut document);
+                document
+            }
             Some(other) => json!({ "value": other }),
             None => json!({ "text": finished.text.trim() }),
         }
@@ -364,6 +367,24 @@ fn past_the_end(total: usize, offset: usize, limit: Option<usize>) -> Option<Ans
 /// signed URL of 300 to 500 bytes that answers nothing an agent is asked
 /// and would make most of a page.
 const LEFT_OUT: [&str; 1] = ["pfp_url"];
+
+/// [`LEFT_OUT`] taken out of the accounts a document names, as a list's
+/// are: the mutual followers of a profile (`followed_by.accounts`), whose
+/// pictures' addresses were most of `snob_profile`'s answer. Looked up with
+/// `get_mut`, never indexed, for the reason [`from`] gives.
+fn leave_out_of_accounts(document: &mut Value) {
+    let accounts = document
+        .get_mut("followed_by")
+        .and_then(|followed| followed.get_mut("accounts"))
+        .and_then(Value::as_array_mut);
+    for account in accounts.into_iter().flatten() {
+        if let Some(fields) = account.as_object_mut() {
+            for key in LEFT_OUT {
+                fields.remove(key);
+            }
+        }
+    }
+}
 
 /// Each item as its compact JSON, which is what a page is measured in and
 /// what the server holds, without the fields [`LEFT_OUT`].
@@ -855,6 +876,23 @@ mod tests {
             (json!(3), json!(3))
         );
         assert!(limited(&all.body).is_none());
+    }
+
+    #[test]
+    fn a_profiles_mutual_followers_are_handed_back_without_their_pictures() {
+        let printed = json!({
+            "username": "nora",
+            "followed_by": {"count": 1, "accounts": [
+                {"pk": 1, "username": "anna", "pfp_url": "https://cdn.example/a.jpg"}
+            ], "complete": true},
+        });
+        let told = from(
+            &plan(&[ExitCode::Ok]),
+            finished(ExitCode::Ok, Some(printed), None),
+        );
+        let anna = &told.body["followed_by"]["accounts"][0];
+        assert!(anna.get("pfp_url").is_none(), "{anna}");
+        assert_eq!(anna["username"], "anna");
     }
 
     #[test]
