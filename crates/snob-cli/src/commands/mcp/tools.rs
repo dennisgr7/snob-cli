@@ -145,8 +145,9 @@ pub fn specs(writes: bool) -> Vec<Spec> {
             name: "snob_list",
             title: "Followers, following and how they cross",
             description: "One of the signed-in account's lists, or another account's: \
-                          followers, following, unfollowers (followed but not following back), \
-                          fans (following but not followed back) or friends (both). A stored \
+                          followers, following, or one of the three crossings of the two \
+                          (unfollowers, fans, friends; the list argument says which is \
+                          which). A stored \
                           list less than a day old is reused after one request that checks its \
                           counter has not moved (two for a crossing); otherwise the list is \
                           walked at a human pace: about an hour for 2,000 accounts, with a \
@@ -187,7 +188,19 @@ pub fn specs(writes: bool) -> Vec<Spec> {
                     "list": {
                         "type": "string",
                         "enum": ["followers", "following", "unfollowers", "fans", "friends"],
-                        "description": "Which list."
+                        // One sentence per value, each saying who follows whom. The
+                        // earlier wording, "unfollowers (followed but not following
+                        // back), fans (following but not followed back)", left out
+                        // who does the following, and a model read fans as the
+                        // accounts the person follows, the opposite of what it is.
+                        "description": "Which list. followers: the accounts that follow \
+                                        the account. following: the accounts the account \
+                                        follows. unfollowers: accounts the account follows \
+                                        that do not follow it back. fans: accounts that \
+                                        follow the account that it does not follow back. \
+                                        friends: accounts that follow the account and that \
+                                        it follows too. The account is the signed-in one, or \
+                                        the one named in account."
                     },
                     "account": {
                         "type": "string",
