@@ -91,8 +91,8 @@ One page, in this order:
 
 1. **Hero**: the headline *who doesn't follow you back?* in mono with the last word
    in the accent and the cursor after it; one sentence; the install command for the
-   visitor's system with a copy button and "other ways ↓"; beside it, a terminal
-   with the profile view of an account.
+   visitor's system with a copy button and "other ways ↓"; beside it, the
+   recording of snob at work (below).
 2. **What it does**: six cards, one command each, with a small terminal.
 3. **How it behaves**: a light client on purpose, and the honest note the README
    makes: there is no official API, so this is outside Instagram's Terms, and the
@@ -117,11 +117,26 @@ promises nothing the README does not.
 Commands and output are real text in HTML: selectable, copyable, indexed and
 readable by an agent.
 
-**Planned, not built**: a short recording of the interactive TUI to replace the
-terminal in the hero, muted and looping, recorded against the test suite's invented
-Instagram, never a real account. It would load nothing until it plays, play only
-when the visitor has not asked for reduced motion, and otherwise keep its poster
-with controls. Until it exists there is no `<video>` on the page.
+**The recording in the hero** shows the tool rather than a sketch of it: a loop
+of about 36 seconds in a dark window with the mark and two tabs, `[terminal]` and
+`[agent]`, in the navigation's style. In the terminal, `snob scan`, its
+unfollowers and one profile opened from the list, then `snob profile`, its
+stories and one kept; then a chat where an agent lists the unfollowers over MCP
+and unfollows one after a yes ticked in snob's own form. Nothing in it is drawn
+by hand: `video/record.sh` records the real views of a `testing` build in tmux,
+and the answers `snob mcp` gives, on an invented Instagram
+(`serve_the_website_world`, never a real account), and `pnpm video` lays them
+out and films them frame by frame (`video/stage.html`, `scripts/video.mjs`). The
+chat is any agent's client, no vendor's; its words come from the same answers.
+
+As the HTML writes it, the video is its poster (the unfollowers list) with the
+player's controls, and loads nothing until played: that is what a visitor sees
+without JavaScript or under reduced motion. Otherwise the fourth script plays it
+muted and looping, without controls, only while it is on screen, with a
+`[pause]` button under it (not on it, where it would cover the chat's own
+button), since anything that moves on its own for more than five seconds must
+be stoppable. Its text, for a screen reader and the Markdown twin,
+is `HERO_VIDEO.description`.
 
 ### Install in the hero
 
@@ -132,8 +147,9 @@ macOS command. "Other ways ↓" always leads to the install section.
 
 ## Behavior and its limits
 
-- **Three small scripts and nothing else**: the platform detection, the copy
-  buttons with the install tabs, and the line that tells the author's portfolio
+- **Four small scripts and nothing else**: the platform detection, the copy
+  buttons with the install tabs, the hero's recording (play while on screen,
+  pause on request), and the line that tells the author's portfolio
   (dennisgr7.dev) its live preview of the page has rendered and takes the theme
   the portfolio shows, inert anywhere else.
   Astro bundles them and writes their hashes into the Content Security Policy. Executable code is never `is:inline`, which the policy

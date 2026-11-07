@@ -1,0 +1,20 @@
+{
+  "_meta": {
+    "progressToken": 0
+  },
+  "message": "Unfollow @dex.drums on Instagram?",
+  "mode": "form",
+  "requestedSchema": {
+    "properties": {
+      "confirm": {
+        "description": "Tick to let snob do this, once.",
+        "title": "Go ahead",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "confirm"
+    ],
+    "type": "object"
+  }
+}

@@ -1,0 +1,454 @@
+<!doctype html>
+<!--
+  The stage the hero's video is drawn on, one frame at a time: a window with
+  the site's mark and two tabs, a terminal showing the frames record.sh
+  captured, and a chat with an agent that calls snob over MCP. video.mjs fills
+  in the fonts, the data and stage.js, then asks for each moment with
+  `renderAt(seconds)`. Nothing here moves on its own: every frame is a pure
+  function of the time, so a render is the same every time.
+
+  The colors are DESIGN.md's terminal palette, dark as every terminal on the
+  site is; the sizes are for 1200x900, shown at about 44% in the hero.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      /*FONTS*/
+
+      :root {
+        --bg: #12151a;
+        --raised: #181c22;
+        --line: #262b33;
+        --text: #e6e8ec;
+        --dim: #8b929c;
+        --faint: #5d636d;
+        --ok: #7ad46b;
+        --accent: #f472b6;
+        --mono: var(--font-plex-mono), 'DejaVu Sans Mono', monospace;
+        --sans: var(--font-plex-sans), 'DejaVu Sans', sans-serif;
+        /*
+         * One terminal cell. Plex Mono's advance is 0.6 em, and Chromium on
+         * Linux rounds a glyph's advance to whole pixels: at 27px a letter
+         * took 16px while a drawn cell took 16.2, and the borders drifted
+         * apart. So the cell is a whole 16px and the size follows from it.
+         */
+        --cell: 16px;
+        --font: calc(var(--cell) / 0.6);
+        --row: 38px;
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      html,
+      body {
+        width: 1200px;
+        height: 900px;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--text);
+        -webkit-font-smoothing: antialiased;
+      }
+
+      /* The window: the mark on the left, the tabs on the right, as the site's own header. */
+      header {
+        position: absolute;
+        inset: 0 0 auto 0;
+        height: 76px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 44px;
+        border-bottom: 2px solid var(--line);
+        font-family: var(--mono);
+      }
+      .mark {
+        font-size: 30px;
+        font-weight: 700;
+        font-style: italic;
+        letter-spacing: -0.03em;
+      }
+      .mark span {
+        color: var(--accent);
+      }
+      nav {
+        display: flex;
+        gap: 26px;
+        font-size: 24px;
+      }
+      nav span {
+        color: var(--dim);
+      }
+      nav span.on {
+        color: var(--accent);
+      }
+
+      .pane {
+        position: absolute;
+        inset: 78px 0 0 0;
+      }
+
+      /* The terminal: a grid of cells, each row exactly one cell tall. */
+      #term {
+        font-family: var(--mono);
+        font-size: var(--font);
+      }
+      #screen {
+        position: absolute;
+        left: calc((1200px - 68 * var(--cell)) / 2);
+        top: calc((822px - 19 * var(--row)) / 2);
+        width: calc(68 * var(--cell));
+        height: calc(19 * var(--row));
+      }
+      .line {
+        position: absolute;
+        left: 0;
+        height: var(--row);
+        line-height: var(--row);
+        white-space: pre;
+      }
+      .run {
+        display: inline-block;
+        height: var(--row);
+        vertical-align: top;
+      }
+      .b {
+        font-weight: 700;
+      }
+      .u {
+        text-decoration: underline;
+        text-underline-offset: 6px;
+        text-decoration-thickness: 2px;
+      }
+      /* A character the text font may not have, held to one cell whatever font draws it. */
+      .c {
+        display: inline-block;
+        width: var(--cell);
+        height: var(--row);
+        vertical-align: top;
+        text-align: center;
+        position: relative;
+      }
+      /* Box drawing, drawn rather than set, so borders meet across rows as in a terminal. */
+      .c::before,
+      .c::after {
+        position: absolute;
+        content: none;
+        border-color: currentColor;
+        border-style: solid;
+        border-width: 0;
+      }
+      .h::before,
+      .v::before {
+        content: '';
+      }
+      .h::before {
+        left: 0;
+        right: 0;
+        top: calc(50% - 1px);
+        border-top-width: 2px;
+      }
+      .v::before {
+        top: 0;
+        bottom: 0;
+        left: calc(50% - 1px);
+        border-left-width: 2px;
+      }
+      .tl::before,
+      .tr::before,
+      .bl::before,
+      .br::before {
+        content: '';
+      }
+      .tl::before {
+        left: calc(50% - 1px);
+        top: calc(50% - 1px);
+        right: 0;
+        bottom: 0;
+        border-left-width: 2px;
+        border-top-width: 2px;
+        border-top-left-radius: 9px;
+      }
+      .tr::before {
+        left: 0;
+        top: calc(50% - 1px);
+        right: calc(50% - 1px);
+        bottom: 0;
+        border-right-width: 2px;
+        border-top-width: 2px;
+        border-top-right-radius: 9px;
+      }
+      .bl::before {
+        left: calc(50% - 1px);
+        top: 0;
+        right: 0;
+        bottom: calc(50% - 1px);
+        border-left-width: 2px;
+        border-bottom-width: 2px;
+        border-bottom-left-radius: 9px;
+      }
+      .br::before {
+        left: 0;
+        top: 0;
+        right: calc(50% - 1px);
+        bottom: calc(50% - 1px);
+        border-right-width: 2px;
+        border-bottom-width: 2px;
+        border-bottom-right-radius: 9px;
+      }
+      #cursor {
+        position: absolute;
+        width: var(--cell);
+        height: var(--row);
+        background: var(--text);
+      }
+
+      /* The chat: a conversation over an input, as any agent's client draws one. */
+      #chat {
+        font-family: var(--sans);
+        font-size: 28px;
+        line-height: 1.45;
+      }
+      .connected {
+        position: absolute;
+        left: 90px;
+        top: 26px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 6px 18px 6px 14px;
+        border: 2px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 20px;
+        color: var(--dim);
+      }
+      .connected i {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: var(--ok);
+      }
+      #thread {
+        position: absolute;
+        left: 90px;
+        right: 90px;
+        top: 168px;
+        bottom: 160px;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-end;
+        gap: 26px;
+        overflow: hidden;
+        mask-image: linear-gradient(to bottom, transparent 0, #000 56px);
+      }
+      .you {
+        align-self: flex-end;
+        max-width: 72%;
+        padding: 16px 28px;
+        border-radius: 28px;
+        background: #242931;
+      }
+      .agent {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 18px;
+      }
+      .agent p code,
+      .form code {
+        font-family: var(--mono);
+        font-size: 0.88em;
+        color: var(--accent);
+      }
+      .tool {
+        min-width: 560px;
+        padding: 16px 22px;
+        border: 2px solid var(--line);
+        border-radius: 18px;
+        background: var(--raised);
+        font-family: var(--mono);
+        font-size: 22px;
+        line-height: 1.5;
+      }
+      .tool .head {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+      }
+      .tool .from {
+        color: var(--dim);
+      }
+      .tool .state {
+        margin-left: auto;
+        width: 26px;
+        height: 26px;
+        display: grid;
+        place-items: center;
+      }
+      .spin {
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        border: 3px solid var(--line);
+        border-top-color: var(--accent);
+      }
+      .done {
+        color: var(--ok);
+        font-size: 26px;
+      }
+      .tool .args,
+      .tool .out {
+        color: var(--dim);
+        padding-left: 2px;
+      }
+      .tool .out b {
+        color: var(--text);
+        font-weight: 400;
+      }
+      .form {
+        width: 760px;
+        padding: 24px 28px;
+        border: 2px solid rgb(244 114 182 / 0.55);
+        border-radius: 20px;
+        background: #1b1720;
+      }
+      .form .who {
+        font-family: var(--mono);
+        font-size: 20px;
+        color: var(--dim);
+      }
+      .form .what {
+        margin-top: 6px;
+        font-size: 30px;
+        font-weight: 600;
+      }
+      .form label {
+        margin-top: 18px;
+        display: flex;
+        align-items: flex-start;
+        gap: 16px;
+        font-size: 26px;
+      }
+      .box {
+        flex: none;
+        margin-top: 4px;
+        width: 30px;
+        height: 30px;
+        border: 2px solid var(--dim);
+        border-radius: 7px;
+        display: grid;
+        place-items: center;
+      }
+      .box svg {
+        width: 22px;
+        height: 22px;
+      }
+      .box.ticked {
+        background: var(--accent);
+        border-color: var(--accent);
+      }
+      .form small {
+        display: block;
+        font-size: 22px;
+        color: var(--dim);
+      }
+      .buttons {
+        margin-top: 20px;
+        display: flex;
+        justify-content: flex-end;
+        gap: 14px;
+        font-size: 24px;
+      }
+      .buttons span {
+        padding: 10px 26px;
+        border-radius: 12px;
+        border: 2px solid var(--line);
+        color: var(--dim);
+      }
+      .buttons .go {
+        border-color: var(--accent);
+        background: var(--accent);
+        color: var(--bg);
+        font-weight: 600;
+      }
+      .buttons .go.pressed {
+        filter: brightness(0.82);
+      }
+      #input {
+        position: absolute;
+        left: 90px;
+        right: 90px;
+        bottom: 46px;
+        height: 84px;
+        display: flex;
+        align-items: center;
+        padding: 0 16px 0 34px;
+        border: 2px solid var(--line);
+        border-radius: 42px;
+        background: var(--raised);
+      }
+      #typed {
+        flex: 1;
+        white-space: pre;
+      }
+      #typed.empty {
+        color: var(--faint);
+      }
+      #caret {
+        display: inline-block;
+        width: 2px;
+        height: 34px;
+        margin-left: 2px;
+        vertical-align: -6px;
+        background: var(--text);
+      }
+      #send {
+        width: 56px;
+        height: 56px;
+        border-radius: 50%;
+        display: grid;
+        place-items: center;
+        background: var(--line);
+        color: var(--dim);
+        font-family: var(--mono);
+        font-size: 28px;
+        font-weight: 700;
+      }
+      #send.ready {
+        background: var(--accent);
+        color: var(--bg);
+      }
+      #pointer {
+        position: absolute;
+        width: 34px;
+        height: 34px;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="mark">snob<span>.</span></div>
+      <nav><span id="tab-terminal">[terminal]</span><span id="tab-agent">[agent]</span></nav>
+    </header>
+    <section class="pane" id="term">
+      <div id="screen"></div>
+    </section>
+    <section class="pane" id="chat">
+      <div class="connected"><i></i>snob · MCP</div>
+      <div id="thread"></div>
+      <div id="input"><span id="typed"></span><span id="send">↑</span></div>
+    </section>
+    <svg id="pointer" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 2 L4 19 L8.6 14.8 L11.6 21.6 L14.6 20.3 L11.7 13.6 L18 13.4 Z" fill="#e6e8ec" stroke="#12151a" stroke-width="1.4" stroke-linejoin="round" />
+    </svg>
+    <script>
+      /*SCRIPT*/
+    </script>
+  </body>
+</html>

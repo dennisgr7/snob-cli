@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
-import { HERO_INSTALL } from '@/lib/content';
+import { HERO_INSTALL, HERO_VIDEO } from '@/lib/content';
 import { detectPlatform } from '@/lib/platform';
 
 /** User agents as each system's browser sends them, cut to what matters here. */
@@ -115,6 +115,9 @@ test.describe('without JavaScript', () => {
     await expect(page.getByRole('heading', { name: 'From source' })).toBeVisible();
     // A copy button that could not copy is never shown.
     await expect(page.locator('button[data-copy]:visible')).toHaveCount(0);
+    // The recording is its poster and the player's controls.
+    await expect(page.locator('[data-hero-video]')).toHaveAttribute('controls', '');
+    await expect(page.locator('[data-hero-video-toggle]')).toBeHidden();
   });
 });
 
@@ -131,5 +134,37 @@ test.describe('motion', () => {
     await page.goto('/');
     const name = await page.locator('h1 .cursor').evaluate((el) => getComputedStyle(el).animationName);
     expect(name).toBe('none');
+  });
+
+  test('the recording plays, muted and without controls, and the button pauses it', async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    await page.goto('/');
+    const video = page.locator('[data-hero-video]');
+    const toggle = page.locator('[data-hero-video-toggle]');
+    await expect.poll(() => video.evaluate((v: HTMLVideoElement) => !v.paused && v.muted && !v.controls)).toBe(true);
+    await expect(toggle).toHaveAccessibleName(HERO_VIDEO.pause.label);
+    await expect(toggle).toHaveText(HERO_VIDEO.pause.text);
+
+    await toggle.click();
+    await expect.poll(() => video.evaluate((v: HTMLVideoElement) => v.paused)).toBe(true);
+    await expect(toggle).toHaveAccessibleName(HERO_VIDEO.play.label);
+    await expect(toggle).toHaveText(HERO_VIDEO.play.text);
+    await toggle.click();
+    await expect.poll(() => video.evaluate((v: HTMLVideoElement) => v.paused)).toBe(false);
+  });
+
+  test('under reduced motion the recording is its poster, and loads nothing until played', async ({ page }) => {
+    const media: string[] = [];
+    page.on('request', (request) => {
+      if (new URL(request.url()).pathname.match(/\.(webm|mp4)$/)) media.push(request.url());
+    });
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.goto('/');
+    await page.waitForLoadState('networkidle');
+    const video = page.locator('[data-hero-video]');
+    expect(await video.evaluate((v: HTMLVideoElement) => v.paused && v.controls)).toBe(true);
+    await expect(video).toHaveAttribute('poster', HERO_VIDEO.poster);
+    await expect(page.locator('[data-hero-video-toggle]')).toBeHidden();
+    expect(media).toEqual([]);
   });
 });

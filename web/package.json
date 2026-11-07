@@ -17,7 +17,8 @@
     "check": "astro check",
     "astro": "astro",
     "test": "playwright test",
-    "brand": "node scripts/brand.mjs"
+    "brand": "node scripts/brand.mjs",
+    "video": "node scripts/video.mjs"
   },
   "dependencies": {
     "@astrojs/sitemap": "3.7.4",

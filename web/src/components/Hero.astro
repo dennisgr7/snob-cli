@@ -1,13 +1,12 @@
 ---
 import Cursor from '@/components/Cursor.astro';
+import HeroVideo from '@/components/HeroVideo.astro';
 import InstallHero from '@/components/InstallHero.astro';
-import Terminal from '@/components/Terminal.astro';
-import { HERO, HERO_SAMPLE } from '@/lib/content';
+import { HERO } from '@/lib/content';
 
 /**
  * The wink: the question everybody asks, the answer in one sentence, the
- * install, and the tool beside it. The sketch on the right stands in for the
- * recording of the TUI until it exists.
+ * install, and the tool beside it, recorded.
  */
 ---
 
@@ -20,6 +19,6 @@ import { HERO, HERO_SAMPLE } from '@/lib/content';
       <p class="mt-6 max-w-[52ch] text-lg text-muted">{HERO.lead}</p>
       <InstallHero />
     </div>
-    <Terminal label="The profile view of an account" lines={HERO_SAMPLE} class="shadow-2xl shadow-black/20" />
+    <HeroVideo />
   </div>
 </section>

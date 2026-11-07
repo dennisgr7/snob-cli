@@ -2541,6 +2541,24 @@ async fn serve_the_fake_world() {
     tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
 }
 
+/// Serves the REST face of the world the website's video is recorded on
+/// ([`World::for_the_website`]) and prints its address, for
+/// `SNOB_TEST_SERVE_SECS` seconds (ten minutes by default).
+/// `web/video/record.sh` starts it, and draws the views a sandboxed snob
+/// shows on it.
+#[tokio::test]
+#[ignore = "serves the website's fake Instagram for its recording; run by hand"]
+async fn serve_the_website_world() {
+    let world = World::for_the_website();
+    let face = world.serve_rest().await;
+    println!("REST face: {}", face.uri());
+    let seconds = std::env::var("SNOB_TEST_SERVE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
+    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+}
+
 /// **A measurement, not a check**: how long a command that loads a page takes
 /// through a browser running efficiently, against one running at the normal
 /// pace (`power::qos`), on this machine.

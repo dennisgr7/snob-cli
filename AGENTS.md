@@ -183,7 +183,8 @@ Locally:
   `.agents/` (vendored skills) and `pnpm-lock.yaml` are skipped.
 - Hand-run only: `cargo test -p snob-cli --features testing --test headless
   serve_the_fake_world -- --ignored --nocapture` serves the fake Instagram for
-  `SNOB_TEST_SERVE_SECS`; `tools/parity/tui.sh` diffs the full-screen views of
+  `SNOB_TEST_SERVE_SECS` (`serve_the_website_world`, the same people under
+  readable names, is what `web/video/record.sh` records on); `tools/parity/tui.sh` diffs the full-screen views of
   two `testing` builds frame by frame in tmux.
 - Migrations: the `validate()` test runs the whole chain; it is mandatory.
 
@@ -993,10 +994,15 @@ pnpm check && pnpm build && pnpm test   # Playwright against `wrangler dev` serv
   `llms.txt` and the Markdown twin (`index.md`); it may promise nothing the
   README and `--help` do not. The version is read from `Cargo.toml` at build
   time (`src/lib/version.ts`); never copy it.
-- Three small scripts, hashed into the CSP; no `is:inline` code, no `style`
+- Four small scripts, hashed into the CSP; no `is:inline` code, no `style`
   attributes; everything works without JavaScript.
 - `pnpm brand` regenerates the committed images in `public/` (after
-  `pnpm build`).
+  `pnpm build`). The hero's recording is two steps: `bash web/video/record.sh`
+  records the real views and MCP answers of a `testing` build on the invented
+  world of `serve_the_website_world` into `web/video/captures/`, and `pnpm
+  video` (after `pnpm build`, with ffmpeg) films them into `public/video/`.
+  Both outputs are committed; record again when a view the video shows
+  changes.
 
 ## Release and packaging
 

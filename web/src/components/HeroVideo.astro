@@ -1,0 +1,115 @@
+---
+import { HERO_VIDEO } from '@/lib/content';
+
+/**
+ * The recording in the hero: snob's own views on an invented Instagram, then
+ * the same world through an agent over MCP (`video/`, and `pnpm video`).
+ *
+ * As the HTML has it, it is its poster with the player's controls, and loads
+ * nothing until somebody plays it: that is the page without JavaScript, and
+ * for a visitor who asked for reduced motion. Otherwise the script plays it,
+ * muted, looping and without controls, only while it is on screen, and shows
+ * the button under it that pauses it: anything that moves on its own for more
+ * than five seconds can be stopped (WCAG 2.2.2). Its text is `description`,
+ * read in place of the picture.
+ */
+interface Props {
+  class?: string;
+}
+
+const { class: className } = Astro.props;
+---
+
+<div class:list={['flex flex-col items-end gap-2', className]}>
+  <figure class="w-full overflow-hidden rounded-card border border-term-line bg-term-bg shadow-2xl shadow-black/20">
+    <video
+      data-hero-video
+      class="block aspect-[4/3] h-auto w-full"
+      width="1200"
+      height="900"
+      poster={HERO_VIDEO.poster}
+      preload="none"
+      muted
+      loop
+      playsinline
+      controls
+      aria-describedby="hero-video-description"
+    >
+      <source src={HERO_VIDEO.webm} type="video/webm" />
+      <source src={HERO_VIDEO.mp4} type="video/mp4" />
+    </video>
+    <figcaption id="hero-video-description" class="sr-only">{HERO_VIDEO.description}</figcaption>
+  </figure>
+  {/* Under the recording rather than on it, where it would cover what it shows. */}
+  <button
+    type="button"
+    hidden
+    data-hero-video-toggle
+    data-pause-text={HERO_VIDEO.pause.text}
+    data-pause-label={HERO_VIDEO.pause.label}
+    data-play-text={HERO_VIDEO.play.text}
+    data-play-label={HERO_VIDEO.play.label}
+    aria-label={HERO_VIDEO.pause.label}
+    class="font-mono text-sm text-muted hover:text-text"
+  >
+    {HERO_VIDEO.pause.text}
+  </button>
+</div>
+
+<script>
+  const video = document.querySelector<HTMLVideoElement>('[data-hero-video]');
+  const toggle = document.querySelector<HTMLButtonElement>('[data-hero-video-toggle]');
+  const still = matchMedia('(prefers-reduced-motion: reduce)');
+
+  if (video && toggle) {
+    /** Paused by the button, and kept so until the button plays it again. */
+    let stopped = false;
+    let onScreen = false;
+
+    const label = () => {
+      const now = stopped ? 'play' : 'pause';
+      toggle.textContent = toggle.dataset[`${now}Text`] ?? '';
+      toggle.setAttribute('aria-label', toggle.dataset[`${now}Label`] ?? '');
+    };
+
+    // Back to the HTML's own: the poster, the controls, nothing playing.
+    const asWritten = () => {
+      video.pause();
+      video.controls = true;
+      toggle.hidden = true;
+    };
+
+    const decide = () => {
+      if (still.matches) return;
+      if (stopped || !onScreen) {
+        video.pause();
+        return;
+      }
+      video.muted = true;
+      // A pause while it was starting is no failure; a refusal to autoplay,
+      // or no source this browser can play, is.
+      video.play().catch((error: unknown) => {
+        if (!(error instanceof DOMException && error.name === 'AbortError')) asWritten();
+      });
+    };
+
+    const start = () => {
+      video.controls = false;
+      toggle.hidden = false;
+      label();
+      decide();
+    };
+
+    toggle.addEventListener('click', () => {
+      stopped = !stopped;
+      label();
+      decide();
+    });
+    new IntersectionObserver(([entry]) => {
+      onScreen = entry?.isIntersecting ?? false;
+      decide();
+    }).observe(video);
+    still.addEventListener('change', () => (still.matches ? asWritten() : start()));
+    if (!still.matches) start();
+  }
+</script>

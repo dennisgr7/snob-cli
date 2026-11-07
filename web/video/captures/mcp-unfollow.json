@@ -1,0 +1,16 @@
+{
+  "action": "unfollow",
+  "changed": true,
+  "following": false,
+  "outcome": "unfollowed",
+  "requested": false,
+  "target": {
+    "is_private": false,
+    "pk": 1023,
+    "username": "dex.drums"
+  },
+  "viewer": {
+    "pk": 42,
+    "username": "you"
+  }
+}

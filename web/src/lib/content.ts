@@ -171,22 +171,22 @@ export const HERO = {
 } as const;
 
 /**
- * A sketch of the full-screen profile view, shown in the hero until the
- * recording of the real one exists.
+ * The recording beside the headline (HeroVideo.astro): snob's own views and
+ * its MCP server's answers on an invented Instagram, recorded by
+ * `video/record.sh` and filmed by `scripts/video.mjs`, never a real account.
+ * `description` is its text, for a screen reader and the Markdown twin: what
+ * it shows, in order.
  */
-export const HERO_SAMPLE: Sample = [
-  { command: 'snob profile someone' },
-  { output: [{ text: '@someone', tone: 'prompt' }, '  Someone Example  ', { text: '(verified)', tone: 'dim' }] },
-  { output: '  photographer, mostly coffee' },
-  { output: '' },
-  { output: 'Followers:    1234' },
-  { output: 'Following:    56' },
-  { output: 'Posts:        78' },
-  { output: '' },
-  { output: [{ text: 'You do not follow them, they follow you', tone: 'info' }] },
-  { output: 'Highlights:   2' },
-  { output: [{ text: 'Stories up:   1', tone: 'ok' }] },
-];
+export const HERO_VIDEO = {
+  webm: '/video/hero.webm',
+  mp4: '/video/hero.mp4',
+  poster: '/video/hero.webp',
+  /** The button under it: what it shows, and what a screen reader hears. */
+  pause: { text: '[pause]', label: 'Pause the recording' },
+  play: { text: '[play]', label: 'Play the recording' },
+  description:
+    'A recording of snob on an invented Instagram account. In the terminal, snob scan shows how its followers and following cross, opens the 14 accounts it follows that do not follow it back, and the profile of one of them; snob profile shows another account, its two stories up, and keeps one. Then, in a chat, an AI agent answers "Who doesn’t follow me back?" through snob’s MCP server, and unfollows one account once the person ticks "Go ahead" in the form snob asks with.',
+} as const;
 
 export interface Feature {
   /** The command, as typed after `snob`. */

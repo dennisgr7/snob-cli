@@ -4,7 +4,7 @@ import {
   FEATURES,
   FEATURES_SECTION,
   HERO,
-  HERO_SAMPLE,
+  HERO_VIDEO,
   INSTALL,
   INSTALL_SECTION,
   ARM,
@@ -58,7 +58,7 @@ export function homeToMarkdown(site: URL | string): string {
 
 ${HERO.lead}
 
-${block(HERO_SAMPLE)}
+${HERO_VIDEO.description}
 
 ## ${heading(FEATURES_SECTION.title, FEATURES_SECTION.accent)}
 
