@@ -481,13 +481,34 @@ pub async fn show(
     } else {
         crate::ui::say!("{}", line(&seen, now));
         if let Some(finished) = finished(&seen) {
-            crate::ui::say!(
-                "  It exited {}.",
-                finished["exit"].as_str().unwrap_or("error")
-            );
+            crate::ui::say!("  {}", ended(&finished, seen.id.as_str()));
         }
     }
     Ok(ExitCode::Ok)
+}
+
+/// How a finished job ended, for a person: its exit, and, when it left a
+/// result, how many entries it holds and where to read it. "It exited ok."
+/// alone left nobody knowing there was a list to be had.
+fn ended(finished: &Value, id: &str) -> String {
+    let exit = finished["exit"].as_str().unwrap_or("error");
+    match finished.get("output") {
+        Some(Value::Array(items)) => format!(
+            "It exited {exit}, with {} {}; \"snob jobs show {id} --json\" prints them, under \
+             finished.output, for a day after it ended.",
+            items.len(),
+            if items.len() == 1 {
+                "account"
+            } else {
+                "accounts"
+            },
+        ),
+        Some(Value::Null) | None => format!("It exited {exit}."),
+        Some(_) => format!(
+            "It exited {exit}; \"snob jobs show {id} --json\" prints its result, under \
+             finished.output, for a day after it ended."
+        ),
+    }
 }
 
 /// `list`: the jobs not yet finished, or every one kept with `all`.
