@@ -291,7 +291,10 @@ pub async fn serve(
         .into());
     };
     // Narrower than on standard input and output: whoever holds the key
-    // can call, and a yes in the chat may be theirs.
+    // can call, and a yes in the chat may be theirs. **This narrows the chat
+    // only**: a client that declares a form answers it as it likes
+    // (`Server::consent` asks a form first), so whoever holds the key can
+    // confirm a write whatever this says, which [`writes_warning`] tells.
     let in_chat = settings.in_chat.unwrap_or(ConfirmInChat::Lists);
     let closing = crate::interrupt::install();
     let server = Server::new(launch, &settings, in_chat, closing.clone())?;
@@ -301,33 +304,9 @@ pub async fn serve(
     let gate = Gate::new(&key)?;
     drop(key);
 
-    let (hosts, origins) = allowed(bound.host(), listen.public.as_ref());
-    let config = StreamableHttpServerConfig::default()
-        .with_allowed_hosts(hosts)
-        .with_allowed_origins(origins)
-        // With no public URL there is no origin to allow, and an empty
-        // list would otherwise mean no check at all: a page in a browser
-        // on this machine has no business here.
-        .enforce_origin_validation()
-        .with_max_request_body_bytes(MOST_BODY)
-        // Sessions for the revisions before 2026-07-28, which is where a
-        // question asked with `elicitation/create` travels, on the stream of
-        // the call that asks it.
-        .with_legacy_session_mode(true);
+    let config = config(bound.host(), listen.public.as_ref());
     let stopping = config.cancellation_token.clone();
-    // Both `#[non_exhaustive]`: built from their defaults, then changed.
-    let mut manager = LocalSessionManager::default();
-    manager.session_config.keep_alive = Some(SESSION_IDLE);
-    let manager = Arc::new(manager);
-    let service =
-        StreamableHttpService::new(move || Ok(server.clone()), Arc::clone(&manager), config);
-    let front = Arc::new(Front {
-        gate,
-        service,
-        manager,
-        answering: Arc::new(InFlight::default()),
-        activity: Activity::default(),
-    });
+    let front = Arc::new(Front::new(server, gate, config));
 
     started(
         &bound,
@@ -390,6 +369,24 @@ pub async fn serve(
     let _ = tokio::time::timeout(CLOSING_WITHIN, ended).await;
     connections.abort_all();
     Ok(ExitCode::Interrupted)
+}
+
+/// The SDK's configuration for a server bound to `bound`, and reached
+/// through `public` when given.
+fn config(bound: IpAddr, public: Option<&Url>) -> StreamableHttpServerConfig {
+    let (hosts, origins) = allowed(bound, public);
+    StreamableHttpServerConfig::default()
+        .with_allowed_hosts(hosts)
+        .with_allowed_origins(origins)
+        // With no public URL there is no origin to allow, and an empty
+        // list would otherwise mean no check at all: a page in a browser
+        // on this machine has no business here.
+        .enforce_origin_validation()
+        .with_max_request_body_bytes(MOST_BODY)
+        // Sessions for the revisions before 2026-07-28, which is where a
+        // question asked with `elicitation/create` travels, on the stream of
+        // the call that asks it.
+        .with_legacy_session_mode(true)
 }
 
 /// A connection, whichever listener it came from.
@@ -630,7 +627,8 @@ fn started(
             ));
             ui::info(&format!(
                 "Only you, and root, can connect to it. A tunnel of your own brings it \
-                 elsewhere: ssh -L 8750:\"{path}\" to this machine, and then \
+                 elsewhere: ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8750:\"{path}\" \
+                 to this machine, which stops at once if that port is taken there, and then \
                  http://127.0.0.1:8750{PATH} there, or cloudflared with the service \
                  unix:{path}."
             ));
@@ -644,17 +642,27 @@ fn started(
         ));
     }
     if settings.writes {
-        let confirm = if in_chat == ConfirmInChat::All {
-            ", and can confirm them in the chat itself"
-        } else {
-            ""
-        };
-        ui::warn(&format!(
-            "with --allow-writes, whoever holds the key can call follow and unfollow{confirm}; \
-             keep the key to clients you trust."
-        ));
+        ui::warn(&writes_warning(in_chat));
     }
     ui::info("Ctrl+C stops it, giving the calls still running their grace.");
+}
+
+/// What startup warns of with `--allow-writes`. **Whoever holds the key can
+/// confirm a write whatever `--confirm-in-chat` says**: it is the client,
+/// and a client that declares a form answers the form itself, which the
+/// server cannot tell from a person ticking a box (and records as a yes
+/// given in a form). `--confirm-in-chat` closes the chat only.
+fn writes_warning(in_chat: ConfirmInChat) -> String {
+    let how = if in_chat == ConfirmInChat::All {
+        "in the chat or in a form it answers itself"
+    } else {
+        "in a form it answers itself, whatever --confirm-in-chat says, which closes only the \
+         chat"
+    };
+    format!(
+        "with --allow-writes, whoever holds the key can call follow and unfollow and confirm \
+         them, {how}; keep the key to clients you trust."
+    )
 }
 
 /// One connection, served until it ends or the server stops, when it is
@@ -718,6 +726,23 @@ struct Front {
 }
 
 impl Front {
+    /// What stands in front of `server`, behind `gate`.
+    fn new(server: Server, gate: Gate, config: StreamableHttpServerConfig) -> Self {
+        // Both `#[non_exhaustive]`: built from their defaults, then changed.
+        let mut manager = LocalSessionManager::default();
+        manager.session_config.keep_alive = Some(SESSION_IDLE);
+        let manager = Arc::new(manager);
+        let service =
+            StreamableHttpService::new(move || Ok(server.clone()), Arc::clone(&manager), config);
+        Self {
+            gate,
+            service,
+            manager,
+            answering: Arc::new(InFlight::default()),
+            activity: Activity::default(),
+        }
+    }
+
     /// Answers one request, in the order the header gives, noting on `seen`
     /// that it came, and whether it showed the key.
     async fn answer(&self, request: Request<Incoming>, seen: &Seen) -> Response {
@@ -735,15 +760,21 @@ impl Front {
         let answering = (request.method() == Method::POST).then(|| self.answering.enter());
         // A request in a session is that session alive; a `POST` is one of
         // its calls until its answer has been sent, and its session is never
-        // closed under it.
+        // closed under it. Only a session the manager holds: any other id
+        // is answered 404 by the SDK, and is noted nowhere.
         let session = request
             .headers()
             .get("mcp-session-id")
             .and_then(|id| id.to_str().ok())
             .map(Arc::<str>::from);
-        let call = session
-            .as_ref()
-            .and_then(|id| self.activity.touch(id, request.method() == Method::POST));
+        let call = match &session {
+            Some(id) => {
+                self.activity
+                    .touch_held(&self.manager, id, request.method() == Method::POST)
+                    .await
+            }
+            None => None,
+        };
         let (parts, body) = request.into_parts();
         let body = match read(&parts.headers, body).await {
             Ok(body) => body,
@@ -813,6 +844,15 @@ impl Front {
 
 /// What each session has done lately, by its id: when it was last asked
 /// anything, and how many of its calls are being answered.
+///
+/// **Only sessions the manager holds are kept**: the id is whatever the
+/// client's `Mcp-Session-Id` says, up to the size of [`BUFFER`], and every
+/// request with an id nobody was given is answered 404 by the SDK without a
+/// tool being called, so none of the call limits counts it. Noting those
+/// would grow this map by one header per request, with nothing to remove
+/// them but the next `initialize`. So a request's session is noted through
+/// [`Activity::touch_held`], and the map holds no more than the sessions
+/// open and those closed since the last one opened ([`Activity::keep_only`]).
 #[derive(Default)]
 struct Activity(Arc<Mutex<HashMap<Arc<str>, Lately>>>);
 
@@ -844,6 +884,23 @@ impl Activity {
             of: Arc::clone(&self.0),
             id: Arc::clone(id),
         })
+    }
+
+    /// [`Activity::touch`], for the session a request names, only if
+    /// `manager` holds it; an id it does not hold is noted nowhere. Asked
+    /// under the manager's lock, so a session closed in between is closed
+    /// after it was noted, and the next opening forgets it.
+    async fn touch_held(
+        &self,
+        manager: &LocalSessionManager,
+        id: &Arc<str>,
+        call: bool,
+    ) -> Option<Call> {
+        let sessions = manager.sessions.read().await;
+        if !sessions.contains_key(id) {
+            return None;
+        }
+        self.touch(id, call)
     }
 
     /// Forgets the sessions that are not in `open`, so what is kept is
@@ -1168,6 +1225,158 @@ mod tests {
         // SAFETY: `raw` is the bound socket the listener owns.
         assert_eq!(unsafe { listen(raw, 1) }, 0, "listen");
         Some(listener)
+    }
+
+    /// The warning with `--allow-writes` says that whoever holds the key can
+    /// confirm the writes, through a form it answers, whatever
+    /// `--confirm-in-chat` says, and through the chat too only under `all`.
+    #[test]
+    fn the_writes_warning_says_a_key_holder_confirms_them_whatever_the_chat_allows() {
+        for in_chat in [
+            ConfirmInChat::None,
+            ConfirmInChat::Lists,
+            ConfirmInChat::All,
+        ] {
+            let said = writes_warning(in_chat);
+            assert!(
+                said.contains("whoever holds the key can call follow and unfollow and confirm"),
+                "{said}"
+            );
+            assert!(said.contains("a form it answers itself"), "{said}");
+            assert_eq!(
+                said.contains("in the chat or"),
+                in_chat == ConfirmInChat::All,
+                "{said}"
+            );
+        }
+        assert!(writes_warning(ConfirmInChat::Lists).contains("closes only the chat"));
+    }
+
+    /// A request naming a session the manager does not hold, which the SDK
+    /// answers 404 past every call limit, leaves nothing behind however many
+    /// come and however long their ids; one the manager holds is noted, and
+    /// its call counted.
+    #[tokio::test]
+    async fn only_a_session_the_manager_holds_is_noted() {
+        let manager = LocalSessionManager::default();
+        let activity = Activity::default();
+        for n in 0..1_000 {
+            let made_up: Arc<str> = Arc::from(format!("{n}{}", "x".repeat(BUFFER / 2)));
+            assert!(
+                activity
+                    .touch_held(&manager, &made_up, true)
+                    .await
+                    .is_none()
+            );
+            assert!(
+                activity
+                    .touch_held(&manager, &made_up, false)
+                    .await
+                    .is_none()
+            );
+        }
+        assert!(activity.seen().is_empty(), "made-up ids were kept");
+
+        let (id, _transport) = manager.create_session().await.unwrap();
+        let call = activity.touch_held(&manager, &id, true).await;
+        assert!(call.is_some(), "a held session's call is counted");
+        assert_eq!(activity.seen().get(&id).map(|lately| lately.calls), Some(1));
+        drop(call);
+        assert_eq!(activity.seen().get(&id).map(|lately| lately.calls), Some(0));
+        assert_eq!(activity.seen().len(), 1);
+        manager.close_session(&id).await.unwrap();
+    }
+
+    /// The same, through the request path: over HTTP to a [`Front`] as
+    /// [`serve`] builds it, requests that name a session nobody was given,
+    /// each answered 404, leave nothing in what [`Front::answer`] notes, and
+    /// the one session opened is all it holds. [`Activity::touch`] called on
+    /// a request's own header would keep every one of them.
+    #[tokio::test]
+    async fn a_request_naming_a_session_nobody_was_given_is_noted_nowhere() {
+        let key = key::Key::generate().unwrap();
+        let settings = Settings {
+            writes: false,
+            in_chat: None,
+            writes_a_day: None,
+            max_wait: None,
+        };
+        // No tool is called, so the binary is never started.
+        let launch = child::Launch::new(std::path::PathBuf::from("snob"), Vec::new());
+        let closing = CancelToken::default();
+        let server = Server::new(launch, &settings, ConfirmInChat::Lists, closing.clone()).unwrap();
+        let front = Arc::new(Front::new(
+            server,
+            Gate::new(&key).unwrap(),
+            config(IpAddr::V4(Ipv4Addr::LOCALHOST), None),
+        ));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let url = format!("http://{}{PATH}", listener.local_addr().unwrap());
+        let serving = {
+            let front = Arc::clone(&front);
+            let closing = closing.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(connection(
+                        Box::new(stream),
+                        Arc::clone(&front),
+                        closing.clone(),
+                        Arc::new(Seen::default()),
+                    ));
+                }
+            })
+        };
+
+        let http = reqwest::Client::new();
+        let post = async |session: Option<&str>, message: String| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(key.expose())
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .body(message);
+            if let Some(id) = session {
+                request = request
+                    .header("Mcp-Session-Id", id)
+                    .header("MCP-Protocol-Version", "2025-11-25");
+            }
+            let response = request.send().await.unwrap();
+            let status = response.status().as_u16();
+            let session = response
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|id| id.to_str().ok())
+                .map(str::to_string);
+            // Read whole, so the call it answered has ended.
+            let _ = response.bytes().await;
+            (status, session)
+        };
+
+        let hello = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
+        let (status, session) = post(None, hello.to_string()).await;
+        assert_eq!(status, 200);
+        let session = session.expect("a session id");
+        let initialized = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let (status, _) = post(Some(&session), initialized.to_string()).await;
+        assert_eq!(status, 202);
+
+        for n in 0..64 {
+            let made_up = format!("{n}{}", "x".repeat(BUFFER / 4));
+            let ping = format!(r#"{{"jsonrpc":"2.0","id":{},"method":"ping"}}"#, n + 2);
+            let (status, _) = post(Some(&made_up), ping).await;
+            assert_eq!(status, 404, "a session nobody was given");
+        }
+        let ping = r#"{"jsonrpc":"2.0","id":100,"method":"ping"}"#;
+        let (status, _) = post(Some(&session), ping.to_string()).await;
+        assert_eq!(status, 200, "the session opened is still served");
+
+        let noted: Vec<Arc<str>> = front.activity.seen().keys().cloned().collect();
+        assert_eq!(noted.len(), 1, "sessions nobody was given were noted");
+        assert_eq!(&*noted[0], session.as_str());
+
+        closing.cancel();
+        serving.abort();
+        let _ = front.manager.close_session(&Arc::from(session)).await;
     }
 
     /// A new session closes the one asked anything longest ago that has no

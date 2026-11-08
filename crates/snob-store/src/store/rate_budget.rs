@@ -20,7 +20,9 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use snob_core::EpochMs;
 use snob_core::Pk;
-use snob_core::budget::{Brake, RateBudget, RateBudgetError, Sitting, SittingRule, common_brake};
+use snob_core::budget::{
+    AnswerTime, Brake, RateBudget, RateBudgetError, Sitting, SittingRule, common_brake,
+};
 use snob_core::clock::now_ms;
 
 use super::StoreError;
@@ -150,7 +152,7 @@ const WRITE_BURST_MS: i64 = WRITE_EMISSION_MS * 2;
 pub const WRITES_IN_A_DAY: u32 = (DAY_MS / WRITE_EMISSION_MS) as u32 + 3;
 
 /// Slack before deciding the system clock has gone backwards.
-const CLOCK_SKEW_TOLERANCE_MS: i64 = 5_000;
+pub(crate) const CLOCK_SKEW_TOLERANCE_MS: i64 = 5_000;
 
 const MAX_COOLDOWN_MS: i64 = 24 * 3600 * 1000;
 
@@ -334,6 +336,15 @@ impl SqliteRateBudget {
     /// they hand back, and **all of the buckets are charged whichever wait
     /// wins** — a request held back by one budget still spends the others,
     /// because it is still going to be sent.
+    ///
+    /// **A reservation is not given back**, even when the process waiting
+    /// out its turn is stopped or killed before it sends: a follow killed
+    /// while it waits for the write bucket has spent that turn, and the next
+    /// one waits behind it. That errs on the slow side by one request at
+    /// most, which is the side the pace is allowed to err on; giving a turn
+    /// back would need its release to be written by a process that may never
+    /// get to write it, and two processes could then both believe the same
+    /// turn was theirs.
     ///
     /// One transaction for all of them, and it is `IMMEDIATE` for the reason
     /// spelled out below. Charging the write bucket in a second transaction
@@ -811,6 +822,20 @@ impl RateBudget for SqliteRateBudget {
             )
             .map_err(budget_err)?;
         Ok(())
+    }
+
+    /// The answers are the account's, kept in its database, so that every
+    /// process walking it is slowed by what the others were answered.
+    fn keeps_answers(&self) -> bool {
+        true
+    }
+
+    fn answer_timed(&self, answer: &AnswerTime) -> Result<(), RateBudgetError> {
+        super::answers::record(&mut self.conn(), answer, now_ms()).map_err(budget_err)
+    }
+
+    fn recent_waits(&self, since: EpochMs, n: usize) -> Result<Vec<Duration>, RateBudgetError> {
+        super::answers::recent_waits(&self.conn(), since, n).map_err(budget_err)
     }
 
     /// Reads the previous cooldown and writes the next one in **one**
@@ -1338,6 +1363,7 @@ mod tests {
         assert_eq!(b.accounts_left().unwrap(), 2_000);
         assert_eq!(b.accounts_wait(25).unwrap(), Duration::ZERO);
 
+        let started = std::time::Instant::now();
         for _ in 0..79 {
             b.spend_accounts(25).unwrap();
         }
@@ -1347,10 +1373,16 @@ mod tests {
 
         assert_eq!(b.accounts_left().unwrap(), 0);
         let wait = b.accounts_wait(25).unwrap();
-        // All of it was read just now, so the room comes back a day from now.
+        // All of it was read just now, so the room comes back a day from the
+        // first read. How long ago that was is measured, not assumed: on a
+        // loaded windows-latest runner the 80 writes took more than the 10 s
+        // this test once allowed (86388.282 s left, 2026-10-31). The second
+        // of slack covers the store's milliseconds against the monotonic
+        // clock.
+        let earliest = Duration::from_secs(86_400) - started.elapsed() - Duration::from_secs(1);
         assert!(
-            wait > Duration::from_secs(86_390) && wait <= Duration::from_secs(86_400),
-            "{wait:?}"
+            wait >= earliest && wait <= Duration::from_secs(86_400),
+            "{wait:?}, at least {earliest:?}"
         );
     }
 

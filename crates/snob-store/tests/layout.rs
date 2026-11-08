@@ -6,8 +6,8 @@
 
 use std::path::Path;
 
-use snob_core::Pk;
 use snob_core::session::{Session, SessionOrigin};
+use snob_core::{Epoch, Pk};
 use snob_store::config::{self, WatchConfig};
 use snob_store::layout::{self, LayoutError, Settled};
 use snob_store::paths::{AccountPaths, AppPaths};
@@ -51,13 +51,18 @@ impl Machine {
     ///
     /// Written as the account's own and moved: the two files are one format.
     fn old_session_at(&self, file: &Path) {
+        let made = !self.me().dir().exists();
         self.secrets
             .session_of(&self.me())
             .save(&session())
             .unwrap();
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::rename(self.me().session_file(), file).unwrap();
-        // Unless something else is in it already.
+        // With the list of who is signed in a directory is made with, unless
+        // something else is in it already.
+        if made {
+            let _ = std::fs::remove_file(self.me().signed_in());
+        }
         let _ = std::fs::remove_dir(self.me().dir());
     }
 
@@ -261,6 +266,21 @@ fn with_no_session_the_one_account_there_is_takes_it() {
 
     m.assert_settled();
     assert!(m.me().session_file().exists());
+}
+
+/// The session moved is the account's to send as, like a login's, even in
+/// an account directory the move made, which starts with nobody signed in.
+#[test]
+fn the_session_moved_is_signed_in() {
+    let m = machine();
+    m.old_session_at(&m.old_session_file());
+    assert!(!m.me().dir().exists());
+
+    m.settle().unwrap();
+
+    let moved = m.my_session().unwrap();
+    assert!(m.me().signed_in().exists(), "the move made the directory");
+    assert!(!m.me().refuses_session(moved.created_at));
 }
 
 /// A session that never learned its username is registered with none, not
@@ -537,6 +557,26 @@ fn a_login_takes_the_unclaimed_database() {
     }
 }
 
+/// An account directory a login makes by taking the unclaimed database, as
+/// one after a `purge` of the account is, starts with nobody signed in: a
+/// session held from before the purge stays refused, and only the login's
+/// own is let in.
+#[test]
+fn a_directory_made_by_taking_the_unclaimed_database_signs_nobody_in() {
+    let m = machine();
+    unclaimed(&m, None);
+    assert!(!m.me().dir().exists());
+    let (held, login) = (Epoch::new(1_800_000_000), Epoch::new(1_800_000_600));
+
+    assert!(layout::adopt(&m.paths, ME).unwrap());
+
+    assert!(m.me().signed_in().exists());
+    assert!(m.me().refuses_session(held));
+    m.me().admit_session(login).unwrap();
+    assert!(!m.me().refuses_session(login));
+    assert!(m.me().refuses_session(held), "only the login's own");
+}
+
 /// Another account's history, or a database the account already has, is
 /// never what a login takes.
 #[test]
@@ -562,6 +602,8 @@ fn a_login_that_did_not_happen_gives_the_database_back() {
     let m = machine();
     let db = unclaimed(&m, None);
     assert!(layout::adopt(&m.paths, ME).unwrap());
+    // As the login does before its check.
+    m.me().admit_session(Epoch::new(1_800_000_000)).unwrap();
 
     assert!(layout::unadopt(&m.paths, ME).unwrap());
 

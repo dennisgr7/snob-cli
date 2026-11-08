@@ -150,6 +150,12 @@ pub struct ListOutcome {
     /// and only the store knows whether the partial has already aged out of the
     /// resume window.
     pub resumable: bool,
+    /// How many follows and unfollows the account made through snob since a
+    /// stored list of its own following was walked, which it is handed out
+    /// with applied (`serve_stored`). Zero for a walk, and for every other
+    /// list. Said beside the list, never folded into its date: the list is
+    /// still the walk's, plus what this computer knows it changed.
+    pub own_changes: usize,
 }
 
 impl ListOutcome {
@@ -184,6 +190,8 @@ impl ListOutcome {
             // A stored list is a finished one — the view this comes from cannot
             // return anything else — so there is nothing left to continue.
             resumable: false,
+            // `serve_stored` counts them once it has applied them.
+            own_changes: 0,
         }
     }
 
@@ -240,6 +248,7 @@ impl ListOutcome {
             snapshot_id: 1,
             stopped_by: None,
             resumable: false,
+            own_changes: 0,
         }
     }
 
@@ -390,15 +399,33 @@ async fn decide(
 }
 
 /// A stored capture as the answer: its members, and where they came from.
+///
+/// **The account's own following is handed out with the follows and
+/// unfollows it made through snob since the walk applied**
+/// (`snob_store::store::own_writes`), and says so, naming them: the list is
+/// still the walk's, of its date and provenance, plus what this computer
+/// knows it changed, having sent it. Every other list is the walk's alone.
+/// The monitor compares captures by their id, not these members, so what it
+/// reports is what was walked.
 pub(super) fn serve_stored(
     app: &App,
     snapshot: &snapshots::Snapshot,
     provenance: Provenance,
 ) -> Result<(Vec<User>, ListOutcome)> {
-    Ok((
-        snapshots::members(app.db().conn(), snapshot.id)?,
-        ListOutcome::cached(snapshot, provenance),
-    ))
+    let mut members = snapshots::members(app.db().conn(), snapshot.id)?;
+    let mut outcome = ListOutcome::cached(snapshot, provenance);
+    if snapshot.kind == ListKind::Following && snapshot.account_pk == app.viewer().pk {
+        let applied =
+            snob_store::store::own_writes::apply(app.db().conn(), &mut members, outcome.taken_at)?;
+        if !applied.is_empty() {
+            app.warn(&crate::report::own_writes_applied(
+                outcome.taken_at,
+                &applied,
+            ));
+            outcome.own_changes = applied.len();
+        }
+    }
+    Ok((members, outcome))
 }
 
 /// Asks before enumerating somebody else's account, at most once per run.

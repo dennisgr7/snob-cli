@@ -282,10 +282,14 @@ impl TestTab {
             if let Some(body) = &request.body {
                 sending = sending.body(body.clone());
             }
+            // Timed as `FETCH` times it in the tab: to the answer's headers.
+            let sent = std::time::Instant::now();
             let response = sending
                 .send()
                 .await
                 .map_err(|e| PageError::Unreachable(e.to_string()))?;
+            let waited_ms = (!request.navigate)
+                .then(|| u32::try_from(sent.elapsed().as_millis()).unwrap_or(u32::MAX));
             let status = response.status().as_u16();
             if response.status().is_redirection() {
                 if !request.navigate {
@@ -334,6 +338,7 @@ impl TestTab {
                 hops,
                 url,
                 too_large,
+                waited_ms,
             });
         }
     }

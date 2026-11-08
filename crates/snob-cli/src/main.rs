@@ -32,7 +32,13 @@ use snob_store::secrets::SecretStore;
 /// to go.
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) if e.kind() == clap::error::ErrorKind::MissingSubcommand => {
+            return no_command();
+        }
+        Err(e) => e.exit(),
+    };
     if let Err(refused) = cli.refuse_a_named_account() {
         refused.exit();
     }
@@ -47,6 +53,54 @@ async fn main() -> std::process::ExitCode {
             snob_cli::exit::exit_code_for(&e)
         }
     };
+    std::process::ExitCode::from(snob_cli::exit::code(code))
+}
+
+/// The list command and its arguments, when it was given `--background`.
+fn in_the_background(command: &Command) -> Option<(&'static str, &snob_cli::cli::ListArgs)> {
+    let (name, args) = match command {
+        Command::Followers(args) => ("followers", args),
+        Command::Following(args) => ("following", args),
+        Command::Unfollowers(args) => ("unfollowers", args),
+        Command::Fans(args) => ("fans", args),
+        Command::Friends(args) => ("friends", args),
+        _ => return None,
+    };
+    args.background.then_some((name, args))
+}
+
+/// `snob` typed with no command.
+///
+/// On a terminal, where to start (`commands::start`). Anywhere else, the
+/// error and exit 2 of any other mistake on the command line, but with
+/// clap's list of commands left out: clap lists every one, the hidden
+/// plumbing included, and `snob --help` lists those a person types.
+///
+/// The global flags typed are read by parsing the same line again with a
+/// command that takes no argument of its own, so the screen finds the
+/// sandbox and the account a real command would. A line that does not parse
+/// even then is reported as clap reports it.
+fn no_command() -> std::process::ExitCode {
+    use clap::CommandFactory;
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::MissingSubcommand,
+                "snob needs a command; \"snob --help\" lists them",
+            )
+            .exit();
+    }
+    let line = std::env::args_os().chain(std::iter::once("status".into()));
+    let cli = Cli::try_parse_from(line).unwrap_or_else(|e| e.exit());
+    let env = std::env::var("SNOB_ACCOUNT").ok();
+    let shown = wiring(&cli).and_then(|(paths, _, _)| {
+        commands::start::run(&paths, cli.account.as_deref(), env.as_deref())
+    });
+    let code = shown.unwrap_or_else(|e| {
+        snob_cli::report::print_error(&e, snob_cli::report::Wording::Prose);
+        snob_cli::exit::exit_code_for(&e)
+    });
     std::process::ExitCode::from(snob_cli::exit::code(code))
 }
 
@@ -72,6 +126,8 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
         | Command::Fans(args)
         | Command::Friends(args) => document(args.output.format, args.output.path.as_deref()),
         Command::Scan(args) => document(args.output.format, args.output.path.as_deref()),
+        Command::Snapshots(args) => document(args.output.format, args.output.path.as_deref()),
+        Command::Changes(args) => document(args.output.format, args.output.path.as_deref()),
         // `-o` is where the listing goes only when listing; with `-d` it is
         // where the download goes, and names no format.
         Command::Stories(args) => {
@@ -102,6 +158,8 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
             Some(WatchCommand::Once(once)) => once.output.json,
             Some(WatchCommand::Check(check)) => check.output.json,
             Some(WatchCommand::Status(status)) => status.output.json,
+            Some(WatchCommand::Deliver(deliver)) => deliver.output.json,
+            Some(WatchCommand::Unit(_)) => false,
             Some(WatchCommand::Diff(diff)) => diff.output.json,
             Some(WatchCommand::Setup(_)) => false,
         },
@@ -438,6 +496,13 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
     // registry.
     let named = snob_cli::account::given(cli.account.as_deref(), env.as_deref()).is_some();
 
+    // A list walk asked for in the background is a job's to run, and needs
+    // the whole command line (`jobs::argv::globals`), which the match below
+    // takes apart.
+    if let Some((command, args)) = in_the_background(&cli.command) {
+        return commands::background::run(&cli, command, args, &store, &required()?).await;
+    }
+
     match cli.command {
         Command::Login(args) => {
             // An account being added is none of those signed in here, and
@@ -486,6 +551,8 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
         }
         Command::Profile(args) => commands::profile::run(args, store, &required()?).await,
         Command::Scan(args) => commands::scan::run(args, store, &required()?).await,
+        Command::Snapshots(args) => commands::snapshots::run(args, &required()?),
+        Command::Changes(args) => commands::changes::run(args, &required()?),
         Command::Unfollowers(args) => {
             commands::sets::run(args, store, &required()?, SetOp::Unfollowers).await
         }

@@ -55,6 +55,8 @@ pub fn prompt_secret(prompt: &str) -> Result<Zeroizing<String>> {
 
     let mut buffer = Zeroizing::new(String::with_capacity(SECRET_CAPACITY));
 
+    let prompt = spaced(prompt);
+    let prompt = prompt.as_ref();
     term.write_str(prompt)
         .context("could not write to the terminal")?;
 
@@ -85,6 +87,20 @@ pub fn prompt_secret(prompt: &str) -> Result<Zeroizing<String>> {
 
     term.write_line("")?;
     Ok(buffer)
+}
+
+/// A question with room after it for the answer.
+///
+/// The answer is typed on the question's own line, so a question that ends
+/// in its last letter -- `How often? (for example 6h)`, as most of the
+/// wizard's do -- would have the answer written against it: `...6h)6h`. One
+/// space is added where the question did not leave one.
+fn spaced(prompt: &str) -> std::borrow::Cow<'_, str> {
+    if prompt.is_empty() || prompt.ends_with(char::is_whitespace) {
+        std::borrow::Cow::Borrowed(prompt)
+    } else {
+        std::borrow::Cow::Owned(format!("{prompt} "))
+    }
 }
 
 /// Whether the masked prompt can run, from the two facts it depends on.
@@ -181,7 +197,7 @@ pub fn a_human_would_watch_the_listing_scroll_by() -> bool {
 /// "User-Agent: " into the file and then block on stdin with nothing on
 /// screen. That reads as a hang.
 pub fn prompt_line(prompt: &str) -> Result<String> {
-    eprint!("{prompt}");
+    eprint!("{}", spaced(prompt));
     std::io::stderr().flush().ok();
     let mut line = String::new();
     std::io::stdin()
@@ -255,12 +271,15 @@ pub enum LoginMethod {
 /// The methods the menu offers, in its order, for someone sitting at `seat`:
 /// the window first where it opens in front of them, the tunnel first where
 /// it would not, and the window left out where it cannot open at all.
+///
+/// **Every label fits an 80-column terminal** with the menu's pointer in
+/// front of it: the menu clips a row at the edge, and the words a long label
+/// loses there are its last ones, which is where "(recommended)" is.
 pub fn login_methods(seat: &crate::seat::Seat) -> Vec<(LoginMethod, &'static str)> {
     use crate::seat::Window;
-    const REMOTE: &str =
-        "Log in from the browser of the computer you are at, through an SSH tunnel";
-    const REMOTE_FIRST: &str = "Log in from the browser of the computer you are at, through an \
-                                SSH tunnel  (recommended)";
+    const REMOTE: &str = "Log in from the browser of the computer you are at, over SSH";
+    const REMOTE_FIRST: &str =
+        "Log in from the browser of the computer you are at, over SSH  (recommended)";
     const PASTE: &str = "Paste the sessionid from the developer tools";
     match seat.window {
         Window::Seen => vec![
@@ -463,6 +482,13 @@ mod tests {
                 .filter(|(_, label)| label.contains("recommended"))
                 .collect();
             assert_eq!(recommended, [&methods[0]], "{window:?}");
+            // The pointer and its space, then the label, inside 80 columns.
+            for (_, label) in &methods {
+                assert!(
+                    2 + console::measure_text_width(label) <= 80,
+                    "{label:?} is cut on an 80-column terminal"
+                );
+            }
         }
     }
 
@@ -519,6 +545,21 @@ mod tests {
     #[test]
     fn a_menu_asks_about_the_stream_it_draws_on() {
         assert!(!can_show_a_menu() || can_be_asked());
+    }
+
+    /// A question that ends in its last letter gets one space before the
+    /// answer; one that already left room, or "\nDelete all of it? [y/N] ",
+    /// is left as it was.
+    #[test]
+    fn the_answer_is_not_typed_against_the_question() {
+        use super::spaced;
+        assert_eq!(
+            spaced("How often? (for example 6h)"),
+            "How often? (for example 6h) "
+        );
+        assert_eq!(spaced("User-Agent: "), "User-Agent: ");
+        assert_eq!(spaced("Replace it? [y/N] "), "Replace it? [y/N] ");
+        assert_eq!(spaced(""), "");
     }
 
     #[test]

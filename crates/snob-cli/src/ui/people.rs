@@ -532,7 +532,7 @@ fn moving(shelf: &Shelf<'_>, state: &mut State, flat: bool, page_rows: usize, ev
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
 
     // The two keys `action_of` cannot answer for this browser: `/` starts a
-    // query, and Esc clears one before it means leave.
+    // query, and Esc clears one before it means anything else.
     if let Level::Inside(_) = state.level {
         if key.code == KeyCode::Char('/') && plain {
             state.mode = Mode::Filtering;
@@ -547,8 +547,17 @@ fn moving(shelf: &Shelf<'_>, state: &mut State, flat: bool, page_rows: usize, ev
         }
     }
 
+    // Inside one list of a tray Esc walks back out to the tray, as it does
+    // from a post to its grid and from a sub-view to the profile card; only
+    // where there is no level above it does it leave.
+    let action = match action_of(key) {
+        Action::Quit if key.code == KeyCode::Esc && !flat && state.level != Level::Tray => {
+            Action::Back
+        }
+        action => action,
+    };
     let rows = rows_in(shelf, state);
-    match action_of(key) {
+    match action {
         Action::Up => state.selected = state.selected.saturating_sub(1),
         Action::Down => state.selected = (state.selected + 1).min(rows.saturating_sub(1)),
         Action::PageUp => state.selected = state.selected.saturating_sub(page(page_rows)),
@@ -790,28 +799,43 @@ fn draw(
     }
 }
 
-/// What the top border calls the current level.
+/// What the top border calls the current level, in the other views' shape:
+/// capitalized, its parts apart by ` · ` (`Stories · @someone · 3 up`).
+///
+/// The shelf's title stays lowercase where the commands build it, because
+/// the same words go in the middle of a sentence too ("Walk unfollowers of
+/// @x as @y?"); only the heading capitalizes it.
 fn title_of(shelf: &Shelf<'_>, state: &State) -> String {
+    let heading = capitalized(&shelf.title);
     match state.level {
-        Level::Tray => shelf.title.clone(),
+        Level::Tray => heading,
         Level::Inside(index) => {
             let set = &shelf.sets[index];
             let title = if shelf.sets.len() == 1 {
-                shelf.title.clone()
+                heading
             } else {
-                format!("{} — {}", shelf.title, set.label)
+                format!("{heading} · {}", set.label)
             };
             if state.query.is_empty() {
-                format!("{title} — {} accounts", set.people.len())
+                format!("{title} · {}", report::accounts(set.people.len()))
             } else {
                 format!(
-                    "{title} — {} of {} match \"{}\"",
+                    "{title} · {} of {} match \"{}\"",
                     state.shown.len(),
                     set.people.len(),
                     state.query
                 )
             }
         }
+    }
+}
+
+/// `text` with its first letter in capitals.
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -1295,6 +1319,30 @@ mod tests {
         );
         assert_eq!(state.level, Level::Tray);
         assert_eq!(state.selected, 1, "the tray remembers where it was");
+
+        // Esc walks out of a set as Left does, and only at the tray leaves.
+        open(&shelf, &mut state);
+        assert!(matches!(
+            moving(&shelf, &mut state, false, 10, key(KeyCode::Esc)),
+            Step::Go
+        ));
+        assert_eq!(state.level, Level::Tray);
+        assert!(matches!(
+            moving(&shelf, &mut state, false, 10, key(KeyCode::Esc)),
+            Step::Leave(ExitCode::Ok)
+        ));
+    }
+
+    /// On a flat list there is nothing above it, so Esc leaves.
+    #[test]
+    fn esc_on_a_flat_list_leaves() {
+        let people = [person(1, "anna", None)];
+        let shelf = shelf_of(&people);
+        let mut state = inside(&shelf);
+        assert!(matches!(
+            moving(&shelf, &mut state, true, 10, key(KeyCode::Esc)),
+            Step::Leave(ExitCode::Ok)
+        ));
     }
 
     /// The heading carries the count, and the query rewrites it into a
@@ -1307,7 +1355,7 @@ mod tests {
 
         let terminal = rendered(&shelf, &state);
         assert!(
-            tui::row_text(&terminal, 0).contains("unfollowers of @someone — 2 accounts"),
+            tui::row_text(&terminal, 0).contains("Unfollowers of @someone · 2 accounts"),
             "{}",
             tui::row_text(&terminal, 0)
         );
@@ -1325,6 +1373,41 @@ mod tests {
             "{}",
             tui::row_text(&terminal, 0)
         );
+    }
+
+    /// A list of one says so in the singular, and a tray's set is named
+    /// after the tray, apart by the same dot as every other view's title.
+    #[test]
+    fn the_heading_counts_one_in_the_singular() {
+        let people = [person(1, "anna", None)];
+        let shelf = shelf_of(&people);
+        let state = inside(&shelf);
+        assert_eq!(
+            title_of(&shelf, &state),
+            "Unfollowers of @someone · 1 account"
+        );
+
+        let shelf = Shelf {
+            title: "scan of @someone".to_string(),
+            sets: vec![
+                Set {
+                    label: "fans".to_string(),
+                    people: &people,
+                },
+                Set {
+                    label: "friends".to_string(),
+                    people: &[],
+                },
+            ],
+            viewer: tui::me(),
+        };
+        let mut state = inside(&shelf);
+        assert_eq!(
+            title_of(&shelf, &state),
+            "Scan of @someone · fans · 1 account"
+        );
+        state.level = Level::Tray;
+        assert_eq!(title_of(&shelf, &state), "Scan of @someone");
     }
 
     /// While the query owns the keyboard the bottom border carries it, and

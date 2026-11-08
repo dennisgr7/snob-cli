@@ -52,10 +52,11 @@
 //! **Where.** In a task of its own, fed by the dispatcher's events. A body is
 //! read with `Network.getResponseBody` from yet another task: the dispatcher
 //! must never wait on a reply, and this task must not stop listening while it
-//! waits for one. `Fetch.enable` is not used for any of this: it pauses every
-//! request it matches — the API calls, the paths snob never sends to, and
-//! video — and each is judged in the dispatcher ([`super::guard`]), where no
-//! event is dropped, rather than here.
+//! waits for one. `Fetch.enable` is not used for any of this: it pauses
+//! every request a page's scripts make and every document, whatever its
+//! address, as well as the event log, the sync with Facebook and video by
+//! address; each is judged in the dispatcher, where no event is dropped,
+//! rather than here, by the rule [`super::guard`] writes down.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};

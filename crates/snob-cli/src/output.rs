@@ -32,6 +32,7 @@ pub(crate) const USER_COLUMNS: [&str; 6] = [
 ];
 
 pub(crate) mod csv;
+pub(crate) mod grid;
 pub(crate) mod md;
 pub(crate) mod table;
 #[cfg(feature = "xlsx")]
@@ -152,12 +153,7 @@ pub fn check_destination(format: Format, destination: Option<&Path>) -> Result<(
 }
 
 /// Builds a file name for a result nobody named, and refuses the ones that
-/// would not behave as files.
-///
-/// The stem comes from a server rather than from what anyone typed, so it is
-/// checked before it becomes a path: no separators, no leading dot, and none of
-/// the names Windows resolves to devices whatever extension they carry — that
-/// last one is how a download reports success while going to the null device.
+/// would not behave as files ([`usable_stem`]).
 ///
 /// An existing file is never overwritten here. With `-o` the user picked the
 /// name and replacing it is their call; with this one they did not.
@@ -169,6 +165,29 @@ pub fn check_destination(format: Format, destination: Option<&Path>) -> Result<(
 /// What comes back is still the bare name, because that is what gets printed
 /// and what the caller writes to.
 pub fn default_path(in_dir: &Path, stem: &str, extension: &str) -> Result<PathBuf> {
+    usable_stem(stem)?;
+    let name = format!("{stem}.{extension}");
+    if in_dir.join(&name).exists() {
+        return Err(anyhow!(
+            "{name} already exists here. Use -o to say where the result should go"
+        ));
+    }
+    Ok(name.into())
+}
+
+/// Refuses a stem that would not behave as a file name.
+///
+/// The stem comes from a server rather than from what anyone typed, so it is
+/// checked before it becomes a path: no separators, no leading dot, and none of
+/// the names Windows resolves to devices whatever extension they carry — that
+/// last one is how a download reports success while going to the null device.
+///
+/// **The one home of that rule.** [`default_path`] asks it, and so does a
+/// caller that builds paths of its own from a stem before it gets there
+/// (`media::save_named`, whose look for an earlier copy and whose `.part`
+/// are both paths): a `..` or a share name in the stem would otherwise have
+/// been probed and written outside the directory before this said no.
+pub fn usable_stem(stem: &str) -> Result<()> {
     #[rustfmt::skip]
     const RESERVED: [&str; 24] = [
         "con", "prn", "aux", "nul", "conin$", "conout$",
@@ -203,14 +222,7 @@ pub fn default_path(in_dir: &Path, stem: &str, extension: &str) -> Result<PathBu
             printable(stem)
         ));
     }
-
-    let name = format!("{stem}.{extension}");
-    if in_dir.join(&name).exists() {
-        return Err(anyhow!(
-            "{name} already exists here. Use -o to say where the result should go"
-        ));
-    }
-    Ok(name.into())
+    Ok(())
 }
 
 pub fn write(
@@ -558,7 +570,7 @@ fn write_stdout(bytes: &[u8]) -> Result<()> {
 /// Markdown and CSV already filter both names; this is the same filter, so no
 /// format is the one left uncovered. The picture address is left alone: it is
 /// Instagram's, not a person's.
-fn readable(users: &[User]) -> Vec<User> {
+pub(crate) fn readable(users: &[User]) -> Vec<User> {
     users
         .iter()
         .map(|user| User {

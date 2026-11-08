@@ -1414,6 +1414,20 @@ async fn profile_and_followers_of_someone_through_the_browser() {
         )
         .await;
     assert!(found.is_empty(), "{found:?}");
+
+    // Each answer was timed inside the tab, and `status` says so.
+    let out = snob(
+        tmp.path(),
+        &instagram,
+        &["status", "--answers", "--json"],
+        None,
+    );
+    assert!(out.status.success(), "{}", told(tmp.path(), &out));
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let answers = &status["answers"];
+    assert_eq!(answers["via"], "browser", "{answers}");
+    assert!(answers["count"].as_u64().unwrap() >= 3, "{answers}");
+    assert!(answers["median_ms"].as_u64().is_some(), "{answers}");
 }
 
 /// Another account's highlights through the browser: the tray is the web
@@ -1831,6 +1845,25 @@ impl<R: wiremock::Respond> wiremock::Respond for Slowly<R> {
     }
 }
 
+/// What `R` answers, late enough that a command started while the request
+/// is held has certainly done what it does first.
+///
+/// **Long, not a few seconds**: the logout test needs `snob logout` to have
+/// signed the account out before the walk's next request is checked, and
+/// that request is checked as soon as this one is answered. A logout is a
+/// process of its own, which on a loaded CI runner took longer than five
+/// seconds to get there. The logout waits for this request to end
+/// (`owner::release`), so the test takes this long once per mode, no more.
+struct Held<R>(R);
+
+impl<R: wiremock::Respond> wiremock::Respond for Held<R> {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        self.0
+            .respond(request)
+            .set_delay(std::time::Duration::from_secs(20))
+    }
+}
+
 /// A crossing of account 42's own lists, fetched afresh.
 const CROSSING_42: &[&str] = &[
     "unfollowers",
@@ -1894,6 +1927,63 @@ async fn another_accounts_login_logout_or_purge_leaves_this_ones_browser() {
             page_loads_of_42(&instagram, since).await,
             1,
             "{args:?} closed account 42's browser under its crossing"
+        );
+    }
+}
+
+/// A walk still running as an account when it is logged out of sends
+/// nothing more: its next request is refused as no session (exit 3), and no
+/// browser is started again on the profile the logout removed, through the
+/// owner or with a browser of the walk's own, which the logout waits for to
+/// let go of the profile, on Windows too (`owner::let_go_of`). Logging in
+/// again afterwards is not refused.
+#[tokio::test]
+async fn a_walk_running_when_its_account_is_logged_out_of_sends_nothing_more() {
+    let Some(_alone) = a_browser_alone().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let (world, instagram) = fake_instagram().await;
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v1/friendships/42/(followers|following)/$",
+        ))
+        .respond_with(Held(world.lists()))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    let profile = AppPaths::rooted_at(tmp.path()).browser_profile_for(snob_core::Pk::new(42));
+
+    let modes: &[&[(&str, &str)]] = &[&[], &[("SNOB_NO_OWNER", "1")]];
+    for envs in modes {
+        logged_in(tmp.path(), &instagram, SESSIONID, &format!("{envs:?}: "));
+        let since = requests_so_far(&instagram).await;
+        let walk = snob_started(tmp.path(), &instagram, CROSSING_42, None, envs);
+        a_list_of_42_asked_for(&instagram, since).await;
+        let out = snob(tmp.path(), &instagram, &["logout"], None);
+        assert!(out.status.success(), "{envs:?}: {}", told(tmp.path(), &out));
+        let logged_out = requests_so_far(&instagram).await;
+        assert!(
+            !profile.exists(),
+            "{envs:?}: the logout removed the profile"
+        );
+
+        let walked = walk.wait_with_output().unwrap();
+        assert_eq!(
+            walked.status.code(),
+            Some(3),
+            "{envs:?}: {}",
+            told(tmp.path(), &walked)
+        );
+        assert!(
+            api_paths_since(&instagram, logged_out).await.is_empty(),
+            "{envs:?}: sent as the account after it was logged out of"
+        );
+        assert_eq!(page_loads_of_42(&instagram, logged_out).await, 0);
+        owner_gone(&AppPaths::rooted_at(tmp.path())).await;
+        assert!(
+            !profile.exists(),
+            "{envs:?}: a browser was started again on the profile removed"
         );
     }
 }
@@ -2128,6 +2218,7 @@ fn without_the_runs_times(text: &str, from: u64, to: u64) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
+    let text = &without_iso_times(text, from, to);
     let mut digits = String::new();
     let mut out = String::new();
     for c in text.chars().chain(std::iter::once('\0')) {
@@ -2181,6 +2272,37 @@ fn without_the_runs_times(text: &str, from: u64, to: u64) -> String {
         .collect();
     let trailing = if text.ends_with('\n') { "\n" } else { "" };
     lines.join("\n") + trailing
+}
+
+/// `text` with each RFC 3339 moment in UTC (`2026-11-08T01:00:42Z`, what the
+/// monitor's JSON gives beside its epochs) that falls within `from..=to`
+/// made [`A_MOMENT`], as its epoch beside it is.
+fn without_iso_times(text: &str, from: u64, to: u64) -> String {
+    const LONG: usize = "2026-11-08T01:00:42Z".len();
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find('T') {
+        let start = at.saturating_sub(10);
+        let moment = (at >= 10)
+            .then(|| rest.get(start..start + LONG))
+            .flatten()
+            .and_then(|candidate| chrono::DateTime::parse_from_rfc3339(candidate).ok())
+            .map(|moment| moment.timestamp())
+            .filter(|&moment| u64::try_from(moment).is_ok_and(|m| (from..=to).contains(&m)));
+        match moment {
+            Some(_) => {
+                out.push_str(&rest[..start]);
+                out.push_str(A_MOMENT);
+                rest = &rest[start + LONG..];
+            }
+            None => {
+                out.push_str(&rest[..=at]);
+                rest = &rest[at + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `text` with each count of requests it prints made `<n>`: what a path
@@ -2451,6 +2573,24 @@ async fn serve_the_fake_world() {
     tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
 }
 
+/// Serves the REST face of the world the website's video is recorded on
+/// ([`World::for_the_website`]) and prints its address, for
+/// `SNOB_TEST_SERVE_SECS` seconds (ten minutes by default).
+/// `web/video/record.sh` starts it, and draws the views a sandboxed snob
+/// shows on it.
+#[tokio::test]
+#[ignore = "serves the website's fake Instagram for its recording; run by hand"]
+async fn serve_the_website_world() {
+    let world = World::for_the_website();
+    let face = world.serve_rest().await;
+    println!("REST face: {}", face.uri());
+    let seconds = std::env::var("SNOB_TEST_SERVE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
+    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+}
+
 /// **A measurement, not a check**: how long a command that loads a page takes
 /// through a browser running efficiently, against one running at the normal
 /// pace (`power::qos`), on this machine.
@@ -2606,7 +2746,7 @@ async fn a_login_through_the_relay_is_stored() {
             .recv_timeout(std::time::Duration::from_secs(120))
             .unwrap_or_else(|_| panic!("no tunnel and link were printed:\n{}", printed.join("\n")));
         let trimmed = line.trim().to_string();
-        if trimmed.starts_with("ssh -N -L ") {
+        if trimmed.starts_with("ssh -N ") {
             tunnel = Some(trimmed.clone());
         } else if trimmed.starts_with("http://127.0.0.1:") {
             link = Some(trimmed.clone());
@@ -2614,10 +2754,11 @@ async fn a_login_through_the_relay_is_stored() {
         printed.push(line);
     }
     let (tunnel, link) = (tunnel.unwrap(), link.unwrap());
-    // `ssh -N -L 127.0.0.1:<near port>:<far end> <host>`
+    // `ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:<near port>:<far end> <host>`
     let forward = tunnel
         .split_whitespace()
-        .nth(3)
+        .skip_while(|word| *word != "-L")
+        .nth(1)
         .expect("a forward")
         .trim_matches('"')
         .strip_prefix("127.0.0.1:")

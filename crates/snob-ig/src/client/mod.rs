@@ -326,8 +326,17 @@ impl IgClient {
     /// Only against Instagram ([`Self::is_live`]), like every wait in the
     /// walker: a mock server is not somebody's account. For what pages by
     /// hand rather than through the walker, so the rule is kept in one place.
+    ///
+    /// Lengthened when the latest answers were slow (`Pacer::slowed`).
     pub async fn step_between(&self, pace: &Pace) -> bool {
-        self.is_live() && self.pacer.cancel_token().sleep_or_cancel(pace.step()).await
+        if !self.is_live() {
+            return false;
+        }
+        let step = self
+            .pacer
+            .slowed(pace, pace.step(), snob_core::clock::now_ms())
+            .await;
+        self.pacer.cancel_token().sleep_or_cancel(step).await
     }
 
     /// Waits as a person looks at a profile before opening one of its lists
@@ -335,12 +344,42 @@ impl IgClient {
     /// Instagram, as [`Self::step_between`]; for what reads a list by hand
     /// rather than through the walker, which waits it itself.
     pub async fn dwell_before_a_list(&self, pace: &Pace) -> bool {
-        self.is_live()
-            && self
-                .pacer
-                .cancel_token()
-                .sleep_or_cancel(pace.dwell())
-                .await
+        if !self.is_live() {
+            return false;
+        }
+        let dwell = self
+            .pacer
+            .slowed(pace, pace.dwell(), snob_core::clock::now_ms())
+            .await;
+        self.pacer.cancel_token().sleep_or_cancel(dwell).await
+    }
+
+    /// Writes down how long an answer of the API took to arrive, under
+    /// `operation` (`transport::named`): what the pace slows down on, and
+    /// what `snob status` shows. Nothing when there was no time to write.
+    pub(in crate::client) async fn timed(
+        &self,
+        operation: String,
+        status: u16,
+        waited: Option<Duration>,
+        load: Option<String>,
+        via: snob_core::budget::Via,
+    ) {
+        // Status 0 is a redirect the page did not follow: no answer of the
+        // server's to time.
+        let Some(waited) = waited.filter(|_| status != 0) else {
+            return;
+        };
+        self.pacer
+            .answered(snob_core::budget::AnswerTime {
+                at: snob_core::clock::now_ms(),
+                operation,
+                status,
+                waited,
+                load,
+                via,
+            })
+            .await;
     }
 
     /// Pays the rest a sitting owes, if one is owed (`Pacer::rest_owed`),
@@ -474,11 +513,26 @@ impl IgClient {
         let served = answer.served.as_deref().unwrap_or("<absent>");
         let body = crate::error::body_excerpt(&answer.body);
         if crate::error::cooldown_for(error).is_some() {
-            tracing::warn!(endpoint, status, retry_after, load, served, %body, "Instagram pushed back");
+            let before = answered_before(&self.pacer.latest_answers());
+            tracing::warn!(endpoint, status, retry_after, load, served, %before, %body, "Instagram pushed back");
         } else {
             tracing::debug!(endpoint, status, retry_after, load, served, %body, "Instagram refused");
         }
     }
+}
+
+/// The answers before a push-back, oldest first, as its log line says them:
+/// `followers 200 420ms, followers 200 2300ms`, the refusal itself among
+/// them when it was timed.
+fn answered_before(answers: &[snob_core::budget::AnswerTime]) -> String {
+    if answers.is_empty() {
+        return "<none timed>".to_string();
+    }
+    answers
+        .iter()
+        .map(|a| format!("{} {} {}ms", a.operation, a.status, a.waited.as_millis()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The names of the fields under `data` when `data` is an object without
@@ -521,6 +575,23 @@ mod tests {
 
     use super::*;
     use crate::client::harness::{answering, client, watching};
+
+    #[test]
+    fn a_push_back_says_the_answers_before_it() {
+        let answer = |status, ms| snob_core::budget::AnswerTime {
+            at: snob_core::EpochMs::new(0),
+            operation: "followers".to_string(),
+            status,
+            waited: Duration::from_millis(ms),
+            load: None,
+            via: snob_core::budget::Via::Browser,
+        };
+        assert_eq!(answered_before(&[]), "<none timed>");
+        assert_eq!(
+            answered_before(&[answer(200, 420), answer(429, 2_300)]),
+            "followers 200 420ms, followers 429 2300ms"
+        );
+    }
 
     /// Every push-back is written down, with the length its own cause earns.
     ///

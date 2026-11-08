@@ -67,6 +67,7 @@ pub fn args() -> ListArgs {
             ..WalkArgs::default()
         },
         agent: Default::default(),
+        background: false,
     }
 }
 

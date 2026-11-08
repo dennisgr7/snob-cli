@@ -18,6 +18,8 @@ pub mod commands;
 /// nothing of the command's: its output, its terminal, its job.
 pub(crate) mod detach;
 pub mod engine;
+/// The path to this binary a printed configuration names.
+pub(crate) mod exe;
 pub mod exit;
 pub mod headless;
 pub(crate) mod interrupt;

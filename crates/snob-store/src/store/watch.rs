@@ -502,6 +502,9 @@ pub struct Queued<'a> {
     ///
     /// **Not an `Option`.** A report with nowhere to go is never queued at all.
     pub destination: &'a str,
+    /// The event and the type it goes as; `None` is snob's JSON, its event
+    /// read from the body.
+    pub form: Option<&'a super::deliveries::Form>,
 }
 
 /// Commits a report: queues it, and moves the marks it makes stale.
@@ -531,13 +534,14 @@ pub fn commit_report(
     let tx = store.conn_mut().transaction()?;
 
     let queued = match delivery {
-        Some(queued) => Some(super::deliveries::enqueue(
+        Some(queued) => Some(super::deliveries::enqueue_as(
             &tx,
             queued.run_id,
             account_pk,
             queued.body,
             at,
             queued.destination,
+            queued.form,
         )?),
         None => None,
     };
@@ -627,6 +631,61 @@ pub fn renames_since(
     // this out on its own: somebody who changed their name and changed it back
     // has two history rows and a current name equal to the first one, and
     // reporting "@someone is now @someone" is noise that reads as a bug.
+    Ok(rows
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|r| r.from != r.to)
+        .collect())
+}
+
+/// The renames among the members of `snapshots` noticed after `after` and
+/// up to `until`, each once: the name it had when the window opened and the
+/// one it has when it closes. For `snob changes`, which compares two
+/// captures of the reader's choosing and answers for the window between
+/// them, so unlike [`renames_since`] it keeps no cursor and has no `head`:
+/// it records nothing, and the same question asked twice gets one answer.
+///
+/// `username_history` files the name an account **had** when a walk saw a
+/// new one, so the first row in the window is the old name, and the new one
+/// is the first row filed after the window, or the current name when there
+/// is none. A name changed and changed back is no rename.
+pub fn renames_between(
+    conn: &Connection,
+    snapshots: &[i64],
+    after: Epoch,
+    until: Epoch,
+) -> Result<Vec<Rename>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT h.pk, h.id, h.username,
+                coalesce(
+                  (SELECT n.username FROM username_history n
+                   WHERE n.pk = h.pk AND n.changed_at > ?3
+                   ORDER BY n.changed_at, n.id LIMIT 1),
+                  u.username),
+                h.changed_at
+         FROM username_history h
+         JOIN users u ON u.pk = h.pk
+         WHERE h.changed_at > ?2 AND h.changed_at <= ?3
+           AND h.id = (
+             SELECT MIN(e.id) FROM username_history e
+             WHERE e.pk = h.pk AND e.changed_at > ?2 AND e.changed_at <= ?3
+           )
+           AND EXISTS (
+             SELECT 1 FROM snapshot_members m, json_each(?1) j
+             WHERE m.user_pk = h.pk AND m.snapshot_id = j.value
+           )
+         ORDER BY h.changed_at, h.id",
+    )?;
+    let ids = serde_json::to_string(snapshots).unwrap_or_else(|_| "[]".into());
+    let rows = stmt.query_map(params![ids, after.get(), until.get()], |row| {
+        Ok(Rename {
+            pk: pk_from_sql(row.get(0)?),
+            history_id: row.get(1)?,
+            from: row.get(2)?,
+            to: row.get(3)?,
+            at: Epoch::new(row.get(4)?),
+        })
+    })?;
     Ok(rows
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -876,6 +935,7 @@ mod tests {
                 run_id: "run-1",
                 body: "{}",
                 destination: HERE,
+                form: None,
             }),
         )
         .unwrap();
@@ -1038,6 +1098,35 @@ mod tests {
         assert_eq!(found[0].pk, Pk::new(1));
         assert_eq!(found[0].from, "before");
         assert_eq!(found[0].to, "after");
+    }
+
+    #[test]
+    fn renames_between_two_moments_name_the_first_and_the_last_name() {
+        let mut db = Store::in_memory().unwrap();
+        let id = account_with_capture(&mut db, Pk::new(7), &[user(1, "first")]);
+        users::upsert(db.conn(), &user(1, "second")).unwrap();
+        users::upsert(db.conn(), &user(1, "third")).unwrap();
+        let now = snob_core::clock::now();
+
+        let found = renames_between(db.conn(), &[id], Epoch::new(0), now).unwrap();
+        assert_eq!(found.len(), 1, "one account, one rename: {found:?}");
+        assert_eq!(
+            (found[0].from.as_str(), found[0].to.as_str()),
+            ("first", "third")
+        );
+
+        // A window that ended before the renames holds none, and nor does a
+        // capture the account is not in.
+        assert!(
+            renames_between(db.conn(), &[id], Epoch::new(0), Epoch::new(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            renames_between(db.conn(), &[id + 99], Epoch::new(0), now)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The bound that stops one event being announced by two runs in a row.

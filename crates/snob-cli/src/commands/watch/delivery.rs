@@ -15,22 +15,24 @@ use snob_core::secret::Secret;
 use snob_core::watch::Changes;
 use snob_core::{Epoch, Pk};
 use snob_ig::pace::CancelToken;
-use snob_store::config::{WatchConfig, WebhookConfig};
+use snob_store::config::{WatchConfig, WebhookConfig, WebhookFormat};
 use snob_store::secrets::{Kind, SecretStore, Stored};
 use snob_store::store::{Store, deliveries, watch::Queued};
 use url::Url;
 
 use crate::cli::WebhookArgs;
 use crate::engine::watch::TickReport;
-use crate::ui;
 use crate::watch::webhook::{self, Attempt, Webhook, WebhookClient};
+use crate::{report, ui};
 
-use super::wire::{event, payload};
+use super::wire::{event, outgoing, payload};
 
 /// Where reports go, once the arguments have been checked.
 pub(super) struct Delivery {
     pub(super) client: WebhookClient,
     pub(super) heartbeat: bool,
+    /// What a report this run queues is made into (`wire::outgoing`).
+    pub(super) format: WebhookFormat,
     /// Whether the body will carry `X-Snob-Signature`. Held so `check` can say
     /// what it just sent rather than guessing at what the client did.
     pub(super) signed: bool,
@@ -40,6 +42,18 @@ pub(super) struct Delivery {
     /// read back by `snob watch status`, which has to ask the queue the same
     /// question a run would.
     pub(super) destination: String,
+    /// Whether a report this run tried was left undelivered, queued or given
+    /// up on. Set by [`send_one`] and read by `once`, which exits 1 for it:
+    /// a run on a timer that said 0 while its report sat in the queue left
+    /// nobody to notice, since nothing tries it again before the next run.
+    pub(super) undelivered: std::sync::atomic::AtomicBool,
+}
+
+impl Delivery {
+    /// Whether a report this run tried is not at its receiver.
+    pub(super) fn left_undelivered(&self) -> bool {
+        self.undelivered.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// What this run would send, worked out without touching the keyring or the
@@ -51,6 +65,7 @@ pub(super) struct Delivery {
 struct Planned {
     webhook: Webhook,
     heartbeat: bool,
+    format: WebhookFormat,
 }
 
 /// Decides what to send, and what to say about it.
@@ -91,7 +106,11 @@ fn plan(
         .clone()
         .or_else(|| from_file.map(|w| w.url.clone()))
     else {
-        if !args.header.is_empty() || args.sign_with.is_some() || args.heartbeat {
+        if !args.header.is_empty()
+            || args.sign_with.is_some()
+            || args.heartbeat
+            || args.webhook_format.is_some()
+        {
             warnings.push(
                 "there is no webhook, so nothing is sent and those options do nothing".to_string(),
             );
@@ -99,7 +118,18 @@ fn plan(
         return Ok((None, warnings));
     };
 
-    let url = Url::parse(&url).with_context(|| format!("\"{url}\" is not an address"))?;
+    // Never the address itself: the likeliest one that does not parse is one
+    // hand-edited without its scheme, where `shown` cannot take a Slack or
+    // Discord secret out of the path, and this is the error every scheduled
+    // run fails with into the log of an unattended service. Where it came
+    // from says which, and the parse error carries none of the input.
+    let url = Url::parse(&url).with_context(|| {
+        if args.webhook.is_some() {
+            "the address given with --webhook is not an address"
+        } else {
+            "the webhook's url in watch.toml is not an address"
+        }
+    })?;
 
     // Whether this run is posting to the address the configuration was written
     // for.
@@ -232,21 +262,48 @@ fn plan(
 
     // Said whatever the file asks for, because the file is what says a
     // credential was ever meant to travel. It cannot be asked whether one was
-    // stored -- that is the question that could not be answered.
+    // stored -- that is the question that could not be answered. **It names
+    // only what is really missing**: a key from `--sign-with` or
+    // `SNOB_SIGNING_KEY` still signs, and a header still authenticates, and a
+    // warning that said otherwise sent somebody looking for a fault there
+    // was not.
+    let authenticated = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
     if store_unreadable && from_file.is_some() {
-        warnings.push(
-            "the system keyring could not be read, so any token or signing key stored by \
-             \"snob watch setup\" is not being used: this report goes out unauthenticated and \
-             unsigned. Pass them with --header and --sign-with, or run where the keyring is \
-             reachable."
-                .to_string(),
-        );
+        let (stored, goes_out, pass) = match (authenticated, key.is_some()) {
+            (true, true) => (None, "", ""),
+            (true, false) => (Some("signing key"), "unsigned", "it with --sign-with"),
+            (false, true) => (Some("token"), "unauthenticated", "it with --header"),
+            (false, false) => (
+                Some("token or signing key"),
+                "unauthenticated and unsigned",
+                "them with --header and --sign-with",
+            ),
+        };
+        if let Some(stored) = stored {
+            warnings.push(format!(
+                "the system keyring could not be read, so any {stored} stored by \
+                 \"snob watch setup\" is not being used: this report goes out {goes_out}. \
+                 Pass {pass}, or run where the keyring is reachable."
+            ));
+        }
     }
 
     Ok((
         Some(Planned {
             webhook: Webhook { url, headers, key },
             heartbeat: args.heartbeat || from_file.is_some_and(|w| w.heartbeat),
+            // The file's format is the file's address's: Slack's shape posted
+            // to another address given with --webhook would be refused there.
+            format: args
+                .webhook_format
+                .or_else(|| {
+                    from_file
+                        .filter(|w| args.webhook.as_deref().is_none_or(|given| given == w.url))
+                        .map(|w| w.format)
+                })
+                .unwrap_or_default(),
         }),
         warnings,
     ))
@@ -286,6 +343,8 @@ pub(super) fn delivery_from(
         signed: planned.webhook.key.is_some(),
         client: WebhookClient::new(planned.webhook)?,
         heartbeat: planned.heartbeat,
+        format: planned.format,
+        undelivered: std::sync::atomic::AtomicBool::new(false),
     }))
 }
 
@@ -326,16 +385,25 @@ pub(super) async fn deliver(
     // An automation where every message means something is the point of that;
     // a heartbeat is for the opposite case, where the absence of messages is
     // the signal and "quiet" has to be told from "stopped".
-    let body = match delivery.and_then(|d| event_for(&changes, d.heartbeat)) {
-        Some(event) => {
+    let body = match delivery.and_then(|d| Some((d, event_for(&changes, d.heartbeat)?))) {
+        Some((delivery, event)) => {
             let run_id = run_id(snob_core::clock::now(), tick.report.account_pk);
-            // Serialized once, here, and stored as the string that goes on the
+            // What a person reads of it, as the terminal prints it: the
+            // summary a chat service is sent, and `summary` in the JSON.
+            let refused = tick.lists.iter().any(|list| list.skipped.is_some());
+            let summary = super::say::describe(&tick.report, refused).join("\n");
+            // Made once, here, and stored as the string that goes on the
             // wire. `serde_json` may render one value two ways, and the
             // signature covers bytes — so a retry that rendered it again could
             // be rejected after the first attempt was accepted.
+            let made = outgoing(delivery.format, payload(tick, &run_id, event), &summary);
             Some((
-                run_id.clone(),
-                serde_json::to_string(&payload(tick, &run_id, event))?,
+                run_id,
+                made.body,
+                deliveries::Form {
+                    event: event.to_string(),
+                    content_type: made.content_type.to_string(),
+                },
             ))
         }
         None => None,
@@ -350,10 +418,11 @@ pub(super) async fn deliver(
         // to come back empty.
         delivery
             .zip(body.as_ref())
-            .map(|(to, (run_id, body))| Queued {
+            .map(|(to, (run_id, body, form))| Queued {
                 run_id,
                 body,
                 destination: to.destination.as_str(),
+                form: Some(form),
             }),
     )?;
 
@@ -362,8 +431,8 @@ pub(super) async fn deliver(
     };
 
     // This run's report, when it made one.
-    if let (Some(id), Some((run_id, body))) = (queued, body.as_ref()) {
-        send_one(app.db(), delivery, id, run_id, body, 1).await;
+    if let (Some(id), Some((run_id, body, form))) = (queued, body.as_ref()) {
+        send_one(app.db(), delivery, id, run_id, body, Some(form), 1).await;
     }
 
     // Whatever is still owed from earlier runs is NOT drained here but once
@@ -388,12 +457,18 @@ async fn send_one(
     id: i64,
     run_id: &str,
     body: &str,
+    form: Option<&deliveries::Form>,
     attempt: i64,
 ) {
     let now = snob_core::clock::now();
+    // As it was queued: a row from before the form was kept is snob's JSON.
+    let (content_type, event) = match form {
+        Some(form) => (form.content_type.as_str(), form.event.as_str()),
+        None => (webhook::JSON, event_of(body)),
+    };
     let outcome = delivery
         .client
-        .post(body, event_of(body), run_id, attempt)
+        .post(body, content_type, event, run_id, attempt)
         .await;
 
     // Failing to write down what happened is not worth failing the run over:
@@ -415,6 +490,11 @@ async fn send_one(
             deliveries::failed(db.conn(), id, None, error, true, now).map(Some)
         }
     };
+    if !matches!(outcome, Attempt::Delivered { .. }) {
+        delivery
+            .undelivered
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let settled = match recorded {
         Ok(settled) => settled,
         Err(e) => {
@@ -430,8 +510,12 @@ async fn send_one(
     // must not be announced as "it is queued and will be tried again".
     match (&outcome, settled) {
         (Attempt::Delivered { .. }, _) => {}
+        // Not "in 1m": the queue is drained once per run, so nothing tries
+        // it before the next run, however soon its backoff ends. Said as the
+        // moment from which a run will, which holds on a timer and in the
+        // scheduled mode alike.
         (_, Some(deliveries::Outcome::Retrying(at))) => ui::warn(&format!(
-            "the report could not be delivered ({}); it is queued and will be tried again {}",
+            "the report could not be delivered ({}); it is queued, and {}",
             outcome.error(),
             describe_when(at, now)
         )),
@@ -455,14 +539,15 @@ async fn send_one(
     }
 }
 
-/// "in 4m", for a moment in the near future.
+/// Which run tries a queued report again, given when its backoff ends.
 fn describe_when(at: Epoch, now: Epoch) -> String {
-    match at - now {
-        seconds if seconds > 0 => format!(
-            "in {}",
-            snob_core::duration::format(std::time::Duration::from_secs(seconds as u64))
-        ),
-        _ => "on the next run".to_string(),
+    if at > now {
+        format!(
+            "the first run after {} tries it again",
+            report::stored_on(at)
+        )
+    } else {
+        "the next run tries it again".to_string()
     }
 }
 
@@ -507,33 +592,51 @@ fn event_of(body: &str) -> &'static str {
 /// and stalls would buy several more minutes of a run the terminal has already
 /// said is stopping. Nothing is gained by finishing: the rows stay pending and
 /// the next run drains them, which is the whole point of the queue.
-pub(super) async fn drain(db: &Store, cancel: &CancelToken, delivery: &Delivery) {
+///
+/// `at_once` is `snob watch deliver`'s: a person asked to send now, so the
+/// rows still waiting out their backoff go too (`deliveries::owed_now`).
+/// Returns how many it tried.
+pub(super) async fn drain(
+    db: &Store,
+    cancel: &CancelToken,
+    delivery: &Delivery,
+    at_once: bool,
+) -> usize {
     let now = snob_core::clock::now();
-    let owed = match deliveries::due(db.conn(), now, DRAIN_LIMIT, &delivery.destination) {
+    let owing = if at_once {
+        deliveries::owed_now
+    } else {
+        deliveries::due
+    };
+    let owed = match owing(db.conn(), now, DRAIN_LIMIT, &delivery.destination) {
         Ok(owed) => owed,
         Err(e) => {
             ui::warn(&format!("could not read the queue of owed reports: {e}"));
-            return;
+            return 0;
         }
     };
 
+    let mut tried = 0;
     for report in owed {
         // Asked before each one rather than only before the first. A POST has
         // its own timeout, so the token can be set at any point in this loop,
         // and the answer has to be read where the next request would go out.
         if cancel.is_canceled() {
-            return;
+            return tried;
         }
+        tried += 1;
         send_one(
             db,
             delivery,
             report.id,
             &report.run_id,
             &report.body,
+            report.form.as_ref(),
             report.attempts + 1,
         )
         .await;
     }
+    tried
 }
 
 /// How many owed reports one run will try before leaving the rest.
@@ -683,7 +786,7 @@ mod tests {
         let now = snob_core::clock::now();
         owe(&app, &delivery, 2, now);
 
-        drain(app.db(), app.cancel(), &delivery).await;
+        drain(app.db(), app.cancel(), &delivery, false).await;
 
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
         assert_eq!(deliveries::pending(app.db().conn()).unwrap(), 0);
@@ -703,7 +806,7 @@ mod tests {
         let owed = 25;
         owe(&app, &delivery, owed, now);
 
-        drain(app.db(), app.cancel(), &delivery).await;
+        drain(app.db(), app.cancel(), &delivery, false).await;
 
         let sent = server.received_requests().await.unwrap().len();
         assert!(
@@ -737,6 +840,8 @@ mod tests {
             })
             .unwrap(),
             heartbeat: false,
+            format: WebhookFormat::Json,
+            undelivered: Default::default(),
         };
 
         let id = deliveries::enqueue(
@@ -748,7 +853,7 @@ mod tests {
             &delivery.destination,
         )
         .unwrap();
-        send_one(app.db(), &delivery, id, "run-1", "{}", 1).await;
+        send_one(app.db(), &delivery, id, "run-1", "{}", None, 1).await;
 
         assert!(
             server.received_requests().await.unwrap().is_empty(),
@@ -780,7 +885,7 @@ mod tests {
         owe(&app, &delivery, owed, snob_core::clock::now());
 
         app.cancel().cancel();
-        drain(app.db(), app.cancel(), &delivery).await;
+        drain(app.db(), app.cancel(), &delivery, false).await;
 
         assert_eq!(
             server.received_requests().await.unwrap().len(),
@@ -825,6 +930,7 @@ mod tests {
                 .map(|(n, v)| (n.to_string(), v.to_string()))
                 .collect(),
             heartbeat: false,
+            format: WebhookFormat::Json,
         }
     }
 
@@ -866,6 +972,42 @@ mod tests {
         // And the answer that really does mean "nothing was stored" still says
         // nothing, because there is nothing to say.
         let (_, quiet) = plan(&args, Some(&file), Stored::Nothing, Stored::Nothing).unwrap();
+        assert!(quiet.is_empty(), "{quiet:?}");
+    }
+
+    /// A key given with `--sign-with`, or `SNOB_SIGNING_KEY`, still signs when
+    /// the keyring cannot be read, and the warning says only what is really
+    /// missing: the token. It used to say "unsigned" about a report that a
+    /// receiver then verified.
+    #[test]
+    fn an_unreadable_keyring_with_a_key_given_warns_only_about_the_token() {
+        let file = configured("https://n8n.local/webhook/snob", &[]);
+        let args = WebhookArgs {
+            sign_with: Some("k".repeat(40)),
+            ..Default::default()
+        };
+
+        let (planned, warnings) =
+            plan(&args, Some(&file), Stored::Unreachable, Stored::Unreachable).unwrap();
+        assert!(
+            planned
+                .expect("the file names an address")
+                .webhook
+                .key
+                .is_some()
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("unauthenticated"), "{warnings:?}");
+        assert!(!warnings[0].contains("unsigned"), "{warnings:?}");
+
+        // With an Authorization header too, nothing is missing to warn about.
+        let args = WebhookArgs {
+            sign_with: Some("k".repeat(40)),
+            header: vec!["Authorization: Bearer x".into()],
+            ..Default::default()
+        };
+        let (_, quiet) =
+            plan(&args, Some(&file), Stored::Unreachable, Stored::Unreachable).unwrap();
         assert!(quiet.is_empty(), "{quiet:?}");
     }
 
@@ -928,6 +1070,36 @@ mod tests {
             warnings.iter().any(|w| w.contains("stored token")),
             "withholding it silently would read as never having stored one: {warnings:?}"
         );
+    }
+
+    /// An address that does not parse is never echoed: the likeliest one is
+    /// a Slack address hand-edited without its scheme, whose path is the
+    /// secret, and this is what every scheduled run fails with.
+    #[test]
+    fn an_address_that_does_not_parse_is_not_echoed_in_the_failure() {
+        let file = configured("hooks.slack.com/services/T0/B0/XXXXsecret", &[]);
+        let Err(error) = plan(
+            &WebhookArgs::default(),
+            Some(&file),
+            Stored::Nothing,
+            Stored::Nothing,
+        ) else {
+            panic!("an address that does not parse cannot be posted to");
+        };
+        let said = format!("{error:#}");
+        assert!(!said.contains("XXXXsecret"), "{said}");
+        assert!(said.contains("watch.toml"), "{said}");
+
+        let args = WebhookArgs {
+            webhook: Some("discord.com/api/webhooks/1/YYYYsecret".into()),
+            ..Default::default()
+        };
+        let Err(error) = plan(&args, None, Stored::Nothing, Stored::Nothing) else {
+            panic!("an address that does not parse cannot be posted to");
+        };
+        let said = format!("{error:#}");
+        assert!(!said.contains("YYYYsecret"), "{said}");
+        assert!(said.contains("--webhook"), "{said}");
     }
 
     /// A configured address that does not parse is not an address to match

@@ -638,8 +638,10 @@ fn remote_instructions(relay: &crate::relay::Relay, ssh: Option<&crate::seat::Ss
          The link opens once, in one tab, and only through that tunnel. Log in on the page \
          it shows, which is snob's browser on this machine; snob notices when you are \
          done, and gives up after {} minutes. Ctrl+C to cancel.\n\
-         If the tunnel drops, open it again and reload that tab. If ssh refuses to \
-         forward, use \"snob login --paste\" instead.\n",
+         If the tunnel drops, open it again and reload that tab. If ssh stops at once \
+         because that port is taken on the computer you are at, press Ctrl+C here and \
+         run \"snob login --remote\" again for another; if it refuses to forward at all, \
+         use \"snob login --paste\" instead.\n",
         relay.tunnel(ssh),
         relay.link(),
         cdp::LOGIN_TIMEOUT.as_secs() / 60
@@ -753,6 +755,7 @@ async fn finish(
     // session expired, then costs the one request the check needs. So a
     // renamed account keeps its old name through a login, until
     // `snob whoami` reads the new one off the browser's document.
+    let kept = previous.as_ref().map(|previous| previous.created_at);
     if session.username.is_none() {
         session.username = previous.and_then(|previous| previous.username);
     }
@@ -760,6 +763,14 @@ async fn finish(
     // Checking a session is a request like any other, charged to the budget
     // of the account that signed in: repeated logins spend.
     let pacer = crate::app::pacer_saying_a_line(&account)?;
+    // Let in before the check, which goes out as any request does: a logout
+    // or purge of the account signed out every session it had then, and this
+    // one is a login's own (`owner::signed_out`). Pasting the very sessionid
+    // a logout signed out of makes a session of its own, let in here; the
+    // one a walk still holds from before stays refused. The session stored
+    // before is let in with it on a directory from before the list, so a
+    // check that fails leaves that one working (`admit_login`).
+    account.admit_login(session.created_at, kept)?;
     ui::info("Checking the session against Instagram...");
     let validated = login::validate(&mut session, pacer).await;
     let rejected = matches!(
@@ -770,8 +781,13 @@ async fn finish(
         Ok(outcome) => store.save(&session).map(|()| outcome).map_err(Into::into),
         // A rejection during login means different things depending on where
         // the session came from. Telling someone to check what they pasted is
-        // useless advice when the browser handed it over itself.
+        // useless advice when the browser handed it over itself. Signed out
+        // on this computer while it was checked (a logout or a purge in
+        // another terminal) is not Instagram's doing, and says so itself.
         Err(e) => Err(match &e {
+            login::LoginError::Instagram(snob_ig::error::IgError::SignedOutHere) => {
+                anyhow::anyhow!(e)
+            }
             login::LoginError::Instagram(ig) if ig.invalidates_session() => anyhow::anyhow!(e)
                 .context(match method {
                     LoginMethod::Paste => {

@@ -18,7 +18,8 @@ that span files; it does not repeat what a header already says.
 `[workspace.package]` of `Cargo.toml`). It walks followers and following lists
 and crosses them (`unfollowers`, `fans`, `friends`, `scan`), shows profiles,
 stories, highlights, posts and reels and downloads their media, imports
-Instagram's own data export (`import dyi`, no network at all), and monitors
+Instagram's own data export (`import dyi`, no network at all), compares the
+lists it stored (`snapshots`, `changes`, no network either), and monitors
 accounts over time (`watch`, with webhooks). It signs in as the user, through
 Instagram's own **web** API (`www.instagram.com`, never the mobile API), and by
 default sends every request from a Chromium-based browser installed on the
@@ -61,13 +62,14 @@ Rust 2024 edition, resolver 3. Dependency direction is one-way:
 | `crates/snob-core` | Domain: `Pk`, models (the JSON contract), set arithmetic, `watch` diff, schedule (cron and `--on/--at/--every`), webhook signing (HMAC-SHA256) and the one constant-time comparison (`watch::sign::same`), `Secret`, `Session`, the `RateBudget` trait and cooldown policy, `clock` | **No I/O.** No file, database, network or directory; `clock` is the single exception |
 | `crates/snob-ig` | Instagram web client: `client/` (`read.rs`, `write.rs`, `transport.rs`, `headers.rs`, `cdn.rs`, `media.rs`, `page.rs`, `ask.rs`, `posts.rs`), `web.rs` (calls built as the web app builds them), `allowlist.rs`, `pager.rs` (list walks), `pace.rs`, `graphql.rs`, `error.rs` (classifying answers), `http.rs` (the only place `reqwest` is configured; re-exported) | No SQLite, no keyring, no browser driving (it defines the page request shape only) |
 | `crates/snob-store` | SQLite (`store/`, migrations in `store/sql/`), platform paths, keyring/file secret store, account registry (`accounts.toml`), the monitor's `watch.toml`, layout migration | Domain logic that belongs in `snob-core` |
-| `crates/snob-cli` | `cli.rs` (clap), `main.rs`, `app.rs` (wires everything), `commands/`, `engine/` (rules: cache, consent, cooldown, walks, estimates, monitor), `output/`, `report.rs` (shared sentences), `ui/` (ratatui views), `headless/` + `cdp/` + `pipe.rs` (the browser), `owner/` (one background process that owns the browsers), `detach.rs` (starting a process that outlives its command, with nothing of the command's), `jobs/` (a list walk run as a job that outlives the call that started it: the hidden `__job start|run|show|list|cancel`, and `snob jobs`), `relay/` (`login --remote`), `power/`, `watch/webhook.rs`, `commands/mcp/` (the MCP server, feature `mcp`; over HTTP, `mcp-http`) | |
+| `crates/snob-cli` | `cli.rs` (clap), `main.rs`, `app.rs` (wires everything), `commands/`, `engine/` (rules: cache, consent, cooldown, walks, estimates, monitor), `output/`, `report.rs` (shared sentences), `ui/` (ratatui views), `headless/` + `cdp/` + `pipe.rs` (the browser), `owner/` (one background process that owns the browsers), `detach.rs` (starting a process that outlives its command, with nothing of the command's), `exe.rs` (the path to this binary that survives an upgrade, for what `mcp config` and `watch unit` print), `jobs/` (a list walk run as a job that outlives the call that started it: the hidden `__job start|run|show|list|cancel`, and `snob jobs`), `relay/` (`login --remote`), `power/`, `watch/webhook.rs`, `commands/mcp/` (the MCP server, feature `mcp`; over HTTP, `mcp-http`) | |
 
 Layering rules inside `snob-cli`:
 
 - **Commands take an `App`** and orchestrate; they never build a client or
   open a database themselves. The exceptions say so in their header
-  (`status`, `--dry-run`, `fetch`).
+  (`status`, `--dry-run`, `fetch`, and `snapshots` and `changes`, which read
+  the stored captures with `Store::read_existing` and send nothing).
 - **`engine` returns data and where it came from; it never decides how
   anything looks.** Wording and exit codes for those outcomes live in
   `commands` and `report.rs`. `engine::list` is the one place every list comes
@@ -183,7 +185,8 @@ Locally:
   `.agents/` (vendored skills) and `pnpm-lock.yaml` are skipped.
 - Hand-run only: `cargo test -p snob-cli --features testing --test headless
   serve_the_fake_world -- --ignored --nocapture` serves the fake Instagram for
-  `SNOB_TEST_SERVE_SECS`; `tools/parity/tui.sh` diffs the full-screen views of
+  `SNOB_TEST_SERVE_SECS` (`serve_the_website_world`, the same people under
+  readable names, is what `web/video/record.sh` records on); `tools/parity/tui.sh` diffs the full-screen views of
   two `testing` builds frame by frame in tmux.
 - Migrations: the `validate()` test runs the whole chain; it is mandatory.
 
@@ -202,8 +205,15 @@ with a documented reason in the same place.
   command run its own. Nothing that spends no network starts a browser.
 - **Allowlist.** Every call snob may send is a value in `snob_ig::allowlist`
   (call sites pass those values, never a path or a name). The tab's guard
-  (`headless::guard`) pauses every API call the page makes, the app's own
-  included: GETs go on, a POST only if `allowlist::refused` lets it.
+  (`headless::guard`) pauses every request the page's scripts make, and
+  every document, by its kind and whatever its address, the app's own
+  included: GETs go on, a POST only if `allowlist::refused` lets it, and
+  the view count, the event log and the Facebook sync fail whatever the
+  method. **A follow or an unfollow goes on only as snob's own write**:
+  the tab arms the guard with that request just before it fetches it
+  (`guard::Armed`), the first paused POST matching its address and form
+  exactly spends it, and every other one, the app's under any `doc_id`,
+  fails (`allowlist::refused_app`).
   `doc_id`s are discovered from the page's JavaScript, never hard-coded.
 - **Headers.** Every value is the page's, or computed from the User-Agent of
   the browser actually installed; what cannot be computed is left out. An
@@ -230,6 +240,14 @@ with a documented reason in the same place.
   refuses a wait for the budget (asked with `read_wait`/`write_wait` before
   the charge, so the refusal costs nothing) and never cuts a sitting's rest,
   which would only be owed again by the next run.
+  **Slow answers lengthen the waits, never shorten them** (`SlowRule` in
+  `snob_core::budget`, the numbers in `pace.rs`): every answer of the API
+  is timed to its headers (inside the tab on the browser's path, around
+  `send` on `reqwest`'s) and written to the account's `answers` table with
+  the load it declared; before a step or a dwell, `Pacer::slowed` takes the
+  median of the latest five healthy answers of the last ten minutes, and
+  with at least three of them the wait lasts at least twice that, at most a
+  minute. The load headers are written down and still never acted on.
 - **Push-back is a hard stop.** The first refusal stops the run and starts a
   cooldown: 2 h for a throttle, 12 h for an action block, 30 min for a
   challenge (`snob_core::budget`, pinned by
@@ -304,7 +322,14 @@ with a documented reason in the same place.
   `User-Agent: snob`, refuses `http://` outside private networks, signs with
   `X-Snob-Signature: sha256=<hex>`, and its token and key live in the
   keyring, never in `watch.toml`. Retries are allowed there (it is the user's
-  server), never against Instagram.
+  server), never against Instagram. What it is sent is `format` under
+  `[webhook]` (or `--webhook-format`), made in `wire::outgoing`: snob's JSON
+  by default, with `summary` and `*_iso` dates beside the epochs (additive,
+  so `SENT_SCHEMA` stays 1), or the summary alone as Slack, Discord, ntfy or
+  plain text take it. The signature covers the bytes sent, which are the
+  bytes queued; each row keeps its event and content type (migration 017),
+  so a retry goes in the shape it was queued in, whatever the file says by
+  then. `watch setup` picks the format a known host takes.
 - **API redirects**: the API client's policy is `none()`; the transport
   follows redirects itself, pays for every hop, and never leaves
   instagram.com.
@@ -325,6 +350,13 @@ with a documented reason in the same place.
   the data directory, and falls back to a TCP port on `127.0.0.1` only on
   Windows or where the socket path cannot be forwarded by `ssh -L`
   (`relay::can_be_forwarded`).
+- **The account's own writes reach its stored following list**
+  (`snob_store::store::own_writes`, `engine::serve_stored`): a follow or an
+  unfollow Instagram took is written down, and a stored following list of
+  the account's own is handed out with the writes made since its walk
+  applied, said in a warning and, to an agent, as `own_changes` in
+  `served`; never as a walk. The monitor compares captures by id, so it
+  reports what was walked.
 - **Rotated cookies are written back** from the browser to the store when a
   command leaves it (`headless/write_back.rs`); a login is authoritative.
 - **Local data is per user, never per directory** (`snob-store/src/paths.rs`,
@@ -332,7 +364,9 @@ with a documented reason in the same place.
   synced folder corrupts SQLite), created with a user-only DACL and
   `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED`. Per account under `accounts/<pk>/`;
   `shared.db` for what accounts share; the account's database also keeps
-  what agents were told yes to through `snob mcp` (`mcp_acts`, a week of
+  how long Instagram's answers took (`answers`, a week of rows, the last
+  day shown by `snob status --answers`, by the call's name and never its
+  path), and what agents were told yes to through `snob mcp` (`mcp_acts`, a week of
   rows, the last day shown by `snob status`); its jobs under
   `accounts/<pk>/jobs/<id>/` (`job.json`, `state.json`, the walk's output and
   log, `0600` on Unix; a finished job's result kept a day, the job a week, at
@@ -343,7 +377,42 @@ with a documented reason in the same place.
   starts it again into what is going, and **both holding the account's jobs
   lock until its session is gone** (an account that never ran a job
   included), since a start checks the session again under that lock and
-  makes nothing without one; `accounts.toml` changed only
+  makes nothing without one. **Then, before the browsers close, both sign
+  the account out for every other process** (`owner::sign_out`: the
+  account's `signed-in` list emptied, `AccountPaths::signed_in`, which names
+  the sessions that may be sent as by their `created_at`, compared for
+  equality only, so no clock set back can refuse a login; **every rewrite
+  of it holds `signed-in.lock` beside it**, `AccountPaths::signed_in_lock`,
+  so a login trimming a full list cannot put back what a sign-out emptied
+  meanwhile): a walk typed
+  elsewhere, the monitor's run or an agent's call still holding a session
+  in memory is refused its next request, by itself, by the owner and by
+  the browser's holder once it has the account's browser (before every
+  start while it waits for the profile included), as exit 3 saying it was
+  signed out on this computer (`IgError::SignedOutHere`, never Instagram's
+  "expired"), and starts no browser on the profile going (one running its own browser
+  closes it within two seconds, and the profiles are removed once it has
+  let go, seen on Windows as on Unix, `headless::profile::in_use`). **It
+  stays refused through any later login**, which lets in its own session
+  only (`AccountPaths::admit_session`, before its check), a sessionid
+  pasted again included. **A session stored here and signed out of** (a
+  `logout` that could not remove it, or its account's directory gone) is
+  refused by every command at its start (`App::open`, and the checks
+  ahead of a job and of a write), exit 3 with the same sentence
+  (`report::SIGNED_OUT_HERE`); `snob status` reports it as no session,
+  with that sentence as the error's message, and `snob whoami` reports it
+  with `alive: false` and `not_checked: "signed_out"` (a value added).
+  An account directory that is gone, as `purge`
+  leaves it, refuses every session, and one made again (`ensure_dirs`, or
+  the layout's move landing one whole as a login adopts the database left
+  `unclaimed`) starts with nobody signed in; a directory with no list, as every one
+  made before the list existed, was never signed out of and refuses none
+  until its first sign-out or login: **a login starts a missing list with
+  its own session**, never reading it as "refuses none", since the
+  directory may be one another process has just made and is about to give
+  its empty list.
+  `SNOB_NO_BROWSER` sends with `reqwest`, which asks nothing of it.
+  `accounts.toml` changed only
   through `Registry::update` (file lock). `watch.toml` and `accounts.toml`
   are read with serde and written from a hand-written template, tested to
   round-trip. `snob status` and `--dry-run` write nothing. `snob purge`
@@ -395,7 +464,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   word for word and hands back on the same call only on a yes. A decline, a
   dismissal or a timeout in a form is a no, never a reason to ask in the
   chat. `--confirm-in-chat none|lists|all` (`all` when not given on stdio,
-  `lists` with `--listen`) says what the chat may cover; past it the call is `cannot_confirm`. Not
+  `lists` with `--listen`) says what the chat may cover; past it the call is `cannot_confirm`.
+  **It limits the chat route only**: a client that declares a form answers
+  it as it likes, so over `--listen` whoever holds the key can confirm a
+  write whatever it says (recorded as a yes given in a form). Not
   offered, ever: `login`, `logout`, `purge`, the monitor, `--same-day`,
   downloads (outside the request budget), any flag that writes a file.
 - **The yes comes from the client, not provably from the person.** The
@@ -482,7 +554,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   stored to serve), and a write through `follow --check-ahead` (a job
   walking or `spend.lock` held, `busy`; no CSRF token; the cooldown, with
   `cooldown_until`; `mcp_write_cap`; a wait for the write bucket past
-  `--max-wait`, `budget_wait`). In a cooldown a stored list is still asked
+  `--max-wait`, `budget_wait`), and a follow of an account the following
+  list walked in the last hour holds is answered `already_following` with
+  no question (`follow::followed_as_stored`; never an unfollow, since no
+  list shows a pending request it would withdraw). In a cooldown a stored list is still asked
   about: the command carries `-y`, which a question skipped would hand a
   walk with no yes once the cooldown lifts. What can still refuse after the
   yes: what changes between the check and the yes (another process taking
@@ -529,10 +604,11 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   bytes that answers nothing an agent is asked, and with it a page held
   some 65 accounts. `{total, count, offset, items, next_offset}`: `total`
   the list's, `count` what the call hands back across its pages, at most
-  `limit`. **The server applies `limit`** (`tools::Page::limit`), never the
-  command's `--limit`, so a call given one still says the whole list's
-  `total`, and one it cut to a single page says so in a sentence
-  (`answer::limited`); the limit stays out of `Plan.args`, so a yes is to
+  `limit`; an `offset` at or past `count` is refused as `offset_past_end`,
+  never answered with an empty page. **The server applies `limit`**
+  (`tools::Page::limit`), never the command's `--limit`, so a call given
+  one still says the whole list's `total`, and one it cut to a single page
+  says so in a sentence (`answer::limited`); the limit stays out of `Plan.args`, so a yes is to
   the walk whatever it trims, and every limit pages from the same list held.
   A failure's `partial` is one page with no `next_offset`, since what a walk
   stopped short read is not stored as a whole list. **A list is never
@@ -559,7 +635,12 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   when its lists were walked far apart. Not held, the page is read from the
   store; for a call given `max_pages`, it is refused as `page_unavailable`.
 - **A walk can outlive the call that started it, as a job** (`jobs/`, in
-  every build: `std` processes and threads, no `mcp` feature). `snob __job
+  every build: `std` processes and threads, no `mcp` feature). A person
+  starts one with `--background` on a list command
+  (`commands/background.rs`): consent is asked first, in this process, as
+  the walk would ask it, and no job is made on a no; the job's command
+  then carries `-y`, and `--background` is refused beside every flag a
+  job's command does not take (`argv::ALLOWED`). `snob __job
   start` checks the walk, makes the job under the account's `jobs/.lock`
   (one running per account: the same command again is `reused`, the
   `--confirmed-*` aside, another is `too_many_jobs`, and one asked to stop
@@ -601,9 +682,11 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   would, with `job_id` beside it and its pages held as any list's; otherwise
   with `{status: "running", done: false, job_id, progress, eta_seconds,
   detached, poll_with: "snob_job"}` and a sentence (`commands/mcp/job.rs`).
-  `snob_job` (`__job show <id> --wait`), `snob_jobs` (`__job list`) and
-  `snob_job_cancel` (`__job cancel <id>`) are offered always, spend nothing,
-  and take a `job_id` only as `JobId::parse` reads it. A finished job answers
+  `snob_job` (`__job show <id> --wait`), `snob_jobs` (`__job list`, each
+  row without the `estimate` a job is started with, which `snob_job`
+  gives) and `snob_job_cancel` (`__job cancel <id>`) are offered always,
+  spend nothing, and take a `job_id` only as `JobId::parse` reads it. A
+  finished job answers
   through `answer::from` with the plan rebuilt from the tool and arguments it
   recorded, its pages read again from the job's `out.json` (`offset`); a
   result swept a day later is `result_gone`, a lost job `job_lost`. **All job
@@ -659,9 +742,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   mandatory** (no key, exit 1 and a hint), because loopback TCP is
   reachable by every local user, unlike the owner's pipe; startup says its
   source and fingerprint, never the key, and with `--allow-writes` warns
-  that whoever holds it can call the writes (and confirm them in the chat
-  under `--confirm-in-chat all`). **The reverse does not hold: the server
-  does not prove itself to its clients.** A client or tunnel sends the key
+  that whoever holds it can call the writes and confirm them, in a form it
+  answers itself whatever `--confirm-in-chat` says (and in the chat too
+  under `all`). **The reverse does not hold: the server does not prove
+  itself to its clients.** A client or tunnel sends the key
   to whatever answers on the port, so another local user who binds it while
   snob is not listening is handed the key; `--listen` is for a machine where
   nobody else can run code, and startup says to replace the key if the
@@ -736,8 +820,16 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   (`ExitError::with_reason`, e.g. `busy`, `mcp_write_cap`,
   `walked_elsewhere`, `nothing_stored`, `stored_moments` for a crossing of
   two stored lists too far apart under `--offline`, `budget_wait` for a
-  wait past `--max-wait`, and a job's `too_many_jobs`, `job_stopping`,
-  `no_such_job`, `refused_argv`).
+  wait past `--max-wait`, `consent_required` when nobody could be asked
+  and `declined` when the answer was no (both exit 130, as Ctrl+C is),
+  `no_such_account` for a name Instagram says is nobody's,
+  `no_such_snapshot` for a `changes --from/--to` that names no whole capture
+  of the account, `not_delivered`
+  for a `watch once` whose report did not reach the webhook, and a job's
+  `too_many_jobs`, `job_stopping`, `no_such_job`, `refused_argv`). A name
+  that cannot be a username is refused by clap, exit 2, before anything is
+  asked or spent (`snob_core::model::possible_username`, the rule `snob
+  mcp` checks its `account` with too).
   `cooldown_until` is when a cooldown that refused the run lifts
   (`ExitError::with_cooldown_until`), and `retry_at` when a refusal that is
   no cooldown stops applying (`ExitError::with_retry_at`: `mcp_write_cap`,
@@ -758,10 +850,12 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   separate from the wire models in `snob-ig`, which follow Instagram. A JSON
   shape change is a contract change.
 - **Every string from another person goes through `snob_core::model::printable`**
-  before it reaches a terminal or a JSON list (`output::readable`; a JSON
-  reader may be a model, and `serde_json` writes `Cf` as it is): all of `Cc`
-  and all of `Cf` removed, plus the invisible letters such as Hangul fillers
-  and the marks that draw nothing (the whole of `Default_Ignorable_Code_Point`:
+  before it reaches a terminal, a JSON list (`output::readable`) or a
+  monitor's report, printed or sent to a webhook (`watch/wire.rs`,
+  `account_json`), since a JSON reader may be a model and `serde_json` writes
+  `Cf` as it is. `printable` removes all of `Cc` and all of `Cf`, plus the
+  invisible letters such as Hangul fillers and the marks that draw nothing
+  (the whole of `Default_Ignorable_Code_Point`:
   the combining grapheme joiner, the Mongolian and supplementary variation
   selectors, U+FE00 to U+FE0D, and U+FE0E/U+FE0F anywhere but alone right
   after a symbol in the ranges where Unicode puts the bases of presentation
@@ -819,7 +913,22 @@ reaches a server already listening: no command, no key, see "Over HTTP").
 - The monitor: a run compares against what was last **reported**
   (`watch_marks`), not against the newest capture; a report is queued before
   its mark moves; the delivery queue is drained once per run, after every
-  account (`commands/watch/run.rs`); what a run reports as spent is what the
+  account (`commands/watch/run.rs`), and a report is owed for a week
+  (`deliveries::MAX_AGE_SECS`), so a daily run's single retry is never too
+  late; `watch once` exits 1 (`not_delivered`) when a report it tried did
+  not arrive; `watch deliver` (`commands/watch/deliver.rs`) is that drain
+  alone, with no session and no request to Instagram, sending what is owed
+  to the webhook's address without waiting out each row's backoff
+  (`deliveries::owed_now`), and exits 1 the same way; `watch unit` prints
+  (never installs) a systemd service and timer, a crontab line, a launch
+  agent or a `schtasks` command that all run `watch once --when-due` every
+  15 minutes, so the schedule is translated nowhere: the run asks the
+  scheduled mode's evaluator (`schedule::due`, from `scheduled::seed_for`)
+  and, not due, reads no session and sends nothing; `watch status` says
+  when that evaluator next comes round (`next_run` in `--json`), from the
+  last run it would start from, read and never written
+  (`scheduled::seed_as_stored`), with no request; what a run reports
+  as spent is what the
   pacer was charged, measured around the tick. Schedules: `--every` is a floor
   from the previous run and `--on/--at` or `--cron` a calendar; the next run
   is on the calendar and past the floor, both (`--every 2w --on mon` is legal
@@ -846,9 +955,25 @@ Platform-specific code, all of it reached only by the CI job on that OS:
   EcoQoS, the data directory's ACL, the keyring's local persistence, the
   language preference, `QueryUnbiasedInterruptTime` for sleep detection
   (`snob_ig::awake`). Static CRT and `/Brepro` via `.cargo/config.toml`.
-- Unix (`libc`): `dup2` of the CDP pipe ends onto fds 3 and 4, `setsid`
-  for a detached start (`detach.rs`), the owner's socket with `peer_cred`.
-  Linux adds a logind `idle` inhibitor (`zbus`) and `SCHED_BATCH`/`uclamp_max`;
+- Unix (`libc`): the CDP pipe made with `pipe2` (on macOS, which has
+  none, `pipe` and `fcntl(FD_CLOEXEC)`), its ends put onto fds 3 and 4
+  with `dup2` and `fcntl` clearing `FD_CLOEXEC` on one already there, the
+  parent's copies of the child's ends closed with `close`, the browser in
+  a process group of its own with `setpgid`, asked after and killed with
+  `kill`/`killpg` (`pipe.rs`), `setsid` for a detached start
+  (`detach.rs`), another snob's browser holding a profile asked after with
+  `kill(pid, 0)` and the machine's name from `gethostname`
+  (`headless/profile.rs`, `cdp/mod.rs`), the owner's lock with `flock`, and
+  `geteuid`, compared with `peer_cred`, for every socket that admits this
+  user alone: the owner's (`owner/socket.rs`), the relay's
+  (`relay/mod.rs`) and `snob mcp --listen socket`'s
+  (`commands/mcp/http/socket.rs`, root too); and `geteuid` to refuse
+  starting the browser as root (`headless::refuse_root`).
+  In `snob-store` (`paths.rs`), the scratch root is opened with
+  `O_DIRECTORY | O_NOFOLLOW`, made `0700` through the descriptor, and asked
+  its owner (`geteuid`) before it is made private or swept.
+  Linux adds a logind `idle` inhibitor (`zbus`) and `SCHED_BATCH`/`uclamp_max`
+  (`syscall` for `sched_setscheduler`/`sched_setattr`, `power/qos.rs`);
   macOS uses `caffeinate -i -w <pid>` and leaves the browser's scheduling
   alone.
 - TLS backend and `--strict-roots` differ on Windows ARM64 (see above).
@@ -903,6 +1028,10 @@ push-back (`headless/listen.rs`), the prefix of `CLAIM_HANDED_OUT`
 
 A static Astro site (`output: 'static'`, Tailwind 4) served by Cloudflare
 Workers from `dist/` (`wrangler.jsonc`, custom domain `snob.dennisgr7.dev`).
+The one piece of Worker code, `web/worker/index.ts`, runs for the hero's
+videos alone (`run_worker_first`) and answers byte ranges, which static assets
+do not and Safari needs to play a video; it sets its own headers, since
+`_headers` does not reach a Worker's answers.
 Workers Builds deploys `main` and uploads a preview for every other branch.
 Node `24.21.0` (`web/.node-version`), pnpm `12.9.1` via Corepack; exact
 versions only, a 24 h release quarantine and an install-script allowlist in
@@ -922,10 +1051,15 @@ pnpm check && pnpm build && pnpm test   # Playwright against `wrangler dev` serv
   `llms.txt` and the Markdown twin (`index.md`); it may promise nothing the
   README and `--help` do not. The version is read from `Cargo.toml` at build
   time (`src/lib/version.ts`); never copy it.
-- Three small scripts, hashed into the CSP; no `is:inline` code, no `style`
+- Four small scripts, hashed into the CSP; no `is:inline` code, no `style`
   attributes; everything works without JavaScript.
 - `pnpm brand` regenerates the committed images in `public/` (after
-  `pnpm build`).
+  `pnpm build`). The hero's recording is two steps: `bash web/video/record.sh`
+  records the real views and MCP answers of a `testing` build on the invented
+  world of `serve_the_website_world` into `web/video/captures/`, and `pnpm
+  video` (after `pnpm build`, with ffmpeg) films them into `public/video/`.
+  Both outputs are committed; record again when a view the video shows
+  changes.
 
 ## Release and packaging
 

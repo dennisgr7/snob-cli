@@ -11,6 +11,16 @@
 //! requests pass. A call refused is failed as a content blocker fails one
 //! (`cdp::connection`), and said in the log.
 //!
+//! **Paused by what sends it, not only by where it goes** (`SENT_BY_A_PAGE`).
+//! A list of the API's paths is only as good as the app's habits: a POST
+//! under `/web/`, a beacon at the root or wherever Meta puts the next one
+//! would leave without a verdict. So every request a page's scripts make —
+//! `fetch`, XHR, a beacon, an event stream, what the browser calls other —
+//! and every document, a form posted among them, is paused whatever its
+//! address and host, and a POST among them that the allowlist does not name
+//! fails. Scripts, stylesheets, fonts and images are not paused by kind:
+//! they are GETs, which go on, and the paths below catch a pixel.
+//!
 //! **The app's own reads go on, by name and number.** Its boot calls ask for
 //! the promotions, the message badge's counts and what a profile says of its
 //! account, its posts and the accounts it suggests among them;
@@ -20,6 +30,17 @@
 //! Why each is in or out, and why the beacons (`/ajax/bz`, `/ajax/qm/`) stay
 //! out, is written at `APP_READS`. The numbers of the registry's reads follow
 //! the app when it moves them ([`Rediscovered`]).
+//!
+//! **snob's own write goes on only as the request it armed** ([`Armed`]).
+//! The allowlist lets a follow or an unfollow out by its name and endpoint,
+//! since its number rotates; from the app it is refused outright
+//! (`refused_app`), so that a write nobody asked for, paid for or recorded
+//! cannot leave the tab. snob's write is fetched from the same tab and paused
+//! the same way, so it is told apart by what nobody else could send: just
+//! before the fetch, the tab arms the guard with that request's address and
+//! form, and the first paused POST that matches both exactly is let through
+//! (after the allowlist's own check) and spends it. Any other write fails,
+//! and the expectation is gone once the fetch has answered, whatever it was.
 //!
 //! **One exception, named.** The app's empty POST to [`CLAIM_HANDED_OUT`] is
 //! let through though the allowlist does not name it (snob never sends it):
@@ -32,11 +53,37 @@
 //! under them: the view-count path (`/video/`, never spelled out here), the
 //! app's event log, and the sync it runs with Facebook, whose hosts are the
 //! only ones the patterns name. Everything else has no host, so a sandbox's
-//! fake is judged the same way.
+//! fake is judged the same way. **These, and the app's two beacons under the
+//! API (`/ajax/bz`, `/ajax/qm/`), fail whatever the method** (`EVENTS`): a
+//! GET carries a signal in its query, or as a pixel, as well as a POST does
+//! in its form, and snob never sends either beacon, so a GET of one is the
+//! app's. The one GET that goes on is the tab's own navigation to a profile
+//! whose name happens to be one of them (`/video/` is somebody's).
 //!
-//! **What it cannot see**: the app's realtime socket, and a route the app
-//! takes inside the page, which is not a request. snob never clicks, and the
+//! **The realtime host is never reached.** The app keeps a connection to
+//! Meta (MQTT over a WebSocket to `edge-chat`), which can publish presence
+//! and receipts, and a WebSocket's handshake is never paused by `Fetch`, so
+//! the guard cannot judge it; `Network.setBlockedURLs` does not refuse one
+//! either, nor anything a worker sends (measured on Chrome 156, both
+//! reached the site). So the browser is started unable to resolve any host
+//! named `edge-chat` (`cdp`, `--host-resolver-rules`), which holds for every
+//! page and worker and for the HTTP fallback too. snob sends nothing there.
+//!
+//! **What it cannot see**: a WebSocket to any other host, or to `edge-chat`
+//! from a browser that goes through a proxy, since the rule above holds only
+//! where the browser resolves names itself; and a route the app takes inside
+//! the page, which is not a request. snob never clicks, and the
 //! tab goes only where the allowlist lets it.
+//!
+//! **Nor what the network service sends on its own.** A report under the
+//! Reporting API (`report-to`, the `Reporting-Endpoints` header, deprecation
+//! and intervention reports among them) and a Network Error Logging upload
+//! (`NEL`) are queued and uploaded by the browser's network service, not by
+//! the page, so no `Fetch.requestPaused` is ever raised for them. What a page
+//! does send of that kind, a Content Security Policy report under the older
+//! `report-uri`, is a request of its own kind (`CSPViolationReport`), paused
+//! by that kind and failed whatever the method: snob sends none, and it says
+//! what the page loaded and when.
 //!
 //! **And no video reaches the page.** The feed plays a video that scrolls
 //! into view, muted, on its own, and Instagram counts a play of a reel from
@@ -48,9 +95,11 @@
 //! `clips.mp4` is a username snob may ask about — and `\?` is a literal `?`
 //! in the protocol's patterns, where a bare one is any character.
 
+use std::sync::{Arc, Mutex};
+
 use base64::Engine as _;
 use serde_json::{Value, json};
-use snob_ig::allowlist::{Operation, Rediscovered, refused_app};
+use snob_ig::allowlist::{Operation, Rediscovered, document, refused_app, refused_with};
 use snob_ig::client::page::{Method, PageRequest};
 use url::Url;
 
@@ -65,6 +114,21 @@ const CLAIM_HANDED_OUT: &str = "/api/v1/web/fxcal/ig_sso_users/";
 /// Why a call to Facebook is refused.
 const FACEBOOK: &str = "the app's sync with Facebook";
 
+/// Where the app reports what was seen and done: the view count, its event
+/// log and the sync with Facebook outside the API, and its two beacons under
+/// it (`/ajax/bz` batches its events, impressions among them; `/ajax/qm/` is
+/// the other, whose payload was never recorded; `snob_ig::allowlist`, at
+/// `APP_READS`). Each is paused wherever it appears in an address
+/// ([`patterns`]) and failed whatever the method when a path starts with it
+/// ([`judge`]); no call snob makes is under any.
+const EVENTS: [&str; 5] = [
+    "/video/",
+    "/logging_client_events",
+    "/sync/instagram",
+    "/ajax/bz",
+    "/ajax/qm/",
+];
+
 /// Every piece of video the site would load, feed and reels and stories
 /// alike.
 pub(super) fn video_patterns() -> Vec<Value> {
@@ -76,38 +140,160 @@ pub(super) fn video_patterns() -> Vec<Value> {
     ]
 }
 
-/// The one `Fetch.enable` a target gets: a second would replace it.
+/// The kinds of request, as the protocol names them, that are paused
+/// whatever their address: everything a page's scripts send (`fetch` is
+/// `Fetch`, `navigator.sendBeacon` is `Ping`), and the documents, where a
+/// form is posted. `Other` is what the browser files a request under when it
+/// is none of its kinds, which is where a new way of sending would land.
+/// `CSPViolationReport` is a page's report of what its Content Security
+/// Policy refused, which [`judge`] fails whatever it is.
+const SENT_BY_A_PAGE: [&str; 7] = [
+    "Document",
+    "XHR",
+    "Fetch",
+    "EventSource",
+    "Ping",
+    "CSPViolationReport",
+    "Other",
+];
+
+/// Why a page's report of its Content Security Policy is refused.
+const CSP_REPORT: &str = "a page's report of its content security policy";
+
+/// The one `Fetch.enable` a target gets: a second would replace it. A
+/// request is paused when any one pattern matches it.
 pub(super) fn patterns() -> Value {
-    let judged = [
+    let api = [
         // The API, the app's and snob's.
         "*/api/graphql*",
         "*/graphql/query*",
         "*/ajax/*",
         "*/api/v1/*",
-        // What the app sends outside the API and snob never does.
-        "*/video/*",
-        "*/logging_client_events*",
-        "*/sync/instagram*",
-        "*://facebook.com/*",
-        "*://*.facebook.com/*",
-    ];
+    ]
+    .map(str::to_string);
+    // What the app sends outside the API and snob never does.
+    let events = EVENTS.map(|event| format!("*{event}*"));
+    let facebook = ["*://facebook.com/*", "*://*.facebook.com/*"].map(str::to_string);
     let mut patterns = video_patterns();
     patterns.extend(
-        judged
-            .into_iter()
+        api.into_iter()
+            .chain(events)
+            .chain(facebook)
             .map(|pattern| json!({ "urlPattern": pattern, "requestStage": "Request" })),
+    );
+    patterns.extend(
+        SENT_BY_A_PAGE.map(|kind| json!({ "resourceType": kind, "requestStage": "Request" })),
     );
     json!({ "patterns": patterns })
 }
 
+/// The one write of snob's the guard is told to expect, if any: armed by the
+/// tab just before it sends one ([`Armed::expect`]), spent by the first
+/// paused POST that is it ([`Armed::spend`]). Its form carries the page's
+/// tokens, so it is never printed.
+#[derive(Default)]
+pub(super) struct Armed(Mutex<Held>);
+
+#[derive(Default)]
+struct Held {
+    /// The request expected, and the number of the [`Expecting`] that armed
+    /// it.
+    expected: Option<(u64, Expected)>,
+    /// The number the next [`Expecting`] takes.
+    next: u64,
+}
+
+/// A write, by what a paused request must match exactly to be it.
+struct Expected {
+    url: String,
+    form: String,
+}
+
+impl Armed {
+    /// Expects `request`, snob's own write about to be fetched from the tab,
+    /// until the guard handed back is dropped, which is once the fetch has
+    /// answered or was given up. One at a time: arming again replaces it.
+    pub(super) fn expect(self: &Arc<Self>, request: &PageRequest) -> Expecting {
+        let mut armed = self.lock();
+        let number = armed.next;
+        armed.next = armed.next.wrapping_add(1);
+        armed.expected = Some((
+            number,
+            Expected {
+                url: request.url.clone(),
+                form: request.body.clone().unwrap_or_default(),
+            },
+        ));
+        Expecting {
+            armed: Arc::clone(self),
+            number,
+        }
+    }
+
+    /// Whether the paused POST to `url` with `form` is the write expected,
+    /// which it then spends: a second one like it is not.
+    fn spend(&self, url: &str, form: Option<&str>) -> bool {
+        let mut armed = self.lock();
+        let is_it = armed.expected.as_ref().is_some_and(|(_, expected)| {
+            same_address(&expected.url, url) && expected.form == form.unwrap_or_default()
+        });
+        if is_it {
+            armed.expected = None;
+        }
+        is_it
+    }
+
+    /// The state, whether or not a thread panicked holding it: the guard is
+    /// fed by a browser and never panics.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// While held, the guard expects the write it was made for; dropped, it no
+/// longer does, unless another was armed since.
+#[must_use = "the write is expected only while this is held"]
+pub(super) struct Expecting {
+    armed: Arc<Armed>,
+    number: u64,
+}
+
+impl Drop for Expecting {
+    fn drop(&mut self) {
+        let mut armed = self.armed.lock();
+        if armed
+            .expected
+            .as_ref()
+            .is_some_and(|(number, _)| *number == self.number)
+        {
+            armed.expected = None;
+        }
+    }
+}
+
+/// Whether two addresses are one, as the browser writes back the one it was
+/// asked for: compared parsed, and whole when either does not parse.
+fn same_address(asked: &str, paused: &str) -> bool {
+    match (Url::parse(asked), Url::parse(paused)) {
+        (Ok(asked), Ok(paused)) => asked == paused,
+        _ => asked == paused,
+    }
+}
+
 /// What becomes of one paused request, from the `Fetch.requestPaused`
 /// event's `params`, with the numbers the app was seen to send the
-/// registry's reads under (`found`).
-pub(super) fn judge(params: &Value, found: &Rediscovered) -> Paused {
+/// registry's reads under (`found`) and the write of snob's it was told to
+/// expect (`armed`).
+pub(super) fn judge(params: &Value, found: &Rediscovered, armed: &Armed) -> Paused {
     let request = &params["request"];
     let url = request["url"].as_str().unwrap_or_default();
     if params["resourceType"] == "Media" || is_video(url) {
         return Paused::Fail(Paused::VIDEO.to_string());
+    }
+    if params["resourceType"] == "CSPViolationReport" {
+        return Paused::Fail(CSP_REPORT.to_string());
     }
     let parsed = Url::parse(url).ok();
     if parsed
@@ -120,16 +306,27 @@ pub(super) fn judge(params: &Value, found: &Rediscovered) -> Paused {
     let path = parsed
         .as_ref()
         .map_or("an address that does not parse", Url::path);
-    match request["method"].as_str() {
+    let method = request["method"].as_str();
+    if is_an_event(path) && !(method == Some("GET") && a_profile_loaded(params, path)) {
+        let method = method.unwrap_or("a request with no method to");
+        return Paused::Fail(format!("{method} {path}"));
+    }
+    match method {
         Some("GET") => Paused::Continue,
-        Some("POST") => judge_post(request, url, path, found),
+        Some("POST") => judge_post(request, url, path, found, armed),
         Some(other) => Paused::Fail(format!("{other} {path}")),
         None => Paused::Fail(format!("a request with no method to {path}")),
     }
 }
 
 /// A POST, judged on the form it carries.
-fn judge_post(request: &Value, url: &str, path: &str, found: &Rediscovered) -> Paused {
+fn judge_post(
+    request: &Value,
+    url: &str,
+    path: &str,
+    found: &Rediscovered,
+    armed: &Armed,
+) -> Paused {
     let Ok(form) = form_of(request) else {
         return Paused::Fail(format!(
             "POST {path} with a form the browser did not hand over"
@@ -157,6 +354,13 @@ fn judge_post(request: &Value, url: &str, path: &str, found: &Rediscovered) -> P
         cap: 0,
         timeout_ms: 0,
     };
+    // snob's own write, held to the allowlist as everything of snob's is.
+    if armed.spend(url, sent.body.as_deref()) {
+        return match refused_with(&sent, found) {
+            None => Paused::Continue,
+            Some(what) => Paused::Fail(what),
+        };
+    }
     match refused_app(&sent, found) {
         None => Paused::Continue,
         Some(what) => {
@@ -239,6 +443,19 @@ fn warn_of_a_rotation(form: Option<&str>) {
     }
 }
 
+/// Whether `path` is under one of [`EVENTS`].
+fn is_an_event(path: &str) -> bool {
+    EVENTS.iter().any(|event| path.starts_with(event))
+}
+
+/// Whether the paused request is a document the tab loads, a profile's own
+/// page (`snob_ig::allowlist::document`): the one way a GET of a path that
+/// starts like one of [`EVENTS`] is not the app's signal, since an account
+/// may be called `video`.
+fn a_profile_loaded(params: &Value, path: &str) -> bool {
+    params["resourceType"] == "Document" && document(path)
+}
+
 /// A piece of video, by its address.
 fn is_video(url: &str) -> bool {
     [".mp4?", ".webm?", ".m3u8?"]
@@ -256,9 +473,9 @@ mod tests {
 
     const SITE: &str = "https://www.instagram.com";
 
-    /// A call judged with no number rediscovered.
+    /// A call judged with no number rediscovered and no write expected.
     fn judge(params: &Value) -> Paused {
-        super::judge(params, &Rediscovered::default())
+        super::judge(params, &Rediscovered::default(), &Armed::default())
     }
 
     fn paused(method: &str, url: &str, request: Value) -> Value {
@@ -300,7 +517,7 @@ mod tests {
         for url in [
             format!("{SITE}/api/v1/friendships/2345678901/followers/?count=12"),
             format!("{SITE}/api/graphql"),
-            format!("{SITE}/ajax/bz"),
+            format!("{SITE}/ajax/bulk-route-definitions/"),
         ] {
             assert_eq!(judge(&paused("GET", &url, json!({}))), Paused::Continue);
         }
@@ -373,7 +590,10 @@ mod tests {
         let moved = "1000000000000777";
         let sent = relay(hover.friendly_name(), moved);
         let found = Rediscovered::of(hover, moved);
-        assert_eq!(super::judge(&sent, &found), Paused::Continue);
+        assert_eq!(
+            super::judge(&sent, &found, &Armed::default()),
+            Paused::Continue
+        );
     }
 
     /// A Relay call the registry does not name is refused, whatever it
@@ -385,6 +605,106 @@ mod tests {
             verdict,
             Paused::Fail("POST /api/graphql (SomeBadgeQuery)".to_string())
         );
+    }
+
+    /// A follow or an unfollow the app sends on its own fails under any
+    /// number, the seed's included, and is named in the log.
+    #[test]
+    fn the_apps_own_follow_and_unfollow_fail() {
+        for write in [Operation::Follow, Operation::Unfollow] {
+            for doc_id in [write.doc_id(), "1000000000000003"] {
+                let mut sent = relay(write.friendly_name(), doc_id);
+                sent["request"]["url"] = json!(format!("{SITE}{}", write.path()));
+                assert_eq!(
+                    judge(&sent),
+                    Paused::Fail(format!("POST {} ({})", write.path(), write.friendly_name())),
+                    "{write:?} under {doc_id}"
+                );
+            }
+        }
+    }
+
+    /// snob's own write goes on as the request armed, matched whole, once,
+    /// and only while it is armed: another write while it is, the same one
+    /// a second time, and the same one once the fetch has answered all fail.
+    #[test]
+    fn snobs_own_write_goes_on_once_and_only_as_armed() {
+        let follow = Operation::Follow;
+        let url = format!("{SITE}{}", follow.path());
+        let paused_write = |form: &str| {
+            paused(
+                "POST",
+                &url,
+                json!({
+                    "headers": { "X-FB-Friendly-Name": follow.friendly_name() },
+                    "hasPostData": true,
+                    "postData": form,
+                }),
+            )
+        };
+        let ours = relay_form(follow.friendly_name(), follow.doc_id());
+        let theirs = ours.replace("2345678901", "2345678902");
+        let request = PageRequest {
+            method: Method::Post,
+            url: url.clone(),
+            headers: Vec::new(),
+            referrer: String::new(),
+            body: Some(ours.clone()),
+            navigate: false,
+            cap: 0,
+            timeout_ms: 0,
+        };
+        let found = Rediscovered::default();
+        let armed = Arc::new(Armed::default());
+        let judged = |form: &str| super::judge(&paused_write(form), &found, &armed);
+
+        assert!(fails(&judged(&ours)), "not armed yet");
+        let expecting = armed.expect(&request);
+        assert!(fails(&judged(&theirs)), "another write while armed");
+        assert_eq!(judged(&ours), Paused::Continue, "the write armed");
+        assert!(fails(&judged(&ours)), "spent");
+        drop(expecting);
+
+        let expecting = armed.expect(&request);
+        drop(expecting);
+        assert!(fails(&judged(&ours)), "the fetch answered without it");
+
+        // A guard dropped late does not take away a write armed since.
+        let first = armed.expect(&request);
+        let second = armed.expect(&request);
+        drop(first);
+        assert_eq!(judged(&ours), Paused::Continue, "the second armed");
+        drop(second);
+    }
+
+    /// A write armed is still held to the allowlist: a form under a name
+    /// that is no write's does not go on by matching.
+    #[test]
+    fn a_write_armed_is_still_held_to_the_allowlist() {
+        let url = format!("{SITE}/api/graphql");
+        let form = relay_form("SomeBadgeQuery", "1000000000000001");
+        let request = PageRequest {
+            method: Method::Post,
+            url: url.clone(),
+            headers: Vec::new(),
+            referrer: String::new(),
+            body: Some(form.clone()),
+            navigate: false,
+            cap: 0,
+            timeout_ms: 0,
+        };
+        let armed = Arc::new(Armed::default());
+        let _expecting = armed.expect(&request);
+        let sent = paused(
+            "POST",
+            &url,
+            json!({ "headers": { "X-FB-Friendly-Name": "SomeBadgeQuery" }, "hasPostData": true, "postData": form }),
+        );
+        assert!(fails(&super::judge(
+            &sent,
+            &Rediscovered::default(),
+            &armed
+        )));
     }
 
     /// A name that is not a plain identifier is not repeated into the log.
@@ -437,15 +757,47 @@ mod tests {
         assert!(fails(&judge(&paused("POST", &beside, json!({})))));
     }
 
+    /// The view count, the event log, the sync and the app's beacons fail as
+    /// a GET too, a pixel or a query string being as good a carrier as a
+    /// form.
     #[test]
-    fn the_paths_outside_the_api_fail() {
-        for path in ["/video/x/", "/sync/instagram/", "/logging_client_events"] {
+    fn the_event_paths_fail_whatever_the_method() {
+        for path in [
+            "/video/x/",
+            "/video/x/?media=1",
+            "/sync/instagram/",
+            "/logging_client_events",
+            "/logging_client_events?e=1",
+            "/ajax/bz",
+            "/ajax/bz?__a=1&q=x",
+            "/ajax/qm/",
+            "/ajax/qm/?__a=1",
+        ] {
+            let url = format!("{SITE}{path}");
             let post = paused(
                 "POST",
-                &format!("{SITE}{path}"),
+                &url,
                 json!({ "hasPostData": true, "postData": "a=b" }),
             );
-            assert!(fails(&judge(&post)), "{path}");
+            assert!(fails(&judge(&post)), "POST {path}");
+            for kind in ["Fetch", "XHR", "Image", "Ping", "Document"] {
+                let mut get = paused("GET", &url, json!({}));
+                get["resourceType"] = json!(kind);
+                assert!(fails(&judge(&get)), "GET {path} as {kind}");
+            }
+        }
+    }
+
+    /// An account may be called `video`: the tab loading its profile is not
+    /// the view count, though a fetch of the same address would be.
+    #[test]
+    fn a_profile_named_like_an_event_path_still_loads() {
+        for path in ["/video/", "/logging_client_events/"] {
+            let mut load = paused("GET", &format!("{SITE}{path}"), json!({}));
+            load["resourceType"] = json!("Document");
+            assert_eq!(judge(&load), Paused::Continue, "{path}");
+            load["resourceType"] = json!("Fetch");
+            assert!(fails(&judge(&load)), "{path}");
         }
     }
 
@@ -533,6 +885,29 @@ mod tests {
         assert_eq!(judge(&media), Paused::Fail(Paused::VIDEO.to_string()));
     }
 
+    /// A page's report of its Content Security Policy fails, whatever its
+    /// address and method: snob sends none.
+    #[test]
+    fn a_content_security_policy_report_fails() {
+        for (method, url) in [
+            ("POST", format!("{SITE}/csp-report")),
+            ("POST", "https://example.com/r".to_string()),
+            ("GET", format!("{SITE}/api/v1/x/")),
+        ] {
+            let mut report = paused(
+                method,
+                &url,
+                json!({ "hasPostData": true, "postData": "{}" }),
+            );
+            report["resourceType"] = json!("CSPViolationReport");
+            assert_eq!(
+                judge(&report),
+                Paused::Fail(CSP_REPORT.to_string()),
+                "{method} {url}"
+            );
+        }
+    }
+
     #[test]
     fn a_method_other_than_get_or_post_fails() {
         let put = paused("PUT", &format!("{SITE}/api/v1/x/"), json!({}));
@@ -572,6 +947,74 @@ mod tests {
         let said = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
         assert!(said.contains("under another doc_id"), "{said}");
         assert!(said.contains("1000000000000002"), "{said}");
+    }
+
+    /// Whatever a page's scripts send, and every document, is paused by its
+    /// kind, with no address to miss it by; the kinds that only fetch what a
+    /// page shows are not.
+    #[test]
+    fn what_a_page_sends_is_paused_whatever_its_address() {
+        let all = patterns();
+        let kinds: Vec<&str> = all["patterns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p.get("urlPattern").is_none())
+            .filter_map(|p| p["resourceType"].as_str())
+            .collect();
+        for kind in [
+            "Document",
+            "XHR",
+            "Fetch",
+            "EventSource",
+            "Ping",
+            "CSPViolationReport",
+            "Other",
+        ] {
+            assert!(kinds.contains(&kind), "{kind}: {kinds:?}");
+        }
+        for kind in ["Script", "Stylesheet", "Image", "Font", "Preflight"] {
+            assert!(!kinds.contains(&kind), "{kind}");
+        }
+    }
+
+    /// A POST off every path the API is known under fails as one on them
+    /// does, on any host and from any kind of request: a form posted, a
+    /// beacon, a fetch.
+    #[test]
+    fn a_post_off_the_apis_paths_fails() {
+        for url in [
+            format!("{SITE}/web/likes/1/like/"),
+            format!("{SITE}/stories/reel/seen"),
+            format!("{SITE}/qp/batch_fetch_web/"),
+            format!("{SITE}/"),
+            "https://graph.instagram.com/beacon".to_string(),
+            "https://example.com/collect".to_string(),
+        ] {
+            for kind in ["Fetch", "XHR", "Ping", "Document", "Other"] {
+                let mut post = paused(
+                    "POST",
+                    &url,
+                    json!({ "hasPostData": true, "postData": "a=b" }),
+                );
+                post["resourceType"] = json!(kind);
+                assert!(fails(&judge(&post)), "{kind} POST {url}");
+            }
+        }
+        // And a GET from any of them, a document, a fetch of the CDN, still
+        // goes on.
+        for (kind, url) in [
+            ("Document", format!("{SITE}/someone/")),
+            (
+                "Fetch",
+                "https://scontent.cdninstagram.com/v/t51/x.jpg".into(),
+            ),
+            ("Other", format!("{SITE}/favicon.ico")),
+        ] {
+            let mut get = paused("GET", &url, json!({}));
+            get["resourceType"] = json!(kind);
+            assert_eq!(judge(&get), Paused::Continue, "{kind} GET {url}");
+        }
     }
 
     /// Every pattern is at the request stage, and only the Facebook ones

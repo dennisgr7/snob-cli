@@ -1,0 +1,119 @@
+{
+  "count": 14,
+  "items": [
+    {
+      "full_name": "Felix Grant",
+      "is_private": false,
+      "is_verified": false,
+      "pk": 1010,
+      "username": "felix.vinyl"
+    },
+    {
+      "full_name": "Rosa Ventura",
+      "is_private": false,
+      "is_verified": false,
+      "pk": 1011,
+      "username": "rosa.trails"
+    },
+    {
+      "full_name": "Milo Hart",
+      "is_private": false,
+      "is_verified": false,
+      "pk": 1012,
+      "username": "milo.moves"
+    },
+    {
+      "full_name": "Yuki Tanaka",
+      "is_private": false,
+      "is_verified": false,
+      "pk": 1013,
+      "username": "yuki.ink"
+    },
+    {
+      "full_name": "Leo Fontaine",
+      "is_private": false,
+      "is_verified": false,
+      "pk": 1014,
+      "username": "leo.daily"
+    },
+    {
+      "full_name": "Zara Malik",
+      "is_private": false,
+      "is_verified": false,
+      "pk": 1015,
+      "username": "zara.wears"
+    },
+    {
+      "full_name": "Omar Haddad",
+      "is_private": false,
+      "is_verified": false,
+      "pk": 1016,
+      "username": "omar.cooks"
+    },
+    {
+      "full_name": "Ivy Collins",
+      "is_private": false,
+      "is_verified": false,
+      "pk": 1017,
+      "username": "ivy.greens"
+    },
+    {
+      "full_name": "Bruno Costa",
+      "is_private": false,
+      "is_verified": false,
+      "pk": 1018,
+      "username": "bruno.surfs"
+    },
+    {
+      "full_name": "Nina Petrova",
+      "is_private": false,
+      "is_verified": false,
+      "pk": 1019,
+      "username": "nina.plants"
+    },
+    {
+      "full_name": "Cass Doyle",
+      "is_private": false,
+      "is_verified": false,
+      "pk": 1020,
+      "username": "cass.lifts"
+    },
+    {
+      "full_name": "Remy Laurent",
+      "is_private": false,
+      "is_verified": false,
+      "pk": 1021,
+      "username": "remy.reads"
+    },
+    {
+      "full_name": "Tess Morgan",
+      "is_private": false,
+      "is_verified": false,
+      "pk": 1022,
+      "username": "tess.travels"
+    },
+    {
+      "full_name": "Dex Ortega",
+      "is_private": false,
+      "is_verified": false,
+      "pk": 1023,
+      "username": "dex.drums"
+    }
+  ],
+  "job_id": "j01M6VVRHXX91AVJ4BN50207GC2",
+  "next_offset": null,
+  "offset": 0,
+  "served": [
+    {
+      "from": "stored_unchanged",
+      "list": "followers",
+      "taken_at": 1794083909
+    },
+    {
+      "from": "stored_unchanged",
+      "list": "following",
+      "taken_at": 1794083909
+    }
+  ],
+  "total": 14
+}

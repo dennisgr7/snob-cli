@@ -88,7 +88,10 @@ snob follow someone
 snob unfollow someone
 snob watch                       # keep watching on a schedule, report changes
 snob status                      # budget left, cooldown, stored lists, agents; sends nothing
-snob jobs                        # walks an agent left running, and "snob jobs cancel <id>"
+snob snapshots                   # the captures of your lists stored here; sends nothing
+snob changes --since 7d          # who joined, left or was renamed between two of them
+snob followers --background      # walk as a job and get its id at once; any list command
+snob jobs                        # walks left running, and "snob jobs cancel <id>"
 ```
 
 On a terminal most commands open a full-screen view you move through with the
@@ -106,6 +109,9 @@ can read:
 - `snob status --budget` says what can still be sent today, for no request, and
   exits 5 while the account is cooling down. `--dry-run` on a list command says
   what its walks would cost against that, and sends nothing.
+- `snob status --answers` says how long Instagram's answers took in the last
+  24 hours. When the latest of them are slow, snob waits longer between pages
+  (at least twice their median, at most a minute); it never goes faster.
 - `-o -` is standard output: a list as with no `-o`, and a single downloaded
   file, as in `snob reel <link> -d 1 -o - | ffmpeg -i - ...`.
 - `--no-interactive` always prints. Down a pipe this is the default, and the
@@ -118,8 +124,18 @@ can read:
   again, 4 the account needs verifying, 5 rate limited or cooling down, 130
   stopped. When the output was going to be JSON, a failure is also one JSON
   object on the last line of standard error.
-- `snob watch --webhook <url>` posts each report as JSON; `--json` writes them
-  as lines instead.
+- `snob watch --webhook <url>` posts each report as JSON, with a `summary`
+  sentence and ISO dates beside the epoch seconds; `format = "slack"` (or
+  `discord`, `ntfy`, `text`) under `[webhook]` in `watch.toml`, or
+  `--webhook-format`, sends the summary alone, in the shape that service
+  takes. `--json` writes the reports as lines instead. `snob watch deliver`
+  sends what a receiver that was down is still owed, at once, with no
+  request to Instagram.
+- `snob watch unit` prints what to give the system's scheduler (a systemd
+  timer, a crontab line, a launch agent or a `schtasks` command; installs
+  nothing). Each runs `snob watch once --when-due` every 15 minutes, which
+  runs only when the schedule in `watch.toml` says so and otherwise sends
+  nothing.
 - `snob mcp` is an MCP server for AI agents, on standard input and output:
   the status, the lists and profiles, and with `--allow-writes` follow and
   unfollow. Those, and walking another account's lists, run only after a yes
@@ -160,9 +176,11 @@ can read:
   cloudflared, a VPN) to reach from elsewhere: it refuses any address that
   is not loopback and any request without the key (`Authorization: Bearer`),
   and a yes given in the chat covers only reading lists unless
-  `--confirm-in-chat all`. A client on the stateless revision of MCP has no
-  session, so a chat yes it is handed is bound to the call alone, and any
-  client with the key may redeem it once. TLS ends at the tunnel, whose
+  `--confirm-in-chat all`, though whoever holds the key can still confirm
+  the writes in a form it answers itself, since it is the client. A client
+  on the stateless revision of MCP has no session, so a chat yes it is
+  handed is bound to the call alone, and any client with the key may
+  redeem it once. TLS ends at the tunnel, whose
   provider sees the key and every answer, other people's names and lists
   included; put an access layer in front where the tunnel offers one. The
   server does not prove itself to its clients: they send the key to
@@ -174,7 +192,8 @@ can read:
   macOS, `snob mcp --listen socket` closes that gap: it serves on a socket
   in snob's private data directory (`mcp.sock`, `0600`) that only you and
   root can connect to and nobody else can take, and the tunnel reaches it
-  there (`ssh -L 8750:<path>` from the far end, or cloudflared's
+  there (`ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8750:<path>`
+  from the far end, which stops if that port is taken there, or cloudflared's
   `unix:<path>` service); startup prints the path. `snob
   mcp config codex --remote https://your-tunnel/mcp` (or any other client)
   prints what a client needs to reach that server: no command and no key.

@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
-import { HERO_INSTALL } from '@/lib/content';
+import { HERO_INSTALL, HERO_VIDEO } from '@/lib/content';
 import { detectPlatform } from '@/lib/platform';
 
 /** User agents as each system's browser sends them, cut to what matters here. */
@@ -115,6 +115,9 @@ test.describe('without JavaScript', () => {
     await expect(page.getByRole('heading', { name: 'From source' })).toBeVisible();
     // A copy button that could not copy is never shown.
     await expect(page.locator('button[data-copy]:visible')).toHaveCount(0);
+    // The recording is its poster and the player's controls.
+    await expect(page.locator('[data-hero-video]')).toHaveAttribute('controls', '');
+    await expect(page.locator('[data-hero-video-toggle]')).toBeHidden();
   });
 });
 
@@ -131,5 +134,71 @@ test.describe('motion', () => {
     await page.goto('/');
     const name = await page.locator('h1 .cursor').evaluate((el) => getComputedStyle(el).animationName);
     expect(name).toBe('none');
+  });
+
+  test('the recording plays, muted and without controls, and the button pauses it', async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    await page.goto('/');
+    const video = page.locator('[data-hero-video]');
+    const toggle = page.locator('[data-hero-video-toggle]');
+    await expect.poll(() => video.evaluate((v: HTMLVideoElement) => !v.paused && v.muted && !v.controls)).toBe(true);
+    await expect(toggle).toHaveAccessibleName(HERO_VIDEO.pause.label);
+    await expect(toggle).toHaveText(HERO_VIDEO.pause.text);
+
+    await toggle.click();
+    await expect.poll(() => video.evaluate((v: HTMLVideoElement) => v.paused)).toBe(true);
+    await expect(toggle).toHaveAccessibleName(HERO_VIDEO.play.label);
+    await expect(toggle).toHaveText(HERO_VIDEO.play.text);
+    await toggle.click();
+    await expect.poll(() => video.evaluate((v: HTMLVideoElement) => v.paused)).toBe(false);
+  });
+
+  test('under reduced motion the recording is its poster, and loads nothing until played', async ({ page }) => {
+    const media: string[] = [];
+    page.on('request', (request) => {
+      if (new URL(request.url()).pathname.match(/\.(webm|mp4)$/)) media.push(request.url());
+    });
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.goto('/');
+    await page.waitForLoadState('networkidle');
+    const video = page.locator('[data-hero-video]');
+    expect(await video.evaluate((v: HTMLVideoElement) => v.paused && v.controls)).toBe(true);
+    await expect(video).toHaveAttribute('poster', HERO_VIDEO.poster);
+    await expect(page.locator('[data-hero-video-toggle]')).toBeHidden();
+    expect(media).toEqual([]);
+  });
+});
+
+/**
+ * Safari plays a video only from byte ranges, which static assets do not
+ * serve: `worker/index.ts` cuts them, for `/video/*` alone.
+ */
+test.describe('the recording over byte ranges', () => {
+  test('a range is answered with 206 and those bytes', async ({ request }) => {
+    const whole = await request.get(HERO_VIDEO.mp4);
+    expect(whole.status()).toBe(200);
+    expect(whole.headers()['accept-ranges']).toBe('bytes');
+    const bytes = await whole.body();
+
+    // What Safari asks first.
+    const first = await request.get(HERO_VIDEO.mp4, { headers: { Range: 'bytes=0-1' } });
+    expect(first.status()).toBe(206);
+    expect(first.headers()['content-range']).toBe(`bytes 0-1/${bytes.length}`);
+    expect(first.headers()['content-type']).toBe('video/mp4');
+    expect(await first.body()).toEqual(bytes.subarray(0, 2));
+
+    const tail = await request.get(HERO_VIDEO.webm, { headers: { Range: 'bytes=-10' } });
+    expect(tail.status()).toBe(206);
+    expect((await tail.body()).length).toBe(10);
+  });
+
+  test('a range past the end is refused, and the rest of the site is untouched', async ({ request }) => {
+    const past = await request.get(HERO_VIDEO.mp4, { headers: { Range: 'bytes=999999999-' } });
+    expect(past.status()).toBe(416);
+    expect(past.headers()['content-range']).toMatch(/^bytes \*\/\d+$/);
+    // Anything else is the static assets', with the headers of _headers.
+    const poster = await request.get(HERO_VIDEO.poster, { headers: { Range: 'bytes=0-1' } });
+    expect(poster.status()).toBe(200);
+    expect(poster.headers()['strict-transport-security']).toBeTruthy();
   });
 });

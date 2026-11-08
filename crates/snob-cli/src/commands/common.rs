@@ -276,6 +276,15 @@ pub fn no_session() -> anyhow::Error {
         .into()
 }
 
+/// Refuses a session stored here that this computer no longer sends as
+/// (`owner::signed_out`), with the code and hint of having none, and the
+/// sentence that says why ([`report::SIGNED_OUT_HERE`]).
+pub fn signed_out_here() -> anyhow::Error {
+    ExitError::new(ExitCode::NoSession, report::SIGNED_OUT_HERE)
+        .with_hint(report::SIGN_IN_AGAIN)
+        .into()
+}
+
 /// The part of the command line the engine is asked with.
 ///
 /// Here and not in `engine`, so the engine knows nothing about clap: this is
@@ -655,6 +664,7 @@ pub async fn walk_named(
                 outcome.taken_at,
                 lifts,
                 outcome.reason,
+                outcome.own_changes,
             );
         }
     }
@@ -760,13 +770,13 @@ mod tests {
             "snob-ig-test-switch-declined-{}",
             std::process::id()
         ));
-        let store = secrets.session_of(&paths.account(snob_core::Pk::new(8)));
-        store
-            .save(
-                &Session::from_sessionid("8%3Aabc%3A1", "Mozilla/5.0", SessionOrigin::Paste)
-                    .unwrap(),
-            )
-            .unwrap();
+        let account = paths.account(snob_core::Pk::new(8));
+        let store = secrets.session_of(&account);
+        let session =
+            Session::from_sessionid("8%3Aabc%3A1", "Mozilla/5.0", SessionOrigin::Paste).unwrap();
+        // As a login does: a directory made by anything else signs nobody in.
+        account.admit_session(session.created_at).unwrap();
+        store.save(&session).unwrap();
         let switched = switch(
             &secrets,
             &paths,

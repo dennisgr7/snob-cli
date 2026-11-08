@@ -120,6 +120,8 @@ pub struct Person {
     pub pk: u64,
     pub username: String,
     pub full_name: String,
+    /// What its profile says under the name.
+    pub bio: String,
     pub private: bool,
     /// Whom it follows, in the order it followed them. Its followers are
     /// the people whose `following` names it.
@@ -141,6 +143,7 @@ impl Person {
             pk,
             username: username.into(),
             full_name: format!("Invented {username}"),
+            bio: format!("the invented bio of {username}"),
             private: false,
             following: Vec::new(),
             requested: Vec::new(),
@@ -283,6 +286,126 @@ impl World {
             statuses: Vec::new(),
             base: String::new(),
         })))
+    }
+
+    /// The world the website's video is recorded on (`web/video/`): the
+    /// same people as [`World::new`], under names a visitor can read, and
+    /// with lists that cross into something worth showing. **Every name is
+    /// invented**, as in every other world; the website never shows a real
+    /// account.
+    ///
+    /// - `you` (`me`) follows `lena.frames` (`someone`) and `user0` to
+    ///   `user23`, and is followed by `lena.frames`, `user0` to `user9` and
+    ///   `user24` to `user29`: fourteen accounts do not follow it back;
+    /// - `lena.frames` has two stories up, taken in the last hours, and
+    ///   three highlights.
+    pub fn for_the_website() -> Self {
+        const NAMES: [(&str, &str, &str); USERS as usize] = [
+            ("nora.wilde", "Nora Wilde", "trail runner, slow mornings"),
+            ("theo.marsh", "Theo Marsh", "architecture student"),
+            ("ines.paints", "Ines Calder", "watercolors and walls"),
+            ("kofi.runs", "Kofi Mensah", "5k before coffee"),
+            ("juno.bakes", "Juno Park", "sourdough, mostly"),
+            ("arlo.climbs", "Arlo Brandt", "bouldering, badly"),
+            ("mira.sound", "Mira Okafor", "sound design for small films"),
+            ("sol.and.salt", "Sol Reyes", "cooking by the sea"),
+            ("hugo.frames", "Hugo Lind", "35mm and patience"),
+            ("ada.codes", "Ada Moreau", "writes software, reads poems"),
+            ("felix.vinyl", "Felix Grant", "records, never playlists"),
+            ("rosa.trails", "Rosa Ventura", "maps and long walks"),
+            ("milo.moves", "Milo Hart", "dancer, sometimes teacher"),
+            (
+                "yuki.ink",
+                "Yuki Tanaka",
+                "tattoo artist, books open in May",
+            ),
+            ("leo.daily", "Leo Fontaine", "one photo a day since 2019"),
+            ("zara.wears", "Zara Malik", "thrifted, mostly"),
+            ("omar.cooks", "Omar Haddad", "recipes from my grandmother"),
+            ("ivy.greens", "Ivy Collins", "too many houseplants"),
+            ("bruno.surfs", "Bruno Costa", "cold water, warm coffee"),
+            ("nina.plants", "Nina Petrova", "botanist in training"),
+            ("cass.lifts", "Cass Doyle", "coach, early riser"),
+            ("remy.reads", "Remy Laurent", "a book a week"),
+            ("tess.travels", "Tess Morgan", "slow travel, fast trains"),
+            ("dex.drums", "Dex Ortega", "drummer in two bands"),
+            ("lou.sketches", "Lou Bennett", "a sketchbook a month"),
+            ("kai.waves", "Kai Nakamura", "surf photos"),
+            ("elsa.knits", "Elsa Berg", "patterns and yarn"),
+            ("rafa.films", "Rafa Duarte", "short films, long takes"),
+            ("gwen.grows", "Gwen Holt", "vegetables, slowly"),
+            ("pip.avery", "Pip Avery", ""),
+        ];
+        // Stories are up for a day, so the two on show were taken hours
+        // before the recording, whenever it is made.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+        let world = Self::new();
+        world.person(ME, |me| {
+            me.username = "you".into();
+            me.full_name = "You".into();
+            me.bio = "the account snob signs in as".into();
+            me.following = std::iter::once(SOMEONE)
+                .chain((0..24).map(|n| FIRST_USER + n))
+                .collect();
+        });
+        world.person(SOMEONE, |lena| {
+            lena.username = "lena.frames".into();
+            lena.full_name = "Lena Hart".into();
+            lena.bio = "photographer, mostly coffee".into();
+            lena.posts = 128;
+            lena.stories = vec![
+                Story {
+                    pk: "3200000000000000001".into(),
+                    taken_at: now - 5 * 3600,
+                    video: false,
+                },
+                Story {
+                    pk: "3200000000000000002".into(),
+                    taken_at: now - 2 * 3600,
+                    video: true,
+                },
+            ];
+            lena.highlights = vec![
+                Highlight {
+                    id: "17900000000000011".into(),
+                    title: "Lisbon".into(),
+                    items: vec![
+                        story("3300000000000000001", 10),
+                        story("3300000000000000002", 11),
+                    ],
+                },
+                Highlight {
+                    id: "17900000000000012".into(),
+                    title: "35mm".into(),
+                    items: vec![
+                        story("3300000000000000003", 12),
+                        story("3300000000000000004", 13),
+                        story("3300000000000000005", 14),
+                    ],
+                },
+                Highlight {
+                    id: "17900000000000013".into(),
+                    title: "Coffee".into(),
+                    items: vec![story("3300000000000000006", 15)],
+                },
+            ];
+        });
+        for (n, (username, full_name, bio)) in (0..USERS).zip(NAMES) {
+            world.person(FIRST_USER + n, |user| {
+                user.username = username.into();
+                user.full_name = full_name.into();
+                user.bio = bio.into();
+                user.following.retain(|pk| *pk != ME);
+                // Everyone but the fourteen `you` follows and is not
+                // followed back by.
+                if !(10..24).contains(&n) {
+                    user.following.push(ME);
+                }
+            });
+        }
+        world
     }
 
     /// The app sends a REST POST with its REST token as each document
@@ -1483,7 +1606,7 @@ impl State {
             "id": pk.to_string(),
             "username": person.username,
             "full_name": person.full_name,
-            "biography": format!("the invented bio of {}", person.username),
+            "biography": person.bio,
             "external_url": null,
             "is_private": person.private,
             "is_verified": false,
@@ -2111,7 +2234,7 @@ impl State {
                 "edges": mutual.iter().take(3).map(|pk| json!({ "node": { "username": self.account(*pk).username } })).collect::<Vec<_>>(),
             },
             "highlight_reel_count": person.highlights.len(),
-            "biography": format!("the invented bio of {}", person.username),
+            "biography": person.bio,
         })
     }
 }

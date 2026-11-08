@@ -339,6 +339,7 @@ mod tests {
                 redirected: true,
                 hops: 2,
                 too_large: false,
+                waited_ms: Some(840),
             }),
             Err(PageError::Unreachable("dns".to_string())),
             Err(PageError::NoCsrfToken),
@@ -419,6 +420,7 @@ mod tests {
             })),
             Err(PageError::NotReady("the web session id".to_string())),
             Err(PageError::LoggedOut),
+            Err(PageError::SignedOutHere),
             Err(PageError::NotAllowed("POST /api/graphql".to_string())),
         ];
         for told in told {

@@ -363,7 +363,13 @@ fn read_archive(path: &Path, intake: &mut Intake) -> Result<()> {
         if !entry.is_file() {
             continue;
         }
-        let name = entry.name().to_string();
+        // Since zip 9 a name that is neither UTF-8 nor CP437 is an error.
+        // Every list file is named in ASCII, so such an entry is not one of
+        // them, and it is skipped like any other file the import does not
+        // want, rather than failing the whole export.
+        let Ok(name) = entry.name().map(std::borrow::Cow::into_owned) else {
+            continue;
+        };
         if let Some(listed) = intake.wanted(&name) {
             intake.read(&name, listed, entry.by_ref())?;
         }
@@ -1109,7 +1115,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         {
             let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             for (name, body) in files {
                 writer.start_file(*name, options).unwrap();

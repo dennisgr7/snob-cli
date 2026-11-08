@@ -81,7 +81,11 @@ impl IgClient {
         }
 
         let asked = self.base.join(&ask.endpoint())?;
-        tracing::debug!(url = %asked, ask = ask_name(&ask), "asked of the page");
+        let name = ask_name(&ask);
+        // What is timed is an answer of the API: not the page's own state,
+        // a document, the CDN or a write.
+        let timed = !write && !matches!(ask, Ask::Document { .. } | Ask::Asset { .. });
+        tracing::debug!(url = %asked, ask = name, "asked of the page");
         let cap = match ask {
             Ask::Asset { .. } => super::media::PAGE_ASSET_BYTES as u64,
             _ => MAX_BODY_BYTES,
@@ -104,6 +108,16 @@ impl IgClient {
                 told = page.ask(call) => told.map_err(IgError::from)?,
             }
         };
+        if timed && let Told::Answer(answer) | Told::Pk { answer, .. } = &told {
+            self.timed(
+                name.to_string(),
+                answer.status,
+                answer.waited(),
+                answer.load(),
+                snob_core::budget::Via::Browser,
+            )
+            .await;
+        }
 
         Ok(match told {
             Told::Answer(answer) => Told::Answer(self.read_told(&asked, answer, write).await?),
@@ -590,7 +604,13 @@ fn ask_name(ask: &Ask) -> &'static str {
         Ask::Pk { .. } => "pk",
         Ask::Document { .. } => "document",
         Ask::Query { operation, .. } => operation.friendly_name(),
-        Ask::Rest { .. } => "rest",
+        Ask::Rest { read, .. } => match read {
+            crate::allowlist::Rest::Followers(_) => "followers",
+            crate::allowlist::Rest::Following(_) => "following",
+            crate::allowlist::Rest::MutualFollowers(_) => "mutual_followers",
+            crate::allowlist::Rest::MediaInfo(_) => "media_info",
+            crate::allowlist::Rest::Comments(_) => "comments",
+        },
         Ask::Navigation { .. } => "navigation",
         Ask::Statuses { .. } => "show_many",
         Ask::Write { mutation, .. } => mutation.friendly_name(),

@@ -131,8 +131,9 @@ pub fn specs(writes: bool) -> Vec<Spec> {
             title: "Session, budget and cooldown",
             description: "What snob knows without asking Instagram anything: whether a session \
                           is stored, how much of today's request budget is left, whether the \
-                          account is cooling down after a push-back and until when, and which \
-                          lists are stored and how old they are. Sends no request. Call it \
+                          account is cooling down after a push-back and until when, how long \
+                          Instagram's answers have been taking, and which lists are stored and \
+                          how old they are. Sends no request. Call it \
                           before anything that walks a list.",
             input: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
             read_only: true,
@@ -144,8 +145,9 @@ pub fn specs(writes: bool) -> Vec<Spec> {
             name: "snob_list",
             title: "Followers, following and how they cross",
             description: "One of the signed-in account's lists, or another account's: \
-                          followers, following, unfollowers (followed but not following back), \
-                          fans (following but not followed back) or friends (both). A stored \
+                          followers, following, or one of the three crossings of the two \
+                          (unfollowers, fans, friends; the list argument says which is \
+                          which). A stored \
                           list less than a day old is reused after one request that checks its \
                           counter has not moved (two for a crossing); otherwise the list is \
                           walked at a human pace: about an hour for 2,000 accounts, with a \
@@ -186,7 +188,19 @@ pub fn specs(writes: bool) -> Vec<Spec> {
                     "list": {
                         "type": "string",
                         "enum": ["followers", "following", "unfollowers", "fans", "friends"],
-                        "description": "Which list."
+                        // One sentence per value, each saying who follows whom. The
+                        // earlier wording, "unfollowers (followed but not following
+                        // back), fans (following but not followed back)", left out
+                        // who does the following, and a model read fans as the
+                        // accounts the person follows, the opposite of what it is.
+                        "description": "Which list. followers: the accounts that follow \
+                                        the account. following: the accounts the account \
+                                        follows. unfollowers: accounts the account follows \
+                                        that do not follow it back. fans: accounts that \
+                                        follow the account that it does not follow back. \
+                                        friends: accounts that follow the account and that \
+                                        it follows too. The account is the signed-in one, or \
+                                        the one named in account."
                     },
                     "account": {
                         "type": "string",
@@ -207,10 +221,11 @@ pub fn specs(writes: bool) -> Vec<Spec> {
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Hand back at most this many accounts, the first \
-                                        ones; count is then at most this, and total still \
-                                        says how many the list has. Saves no requests: \
-                                        max_pages is what does that."
+                        "description": "Hand back at most this many accounts in all, the \
+                                        first ones, across every page: a cap on the whole \
+                                        answer, not a page size. count is then at most this, \
+                                        and total still says how many the list has. Saves no \
+                                        requests: max_pages is what does that."
                     },
                     "max_pages": {
                         "type": "integer",
@@ -234,7 +249,8 @@ pub fn specs(writes: bool) -> Vec<Spec> {
                                         answer gave. A later page walks nothing and needs no \
                                         confirmation, whatever the mode: it is handed back \
                                         from what the call without an offset read, or else \
-                                        from what is stored. Not with dry_run."
+                                        from what is stored. An offset at or past count is \
+                                        refused (offset_past_end). Not with dry_run."
                     },
                     "wait_seconds": wait_seconds_property("a walk to end"),
                     "confirmation": confirmation()
@@ -1012,8 +1028,7 @@ fn account(args: &Map<String, Value>, required: bool) -> Result<Option<String>, 
         Some(Value::String(name)) => name.strip_prefix('@').unwrap_or(name),
         Some(other) => return Err(format!("account {other} is not a username")),
     };
-    let allowed = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_';
-    if name.is_empty() || name.len() > 30 || !name.chars().all(allowed) {
+    if !snob_core::model::possible_username(name) || name.starts_with('@') {
         return Err(format!(
             "\"{}\" cannot be an Instagram username: letters, digits, '.' and '_', at most 30",
             snob_core::model::printable(name)
@@ -1032,8 +1047,9 @@ fn count(args: &Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
     }
 }
 
-/// The `offset` argument: 0 when not given. One past the end of the list is
-/// an empty page, not a refusal (`answer::page`).
+/// The `offset` argument: 0 when not given. One at or past the end of what
+/// the call hands back is refused once the list is known
+/// (`answer::past_the_end`), not here, where it is not.
 fn offset(args: &Map<String, Value>) -> Result<usize, String> {
     match args.get("offset") {
         None | Some(Value::Null) => Ok(0),

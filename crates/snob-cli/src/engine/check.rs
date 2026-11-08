@@ -95,8 +95,8 @@ pub struct Checked {
 /// [`Problem::Foreign`] carries text this program did not write — what the
 /// schedule parser refused, what Instagram answered, what the user's own
 /// receiver said — because inventing a sentence for those would lose the only
-/// detail that identifies the cause. It is one variant among twelve rather
-/// than a reason for the other eleven to be strings.
+/// detail that identifies the cause. It is one variant among thirteen rather
+/// than a reason for the other twelve to be strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Problem {
     /// There is no `watch.toml`, so a bare `snob watch` has nothing to run on.
@@ -120,6 +120,9 @@ pub enum Problem {
     SessionSilent,
     /// There is no session at all.
     NoSession,
+    /// The session stored was signed out on this computer since
+    /// (`owner::signed_out`), so nothing is sent as it.
+    SignedOutHere,
     /// The session carries no username and Instagram did not name the account
     /// either, so there is nothing to ask the profile endpoint with.
     NoUsername,
@@ -619,12 +622,16 @@ pub async fn webhook_of(
     signed: bool,
     run_id: &str,
     body: &str,
+    content_type: &str,
 ) -> Checked {
     use crate::watch::webhook::Attempt;
 
     // Built inside each arm, because the status differs; `describe_check`
     // builds its "{destination} answered {code}" sentence out of both fields.
-    match client.post(body, PREFLIGHT_EVENT, run_id, 1).await {
+    match client
+        .post(body, content_type, PREFLIGHT_EVENT, run_id, 1)
+        .await
+    {
         Attempt::Delivered { status } => Checked {
             what: What::Webhook {
                 destination,

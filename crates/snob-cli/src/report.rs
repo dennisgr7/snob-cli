@@ -37,6 +37,21 @@ pub const NOTHING_CONFIGURED: &str =
 pub const NO_RECORDED_CONSENT: &str =
     "no recorded consent, so an unattended run will refuse to read it";
 
+/// What a session stored here that this computer no longer sends as is
+/// (`owner::signed_out`): its account was signed out of here, by a `logout`
+/// whose removal of the session failed, or a `purge`, or the account's data
+/// directory went. Said by every command that meets one at its start
+/// (`App::open`), by `snob status` and `snob whoami`, and by `snob watch
+/// check`, so none of them blames Instagram for it; the refusal a request
+/// meets later is `IgError::SignedOutHere`, and both carry
+/// [`SIGN_IN_AGAIN`].
+pub const SIGNED_OUT_HERE: &str = "the session stored was signed out on this computer (a \
+     logout or a purge, or its data was removed), so nothing is sent as it";
+
+/// The advice for a session this computer no longer sends as, which only a
+/// login lets in again.
+pub const SIGN_IN_AGAIN: &str = "run \"snob login\"";
+
 /// Prints a failed run's error, as one message rather than as several.
 ///
 /// The refusals this tool produces are paragraphs — two or three sentences with
@@ -145,10 +160,13 @@ fn error_json_for(error: &anyhow::Error, viewer: Option<&Viewer>) -> serde_json:
         .map(|at| at.to_epoch_not_before());
     // A wait past `--max-wait` exits as a stop does (130), and is told
     // apart from one by this: it is the one worth trying again later.
-    let reason = ours.and_then(ExitError::reason).or_else(|| {
-        instagram
-            .is_some_and(|e| matches!(e, snob_ig::error::IgError::WaitTooLong { .. }))
-            .then_some("budget_wait")
+    // An account Instagram says does not exist is told apart from any other
+    // failure, which shares its exit code: a typo is the likeliest cause, and
+    // a program should not have to read the sentence to know it.
+    let reason = ours.and_then(ExitError::reason).or(match instagram {
+        Some(snob_ig::error::IgError::WaitTooLong { .. }) => Some("budget_wait"),
+        Some(snob_ig::error::IgError::NotFound { what: Some(_) }) => Some("no_such_account"),
+        _ => None,
     });
 
     serde_json::json!({
@@ -638,10 +656,13 @@ pub fn ask_to_continue(shown: &str) -> String {
 /// monitor keeps its own variant, because "a scheduled run has nobody to ask"
 /// is a different fact from "there is no terminal".
 pub fn refuse_unattended(refused: String, in_advance: String) -> anyhow::Error {
+    // A reason of its own, so a script can tell "nobody could be asked" from
+    // a Ctrl+C, which shares the exit code.
     ExitError::new(
         ExitCode::Interrupted,
         format!("{refused}, and there is no terminal to ask at. {in_advance}"),
     )
+    .with_reason("consent_required")
     .into()
 }
 
@@ -678,7 +699,46 @@ pub fn refuse_declined(shown: &str) -> anyhow::Error {
         ExitCode::Interrupted,
         format!("nothing was done: {shown} was not confirmed"),
     )
+    .with_reason("declined")
     .into()
+}
+
+/// A stored following list handed out with the account's own writes since
+/// its walk applied (`engine::serve_stored`): what was applied, by name, and
+/// that the list was not read again. Never "updated": nothing was walked.
+pub fn own_writes_applied(
+    taken_at: Epoch,
+    applied: &[snob_store::store::own_writes::Applied],
+) -> String {
+    use snob_store::store::own_writes::Verb;
+    let named = |verb: Verb| -> Vec<String> {
+        applied
+            .iter()
+            .filter(|change| change.verb == verb)
+            .map(|change| match &change.username {
+                Some(name) => format!("@{}", printable(name)),
+                None => format!("account {}", change.pk),
+            })
+            .collect()
+    };
+    let mut done = Vec::new();
+    if let Some(names) = and_list(&named(Verb::Unfollow)) {
+        done.push(format!("unfollowed {names}"));
+    }
+    if let Some(names) = and_list(&named(Verb::Follow)) {
+        done.push(format!("followed {names}"));
+    }
+    let changes = if applied.len() == 1 {
+        "1 change".to_string()
+    } else {
+        format!("{} changes", applied.len())
+    };
+    format!(
+        "the following list stored on {} is shown with {changes} you made through snob \
+         since ({}); it was not read again",
+        stored_on(taken_at),
+        done.join(" and ")
+    )
 }
 
 /// Serving a stored list because nothing may be spent.
@@ -831,6 +891,23 @@ pub fn counted(shown: usize, kept: usize, total: usize, one: &str, many: &str) -
     line
 }
 
+/// "1 answer", "12 answers": how many answers of the API `snob status`
+/// counted.
+pub fn answers(n: u32) -> String {
+    match n {
+        1 => "1 answer".to_string(),
+        n => format!("{n} answers"),
+    }
+}
+
+/// "1 account" / "12 accounts", for the headings and notes of the views.
+pub fn accounts(n: usize) -> String {
+    match n {
+        1 => "1 account".to_string(),
+        n => format!("{n} accounts"),
+    }
+}
+
 /// "1 request" / "7 requests".
 pub fn requests(n: u32) -> String {
     if n == 1 {
@@ -915,6 +992,7 @@ fn advice_for(error: &snob_ig::error::IgError) -> Option<&'static str> {
     use snob_ig::error::IgError;
     match error {
         IgError::SessionExpired => Some("run \"snob login\" again"),
+        IgError::SignedOutHere => Some(SIGN_IN_AGAIN),
         IgError::WaitTooLong { .. } => Some(
             "run it again later, or with a longer --max-wait; \"snob status --budget\" says \
              when the budget has room",
@@ -1814,6 +1892,7 @@ third",
 
         for (error, advice) in [
             (IgError::SessionExpired, "run \"snob login\" again"),
+            (IgError::SignedOutHere, "run \"snob login\""),
             (
                 IgError::NoCsrfToken,
                 "run \"snob login --browser\", or, with SNOB_NO_BROWSER, pass the token with \

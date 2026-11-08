@@ -40,14 +40,18 @@ pub fn status(
     let recorded = recorded(paths, config.as_ref(), account.map(|a| a.pk()))?;
     let owed = recorded.owed;
 
+    let now = snob_core::clock::now();
     let health = health(
         config.as_ref(),
         &recorded.runs,
         &recorded.reported,
         owed,
-        snob_core::clock::now(),
+        now,
         waiting_for_power(paths),
     );
+    let next = config
+        .as_ref()
+        .and_then(|config| next_run(paths, config, now));
 
     if args.output.json {
         let document = super::wire::status_json(
@@ -57,6 +61,7 @@ pub fn status(
             &health,
             &recorded.runs,
             &recorded.marks,
+            next,
         );
         crate::ui::say!("{}", serde_json::to_string_pretty(&document)?);
         return Ok(health.verdict.exit_code());
@@ -67,6 +72,9 @@ pub fn status(
             crate::ui::say!("Configured in {}", config::path(paths).display());
             for line in describe_config(config) {
                 crate::ui::say!("  {line}");
+            }
+            if let Some(next) = next {
+                crate::ui::say!("  {}", next_line(next));
             }
         }
         None => crate::ui::say!(
@@ -679,6 +687,49 @@ fn health(
     }
 
     Health { verdict, notes }
+}
+
+/// When the schedule in the file next comes round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NextRun {
+    /// On the grid or past the floor at this moment, before any jitter.
+    At(Epoch),
+    /// Already owed: the next start of the monitor, or its timer, runs it.
+    Now,
+    /// An interval whose clock no run or start has begun: one interval
+    /// after the monitor first starts.
+    AfterFirstStart(std::time::Duration),
+}
+
+/// The next run, asked of the evaluator the scheduled mode sleeps on
+/// (`schedule::due`) from the last run it would start from
+/// (`scheduled::seed_as_stored`, read and never written). Costs nothing:
+/// no session, no request. `None` when the file names no schedule that can
+/// be built, or one that never comes round, which `health` says.
+fn next_run(paths: &AppPaths, config: &WatchConfig, now: Epoch) -> Option<NextRun> {
+    let schedule = schedule_from(&Default::default(), Some(config)).ok()?;
+    let last_run = super::scheduled::seed_as_stored(paths, &schedule).ok()?;
+    if last_run.is_none() && !schedule.is_on_a_calendar() {
+        return config.every.map(NextRun::AfterFirstStart);
+    }
+    match schedule::due(&schedule, last_run, now, &chrono::Local) {
+        schedule::Due::At(at) => Some(NextRun::At(at)),
+        schedule::Due::Now { .. } => Some(NextRun::Now),
+        schedule::Due::Never => None,
+    }
+}
+
+fn next_line(next: NextRun) -> String {
+    match next {
+        NextRun::At(at) => format!("Next run: {}.", report::stored_on(at)),
+        NextRun::Now => {
+            "Next run: due now, at the next start of the monitor or of its timer.".to_string()
+        }
+        NextRun::AfterFirstStart(every) => format!(
+            "Next run: {} after the monitor first starts.",
+            snob_core::duration::format(every)
+        ),
+    }
 }
 
 /// The configuration in a few lines, for `status` and for the confirmation
@@ -1857,6 +1908,7 @@ every = \"6h\"
             &health,
             &recorded.runs,
             &recorded.marks,
+            None,
         );
         let viewers: Vec<_> = document["last_runs"]
             .as_array()

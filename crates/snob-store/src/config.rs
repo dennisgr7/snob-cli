@@ -71,6 +71,41 @@ pub struct WebhookConfig {
     pub headers: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub heartbeat: bool,
+    /// What the body is: snob's own JSON, or the summary in the shape a
+    /// chat service's incoming webhook takes.
+    #[serde(default)]
+    pub format: WebhookFormat,
+}
+
+/// The shape of what a webhook is sent.
+///
+/// `json` is the report a program reads, and the default, so a file written
+/// before this existed sends what it always sent. The others carry the
+/// report's summary alone, as the service at the far end wants it posted:
+/// a Slack or Discord incoming webhook refuses snob's JSON, and ntfy shows
+/// a JSON body as a wall of braces.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookFormat {
+    #[default]
+    Json,
+    Slack,
+    Discord,
+    Ntfy,
+    Text,
+}
+
+impl WebhookFormat {
+    /// The word the file spells it with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Slack => "slack",
+            Self::Discord => "discord",
+            Self::Ntfy => "ntfy",
+            Self::Text => "text",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -326,6 +361,15 @@ pub fn template(
              # silence can tell \"nothing happened\" from \"it stopped running\".\n",
         );
         out.push_str(&format!("heartbeat = {}\n", webhook.heartbeat));
+        // Written only when it is not the default, so a file written before
+        // there was a choice reads the same after a rewrite.
+        if webhook.format != WebhookFormat::Json {
+            out.push_str(
+                "# What the body is: \"json\" (the report, for a program), or the\n\
+                 # summary as \"slack\", \"discord\", \"ntfy\" or \"text\" want it.\n",
+            );
+            out.push_str(&format!("format = \"{}\"\n", webhook.format.as_str()));
+        }
         if signed {
             out.push_str(
                 "# The body is signed: the key is in the system keyring, not here.\n\
@@ -494,6 +538,23 @@ heartbeat = true
         assert_eq!(webhook.url, "https://n8n.local/webhook/snob");
         assert!(webhook.heartbeat);
         assert_eq!(webhook.headers["X-Source"], "homelab");
+        assert_eq!(webhook.format, WebhookFormat::Json, "the default");
+    }
+
+    #[test]
+    fn a_webhook_format_is_one_of_five_words() {
+        let read = |format: &str| {
+            at(&format!(
+                "schema = 1\n[webhook]\nurl = \"https://ntfy.sh/x\"\nformat = \"{format}\"\n"
+            ))
+            .map(|config| config.webhook.map(|webhook| webhook.format))
+        };
+        assert_eq!(read("ntfy").unwrap(), Some(WebhookFormat::Ntfy));
+        assert_eq!(read("slack").unwrap(), Some(WebhookFormat::Slack));
+        assert!(
+            read("teams").is_err(),
+            "a misspelling is refused, not ignored"
+        );
     }
 
     /// Two syntaxes for the same thing, and only one of them would be used;
@@ -653,6 +714,7 @@ agreed_at = 1786925176
                 .into_iter()
                 .collect(),
                 heartbeat: true,
+                format: WebhookFormat::Discord,
             }),
             accounts: vec![
                 AccountConfig {

@@ -43,6 +43,12 @@ pub enum PathError {
     /// the whole follower history in the clear.
     #[error("could not restrict {path} to your account: {detail}")]
     NotPrivate { path: PathBuf, detail: String },
+    #[error("could not write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -335,6 +341,24 @@ impl AccountPaths {
         self.dir().join("jobs")
     }
 
+    /// Makes [`Self::jobs_dir`], private, **only inside an account directory
+    /// that is there**: `false`, and nothing made, when it is not. Never by
+    /// `create_dir_all`, which would make the account's directory again when
+    /// a `purge` removed it between a look and the making, and with no list
+    /// of who is signed in ([`Self::signed_in`]), which sends as every
+    /// session.
+    pub fn create_jobs_dir(&self) -> Result<bool, PathError> {
+        let dir = self.jobs_dir();
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+            Err(source) => return Err(PathError::Create { path: dir, source }),
+        }
+        restrict_to_this_account(&dir)?;
+        Ok(true)
+    }
+
     /// One job's directory. Only ever from a [`JobId`], which is checked, so
     /// no name read from anywhere can reach outside [`AccountPaths::jobs_dir`].
     pub fn job_dir(&self, id: &JobId) -> PathBuf {
@@ -342,10 +366,324 @@ impl AccountPaths {
     }
 
     /// Creates the data directory and the account's, both private.
+    ///
+    /// **An account directory made here starts with nobody signed in**
+    /// ([`Self::signed_in`], empty): what made it again after a `purge` is
+    /// not a login, and a session somebody still holds from before the
+    /// purge must stay refused once it is back. A login lets its own session
+    /// in after ([`Self::admit_session`]).
     pub fn ensure_dirs(&self) -> Result<(), PathError> {
         self.app.ensure_dirs()?;
-        create_private_dir(&self.dir())
+        let made = !self.dir().try_exists().unwrap_or(true);
+        create_private_dir(&self.dir())?;
+        if made {
+            start_signed_out(&self.dir()).map_err(|source| PathError::Write {
+                path: self.signed_in(),
+                source,
+            })?;
+        }
+        Ok(())
     }
+
+    /// Which sessions of the account may be sent as, by any process on this
+    /// machine: one `created_at` a line, in whole seconds, as
+    /// [`snob_core::session::Session`] keeps it. There and empty, none is.
+    /// **Not there, in a directory that is, every session is sent as**: a
+    /// directory from before this file existed, never signed out of nor
+    /// logged in to since. Every way a directory is made starts one, empty
+    /// ([`Self::ensure_dirs`], and the layout's move, which lands a directory
+    /// whole), so only such an old one is ever without it; its first sign-out
+    /// or login starts it ([`Self::sign_out`], [`Self::admit_session`]).
+    ///
+    /// A session is named by when it was made because nothing else about it
+    /// lasts: Instagram rotates the `sessionid` itself, and what the browser
+    /// rotated is written back to the store with the `created_at` it had
+    /// (`snob-cli`'s `headless::write_back`), so the session a walk holds in
+    /// memory and the one stored since are still the same one. **Only ever
+    /// compared for equality, never ordered**: the clock that stamped them
+    /// may have been set back since, which would make a later login look
+    /// older.
+    ///
+    /// **Every rewrite of it holds [`Self::signed_in_lock`]**: a sign-out,
+    /// a login let in, and a full list trimmed. Only making it where there
+    /// is none goes without ([`start_signed_out`]), since a file made new
+    /// cannot put back anything another process took out.
+    pub fn signed_in(&self) -> PathBuf {
+        self.dir().join(SIGNED_IN)
+    }
+
+    /// The lock beside [`Self::signed_in`] that its writers take, one at a
+    /// time, in this process or another ([`lock_file`]).
+    ///
+    /// Why: a login that finds the list full reads it, writes a trimmed copy
+    /// beside it and moves that over it. A sign-out that emptied the list
+    /// between the read and the move would be undone by the move, and the
+    /// sessions it signed out of would be sent as again. Holding this, the
+    /// sign-out waits for the move and empties what it left, or the login
+    /// waits for the sign-out and reads the empty list. A separate file
+    /// because the list itself is replaced, and a lock held on the file it
+    /// replaced holds nothing. Readers ([`Self::refuses_session`]) take
+    /// none: the move and the appended lines are each seen whole.
+    pub fn signed_in_lock(&self) -> PathBuf {
+        self.dir().join(SIGNED_IN_LOCK)
+    }
+
+    /// Takes [`Self::signed_in_lock`], waiting for whoever holds it; held
+    /// until the file returned is dropped. Never makes the account's
+    /// directory: with none it fails as `NotFound`.
+    fn hold_signed_in(&self) -> std::io::Result<std::fs::File> {
+        pause_at(Seam::Locking);
+        lock_file(&self.signed_in_lock())
+    }
+
+    /// Signs the account out for every process on this machine: from now
+    /// on no session it has now is sent as ([`Self::refuses_session`]),
+    /// whichever process still holds one in memory, until a login lets its
+    /// own in ([`Self::admit_session`]). An account with no directory
+    /// writes nothing and makes none: a directory that is gone already
+    /// refuses every session, and one made again starts empty
+    /// ([`Self::ensure_dirs`]).
+    pub fn sign_out(&self) -> std::io::Result<()> {
+        // The lock's file is made in the directory, never the directory, so
+        // one that is gone, or goes as this looks, is not made again.
+        let _held = match self.hold_signed_in() {
+            Ok(held) => held,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        std::fs::File::create(self.signed_in()).map(drop)
+    }
+
+    /// Lets the session made at `made`, which a login has just made, be sent
+    /// as by every process, whatever was signed out of before: it goes on
+    /// [`Self::signed_in`], making the account's directory if it has none.
+    ///
+    /// **Once a login is let in, the list names it**, whatever else was
+    /// making the directory at the same moment: a list not there is started
+    /// with this one line, never read as "every session is sent as", since
+    /// the directory may be one another process has just made and is about
+    /// to give its empty list ([`Self::ensure_dirs`]), which would then
+    /// refuse this login. A login lets the session stored before it in with
+    /// it on an old directory with no list ([`Self::admit_login`]), so there
+    /// a first login only adds to what was sent as already.
+    ///
+    /// **Kept to [`SIGNED_IN_KEPT`] sessions**, the earliest let in going
+    /// first: a session that many logins ago is refused, and a walk still
+    /// holding it after so many logins without a logout is not one to go on.
+    pub fn admit_session(&self, made: snob_core::Epoch) -> Result<(), PathError> {
+        self.ensure_dirs()?;
+        let _held = self.hold_signed_in().map_err(|source| PathError::Write {
+            path: self.signed_in_lock(),
+            source,
+        })?;
+        self.admit_session_held(made)
+    }
+
+    /// [`Self::admit_session`], for a caller holding
+    /// [`Self::signed_in_lock`]. Never takes it again: a second lock on the
+    /// same file, through another handle, waits for the first even in the
+    /// same process.
+    fn admit_session_held(&self, made: snob_core::Epoch) -> Result<(), PathError> {
+        use std::io::Write as _;
+        let list = self.signed_in();
+        let wrote = |source| PathError::Write {
+            path: list.clone(),
+            source,
+        };
+        let line = format!("{}\n", made.get());
+        let read = std::fs::read(&list);
+        pause_at(Seam::Read);
+        let mut admitted = match read {
+            Ok(bytes) => sessions_in(&bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&list)
+                {
+                    Ok(mut file) => return file.write_all(line.as_bytes()).map_err(wrote),
+                    // Made a moment ago by another process, empty or with
+                    // another login's line: this one is added to it.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Vec::new(),
+                    Err(e) => return Err(wrote(e)),
+                }
+            }
+            Err(e) => return Err(wrote(e)),
+        };
+        if admitted.contains(&made.get()) {
+            return Ok(());
+        }
+        if admitted.len() < SIGNED_IN_KEPT {
+            // Appended, one write of a whole line: a reader sees it whole or
+            // not at all ([`sessions_in`] takes only finished lines).
+            return std::fs::OpenOptions::new()
+                .append(true)
+                .open(&list)
+                .and_then(|mut file| file.write_all(line.as_bytes()))
+                .map_err(wrote);
+        }
+        admitted.drain(..=admitted.len() - SIGNED_IN_KEPT);
+        admitted.push(made.get());
+        let text: String = admitted.iter().map(|at| format!("{at}\n")).collect();
+        // Written beside and moved over it, so no reader sees it half done.
+        // **Only under the lock**: the move puts back what was read, and a
+        // sign-out since would be undone ([`Self::signed_in_lock`]).
+        let beside = list.with_extension(format!("{}", std::process::id()));
+        std::fs::write(&beside, text)
+            .and_then(|()| std::fs::rename(&beside, &list))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&beside);
+                wrote(e)
+            })
+    }
+
+    /// Lets a login's session, made at `made`, in ([`Self::admit_session`]),
+    /// where `kept` is the session stored for the account before it, if any.
+    ///
+    /// **A login that fails leaves what worked before working.** A login is
+    /// let in before Instagram is asked about it, and a failed one is not
+    /// taken back out. On a directory with a list, that only adds a line.
+    /// On one a version before the list made (no list, so every session is
+    /// sent as), it would start a list naming the failed login alone, and
+    /// the session still stored would be refused from then on. So there the
+    /// stored one is let in first. After a `purge` nothing is stored, so
+    /// nothing from before is let back in that way.
+    ///
+    /// **Only by making the list, never by adding to one**: both lines are
+    /// written in the one step that creates it. A list there already, a
+    /// logout's or a purge's made a moment ago included, is left to name
+    /// what it names, and only the login's own line goes onto it; adding the
+    /// stored session to it would let back in the very session that logout
+    /// signed out.
+    ///
+    /// Both steps under one hold of [`Self::signed_in_lock`], so no
+    /// sign-out comes between the look for a list and the line added to it.
+    pub fn admit_login(
+        &self,
+        made: snob_core::Epoch,
+        kept: Option<snob_core::Epoch>,
+    ) -> Result<(), PathError> {
+        use std::io::Write as _;
+        let Some(kept) = kept else {
+            return self.admit_session(made);
+        };
+        // With no directory, nothing from before is let in: the one a login
+        // makes starts empty ([`Self::ensure_dirs`]).
+        let _held = match self.hold_signed_in() {
+            Ok(held) => held,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return self.admit_session(made);
+            }
+            Err(source) => {
+                return Err(PathError::Write {
+                    path: self.signed_in_lock(),
+                    source,
+                });
+            }
+        };
+        let list = self.signed_in();
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&list)
+        {
+            Ok(mut file) => {
+                let lines = format!("{}\n{}\n", kept.get(), made.get());
+                file.write_all(lines.as_bytes())
+                    .map_err(|source| PathError::Write { path: list, source })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.admit_session_held(made)
+            }
+            Err(source) => Err(PathError::Write { path: list, source }),
+        }
+    }
+
+    /// Whether the session made at `made` may no longer be sent as: the
+    /// account was signed out of here since, and no login let that session
+    /// in again ([`Self::signed_in`]); or the account's directory is gone, as
+    /// `purge` leaves it; or the list cannot be read. A look at one small
+    /// file, asked before every request.
+    pub fn refuses_session(&self, made: snob_core::Epoch) -> bool {
+        match std::fs::read(self.signed_in()) {
+            Ok(bytes) => !sessions_in(&bytes).contains(&made.get()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                !self.dir().try_exists().unwrap_or(false)
+            }
+            Err(_) => true,
+        }
+    }
+}
+
+/// How many sessions [`AccountPaths::signed_in`] keeps.
+pub const SIGNED_IN_KEPT: usize = 64;
+
+/// The name of [`AccountPaths::signed_in`] in an account's directory.
+const SIGNED_IN: &str = "signed-in";
+
+/// The name of [`AccountPaths::signed_in_lock`] in an account's directory.
+const SIGNED_IN_LOCK: &str = "signed-in.lock";
+
+/// The points in a rewrite of [`AccountPaths::signed_in`] where a test may
+/// hold one thread still, to put another's rewrite in between
+/// ([`pause_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seam {
+    /// About to take [`AccountPaths::signed_in_lock`].
+    Locking,
+    /// A login has read the list and not yet written it.
+    Read,
+}
+
+/// What a test runs at a [`Seam`], on its own thread.
+#[cfg(test)]
+type Pause = Box<dyn Fn(Seam)>;
+
+#[cfg(test)]
+thread_local! {
+    /// What [`pause_at`] runs on this thread, set by a test; nothing by
+    /// default. Per thread, so the other tests, running beside it in the
+    /// same process, are never held.
+    static PAUSE: std::cell::RefCell<Option<Pause>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Nothing outside the tests; in them, whatever this thread's [`PAUSE`] says.
+fn pause_at(seam: Seam) {
+    #[cfg(test)]
+    PAUSE.with_borrow(|pause| {
+        if let Some(pause) = pause {
+            pause(seam);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = seam;
+}
+
+/// Starts the list of who is signed in ([`AccountPaths::signed_in`]),
+/// empty, in `dir`, a directory that is, or is about to become, an
+/// account's: nobody is signed in to an account directory something other
+/// than a login made. **Never over a list already there**: another process
+/// that made the directory at the same moment may have let a login in
+/// since.
+pub(crate) fn start_signed_out(dir: &Path) -> std::io::Result<()> {
+    match std::fs::File::create_new(dir.join(SIGNED_IN)) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// The sessions a [`AccountPaths::signed_in`] list names: its finished lines,
+/// each a number. A line still being written, with no end yet, names
+/// nothing, and neither does one that is not a number.
+fn sessions_in(bytes: &[u8]) -> Vec<i64> {
+    let finished = bytes
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(&[][..], |end| &bytes[..end]);
+    String::from_utf8_lossy(finished)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
 }
 
 impl std::ops::Deref for AccountPaths {
@@ -484,23 +822,33 @@ fn runtime_dir() -> PathBuf {
 ///
 /// Every failure is ignored on purpose. This is housekeeping, and a run that
 /// cannot tidy up after an earlier one still has a story to show.
+///
+/// **It walks only a root that is this user's own.** The root sits at a
+/// predictable name in a directory anybody can write to (`/tmp`, wherever
+/// `$XDG_RUNTIME_DIR` is unset), and the sweep runs before
+/// [`create_fresh_scratch_dir`] gets to refuse a foreign one. So on Unix the
+/// root is opened without following a link, and the open descriptor, not the
+/// name, is asked whether it is a real directory, owned by the effective user
+/// and closed to everybody else ([`own_private_dir`]). Anything else is left
+/// alone unwalked: a directory another user planted there is theirs to
+/// rename, and theirs to swap for a link into this user's home between a
+/// look at the name and a walk of it. On Linux the walk then goes through
+/// `/proc/self/fd`, so it is of the very directory the descriptor checked;
+/// where that is not mounted it goes by the name, which is still the same
+/// directory, since an entry this user owns in a sticky or private directory
+/// cannot be renamed or replaced by anybody else. Windows keeps the link
+/// check alone: its temporary directory is the user's own.
 pub fn sweep_old_scratch(root: &Path, older_than: std::time::Duration) {
-    // Never walk through a link at the root. `read_dir` follows one, and the
-    // root sits at a predictable name in a directory anybody can write to, so
-    // "the root" could be a link into somebody's home with everything in it
-    // older than the cutoff. A link is left alone here; creating the scratch
-    // afterwards removes it as a link, the same as at the leaf.
-    let Ok(found) = std::fs::symlink_metadata(root) else {
+    let Some(walk) = ScratchWalk::of(root) else {
         return; // nothing has ever run, which is the common case
     };
-    if !found.is_dir() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(root) else {
+    let Ok(entries) = std::fs::read_dir(&walk.path) else {
         return;
     };
     let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
+        // `DirEntry::metadata` does not follow a link, and `remove_dir_all`
+        // removes a link as itself, so an entry is never reached through.
         let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
             continue;
         };
@@ -511,6 +859,132 @@ pub fn sweep_old_scratch(root: &Path, older_than: std::time::Duration) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// The scratch root as [`sweep_old_scratch`] may walk it, or `None` when it
+/// must not be walked at all.
+struct ScratchWalk {
+    /// The path the walk reads and removes through.
+    path: PathBuf,
+    /// Held open for the walk, so `/proc/self/fd/<n>` in `path` keeps naming
+    /// the directory that was checked.
+    #[cfg(unix)]
+    _held: std::fs::File,
+}
+
+impl ScratchWalk {
+    #[cfg(unix)]
+    fn of(root: &Path) -> Option<Self> {
+        let (held, found) = own_private_dir(root).ok()?;
+        let path = through_descriptor(&held, &found).unwrap_or_else(|| root.to_path_buf());
+        Some(Self { path, _held: held })
+    }
+
+    /// Never through a link at the root: `read_dir` follows one, and the root
+    /// could be a link into somebody's home with everything in it older than
+    /// the cutoff. A link is left alone here; creating the scratch afterwards
+    /// removes it as a link, the same as at the leaf.
+    #[cfg(not(unix))]
+    fn of(root: &Path) -> Option<Self> {
+        let found = std::fs::symlink_metadata(root).ok()?;
+        found.is_dir().then(|| Self {
+            path: root.to_path_buf(),
+        })
+    }
+}
+
+/// Opens `dir` without following a link at its name, and answers the
+/// descriptor with what `fstat` read from it, provided it is a real
+/// directory; an `Err` otherwise.
+///
+/// What it answers is about the directory the descriptor holds, so a name
+/// swapped for something else after this call does not move the check.
+#[cfg(unix)]
+fn open_dir(dir: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)?;
+    let found = held.metadata()?;
+    if !found.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "it is not a directory",
+        ));
+    }
+    Ok((held, found))
+}
+
+/// An `Err` of kind `PermissionDenied` unless what `found` describes is owned
+/// by the user `me`.
+#[cfg(unix)]
+fn owned_by(found: &std::fs::Metadata, me: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if found.uid() != me {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "it belongs to another account",
+        ));
+    }
+    Ok(())
+}
+
+/// The effective user of this process.
+#[cfg(unix)]
+fn effective_user() -> u32 {
+    // SAFETY: `geteuid` takes no argument, touches no memory of ours and
+    // cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// [`open_dir`], provided the directory is the effective user's own; an
+/// `Err` of kind `PermissionDenied` for one that is somebody else's.
+#[cfg(unix)]
+fn own_dir(dir: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let (held, found) = open_dir(dir)?;
+    owned_by(&found, effective_user())?;
+    Ok((held, found))
+}
+
+/// [`own_dir`], and also closed to everybody else: no group or other bits,
+/// which is what [`create_private_root`] leaves it. A root this user owns but
+/// left open may hold entries somebody else put there, so it is not walked.
+#[cfg(unix)]
+fn own_private_dir(dir: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let (held, found) = own_dir(dir)?;
+    if found.mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "it is open to other accounts",
+        ));
+    }
+    Ok((held, found))
+}
+
+/// The path that reaches the directory `held` is open on, rather than
+/// whatever is at its name now: `/proc/self/fd/<n>` is a link the kernel
+/// resolves to the open directory itself. Taken only when what it reaches is
+/// the same directory (`st_dev` and `st_ino`), so a `/proc` that is missing,
+/// or mounted so as to hide it, falls back to the name.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn through_descriptor(held: &std::fs::File, found: &std::fs::Metadata) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let path = PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd()));
+    let seen = std::fs::metadata(&path).ok()?;
+    (seen.dev() == found.dev() && seen.ino() == found.ino()).then_some(path)
+}
+
+/// No `/proc` to go through: the walk goes by the name.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn through_descriptor(_held: &std::fs::File, _found: &std::fs::Metadata) -> Option<PathBuf> {
+    None
 }
 
 /// Replaces `path` with `contents` by way of `temporary`: written whole with
@@ -625,22 +1099,79 @@ pub fn create_private_dir(dir: &Path) -> Result<(), PathError> {
     restrict_to_this_account(dir)
 }
 
-/// Creates and restricts a directory at a name somebody else can predict,
-/// keeping a real directory that is already there and never following a link.
+/// Where the parent of a fresh directory sits ([`create_fresh_private_dir`],
+/// [`create_fresh_scratch_dir`]), which is who could have made a directory at
+/// its name before this run did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Root {
+    /// The scratch root, at a predictable name in a temporary directory
+    /// anybody can write to (`/tmp`, wherever `$XDG_RUNTIME_DIR` is unset):
+    /// a directory found there must be this account's own.
+    Shared,
+    /// A directory under the data directory, which only this account can
+    /// enter, so nobody else could have made it -- or the data directory
+    /// itself, in a home only this account can write to. **A link found at
+    /// such a name is the person's own** (a data directory moved to another
+    /// disk), so it is followed and what it reaches made private, as
+    /// [`AppPaths::ensure_dirs`] has just done through it; removing it would
+    /// leave every later run an empty directory and the person's sessions and
+    /// databases unreferenced where the link pointed. The owner is not asked
+    /// either: a filesystem may report a wrong one (NFSv4 with broken id
+    /// mapping, sshfs without `idmap=user`) while letting this account change
+    /// the mode, and a login or a browser probe refused there would refuse
+    /// nothing.
+    Private,
+}
+
+/// Creates and restricts the parent of a fresh directory: at the
+/// [`Root::Private`] name with [`create_private_dir`], a link the person made
+/// there followed; at the [`Root::Shared`] name, which somebody else can
+/// predict, keeping a real directory that is already there and never
+/// following a link.
 ///
-/// For the scratch **root** under the world-writable temporary directory --
-/// the parent every [`create_fresh_private_dir`] leaf sits in, and the
-/// directory [`sweep_old_scratch`] walks with `remove_dir_all`.
-/// [`create_private_dir`] cannot be trusted with that name: `create_dir_all`
+/// The shared name is the scratch **root** under the world-writable
+/// temporary directory -- the parent every [`create_fresh_scratch_dir`] leaf
+/// sits in, and the directory [`sweep_old_scratch`] walks with
+/// `remove_dir_all`. [`create_private_dir`] cannot be trusted with that name:
+/// `create_dir_all`
 /// answers `Ok` over a planted link, and [`restrict_to_this_account`] then
 /// lands the `0700` on **whatever the link points at** -- so whoever planted
 /// it chooses which directory of this account's the age sweep then deletes
 /// out of. A link or a stray file found at the name is removed as itself --
 /// the same recipe as at the leaf, through [`remove_entry`] on the one reading
 /// of it -- while a real directory is kept, because it holds other runs'
-/// scratch. A real directory that belongs to somebody else fails in
-/// `restrict_to_this_account`, which is the refusal wanted.
-fn create_private_root(dir: &Path) -> Result<(), PathError> {
+/// scratch. A real directory there that belongs to somebody else is
+/// refused, which is the refusal wanted.
+///
+/// On Unix the `0700` goes on through a descriptor opened without following a
+/// link ([`open_dir`]), never through the name again: whoever planted a real
+/// directory at the name owns it, and could swap it for a link into this
+/// account's home between the look above and a `chmod` by path, choosing
+/// which of this account's directories is made private. The descriptor is
+/// also asked who owns it, so a planted directory is refused even for root,
+/// whom a `chmod` would not stop.
+fn create_private_root(dir: &Path, root: Root) -> Result<(), PathError> {
+    if root == Root::Private {
+        return create_private_dir(dir);
+    }
+    #[cfg(unix)]
+    {
+        create_shared_root_as(dir, effective_user())
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows' temporary directory is the user's own, so nobody else
+        // could have made the scratch root there either; a link or a
+        // junction found at its name is still taken away, not followed.
+        create_root_entry(dir)?;
+        restrict_to_this_account(dir)
+    }
+}
+
+/// The first half of [`create_private_root`] at the [`Root::Shared`] name: a
+/// real directory at the name, whatever was there before it. **Never for a
+/// [`Root::Private`] name**, where what it removes is the person's own link.
+fn create_root_entry(dir: &Path) -> Result<(), PathError> {
     let create = |source| PathError::Create {
         path: dir.to_path_buf(),
         source,
@@ -656,38 +1187,76 @@ fn create_private_root(dir: &Path) -> Result<(), PathError> {
             std::fs::create_dir(dir).map_err(create)?;
         }
     }
-    restrict_to_this_account(dir)
+    Ok(())
+}
+
+/// [`create_private_root`] at the [`Root::Shared`] name for the user `me`,
+/// which a test can make somebody the filesystem does not report as the
+/// owner.
+#[cfg(unix)]
+fn create_shared_root_as(dir: &Path, me: u32) -> Result<(), PathError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    create_root_entry(dir)?;
+    let not_private = |e: std::io::Error| PathError::NotPrivate {
+        path: dir.to_path_buf(),
+        detail: e.to_string(),
+    };
+    let (held, found) = open_dir(dir).map_err(not_private)?;
+    owned_by(&found, me).map_err(not_private)?;
+    held.set_permissions(std::fs::Permissions::from_mode(0o700))
+        .map_err(not_private)
 }
 
 /// Creates a private directory that **did not exist a moment ago**, under a
-/// parent that is made private first.
+/// parent in the data directory that is made private first.
 ///
 /// For a directory whose name somebody else can predict, which is what a
-/// scratch directory named after the process id is. [`create_private_dir`]
-/// adopts whatever is already at the path: `create_dir_all` answers `Ok` when
-/// the entry exists, a symbolic link to a directory included, and the
-/// permissions are then set on **whatever it points at**. On a machine with
-/// other users, a `/tmp/snob-ig-stories/run-<pid>` planted ahead of time as a
-/// link would choose where a run writes every story it fetches, and have a
-/// directory of the victim's own made `0700`. That needs a parent anybody can
-/// create entries in, which an unrestricted one under `/tmp` is.
+/// directory named after the process id is. [`create_private_dir`] adopts
+/// whatever is already at the path: `create_dir_all` answers `Ok` when the
+/// entry exists, a symbolic link to a directory included, and the
+/// permissions are then set on **whatever it points at**.
+///
+/// The parent is made private with [`create_private_dir`]: nobody else can
+/// enter the data directory, so a link at the parent's name is the person's
+/// own and is followed, and the parent is not asked who owns it
+/// ([`Root::Private`]). The scratch, outside it, is
+/// [`create_fresh_scratch_dir`].
+pub fn create_fresh_private_dir(dir: &Path) -> Result<(), PathError> {
+    create_fresh(dir, Root::Private)
+}
+
+/// [`create_fresh_private_dir`] for the scratch, whose root sits at a
+/// predictable name in a temporary directory anybody can write to.
+///
+/// On a machine with other users, a `/tmp/snob-ig-stories/run-<pid>` planted
+/// ahead of time as a link would choose where a run writes every story it
+/// fetches, and have a directory of the victim's own made `0700`. That needs
+/// a parent anybody can create entries in, which an unrestricted one under
+/// `/tmp` is.
 ///
 /// Two things close it. The parent is created and restricted first -- with
 /// `create_private_root`, which refuses to follow a link planted at *its*
-/// predictable name too -- so on a run that is the first to use it nobody else
-/// can put an entry inside; and the leaf is created with `create_dir`, which
-/// fails rather than adopts when something is already there. What is already
-/// there is removed if it is something this tool could have left -- an
-/// earlier run's directory under a reused process id, which Windows hands out
-/// again freely -- and the creation is tried once more. [`remove_tree`] takes
-/// a link as the link itself, never following it.
-pub fn create_fresh_private_dir(dir: &Path) -> Result<(), PathError> {
+/// predictable name too, and refuses a directory there that is somebody
+/// else's ([`Root::Shared`]) -- so on a run that is the first to use it nobody
+/// else can put an entry inside; and the leaf is created with `create_dir`,
+/// which fails rather than adopts when something is already there. What is
+/// already there is removed if it is something this tool could have left --
+/// an earlier run's directory under a reused process id, which Windows hands
+/// out again freely -- and the creation is tried once more. [`remove_tree`]
+/// takes a link as the link itself, never following it.
+pub fn create_fresh_scratch_dir(dir: &Path) -> Result<(), PathError> {
+    create_fresh(dir, Root::Shared)
+}
+
+/// What [`create_fresh_private_dir`] and [`create_fresh_scratch_dir`] share.
+fn create_fresh(dir: &Path, root: Root) -> Result<(), PathError> {
     let create = |source| PathError::Create {
         path: dir.to_path_buf(),
         source,
     };
     if let Some(parent) = dir.parent() {
-        create_private_root(parent)?;
+        create_private_root(parent, root)?;
     }
     if let Err(e) = std::fs::create_dir(dir) {
         if e.kind() != std::io::ErrorKind::AlreadyExists {
@@ -1034,6 +1603,250 @@ mod windows_acl {
 mod tests {
     use super::*;
 
+    /// Every session of an account directory from before the list is sent
+    /// as, until its first login, which starts the list with its own. Once
+    /// the account is signed out, none it had is, through any later login,
+    /// and a login's own always is, whatever the clock said when it was
+    /// made. By identity, never by order: a login made "before" the
+    /// sign-out, as a clock set back makes one, is let in all the same.
+    #[test]
+    fn a_session_signed_out_of_stays_refused_and_a_login_is_always_let_in() {
+        let root = tempfile::tempdir().unwrap();
+        let account = AppPaths::rooted_at(root.path()).account(snob_core::Pk::new(42));
+        let (walking, again, set_back) = (
+            snob_core::Epoch::new(1_800_000_000),
+            snob_core::Epoch::new(1_800_000_600),
+            snob_core::Epoch::new(1_700_000_000),
+        );
+
+        // An account directory from before the list existed.
+        create_private_dir(&account.dir()).unwrap();
+        assert!(!account.refuses_session(walking), "never signed out");
+        account.admit_session(again).unwrap();
+        assert!(!account.refuses_session(again), "a login is let in");
+        assert!(
+            account.refuses_session(walking),
+            "and the session it replaced is not, once it started the list"
+        );
+
+        account.sign_out().unwrap();
+        assert!(account.refuses_session(walking));
+        assert!(account.refuses_session(again));
+        account.admit_session(again).unwrap();
+        assert!(!account.refuses_session(again), "a login is let in");
+        assert!(account.refuses_session(walking), "and only its session");
+        account.admit_session(set_back).unwrap();
+        assert!(
+            !account.refuses_session(set_back),
+            "a login stamped before the sign-out is let in all the same"
+        );
+        assert!(account.refuses_session(walking));
+        account.sign_out().unwrap();
+        assert!(account.refuses_session(again), "a sign-out takes them all");
+    }
+
+    /// With the account's directory gone, as `purge` leaves it, no session is
+    /// sent as, and a sign-out makes nothing. Made again by anything but a
+    /// login, the directory still sends none it had before; a login lets in
+    /// only its own.
+    #[test]
+    fn a_session_purged_stays_refused_once_the_directory_is_made_again() {
+        let root = tempfile::tempdir().unwrap();
+        let account = AppPaths::rooted_at(root.path()).account(snob_core::Pk::new(42));
+        let (walking, again) = (
+            snob_core::Epoch::new(1_800_000_000),
+            snob_core::Epoch::new(1_800_000_600),
+        );
+        create_private_dir(&account.dir()).unwrap();
+        assert!(!account.refuses_session(walking));
+
+        std::fs::remove_dir_all(account.dir()).unwrap();
+        assert!(account.refuses_session(walking));
+        account.sign_out().unwrap();
+        assert!(!account.dir().exists(), "a sign-out makes no directory");
+
+        account.ensure_dirs().unwrap();
+        assert!(account.refuses_session(walking), "made again, not let in");
+        account.ensure_dirs().unwrap();
+        assert!(account.refuses_session(walking));
+        account.admit_session(again).unwrap();
+        assert!(!account.refuses_session(again));
+        account.ensure_dirs().unwrap();
+        assert!(
+            !account.refuses_session(again),
+            "a directory already there keeps its list"
+        );
+        assert!(account.refuses_session(walking));
+    }
+
+    /// A login let in while another process is making the account's
+    /// directory, between the directory and its empty list, stays let in:
+    /// the list it starts is the one the other process finds there, and an
+    /// empty one started first is added to.
+    #[test]
+    fn a_login_let_in_as_the_directory_is_made_elsewhere_stays_let_in() {
+        let root = tempfile::tempdir().unwrap();
+        let account = AppPaths::rooted_at(root.path()).account(snob_core::Pk::new(42));
+        let login = snob_core::Epoch::new(1_800_000_000);
+
+        // The other process has made the directory, and not yet its list.
+        create_private_dir(&account.dir()).unwrap();
+        account.admit_session(login).unwrap();
+        start_signed_out(&account.dir()).unwrap();
+        assert!(!account.refuses_session(login));
+
+        // The other process's list was there first.
+        std::fs::remove_dir_all(account.dir()).unwrap();
+        create_private_dir(&account.dir()).unwrap();
+        start_signed_out(&account.dir()).unwrap();
+        account.admit_session(login).unwrap();
+        assert!(!account.refuses_session(login));
+    }
+
+    /// On a directory from before the list, a login that then fails leaves
+    /// the session stored before it let in; with a list, or with nothing
+    /// stored, only the login is.
+    #[test]
+    fn a_failed_login_on_an_old_directory_keeps_the_stored_session_let_in() {
+        let root = tempfile::tempdir().unwrap();
+        let account = AppPaths::rooted_at(root.path()).account(snob_core::Pk::new(42));
+        let (stored, login) = (
+            snob_core::Epoch::new(1_700_000_000),
+            snob_core::Epoch::new(1_800_000_000),
+        );
+
+        // As 0.8.0 left it: the directory, and no list in it.
+        create_private_dir(&account.dir()).unwrap();
+        account.admit_login(login, Some(stored)).unwrap();
+        assert!(!account.refuses_session(stored), "what worked still works");
+        assert!(!account.refuses_session(login));
+
+        // Signed out of since: the stored one stays refused.
+        account.sign_out().unwrap();
+        account.admit_login(login, Some(stored)).unwrap();
+        assert!(account.refuses_session(stored));
+        assert!(!account.refuses_session(login));
+
+        // Made again after a purge: nothing from before is let in.
+        std::fs::remove_dir_all(account.dir()).unwrap();
+        account.admit_login(login, None).unwrap();
+        assert!(account.refuses_session(stored));
+        assert!(!account.refuses_session(login));
+    }
+
+    /// **A sign-out that comes while a login trims a full list is not
+    /// undone by it.** The login has read the list and is about to move a
+    /// trimmed copy over it; the sign-out waits for that move and then
+    /// empties what it left, so every session the account had is refused,
+    /// the login's own included, as a sign-out after it would leave them.
+    /// Without the lock the sign-out empties the list first, and the move
+    /// puts the sessions back.
+    #[test]
+    fn a_sign_out_while_a_login_trims_the_list_is_not_undone() {
+        use std::sync::mpsc::channel;
+        let root = tempfile::tempdir().unwrap();
+        let account = AppPaths::rooted_at(root.path()).account(snob_core::Pk::new(42));
+        account.ensure_dirs().unwrap();
+        let login = |n: usize| snob_core::Epoch::new(1_800_000_000 + i64::try_from(n).unwrap());
+        for n in 0..SIGNED_IN_KEPT {
+            account.admit_session(login(n)).unwrap();
+        }
+
+        // The login that trims, held once it has read the full list.
+        let (read, has_read) = channel();
+        let (go_on, told_to_go_on) = channel::<()>();
+        let trimming = std::thread::spawn({
+            let account = account.clone();
+            move || {
+                PAUSE.set(Some(Box::new(move |seam| {
+                    if seam == Seam::Read {
+                        read.send(()).unwrap();
+                        told_to_go_on.recv().unwrap();
+                    }
+                })));
+                account.admit_session(login(SIGNED_IN_KEPT)).unwrap();
+            }
+        });
+        has_read.recv().unwrap();
+
+        let (locking, is_locking) = channel();
+        let signing_out = std::thread::spawn({
+            let account = account.clone();
+            move || {
+                PAUSE.set(Some(Box::new(move |seam| {
+                    if seam == Seam::Locking {
+                        locking.send(()).unwrap();
+                    }
+                })));
+                account.sign_out().unwrap();
+            }
+        });
+        is_locking.recv().unwrap();
+        // Ample for a sign-out that does not wait to empty a 64-line file.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !signing_out.is_finished(),
+            "the sign-out waits for the login that read the list"
+        );
+
+        go_on.send(()).unwrap();
+        trimming.join().unwrap();
+        signing_out.join().unwrap();
+        for n in 0..=SIGNED_IN_KEPT {
+            assert!(account.refuses_session(login(n)), "{n} was let back in");
+        }
+        account.admit_session(login(SIGNED_IN_KEPT + 1)).unwrap();
+        assert!(!account.refuses_session(login(SIGNED_IN_KEPT + 1)));
+    }
+
+    /// The jobs directory is made only inside the account's directory, never
+    /// with it: one `purge` removed stays gone.
+    #[test]
+    fn the_jobs_directory_never_makes_the_accounts_again() {
+        let root = tempfile::tempdir().unwrap();
+        let account = AppPaths::rooted_at(root.path()).account(snob_core::Pk::new(42));
+        assert!(!account.create_jobs_dir().unwrap());
+        assert!(!account.dir().exists());
+
+        account.ensure_dirs().unwrap();
+        assert!(account.create_jobs_dir().unwrap());
+        assert!(account.create_jobs_dir().unwrap(), "there already");
+        assert!(account.jobs_dir().is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(account.jobs_dir())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+    }
+
+    /// The list keeps the latest [`SIGNED_IN_KEPT`] logins, and a line not
+    /// finished yet, or not a number, names nobody.
+    #[test]
+    fn the_signed_in_list_keeps_the_latest_logins_and_only_whole_lines() {
+        let root = tempfile::tempdir().unwrap();
+        let account = AppPaths::rooted_at(root.path()).account(snob_core::Pk::new(42));
+        account.ensure_dirs().unwrap();
+        let login = |n: usize| snob_core::Epoch::new(1_800_000_000 + i64::try_from(n).unwrap());
+        for n in 0..=SIGNED_IN_KEPT {
+            account.admit_session(login(n)).unwrap();
+        }
+        account.admit_session(login(SIGNED_IN_KEPT)).unwrap();
+        assert!(account.refuses_session(login(0)), "the earliest went");
+        for n in 1..=SIGNED_IN_KEPT {
+            assert!(!account.refuses_session(login(n)), "{n}");
+        }
+        let kept = std::fs::read(account.signed_in()).unwrap();
+        assert_eq!(sessions_in(&kept).len(), SIGNED_IN_KEPT);
+
+        assert_eq!(sessions_in(b"1\n2\n3"), [1, 2]);
+        assert_eq!(sessions_in(b"1\nnot one\n\n2\n"), [1, 2]);
+        assert!(sessions_in(b"12").is_empty());
+    }
+
     /// **A sandboxed run must not reach the real temporary directory.**
     /// The scratch directory is the one location that comes from the
     /// environment rather than from `directories`, so it is the one that would
@@ -1138,8 +1951,11 @@ mod tests {
     #[test]
     fn the_sweep_takes_the_abandoned_and_leaves_the_living() {
         let tmp = tempfile::tempdir().unwrap();
-        let old = tmp.path().join("run-old");
-        let fresh = tmp.path().join("run-fresh");
+        // Made the way every run makes it: the sweep walks no other kind.
+        let root = tmp.path().join("snob-ig-stories");
+        create_private_root(&root, Root::Shared).unwrap();
+        let old = root.join("run-old");
+        let fresh = root.join("run-fresh");
         std::fs::create_dir_all(&old).unwrap();
         std::fs::create_dir_all(&fresh).unwrap();
         std::fs::write(old.join("story.jpg"), b"x").unwrap();
@@ -1147,12 +1963,86 @@ mod tests {
         // Zero, so everything already on disk counts as abandoned; then a
         // generous one, so nothing does. Testing it this way rather than by
         // waiting keeps the suite off the wall clock.
-        sweep_old_scratch(tmp.path(), std::time::Duration::ZERO);
+        sweep_old_scratch(&root, std::time::Duration::ZERO);
         assert!(!old.exists(), "an abandoned directory should have gone");
 
         std::fs::create_dir_all(&fresh).unwrap();
-        sweep_old_scratch(tmp.path(), std::time::Duration::from_secs(3600));
+        sweep_old_scratch(&root, std::time::Duration::from_secs(3600));
         assert!(fresh.exists(), "a live directory must be left alone");
+    }
+
+    /// A root this account owns but left open to others may hold entries
+    /// somebody else put there, and is not walked: what was planted in it is
+    /// theirs to swap for a link between the look and the removal.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_walks_no_root_that_is_open_to_other_accounts() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("snob-ig-stories");
+        let old = root.join("run-old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        sweep_old_scratch(&root, std::time::Duration::ZERO);
+        assert!(old.exists(), "a root open to others was walked");
+
+        // Closed again, the same root is swept: the refusal was the mode.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        sweep_old_scratch(&root, std::time::Duration::ZERO);
+        assert!(
+            !old.exists(),
+            "a private root of this account's was not swept"
+        );
+    }
+
+    /// A link planted at the root's name is not walked, whatever it points
+    /// at: this account's home has plenty in it older than the cutoff.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_never_walks_through_a_link_at_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(home.join("documents")).unwrap();
+        let root = tmp.path().join("snob-ig-stories");
+        std::os::unix::fs::symlink(&home, &root).unwrap();
+
+        sweep_old_scratch(&root, std::time::Duration::ZERO);
+        assert!(
+            home.join("documents").exists(),
+            "the sweep followed the link"
+        );
+    }
+
+    /// On Linux the walk goes through the descriptor that was checked, so a
+    /// name renamed away and replaced by a link after the check still walks
+    /// the directory the check was about.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn the_sweep_walks_the_directory_it_checked_not_what_the_name_became() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("snob-ig-stories");
+        create_private_root(&root, Root::Shared).unwrap();
+        std::fs::create_dir(root.join("run-ours")).unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(home.join("documents")).unwrap();
+
+        let walk = ScratchWalk::of(&root).expect("a private root of ours is walked");
+        assert!(
+            walk.path.starts_with("/proc/self/fd"),
+            "{}",
+            walk.path.display()
+        );
+
+        std::fs::rename(&root, tmp.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&home, &root).unwrap();
+        let seen: Vec<_> = std::fs::read_dir(&walk.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(seen, vec![std::ffi::OsString::from("run-ours")]);
     }
 
     /// A root that does not exist is not an error. It is the common case: the
@@ -1309,7 +2199,7 @@ mod tests {
         #[cfg(windows)]
         let planted = std::os::windows::fs::symlink_dir(&elsewhere, &leaf).is_ok();
 
-        create_fresh_private_dir(&leaf).unwrap();
+        create_fresh_scratch_dir(&leaf).unwrap();
 
         let made = std::fs::symlink_metadata(&leaf).unwrap();
         assert!(made.is_dir() && !made.is_symlink(), "a link was adopted");
@@ -1322,7 +2212,7 @@ mod tests {
         // An earlier run's directory under a reused process id is replaced,
         // and what it held does not survive into the new run.
         std::fs::write(leaf.join("stale.jpg"), b"x").unwrap();
-        create_fresh_private_dir(&leaf).unwrap();
+        create_fresh_scratch_dir(&leaf).unwrap();
         assert!(!leaf.join("stale.jpg").exists());
         assert!(leaf.is_dir());
     }
@@ -1335,11 +2225,76 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let leaf = tmp.path().join("snob-ig-stories").join("run-1");
-        create_fresh_private_dir(&leaf).unwrap();
+        create_fresh_scratch_dir(&leaf).unwrap();
         for dir in [leaf.parent().unwrap(), leaf.as_path()] {
             let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{}", dir.display());
         }
+    }
+
+    /// A filesystem may report an owner other than the account that can
+    /// change the mode there. Under the data directory, which nobody else can
+    /// enter, the parent is not asked who owns it, so a login is not refused
+    /// on such a home; the scratch root, at a name anybody could take first,
+    /// still is.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_scratch_root_is_refused_for_an_owner_that_is_not_this_account() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let somebody_else = effective_user().wrapping_add(1);
+
+        let profiles = tmp.path().join("browser-profile");
+        create_private_root(&profiles, Root::Private).unwrap();
+        let mode = std::fs::metadata(&profiles).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        let scratch = tmp.path().join("snob-ig-stories");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let refused = create_shared_root_as(&scratch, somebody_else);
+        assert!(
+            matches!(refused, Err(PathError::NotPrivate { .. })),
+            "{refused:?}"
+        );
+        let mode = std::fs::metadata(&scratch).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "a refused root was made private");
+
+        // As the account it is, the same root is made private.
+        create_shared_root_as(&scratch, effective_user()).unwrap();
+        let mode = std::fs::metadata(&scratch).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// A data directory (or a directory of browser profiles) the person
+    /// moved to another disk and linked back is theirs: a fresh directory
+    /// under it is made through the link, which is still there afterwards,
+    /// and what it reaches is made private. Removing it would leave every
+    /// later run an empty directory, with no sessions and no databases.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_data_directory_is_kept_and_a_fresh_directory_made_through_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let moved = tmp.path().join("big-disk").join("snob-ig");
+        std::fs::create_dir_all(&moved).unwrap();
+        std::fs::set_permissions(&moved, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(moved.join("accounts.toml"), b"kept").unwrap();
+        let data = tmp.path().join("snob-ig");
+        std::os::unix::fs::symlink(&moved, &data).unwrap();
+
+        let probe = data.join("browser-probe-1-0");
+        create_fresh_private_dir(&probe).unwrap();
+
+        let found = std::fs::symlink_metadata(&data).unwrap();
+        assert!(found.is_symlink(), "the person's link was taken away");
+        assert_eq!(std::fs::read(moved.join("accounts.toml")).unwrap(), b"kept");
+        assert!(
+            moved.join("browser-probe-1-0").is_dir(),
+            "not made through the link"
+        );
+        let mode = std::fs::metadata(&moved).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "what the link reaches was left open");
     }
 
     /// A failed replacement names the step that failed: the temporary when it
@@ -1375,7 +2330,7 @@ mod tests {
 
         let root = tmp.path().join("snob-ig-stories");
         std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
-        create_fresh_private_dir(&root.join("run-1")).unwrap();
+        create_fresh_scratch_dir(&root.join("run-1")).unwrap();
         let made = std::fs::symlink_metadata(&root).unwrap();
         assert!(made.is_dir() && !made.is_symlink(), "the link was followed");
         assert_eq!(made.permissions().mode() & 0o777, 0o700);
@@ -1385,7 +2340,7 @@ mod tests {
 
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::write(&root, b"stray").unwrap();
-        create_fresh_private_dir(&root.join("run-1")).unwrap();
+        create_fresh_scratch_dir(&root.join("run-1")).unwrap();
         let made = std::fs::symlink_metadata(&root).unwrap();
         assert!(made.is_dir(), "the stray file is still there");
         assert_eq!(made.permissions().mode() & 0o777, 0o700);

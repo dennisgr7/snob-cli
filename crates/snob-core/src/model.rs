@@ -49,6 +49,26 @@ pub fn in_a_path(name: &str) -> String {
     percent_encoding::utf8_percent_encode(name, IN_A_PATH).to_string()
 }
 
+/// The longest username Instagram gives out.
+pub const USERNAME_MAX: usize = 30;
+
+/// Whether `name` could be an Instagram username: ASCII letters, digits, `.`
+/// and `_`, one to [`USERNAME_MAX`] of them. One leading at sign is taken off
+/// first, as every command takes it off.
+///
+/// **The one home of the rule**, for the command line (`cli::username`) and
+/// for `snob mcp` (`tools::account`) alike. A name outside it names nobody, so
+/// refusing it costs nothing, and it is refused before anything that would
+/// cost something: the consent question, the cap on an agent's writes, a
+/// request. It used to reach those first, so `snob followers 'bad name!'`
+/// asked whether to read the lists of an account that cannot exist, and was
+/// then told by Instagram it does not.
+pub fn possible_username(name: &str) -> bool {
+    let name = name.strip_prefix('@').unwrap_or(name);
+    let allowed = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_';
+    !name.is_empty() && name.len() <= USERNAME_MAX && name.chars().all(allowed)
+}
+
 impl User {
     /// An account known by its id and name alone, every other field empty.
     ///
@@ -398,6 +418,33 @@ impl StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_username_is_letters_digits_dots_and_underscores_up_to_thirty() {
+        for good in [
+            "nora.wilde",
+            "@nora.wilde",
+            "a",
+            "_x_",
+            "12345",
+            &"a".repeat(30),
+        ] {
+            assert!(possible_username(good), "{good}");
+        }
+        for bad in [
+            "",
+            "@",
+            "bad name!",
+            "-y",
+            // A letter outside ASCII, written as an escape.
+            "n\u{f3}ra",
+            "a/b",
+            "@@x",
+            &"a".repeat(31),
+        ] {
+            assert!(!possible_username(bad), "{bad}");
+        }
+    }
 
     fn named(username: &str) -> User {
         User::named(Pk::new(1), username)

@@ -501,9 +501,15 @@ fn holds_account_profiles(dir: &Path) -> bool {
 ///
 /// Chromium locks a profile with a link naming the host and the process that
 /// holds it. A lock left by a process that is gone, or by another host, is no
-/// browser of this machine's. On Windows there is no such link; a rename under
-/// an open browser fails there instead, which [`rename_patiently`] reports.
-fn in_use(dir: &Path) -> bool {
+/// browser of this machine's. On Windows there is no such link: Chromium
+/// holds the profile's `lockfile` open instead, shared for reading only and
+/// deleted when it closes (`process_singleton_win.cc`), so opening it shared
+/// with nobody fails while a browser runs, and finds nothing, or a file
+/// nobody holds, once it has gone. Held for that instant only: a browser
+/// starting on the profile in it would find the profile taken, and both
+/// callers ask of a profile no browser is to start on, one being moved
+/// ([`settle_the_layout`]) and the others being removed (`owner::let_go_of`).
+pub(crate) fn in_use(dir: &Path) -> bool {
     #[cfg(unix)]
     {
         let Ok(target) = std::fs::read_link(dir.join("SingletonLock")) else {
@@ -523,7 +529,18 @@ fn in_use(dir: &Path) -> bool {
         let asked = unsafe { libc::kill(pid, 0) };
         asked == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // As `snob_store::layout` asks whether a database is held open.
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(dir.join("lockfile"))
+            .is_err_and(|e| e.raw_os_error() == Some(ERROR_SHARING_VIOLATION))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = dir;
         false

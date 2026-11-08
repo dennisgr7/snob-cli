@@ -17,18 +17,19 @@
     "check": "astro check",
     "astro": "astro",
     "test": "playwright test",
-    "brand": "node scripts/brand.mjs"
+    "brand": "node scripts/brand.mjs",
+    "video": "node scripts/video.mjs"
   },
   "dependencies": {
     "@astrojs/sitemap": "3.7.4",
-    "@tailwindcss/vite": "4.3.3",
-    "astro": "7.4.1",
-    "tailwindcss": "4.3.3"
+    "@tailwindcss/vite": "4.3.4",
+    "astro": "7.4.5",
+    "tailwindcss": "4.3.4"
   },
   "devDependencies": {
-    "@astrojs/check": "0.9.11",
+    "@astrojs/check": "0.9.12",
     "@playwright/test": "1.64.1",
     "typescript": "6.0.3",
-    "wrangler": "4.151.2"
+    "wrangler": "4.156.2"
   }
 }

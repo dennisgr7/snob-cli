@@ -18,6 +18,18 @@ pub enum IgError {
     #[error("the session has expired")]
     SessionExpired,
 
+    /// The session was signed out of on this computer since it was read: a
+    /// logout or a purge of its account, or its account's data removed. The
+    /// caller refused it before anything was sent, and Instagram said
+    /// nothing; read as [`IgError::SessionExpired`] in every other way. Its
+    /// own variant so the failure says what happened rather than blaming
+    /// Instagram.
+    #[error(
+        "this session was signed out on this computer (a logout or a purge, or its data was \
+         removed), so nothing more was sent as it"
+    )]
+    SignedOutHere,
+
     #[error(
         "Instagram rejected the session because the User-Agent does not match the browser that created it"
     )]
@@ -383,6 +395,7 @@ impl IgError {
         matches!(
             self,
             Self::SessionExpired
+                | Self::SignedOutHere
                 | Self::UserAgentMismatch
                 | Self::Challenge { .. }
                 | Self::Checkpoint { .. }

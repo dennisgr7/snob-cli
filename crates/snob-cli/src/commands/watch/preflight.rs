@@ -21,7 +21,7 @@ use super::delivery::{delivery_from, run_id};
 use super::run::{Printing, run_viewers};
 use super::schedule::schedule_from;
 use super::watched::watched_from;
-use super::wire::preflight_body;
+use super::wire::{PREFLIGHT_SUMMARY, outgoing, preflight_body};
 
 /// The checks themselves, without the printing, so `setup` can run them too.
 pub(super) async fn preflight(
@@ -54,7 +54,11 @@ pub(super) async fn preflight(
 
     // Before the session, like `once` does, so an address that could never work
     // is reported even on a machine that cannot log in.
-    let delivery = match delivery_from(&WebhookArgs::default(), configured.as_ref(), secrets) {
+    let webhook = WebhookArgs {
+        sign_with: args.sign_with.clone(),
+        ..WebhookArgs::default()
+    };
+    let delivery = match delivery_from(&webhook, configured.as_ref(), secrets) {
         Ok(delivery) => delivery,
         Err(e) => {
             report.checked.push(check::Checked {
@@ -70,9 +74,18 @@ pub(super) async fn preflight(
         }
     };
 
-    // A missing session is one finding among several here, not a refusal.
+    // A missing session is one finding among several here, not a refusal,
+    // and so is one this computer no longer sends as: the one refusal
+    // `App::open` gives with the no-session code.
+    let mut problem = check::Problem::NoSession;
     let opened = match account {
-        Some(account) => App::open(&secrets.session_of(account), account, false)?,
+        Some(account) => match App::open(&secrets.session_of(account), account, false) {
+            Err(e) if crate::exit::from_chain(&e) == Some(crate::exit::ExitCode::NoSession) => {
+                problem = check::Problem::SignedOutHere;
+                None
+            }
+            opened => opened?,
+        },
         None => None,
     };
     match opened {
@@ -93,7 +106,7 @@ pub(super) async fn preflight(
                 backend: secrets.backend().as_str(),
             },
             verdict: Verdict::Failed,
-            problem: Some(check::Problem::NoSession),
+            problem: Some(problem),
         }),
     }
 
@@ -117,14 +130,17 @@ pub(super) async fn preflight(
         report.checked.push(line);
     } else if let Some(delivery) = delivery.as_ref() {
         let id = run_id(now, Pk::new(0));
-        let body = serde_json::to_string(&preflight_body(&id, now))?;
+        // In the format a report would go in: a Slack address refuses snob's
+        // JSON, so a check that posted it would fail where reports work.
+        let made = outgoing(delivery.format, preflight_body(&id, now), PREFLIGHT_SUMMARY);
         report.checked.push(
             check::webhook_of(
                 &delivery.client,
                 crate::watch::webhook::shown_str(&delivery.destination),
                 delivery.signed,
                 &id,
-                &body,
+                &made.body,
+                made.content_type,
             )
             .await,
         );

@@ -82,6 +82,14 @@ pub struct PageResponse {
     pub hops: u32,
     /// The body was longer than [`PageRequest::cap`] and was not kept.
     pub too_large: bool,
+    /// How long the answer took to arrive, in milliseconds: from the
+    /// `fetch()` to its headers, timed inside the tab (`FETCH` in
+    /// `headless/tab.rs`), so the owner's pipe and the DevTools protocol are
+    /// not in it, while the guard's pause on the request is, a few
+    /// milliseconds. `None` from what does not time it: a navigation, or an
+    /// owner from an older snob.
+    #[serde(default)]
+    pub waited_ms: Option<u32>,
 }
 
 impl PageResponse {
@@ -91,6 +99,12 @@ impl PageResponse {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
+    }
+
+    /// [`Self::waited_ms`] as a length of time.
+    pub fn waited(&self) -> Option<std::time::Duration> {
+        self.waited_ms
+            .map(|ms| std::time::Duration::from_millis(u64::from(ms)))
     }
 
     /// What Instagram said about its own load while answering, as the
@@ -138,6 +152,11 @@ pub enum PageError {
     /// nothing was sent as this one.
     #[error("{}", crate::error::IgError::SessionExpired)]
     LoggedOut,
+    /// The session's account was signed out of on this computer since the
+    /// session was read, so nothing was sent as it: refused by the caller,
+    /// never by Instagram.
+    #[error("{}", crate::error::IgError::SignedOutHere)]
+    SignedOutHere,
 }
 
 impl From<PageError> for crate::error::IgError {
@@ -150,6 +169,7 @@ impl From<PageError> for crate::error::IgError {
             PageError::NotAllowed(what) => Self::NotAllowed(what),
             PageError::NotReady(what) => Self::PageNotReady(what),
             PageError::LoggedOut => Self::SessionExpired,
+            PageError::SignedOutHere => Self::SignedOutHere,
         }
     }
 }

@@ -665,6 +665,68 @@ pub fn delete_partials(
     Ok(deleted)
 }
 
+/// A capture as `snob snapshots` lists it: every row, finished or not, with
+/// what the capture itself recorded about how it went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub snapshot: Snapshot,
+    /// `live` for a walk, `dyi` for Instagram's own export (`import dyi`).
+    pub source: String,
+    /// Whether it is a whole list, the only kind anything is compared with.
+    pub complete: bool,
+    /// How the walk ended (`StopReason::as_str`); `None` while it is open.
+    pub stopped_by: Option<String>,
+}
+
+/// Every capture of `account_pk`'s lists, of `kind` or of both, newest first.
+/// **Reads only**, and the partial ones too: the listing is where somebody
+/// finds out a walk stopped short, and why.
+pub fn listed(
+    conn: &Connection,
+    account_pk: Pk,
+    kind: Option<ListKind>,
+) -> Result<Vec<Listed>, StoreError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SNAPSHOT_COLUMNS}, source, complete, stopped_by
+         FROM snapshots
+         WHERE account_pk = ?1 AND (?2 IS NULL OR kind = ?2)
+         ORDER BY coalesce(taken_at, started_at) DESC, id DESC"
+    ))?;
+    let rows = stmt.query_map(
+        params![pk_to_sql(account_pk), kind.map(ListKind::as_str)],
+        |row| {
+            Ok(Listed {
+                snapshot: row_to_snapshot(row)?,
+                source: row.get(8)?,
+                complete: row.get::<_, i64>(9)? == 1,
+                stopped_by: row.get(10)?,
+            })
+        },
+    )?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Every whole capture of `account_pk`'s list of `kind`, newest first: what
+/// `snob changes` picks the two it compares from. Read from
+/// `usable_snapshots`, so a walk that stopped short is never one of them.
+pub fn usable(
+    conn: &Connection,
+    account_pk: Pk,
+    kind: ListKind,
+) -> Result<Vec<Snapshot>, StoreError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SNAPSHOT_COLUMNS}
+         FROM usable_snapshots
+         WHERE account_pk = ?1 AND kind = ?2
+         ORDER BY taken_at DESC, id DESC"
+    ))?;
+    let rows = stmt.query_map(
+        params![pk_to_sql(account_pk), kind.as_str()],
+        row_to_snapshot,
+    )?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// Reads one capture, by position, from [`SNAPSHOT_COLUMNS`].
 ///
 /// **The `kind` is parsed and not defaulted.** `FromStr for ListKind` exists
