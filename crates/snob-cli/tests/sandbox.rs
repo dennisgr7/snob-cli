@@ -790,6 +790,11 @@ async fn a_run_asked_for_before_it_is_due_sends_nothing() {
         .unwrap_or_default()
         .len();
 
+    // Nothing has started the interval's clock yet, and status says so.
+    let said = json(&snob(tmp.path(), None, &["watch", "status", "--json"]));
+    assert_eq!(said["next_run"]["at"], serde_json::Value::Null, "{said}");
+    assert_eq!(said["next_run"]["due_now"], false, "{said}");
+
     for _ in 0..2 {
         let out = snob(
             tmp.path(),
@@ -799,6 +804,12 @@ async fn a_run_asked_for_before_it_is_due_sends_nothing() {
         assert!(out.status.success(), "{}", stderr(&out));
         assert!(stderr(&out).contains("Not due yet"), "{}", stderr(&out));
     }
+
+    // The first ask started it: the next run is six hours on.
+    let said = json(&snob(tmp.path(), None, &["watch", "status", "--json"]));
+    let at = said["next_run"]["at"].as_i64().expect("a moment now");
+    let in_six_hours = snob_core::clock::now().get() + 6 * 3_600;
+    assert!((in_six_hours - at).abs() < 120, "{said}");
     assert_eq!(
         instagram
             .received_requests()

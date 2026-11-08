@@ -334,7 +334,7 @@ const _: () = assert!(NAP_FAR_SECS < snob_core::watch::schedule::MIN_GAP_SECS);
 /// Opened and closed here rather than held: the loop deliberately keeps no
 /// SQLite connection while it sleeps, so `snob purge` in another terminal is not
 /// blocked by a file this has open.
-fn last_started(paths: &AppPaths) -> Result<Option<Epoch>> {
+pub(super) fn last_started(paths: &AppPaths) -> Result<Option<Epoch>> {
     let mut latest = None;
     for account in account_databases(paths) {
         let Some(store) = snob_store::store::Store::open_existing(&account)? else {
@@ -385,6 +385,36 @@ fn seed_last_run(schedule: &Schedule, now: Epoch) -> Option<Epoch> {
 /// Kept in `shared.db`, because the monitor is one for every account. A seed an
 /// account's own database kept from before is copied there once, the earliest
 /// if several did.
+/// What [`seed_for`] would start from, read and never written: for `watch
+/// status`, which writes nothing. `None` on an interval that never started
+/// is a clock not yet started, which [`seed_for`] would start now.
+pub(super) fn seed_as_stored(paths: &AppPaths, schedule: &Schedule) -> Result<Option<Epoch>> {
+    if let Some(recorded) = last_started(paths)? {
+        return Ok(Some(recorded));
+    }
+    if schedule.is_on_a_calendar() {
+        return Ok(None);
+    }
+    let shared = snob_store::store::shared::Shared::read_existing(paths)?;
+    if let Some(seeded) = shared
+        .as_ref()
+        .map(|shared| shared.interval_seeded_at())
+        .transpose()?
+    {
+        return Ok(seeded);
+    }
+    let mut kept_before = None;
+    for account in account_databases(paths) {
+        let Some(store) = snob_store::store::Store::open_existing(&account)? else {
+            continue;
+        };
+        if let Some(at) = snob_store::store::watch::interval_seeded_at(store.conn())? {
+            kept_before = Some(kept_before.map_or(at, |earliest: Epoch| earliest.min(at)));
+        }
+    }
+    Ok(kept_before)
+}
+
 pub(super) fn seed_for(paths: &AppPaths, schedule: &Schedule, now: Epoch) -> Result<Option<Epoch>> {
     if let Some(recorded) = last_started(paths)? {
         return Ok(Some(recorded));

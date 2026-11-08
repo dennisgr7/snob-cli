@@ -916,7 +916,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   agent or a `schtasks` command that all run `watch once --when-due` every
   15 minutes, so the schedule is translated nowhere: the run asks the
   scheduled mode's evaluator (`schedule::due`, from `scheduled::seed_for`)
-  and, not due, reads no session and sends nothing; what a run reports
+  and, not due, reads no session and sends nothing; `watch status` says
+  when that evaluator next comes round (`next_run` in `--json`), from the
+  last run it would start from, read and never written
+  (`scheduled::seed_as_stored`), with no request; what a run reports
   as spent is what the
   pacer was charged, measured around the tick. Schedules: `--every` is a floor
   from the previous run and `--on/--at` or `--cron` a calendar; the next run

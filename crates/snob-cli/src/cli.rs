@@ -1656,7 +1656,8 @@ pub enum WatchCommand {
     )]
     Check(WatchCheckArgs),
 
-    /// What is configured, when it last ran, and what is still owed
+    /// What is configured, when it last ran and runs next, and what is still
+    /// owed
     Status(WatchStatusArgs),
 
     /// Send the reports still owed to the webhook, and nothing else

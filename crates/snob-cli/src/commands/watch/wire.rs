@@ -213,10 +213,23 @@ pub(super) fn status_json(
     health: &super::status::Health,
     last_runs: &[RunOf],
     marks: &[MarkOf],
+    next: Option<super::status::NextRun>,
 ) -> serde_json::Value {
+    use super::status::NextRun;
     serde_json::json!({
         "configured": configured,
         "config_path": config_path.display().to_string(),
+        // When the schedule next comes round, before any jitter, worked out
+        // with no request: `at` the moment (null while it is due now, or an
+        // interval waits for the monitor's first start), `due_now` whether
+        // it is owed already. Null with no schedule that can come round.
+        "next_run": next.map(|next| match next {
+            NextRun::At(at) => serde_json::json!({ "at": at, "at_iso": iso(at), "due_now": false }),
+            NextRun::Now => serde_json::json!({ "at": null, "at_iso": null, "due_now": true }),
+            NextRun::AfterFirstStart(_) => {
+                serde_json::json!({ "at": null, "at_iso": null, "due_now": false })
+            }
+        }),
         "deliveries": {
             // Split, because "the next run tries these" and "nothing here can
             // send these" are two facts.
