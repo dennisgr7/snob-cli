@@ -353,9 +353,23 @@ fn version_of(path: &std::path::Path) -> Option<String> {
 
 /// Off Windows the executable can be asked directly; it prints something like
 /// "Google Chrome 151.0.7922.47".
+///
+/// Started one at a time with the browsers (`pipe`), so that none of their
+/// pipes is caught open across this one's `exec`, and waited for after.
 #[cfg(not(windows))]
 fn version_of(path: &std::path::Path) -> Option<String> {
-    let output = Command::new(path).arg("--version").output().ok()?;
+    use std::process::Stdio;
+
+    let child = {
+        let _starting = crate::pipe::one_start_at_a_time();
+        Command::new(path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    let output = child.ok()?.wait_with_output().ok()?;
     full_version_from_text(&String::from_utf8_lossy(&output.stdout))
 }
 

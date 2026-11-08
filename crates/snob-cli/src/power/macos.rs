@@ -10,14 +10,19 @@ pub(super) struct Request(Child);
 /// `reason` is not passed on: `caffeinate` takes none, and `pmset -g
 /// assertions` names it, with snob's pid beside it.
 pub(super) fn request(_reason: &'static str) -> Option<Request> {
-    let spawned = Command::new("/usr/bin/caffeinate")
-        .arg("-i")
-        .arg("-w")
-        .arg(std::process::id().to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    // One start at a time with the browsers' (`pipe`), so that none of their
+    // pipes is caught open across this one's `exec`.
+    let spawned = {
+        let _starting = crate::pipe::one_start_at_a_time();
+        Command::new("/usr/bin/caffeinate")
+            .arg("-i")
+            .arg("-w")
+            .arg(std::process::id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    };
     match spawned {
         Ok(child) => Some(Request(child)),
         Err(e) => {

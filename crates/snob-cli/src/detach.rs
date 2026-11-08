@@ -26,9 +26,13 @@
 //! the process goes with the job. A cgroup is not left either: a process
 //! started from a systemd unit ends with the unit.
 //!
-//! **It keeps the command's environment, for its whole life.** Whatever the
+//! **It keeps the command's environment, for its whole life**, but for
+//! `jobs::NEVER_INHERITED`: the key of `snob mcp` served over the network, a
+//! client's copy of it, and the cooldown's escape hatch. Whatever else the
 //! command was started with, a bare one from a cron job or a systemd unit
-//! included, is what the process has until it leaves.
+//! included, is what the process has until it leaves. The browsers are
+//! started without the same three (`pipe`), so the owner of the browsers and
+//! every browser it starts hold none of them, whichever command started it.
 //!
 //! It runs from the root of the system drive, so it holds no directory
 //! anybody may want to remove or unmount — the data directory included, which
@@ -72,6 +76,52 @@ pub(crate) fn spawn(
     stderr: &Path,
 ) -> io::Result<Started> {
     platform::spawn(program, args, &neutral_dir(), stdout, stderr)
+}
+
+/// Whether `name` is one of `jobs::NEVER_INHERITED`, compared as Windows
+/// compares names, without case: `snob_mcp_key` is the same variable.
+#[cfg(windows)]
+fn never_inherited(name: &std::ffi::OsStr) -> bool {
+    crate::jobs::NEVER_INHERITED
+        .iter()
+        .any(|kept| name.eq_ignore_ascii_case(kept))
+}
+
+/// Takes `jobs::NEVER_INHERITED` out of what `command` passes on.
+#[cfg(unix)]
+pub(crate) fn without_what_is_never_inherited(command: &mut std::process::Command) {
+    for name in crate::jobs::NEVER_INHERITED {
+        command.env_remove(name);
+    }
+}
+
+/// The environment block `CreateProcessW` takes with
+/// `CREATE_UNICODE_ENVIRONMENT`: `vars` (this process's, from
+/// `std::env::vars_os`) without `jobs::NEVER_INHERITED`, each `name=value`
+/// wide and ended by a NUL, sorted by name without case as the system keeps
+/// them, and a NUL after the last.
+#[cfg(windows)]
+pub(crate) fn environment_block(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut kept: Vec<(OsString, OsString)> = vars
+        .into_iter()
+        .filter(|(name, _)| !never_inherited(name))
+        .collect();
+    kept.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_uppercase());
+    let mut block = Vec::new();
+    for (name, value) in kept {
+        block.extend(name.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(value.encode_wide());
+        block.push(0);
+    }
+    // An empty block is two NULs: one for the absent first entry.
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    block
 }
 
 /// A directory that is always there and nobody removes.
@@ -140,6 +190,7 @@ mod platform {
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr);
+        super::without_what_is_never_inherited(&mut command);
         // SAFETY: `setsid` is async-signal-safe and touches no memory, which
         // is the whole of what `pre_exec` asks.
         unsafe {
@@ -150,7 +201,12 @@ mod platform {
                 Ok(())
             });
         }
-        let mut child = command.spawn()?;
+        // One start at a time with the browsers' (`pipe`), so that none of
+        // their pipes is caught open across this one's `exec`.
+        let mut child = {
+            let _starting = crate::pipe::one_start_at_a_time();
+            command.spawn()?
+        };
         // Reaped by whoever is still here when it leaves: a command that
         // outlives it — a monitor — would otherwise keep a finished process
         // as a zombie until it exits itself.
@@ -179,11 +235,11 @@ mod platform {
         WAIT_OBJECT_0,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS,
-        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-        InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-        STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT,
+        CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
+        LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     /// Its process handle, to ask whether it has left.
@@ -249,6 +305,7 @@ mod platform {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         let dir = crate::pipe::wide(&dir.display().to_string());
+        let environment = super::environment_block(std::env::vars_os());
 
         let mut attribute_size: usize = 0;
         // SAFETY: asks for the size; fails by design.
@@ -291,7 +348,10 @@ mod platform {
         startup.StartupInfo.hStdError = errors;
         startup.lpAttributeList = attributes;
 
-        let plain = EXTENDED_STARTUPINFO_PRESENT | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+        let plain = EXTENDED_STARTUPINFO_PRESENT
+            | DETACHED_PROCESS
+            | CREATE_NEW_PROCESS_GROUP
+            | CREATE_UNICODE_ENVIRONMENT;
         let mut result: io::Result<super::Started> =
             Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
         for (flags, left_job) in [(plain | CREATE_BREAKAWAY_FROM_JOB, true), (plain, false)] {
@@ -308,7 +368,7 @@ mod platform {
                     std::ptr::null(),
                     1,
                     flags,
-                    std::ptr::null(),
+                    environment.as_ptr().cast(),
                     dir.as_ptr(),
                     &startup.StartupInfo,
                     &mut information,
@@ -405,6 +465,56 @@ mod tests {
             .map(|e| e.expect("an entry").file_name())
             .collect();
         assert_eq!(names, ["err.log"]);
+    }
+
+    /// The key of `snob mcp`, a client's copy and the escape hatch are not
+    /// in what a detached process or a browser is started with, whatever
+    /// their case on Windows; everything else is, in the system's order.
+    #[cfg(windows)]
+    #[test]
+    fn the_environment_passed_on_holds_nothing_never_inherited() {
+        let vars = [
+            ("Path", r"C:\Windows"),
+            ("SNOB_MCP_KEY", "snob_mcp_secret"),
+            ("snob_mcp_token", "snob_mcp_secret"),
+            ("SNOB_IGNORE_COOLDOWN", "1"),
+            ("SNOB_NO_BROWSER", "1"),
+            ("=C:", r"C:\"),
+            ("ComSpec", r"C:\Windows\system32\cmd.exe"),
+        ]
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)));
+        let block = environment_block(vars);
+        assert_eq!(&block[block.len() - 2..], [0, 0]);
+        let entries: Vec<String> = String::from_utf16(&block[..block.len() - 2])
+            .unwrap()
+            .split('\0')
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                r"=C:=C:\",
+                r"ComSpec=C:\Windows\system32\cmd.exe",
+                r"Path=C:\Windows",
+                "SNOB_NO_BROWSER=1",
+            ]
+        );
+        assert_eq!(environment_block(std::iter::empty()), [0, 0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_environment_passed_on_holds_nothing_never_inherited() {
+        let mut command = std::process::Command::new("true");
+        without_what_is_never_inherited(&mut command);
+        let removed: Vec<&std::ffi::OsStr> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name)
+            .collect();
+        for name in crate::jobs::NEVER_INHERITED {
+            assert!(removed.contains(&std::ffi::OsStr::new(name)), "{name}");
+        }
     }
 
     #[test]
