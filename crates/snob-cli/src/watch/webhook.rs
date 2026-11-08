@@ -282,8 +282,14 @@ fn without_address(text: &str, url: &Url) -> String {
         return text.to_string();
     }
     let mut text = text.replace(url.as_str(), &shown);
+    // **Not a path that is only `/`**: a host that is itself the secret
+    // (`<secret>.m.pipedream.net`) is shown with `/...` for its root, and
+    // replacing every `/` in the text would garble all of it, the address
+    // just scrubbed and the receiver's `HTTP/1.1` included, while hiding
+    // nothing.
     if let Ok(clean) = Url::parse(&shown)
         && clean.path() != url.path()
+        && !url.path().trim_matches('/').is_empty()
     {
         text = text.replace(url.path(), clean.path());
     }
@@ -919,6 +925,16 @@ mod tests {
                 &pipedream
             ),
             "certificate not valid for name \"....m.pipedream.net\""
+        );
+        // Its usual address has no path, and the root is no secret to hide:
+        // the rest of the text keeps its slashes.
+        let root = Url::parse("https://eoabc123.m.pipedream.net").unwrap();
+        assert_eq!(
+            without_address(
+                "502 Bad Gateway: HTTP/1.1 from https://eoabc123.m.pipedream.net/",
+                &root
+            ),
+            "502 Bad Gateway: HTTP/1.1 from https://....m.pipedream.net/..."
         );
         // What came before an `@` is somebody's credential, a `://` in the
         // path is no scheme, and a host that does not parse is still a host.
