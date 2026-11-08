@@ -57,12 +57,14 @@ fn render(kind: UnitKind, exe: &str) -> String {
 /// and 130 (held for a critical battery), which are a run declining to run,
 /// not a failing unit; `Persistent` runs a start the machine slept through.
 fn systemd(exe: &str) -> String {
-    // systemd reads `%` as a specifier and splits on spaces outside quotes.
+    // systemd reads `%` as a specifier, `$` as a variable, quoted or not,
+    // and splits on spaces outside quotes.
     let quoted = format!(
         "\"{}\"",
         exe.replace('\\', "\\\\")
             .replace('"', "\\\"")
             .replace('%', "%%")
+            .replace('$', "$$")
     );
     format!(
         "# ~/.config/systemd/user/snob-watch.service\n\
@@ -162,6 +164,7 @@ mod tests {
     use super::*;
 
     const EXE: &str = "/opt/snob 100%/bin/snob";
+    const DOLLAR: &str = "/opt/$HOME/snob";
 
     #[test]
     fn every_unit_runs_the_same_command_on_the_same_cadence() {
@@ -186,6 +189,7 @@ mod tests {
     #[test]
     fn the_path_is_quoted_as_each_scheduler_reads_it() {
         assert!(systemd(EXE).contains("ExecStart=\"/opt/snob 100%%/bin/snob\" watch once"));
+        assert!(systemd(DOLLAR).contains("ExecStart=\"/opt/$$HOME/snob\" watch once"));
         assert!(cron(EXE).contains("'/opt/snob 100\\%/bin/snob' watch once"));
         assert!(launchd("/a&b/snob").contains("<string>/a&amp;b/snob</string>"));
         assert!(
