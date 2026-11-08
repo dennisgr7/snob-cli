@@ -584,6 +584,24 @@ async fn changes_between_two_captures_name_who_left_and_who_was_renamed() {
         stderr(&out)
     );
 
+    // The newest against nothing newer, or the oldest against nothing older,
+    // is no comparison, and says which is missing rather than that fewer
+    // than two are stored.
+    for (flag, at, missing) in [
+        ("--from", 0, "no whole capture newer than"),
+        ("--to", 1, "no whole capture older than"),
+    ] {
+        let id = listed[at]["id"].to_string();
+        let out = snob(
+            tmp.path(),
+            None,
+            &["changes", flag, &id, "--format", "json"],
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(json(&out)["lists"][0]["from"], serde_json::Value::Null);
+        assert!(stderr(&out).contains(missing), "{flag}: {}", stderr(&out));
+    }
+
     // An id that is no whole capture is refused, not stepped over.
     let out = snob(
         tmp.path(),

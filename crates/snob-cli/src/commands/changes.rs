@@ -38,6 +38,20 @@ struct Compared {
     /// Said beside the result when the earlier capture is not the one
     /// `--since` asked for: none is that old.
     note: Option<String>,
+    /// With no comparison, the whole capture there was nothing to compare
+    /// with, and on which side the other one is missing; `None` when fewer
+    /// than two whole captures are stored at all.
+    alone: Option<(snapshots::Snapshot, Missing)>,
+}
+
+/// Which capture of a pair there was none of.
+#[derive(Clone, Copy)]
+enum Missing {
+    /// None was taken after it: the newest, picked by `--from` or by a
+    /// `--since` no capture is newer than.
+    Later,
+    /// None was taken before it: the oldest, picked by `--to`.
+    Earlier,
 }
 
 pub fn run(args: ChangesArgs, account: &AccountPaths) -> Result<ExitCode> {
@@ -127,6 +141,7 @@ fn compare(
     // Newest first.
     let whole = snapshots::usable(store.conn(), pk, kind)?;
     let mut note = None;
+    let mut alone = None;
     let between = if let Some(from) = args.from {
         let from = usable_of(store, pk, from)?;
         let to = match args.to {
@@ -136,13 +151,22 @@ fn compare(
         if to.kind != from.kind {
             bail!("captures {} and {} are of different lists", from.id, to.id);
         }
-        Some(earlier_first(from, to))
+        // A capture against itself is no comparison, as below.
+        if from.id == to.id {
+            alone = Some((from, Missing::Later));
+            None
+        } else {
+            Some(earlier_first(from, to))
+        }
     } else if let Some(to) = args.to {
         let to = usable_of(store, pk, to)?;
         let from = whole
             .iter()
             .find(|older| older.taken_at < to.taken_at)
             .cloned();
+        if from.is_none() {
+            alone = Some((to.clone(), Missing::Earlier));
+        }
         from.map(|from| (from, to))
     } else {
         let after = whole.first().cloned();
@@ -173,6 +197,12 @@ fn compare(
         };
         match (before, after) {
             (Some(before), Some(after)) if before.id != after.id => Some((before, after)),
+            // The newest is as old as `--since` reaches: nothing was taken
+            // after it, which is not the same as two never being stored.
+            (Some(newest), Some(_)) if whole.len() > 1 => {
+                alone = Some((newest, Missing::Later));
+                None
+            }
             _ => None,
         }
     };
@@ -184,6 +214,7 @@ fn compare(
             diff: ListDiff::default(),
             renamed: Vec::new(),
             note,
+            alone,
         });
     };
     let diff = ListDiff::between(
@@ -202,6 +233,7 @@ fn compare(
         diff,
         renamed,
         note,
+        alone: None,
     })
 }
 
@@ -219,11 +251,27 @@ fn earlier_first(
 /// The sentence on standard error for one list.
 fn said(whose: &str, one: &Compared) -> String {
     let Some((before, after)) = &one.between else {
-        return format!(
-            "{whose}'s {} list has fewer than two whole captures stored, so there is nothing \
-             to compare yet; a later walk gives one.",
-            one.kind
-        );
+        return match &one.alone {
+            Some((capture, Missing::Later)) => format!(
+                "{whose}'s {} list has no whole capture newer than the one of {} ({}), so \
+                 there is nothing to compare it with yet; a later walk gives one.",
+                one.kind,
+                report::stored_on(capture.taken_at.unwrap_or_default()),
+                capture.id,
+            ),
+            Some((capture, Missing::Earlier)) => format!(
+                "{whose}'s {} list has no whole capture older than the one of {} ({}), so \
+                 there is nothing to compare it with.",
+                one.kind,
+                report::stored_on(capture.taken_at.unwrap_or_default()),
+                capture.id,
+            ),
+            None => format!(
+                "{whose}'s {} list has fewer than two whole captures stored, so there is \
+                 nothing to compare yet; a later walk gives one.",
+                one.kind
+            ),
+        };
     };
     format!(
         "{whose}'s {}: {} gained, {} lost, {} renamed, between the capture of {} ({}) and the \
