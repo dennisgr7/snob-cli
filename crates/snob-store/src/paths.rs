@@ -403,8 +403,37 @@ impl AccountPaths {
     /// compared for equality, never ordered**: the clock that stamped them
     /// may have been set back since, which would make a later login look
     /// older.
+    ///
+    /// **Every rewrite of it holds [`Self::signed_in_lock`]**: a sign-out,
+    /// a login let in, and a full list trimmed. Only making it where there
+    /// is none goes without ([`start_signed_out`]), since a file made new
+    /// cannot put back anything another process took out.
     pub fn signed_in(&self) -> PathBuf {
         self.dir().join(SIGNED_IN)
+    }
+
+    /// The lock beside [`Self::signed_in`] that its writers take, one at a
+    /// time, in this process or another ([`lock_file`]).
+    ///
+    /// Why: a login that finds the list full reads it, writes a trimmed copy
+    /// beside it and moves that over it. A sign-out that emptied the list
+    /// between the read and the move would be undone by the move, and the
+    /// sessions it signed out of would be sent as again. Holding this, the
+    /// sign-out waits for the move and empties what it left, or the login
+    /// waits for the sign-out and reads the empty list. A separate file
+    /// because the list itself is replaced, and a lock held on the file it
+    /// replaced holds nothing. Readers ([`Self::refuses_session`]) take
+    /// none: the move and the appended lines are each seen whole.
+    pub fn signed_in_lock(&self) -> PathBuf {
+        self.dir().join(SIGNED_IN_LOCK)
+    }
+
+    /// Takes [`Self::signed_in_lock`], waiting for whoever holds it; held
+    /// until the file returned is dropped. Never makes the account's
+    /// directory: with none it fails as `NotFound`.
+    fn hold_signed_in(&self) -> std::io::Result<std::fs::File> {
+        pause_at(Seam::Locking);
+        lock_file(&self.signed_in_lock())
     }
 
     /// Signs the account out for every process on this machine: from now
@@ -415,9 +444,13 @@ impl AccountPaths {
     /// refuses every session, and one made again starts empty
     /// ([`Self::ensure_dirs`]).
     pub fn sign_out(&self) -> std::io::Result<()> {
-        if !self.dir().try_exists()? {
-            return Ok(());
-        }
+        // The lock's file is made in the directory, never the directory, so
+        // one that is gone, or goes as this looks, is not made again.
+        let _held = match self.hold_signed_in() {
+            Ok(held) => held,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
         std::fs::File::create(self.signed_in()).map(drop)
     }
 
@@ -438,15 +471,29 @@ impl AccountPaths {
     /// first: a session that many logins ago is refused, and a walk still
     /// holding it after so many logins without a logout is not one to go on.
     pub fn admit_session(&self, made: snob_core::Epoch) -> Result<(), PathError> {
-        use std::io::Write as _;
         self.ensure_dirs()?;
+        let _held = self.hold_signed_in().map_err(|source| PathError::Write {
+            path: self.signed_in_lock(),
+            source,
+        })?;
+        self.admit_session_held(made)
+    }
+
+    /// [`Self::admit_session`], for a caller holding
+    /// [`Self::signed_in_lock`]. Never takes it again: a second lock on the
+    /// same file, through another handle, waits for the first even in the
+    /// same process.
+    fn admit_session_held(&self, made: snob_core::Epoch) -> Result<(), PathError> {
+        use std::io::Write as _;
         let list = self.signed_in();
         let wrote = |source| PathError::Write {
             path: list.clone(),
             source,
         };
         let line = format!("{}\n", made.get());
-        let mut admitted = match std::fs::read(&list) {
+        let read = std::fs::read(&list);
+        pause_at(Seam::Read);
+        let mut admitted = match read {
             Ok(bytes) => sessions_in(&bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 match std::fs::OpenOptions::new()
@@ -468,8 +515,7 @@ impl AccountPaths {
         }
         if admitted.len() < SIGNED_IN_KEPT {
             // Appended, one write of a whole line: a reader sees it whole or
-            // not at all ([`sessions_in`] takes only finished lines), and a
-            // sign-out that emptied the list meanwhile leaves it the one line.
+            // not at all ([`sessions_in`] takes only finished lines).
             return std::fs::OpenOptions::new()
                 .append(true)
                 .open(&list)
@@ -480,6 +526,8 @@ impl AccountPaths {
         admitted.push(made.get());
         let text: String = admitted.iter().map(|at| format!("{at}\n")).collect();
         // Written beside and moved over it, so no reader sees it half done.
+        // **Only under the lock**: the move puts back what was read, and a
+        // sign-out since would be undone ([`Self::signed_in_lock`]).
         let beside = list.with_extension(format!("{}", std::process::id()));
         std::fs::write(&beside, text)
             .and_then(|()| std::fs::rename(&beside, &list))
@@ -507,32 +555,48 @@ impl AccountPaths {
     /// what it names, and only the login's own line goes onto it; adding the
     /// stored session to it would let back in the very session that logout
     /// signed out.
+    ///
+    /// Both steps under one hold of [`Self::signed_in_lock`], so no
+    /// sign-out comes between the look for a list and the line added to it.
     pub fn admit_login(
         &self,
         made: snob_core::Epoch,
         kept: Option<snob_core::Epoch>,
     ) -> Result<(), PathError> {
         use std::io::Write as _;
-        if let Some(kept) = kept
-            && self.dir().is_dir()
-        {
-            let list = self.signed_in();
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&list)
-            {
-                Ok(mut file) => {
-                    let lines = format!("{}\n{}\n", kept.get(), made.get());
-                    return file
-                        .write_all(lines.as_bytes())
-                        .map_err(|source| PathError::Write { path: list, source });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(source) => return Err(PathError::Write { path: list, source }),
+        let Some(kept) = kept else {
+            return self.admit_session(made);
+        };
+        // With no directory, nothing from before is let in: the one a login
+        // makes starts empty ([`Self::ensure_dirs`]).
+        let _held = match self.hold_signed_in() {
+            Ok(held) => held,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return self.admit_session(made);
             }
+            Err(source) => {
+                return Err(PathError::Write {
+                    path: self.signed_in_lock(),
+                    source,
+                });
+            }
+        };
+        let list = self.signed_in();
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&list)
+        {
+            Ok(mut file) => {
+                let lines = format!("{}\n{}\n", kept.get(), made.get());
+                file.write_all(lines.as_bytes())
+                    .map_err(|source| PathError::Write { path: list, source })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.admit_session_held(made)
+            }
+            Err(source) => Err(PathError::Write { path: list, source }),
         }
-        self.admit_session(made)
     }
 
     /// Whether the session made at `made` may no longer be sent as: the
@@ -556,6 +620,44 @@ pub const SIGNED_IN_KEPT: usize = 64;
 
 /// The name of [`AccountPaths::signed_in`] in an account's directory.
 const SIGNED_IN: &str = "signed-in";
+
+/// The name of [`AccountPaths::signed_in_lock`] in an account's directory.
+const SIGNED_IN_LOCK: &str = "signed-in.lock";
+
+/// The points in a rewrite of [`AccountPaths::signed_in`] where a test may
+/// hold one thread still, to put another's rewrite in between
+/// ([`pause_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seam {
+    /// About to take [`AccountPaths::signed_in_lock`].
+    Locking,
+    /// A login has read the list and not yet written it.
+    Read,
+}
+
+/// What a test runs at a [`Seam`], on its own thread.
+#[cfg(test)]
+type Pause = Box<dyn Fn(Seam)>;
+
+#[cfg(test)]
+thread_local! {
+    /// What [`pause_at`] runs on this thread, set by a test; nothing by
+    /// default. Per thread, so the other tests, running beside it in the
+    /// same process, are never held.
+    static PAUSE: std::cell::RefCell<Option<Pause>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Nothing outside the tests; in them, whatever this thread's [`PAUSE`] says.
+fn pause_at(seam: Seam) {
+    #[cfg(test)]
+    PAUSE.with_borrow(|pause| {
+        if let Some(pause) = pause {
+            pause(seam);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = seam;
+}
 
 /// Starts the list of who is signed in ([`AccountPaths::signed_in`]),
 /// empty, in `dir`, a directory that is, or is about to become, an
@@ -1630,6 +1732,71 @@ mod tests {
         account.admit_login(login, None).unwrap();
         assert!(account.refuses_session(stored));
         assert!(!account.refuses_session(login));
+    }
+
+    /// **A sign-out that comes while a login trims a full list is not
+    /// undone by it.** The login has read the list and is about to move a
+    /// trimmed copy over it; the sign-out waits for that move and then
+    /// empties what it left, so every session the account had is refused,
+    /// the login's own included, as a sign-out after it would leave them.
+    /// Without the lock the sign-out empties the list first, and the move
+    /// puts the sessions back.
+    #[test]
+    fn a_sign_out_while_a_login_trims_the_list_is_not_undone() {
+        use std::sync::mpsc::channel;
+        let root = tempfile::tempdir().unwrap();
+        let account = AppPaths::rooted_at(root.path()).account(snob_core::Pk::new(42));
+        account.ensure_dirs().unwrap();
+        let login = |n: usize| snob_core::Epoch::new(1_800_000_000 + i64::try_from(n).unwrap());
+        for n in 0..SIGNED_IN_KEPT {
+            account.admit_session(login(n)).unwrap();
+        }
+
+        // The login that trims, held once it has read the full list.
+        let (read, has_read) = channel();
+        let (go_on, told_to_go_on) = channel::<()>();
+        let trimming = std::thread::spawn({
+            let account = account.clone();
+            move || {
+                PAUSE.set(Some(Box::new(move |seam| {
+                    if seam == Seam::Read {
+                        read.send(()).unwrap();
+                        told_to_go_on.recv().unwrap();
+                    }
+                })));
+                account.admit_session(login(SIGNED_IN_KEPT)).unwrap();
+            }
+        });
+        has_read.recv().unwrap();
+
+        let (locking, is_locking) = channel();
+        let signing_out = std::thread::spawn({
+            let account = account.clone();
+            move || {
+                PAUSE.set(Some(Box::new(move |seam| {
+                    if seam == Seam::Locking {
+                        locking.send(()).unwrap();
+                    }
+                })));
+                account.sign_out().unwrap();
+            }
+        });
+        is_locking.recv().unwrap();
+        // Ample for a sign-out that does not wait to empty a 64-line file.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !signing_out.is_finished(),
+            "the sign-out waits for the login that read the list"
+        );
+
+        go_on.send(()).unwrap();
+        trimming.join().unwrap();
+        signing_out.join().unwrap();
+        for n in 0..=SIGNED_IN_KEPT {
+            assert!(account.refuses_session(login(n)), "{n} was let back in");
+        }
+        account.admit_session(login(SIGNED_IN_KEPT + 1)).unwrap();
+        assert!(!account.refuses_session(login(SIGNED_IN_KEPT + 1)));
     }
 
     /// The jobs directory is made only inside the account's directory, never

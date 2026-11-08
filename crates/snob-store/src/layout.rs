@@ -266,16 +266,18 @@ pub fn unadopt(paths: &AppPaths, pk: Pk) -> Result<bool, LayoutError> {
 }
 
 /// Removes the account's directory when all it holds is its list of who is
-/// signed in, as [`adopt`] made it and a login that did not happen left it.
+/// signed in, as [`adopt`] made it and a login that did not happen left it,
+/// with the lock its writers take (`AccountPaths::signed_in_lock`), which
+/// holds nothing of the account's.
 /// Moved aside first and removed there, so nothing finds the directory
 /// without its list on the way: with none it would send as every session.
 /// Gone, it refuses them all, as the list did.
 fn remove_if_only_the_list(account: &AccountPaths) {
     let dir = account.dir();
     let only_the_list = std::fs::read_dir(&dir).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .all(|entry| entry.path() == account.signed_in())
+        entries.flatten().all(|entry| {
+            entry.path() == account.signed_in() || entry.path() == account.signed_in_lock()
+        })
     });
     if !only_the_list {
         return;

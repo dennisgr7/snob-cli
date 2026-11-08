@@ -381,7 +381,10 @@ with a documented reason in the same place.
   the account out for every other process** (`owner::sign_out`: the
   account's `signed-in` list emptied, `AccountPaths::signed_in`, which names
   the sessions that may be sent as by their `created_at`, compared for
-  equality only, so no clock set back can refuse a login): a walk typed
+  equality only, so no clock set back can refuse a login; **every rewrite
+  of it holds `signed-in.lock` beside it**, `AccountPaths::signed_in_lock`,
+  so a login trimming a full list cannot put back what a sign-out emptied
+  meanwhile): a walk typed
   elsewhere, the monitor's run or an agent's call still holding a session
   in memory is refused its next request, by itself, by the owner and by
   the browser's holder once it has the account's browser (before every
