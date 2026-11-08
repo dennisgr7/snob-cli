@@ -62,7 +62,7 @@ Rust 2024 edition, resolver 3. Dependency direction is one-way:
 | `crates/snob-core` | Domain: `Pk`, models (the JSON contract), set arithmetic, `watch` diff, schedule (cron and `--on/--at/--every`), webhook signing (HMAC-SHA256) and the one constant-time comparison (`watch::sign::same`), `Secret`, `Session`, the `RateBudget` trait and cooldown policy, `clock` | **No I/O.** No file, database, network or directory; `clock` is the single exception |
 | `crates/snob-ig` | Instagram web client: `client/` (`read.rs`, `write.rs`, `transport.rs`, `headers.rs`, `cdn.rs`, `media.rs`, `page.rs`, `ask.rs`, `posts.rs`), `web.rs` (calls built as the web app builds them), `allowlist.rs`, `pager.rs` (list walks), `pace.rs`, `graphql.rs`, `error.rs` (classifying answers), `http.rs` (the only place `reqwest` is configured; re-exported) | No SQLite, no keyring, no browser driving (it defines the page request shape only) |
 | `crates/snob-store` | SQLite (`store/`, migrations in `store/sql/`), platform paths, keyring/file secret store, account registry (`accounts.toml`), the monitor's `watch.toml`, layout migration | Domain logic that belongs in `snob-core` |
-| `crates/snob-cli` | `cli.rs` (clap), `main.rs`, `app.rs` (wires everything), `commands/`, `engine/` (rules: cache, consent, cooldown, walks, estimates, monitor), `output/`, `report.rs` (shared sentences), `ui/` (ratatui views), `headless/` + `cdp/` + `pipe.rs` (the browser), `owner/` (one background process that owns the browsers), `detach.rs` (starting a process that outlives its command, with nothing of the command's), `jobs/` (a list walk run as a job that outlives the call that started it: the hidden `__job start|run|show|list|cancel`, and `snob jobs`), `relay/` (`login --remote`), `power/`, `watch/webhook.rs`, `commands/mcp/` (the MCP server, feature `mcp`; over HTTP, `mcp-http`) | |
+| `crates/snob-cli` | `cli.rs` (clap), `main.rs`, `app.rs` (wires everything), `commands/`, `engine/` (rules: cache, consent, cooldown, walks, estimates, monitor), `output/`, `report.rs` (shared sentences), `ui/` (ratatui views), `headless/` + `cdp/` + `pipe.rs` (the browser), `owner/` (one background process that owns the browsers), `detach.rs` (starting a process that outlives its command, with nothing of the command's), `exe.rs` (the path to this binary that survives an upgrade, for what `mcp config` and `watch unit` print), `jobs/` (a list walk run as a job that outlives the call that started it: the hidden `__job start|run|show|list|cancel`, and `snob jobs`), `relay/` (`login --remote`), `power/`, `watch/webhook.rs`, `commands/mcp/` (the MCP server, feature `mcp`; over HTTP, `mcp-http`) | |
 
 Layering rules inside `snob-cli`:
 
@@ -909,7 +909,12 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   not arrive; `watch deliver` (`commands/watch/deliver.rs`) is that drain
   alone, with no session and no request to Instagram, sending what is owed
   to the webhook's address without waiting out each row's backoff
-  (`deliveries::owed_now`), and exits 1 the same way; what a run reports
+  (`deliveries::owed_now`), and exits 1 the same way; `watch unit` prints
+  (never installs) a systemd service and timer, a crontab line, a launch
+  agent or a `schtasks` command that all run `watch once --when-due` every
+  15 minutes, so the schedule is translated nowhere: the run asks the
+  scheduled mode's evaluator (`schedule::due`, from `scheduled::seed_for`)
+  and, not due, reads no session and sends nothing; what a run reports
   as spent is what the
   pacer was charged, measured around the tick. Schedules: `--every` is a floor
   from the previous run and `--on/--at` or `--cron` a calendar; the next run

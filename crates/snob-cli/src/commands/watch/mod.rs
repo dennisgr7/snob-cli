@@ -47,6 +47,7 @@ mod diff;
 mod once;
 mod run;
 mod scheduled;
+mod unit;
 
 /// What a run is told before it starts — which accounts it is for and on what
 /// schedule — and, for `check` and `setup`, whether any of it would work at
@@ -65,6 +66,7 @@ use deliver::deliver;
 use diff::diff;
 use once::once;
 use scheduled::scheduled;
+use unit::unit;
 
 /// Runs the monitor. `account` is the account resolved for this run, when any
 /// is signed in; a watched entry that names no viewer is read as it.
@@ -83,6 +85,7 @@ pub async fn run(
         Some(WatchCommand::Setup(args)) => setup::setup(args, secrets, paths, account).await,
         Some(WatchCommand::Status(args)) => status::status(args, paths, account),
         Some(WatchCommand::Deliver(args)) => deliver(args, secrets, paths).await,
+        Some(WatchCommand::Unit(args)) => unit(args),
         // With nobody signed in there is nobody to read any entry as, and a
         // service started then would read the entries that name no viewer as
         // nobody for as long as it ran.

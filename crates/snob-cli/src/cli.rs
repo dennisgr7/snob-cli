@@ -1632,6 +1632,46 @@ pub enum WatchCommand {
                       Exits 1 (reason not_delivered) when a report it tried did not arrive."
     )]
     Deliver(WatchDeliverArgs),
+
+    /// Print what to give a scheduler: systemd, cron, launchd or schtasks
+    #[command(
+        after_help = "Prints and installs nothing. Every unit runs \"snob watch once \
+                      --when-due\" every 15 minutes, and the run decides whether the schedule \
+                      in watch.toml says it is due, so the schedule is kept in one place and \
+                      a run that is not due sends nothing.\n\n\
+                      With no argument, the unit for this system: systemd on Linux, launchd \
+                      on macOS, schtasks on Windows. The path printed is one that survives an \
+                      upgrade where the installer keeps one."
+    )]
+    Unit(WatchUnitArgs),
+}
+
+#[derive(Args, Debug, Default)]
+pub struct WatchUnitArgs {
+    /// Which scheduler. Defaults to this system's own
+    pub kind: Option<UnitKind>,
+}
+
+/// The schedulers `snob watch unit` prints for.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitKind {
+    Systemd,
+    Cron,
+    Launchd,
+    Schtasks,
+}
+
+impl UnitKind {
+    /// The scheduler this system comes with.
+    pub fn of_this_platform() -> Self {
+        if cfg!(windows) {
+            Self::Schtasks
+        } else if cfg!(target_os = "macos") {
+            Self::Launchd
+        } else {
+            Self::Systemd
+        }
+    }
 }
 
 #[derive(Args, Debug, Default)]
@@ -1705,6 +1745,12 @@ pub struct WatchOnceArgs {
     // which is the only thing an unattended run accepts.
     #[arg(value_parser = username)]
     pub target: Option<String>,
+
+    /// Run only if the schedule in watch.toml says a run is due, and
+    /// otherwise exit 0 having sent nothing. For a timer that asks often:
+    /// "snob watch unit" prints one
+    #[arg(long)]
+    pub when_due: bool,
 
     #[command(flatten)]
     pub output: StatusOutputArgs,

@@ -776,6 +776,54 @@ async fn watch_deliver_sends_what_is_owed_and_nothing_to_instagram() {
     assert_eq!(posted(&hook).await.len(), 2);
 }
 
+/// A timer that asks before the schedule says a run is due gets a 0 and
+/// spends nothing: the first ask of an interval only starts its clock.
+#[tokio::test]
+async fn a_run_asked_for_before_it_is_due_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    configure(tmp.path(), "schema = 1\nevery = \"6h\"\n");
+    let asked = instagram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .len();
+
+    for _ in 0..2 {
+        let out = snob(
+            tmp.path(),
+            Some(&instagram),
+            &["watch", "once", "--when-due"],
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(stderr(&out).contains("Not due yet"), "{}", stderr(&out));
+    }
+    assert_eq!(
+        instagram
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len(),
+        asked,
+        "nothing was asked of Instagram"
+    );
+
+    // With no schedule anywhere there is nothing to be due on.
+    configure(tmp.path(), "schema = 1\n");
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["watch", "once", "--when-due"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("how often should this run"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 /// A stranger's lists are not read on an answer nobody gave.
 ///
 /// The domain rule, asserted of the program rather than of a function: an

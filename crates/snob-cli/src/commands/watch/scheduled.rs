@@ -385,7 +385,7 @@ fn seed_last_run(schedule: &Schedule, now: Epoch) -> Option<Epoch> {
 /// Kept in `shared.db`, because the monitor is one for every account. A seed an
 /// account's own database kept from before is copied there once, the earliest
 /// if several did.
-fn seed_for(paths: &AppPaths, schedule: &Schedule, now: Epoch) -> Result<Option<Epoch>> {
+pub(super) fn seed_for(paths: &AppPaths, schedule: &Schedule, now: Epoch) -> Result<Option<Epoch>> {
     if let Some(recorded) = last_started(paths)? {
         return Ok(Some(recorded));
     }
