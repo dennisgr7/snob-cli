@@ -665,14 +665,6 @@ pub fn delete_partials(
     Ok(deleted)
 }
 
-/// Reads one capture, by position, from [`SNAPSHOT_COLUMNS`].
-///
-/// **The `kind` is parsed and not defaulted.** `FromStr for ListKind` exists
-/// for exactly this read and fails rather than guessing, and
-/// `watch::all_marks` obeys it too. The CHECK on the column keeps the state
-/// unreachable only until somebody edits the schema, and a default would then
-/// hand a followers capture back as a following one — the wrong list,
-/// silently, on the path every comparison reads.
 /// A capture as `snob snapshots` lists it: every row, finished or not, with
 /// what the capture itself recorded about how it went.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -735,6 +727,14 @@ pub fn usable(
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// Reads one capture, by position, from [`SNAPSHOT_COLUMNS`].
+///
+/// **The `kind` is parsed and not defaulted.** `FromStr for ListKind` exists
+/// for exactly this read and fails rather than guessing, and
+/// `watch::all_marks` obeys it too. The CHECK on the column keeps the state
+/// unreachable only until somebody edits the schema, and a default would then
+/// hand a followers capture back as a following one — the wrong list,
+/// silently, on the path every comparison reads.
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
     let kind: String = row.get(2)?;
     let kind = kind.parse::<ListKind>().map_err(|()| {
