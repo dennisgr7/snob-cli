@@ -7830,6 +7830,166 @@ async fn the_http_server_refuses_to_start_without_a_key() {
     assert!(!stderr(&out).contains("serving on"), "{}", stderr(&out));
 }
 
+/// A server the test lost its parent for, killed with `SIGKILL` on drop
+/// whatever happened, so that no failed assertion leaves it listening.
+#[cfg(all(unix, feature = "mcp-http"))]
+struct Orphan {
+    pid: libc::pid_t,
+    said: std::path::PathBuf,
+}
+
+#[cfg(all(unix, feature = "mcp-http"))]
+impl Orphan {
+    /// `snob mcp --listen` started in the background by a shell, which is
+    /// then killed with `SIGKILL`, as a script's timeout or a crashed app
+    /// would end: nothing is sent to the server, its standard input is the
+    /// null device (a background job's in a shell without job control), and
+    /// its standard output a pipe the test still holds. Under `nohup` when
+    /// `nohup` says so. Returns once the shell is gone.
+    fn start(root: &Path, nohup: bool) -> (Self, std::process::ChildStdout) {
+        use std::io::BufRead;
+        let base = command(root, None);
+        let said = root.join("said.log");
+        let script = format!(
+            "{} \"$0\" \"$@\" mcp --listen 127.0.0.1:0 2>\"$SAID\" & echo $!; exec sleep 60",
+            if nohup { "nohup" } else { "" }
+        );
+        let mut shell = Command::new("sh");
+        shell
+            .arg("-c")
+            .arg(script)
+            .arg(base.get_program())
+            .args(base.get_args());
+        for (name, value) in base.get_envs() {
+            match value {
+                Some(value) => shell.env(name, value),
+                None => shell.env_remove(name),
+            };
+        }
+        shell
+            .env("SNOB_MCP_KEY", MCP_KEY)
+            .env("SAID", &said)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut parent = shell.spawn().expect("sh runs");
+        let mut out = std::io::BufReader::new(parent.stdout.take().unwrap());
+        let mut line = String::new();
+        out.read_line(&mut line).unwrap();
+        let orphan = Self {
+            pid: line
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("a pid in {line:?}")),
+            said,
+        };
+        // Its parent is killed only once it listens: before, it might not
+        // have looked at its parent yet, and would find itself adopted
+        // already, which is no parent to watch.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !orphan.said().contains("serving on") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "it did not listen: {}",
+                orphan.said()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        parent.kill().unwrap();
+        parent.wait().unwrap();
+        (orphan, out.into_inner())
+    }
+
+    fn said(&self) -> String {
+        std::fs::read_to_string(&self.said).unwrap_or_default()
+    }
+
+    /// Whether it still runs. An exited process its adopter has not reaped
+    /// yet is a zombie, which `kill(pid, 0)` still finds, so the state is
+    /// read: from `/proc` on Linux, from `ps` elsewhere.
+    fn running(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        let state = std::fs::read_to_string(format!("/proc/{}/stat", self.pid))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    .map(|(_, rest)| rest.trim_start().to_owned())
+            })
+            .unwrap_or_default();
+        #[cfg(not(target_os = "linux"))]
+        let state = Command::new("ps")
+            .args(["-o", "stat=", "-p", &self.pid.to_string()])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .unwrap_or_default();
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
+    /// Whether it stops within `patience`.
+    fn stops_within(&self, patience: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + patience;
+        while self.running() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        true
+    }
+}
+
+#[cfg(all(unix, feature = "mcp-http"))]
+impl Drop for Orphan {
+    fn drop(&mut self) {
+        if self.running() {
+            // SAFETY: a pid this test started and saw running just now.
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// A server a program started stops when that program dies, as it stops for
+/// `SIGTERM`: nobody is left to want it, and it held a port for ever before.
+#[cfg(all(unix, feature = "mcp-http"))]
+#[test]
+fn a_server_stops_when_the_program_that_started_it_dies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (orphan, _out) = Orphan::start(tmp.path(), false);
+    assert!(
+        orphan.stops_within(std::time::Duration::from_secs(30)),
+        "it went on serving for nobody: {}",
+        orphan.said()
+    );
+}
+
+/// `nohup` asked for it to outlive its terminal and its parent, so it does:
+/// neither its parent dying nor a `SIGHUP` stops it, and `SIGTERM` still does.
+#[cfg(all(unix, feature = "mcp-http"))]
+#[test]
+fn a_server_under_nohup_outlives_its_parent_and_a_hangup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (orphan, _out) = Orphan::start(tmp.path(), true);
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        orphan.running(),
+        "it stopped with its parent: {}",
+        orphan.said()
+    );
+
+    // SAFETY: a pid this test started and saw running just now.
+    unsafe { libc::kill(orphan.pid, libc::SIGHUP) };
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(orphan.running(), "a hangup stopped it: {}", orphan.said());
+
+    // SAFETY: as above.
+    unsafe { libc::kill(orphan.pid, libc::SIGTERM) };
+    assert!(
+        orphan.stops_within(std::time::Duration::from_secs(30)),
+        "SIGTERM did not stop it: {}",
+        orphan.said()
+    );
+}
+
 /// Loopback only, and a public address only over https and with --listen.
 #[cfg(feature = "mcp-http")]
 #[test]

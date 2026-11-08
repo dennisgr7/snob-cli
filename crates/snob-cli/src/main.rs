@@ -324,6 +324,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     if cli.stop_when_stdin_closes {
         snob_cli::app::stop_when_stdin_closes();
     }
+    // The owner of the browsers and a job's supervisor are started to
+    // outlive the command that started them (`detach`); everything else stops
+    // with a program that drove it and went (`parent`).
+    snob_cli::app::stop_when_parent_exits(matches!(
+        cli.command,
+        Command::BrowserOwner | Command::Job(snob_cli::cli::JobCommand::Run(_))
+    ));
     if cli.spend_alone {
         snob_cli::app::spend_alone();
     }

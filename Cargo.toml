@@ -287,7 +287,13 @@ zeroize = "1"
 # handle it is registered under, are the owner's window that hears the end of
 # the session (`snob_cli::owner::end_of_session`): a process with no console
 # and no window is told nothing when Windows signs out or shuts down.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Security_Cryptography", "Win32_Globalization", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_WindowsAndMessaging"] }
+#
+# `Win32_System_Diagnostics_ToolHelp` is for one question: which process
+# started this one, so that a run a program drives stops when that program
+# goes (`snob_cli::parent`). A snapshot of the processes is the documented
+# way to ask it; the other is `NtQueryInformationProcess`, which is `ntdll`'s
+# and says it may change.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Security_Cryptography", "Win32_Globalization", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_WindowsAndMessaging"] }
 
 # Test-only
 wiremock = "0.6"

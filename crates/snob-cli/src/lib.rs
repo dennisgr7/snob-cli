@@ -29,6 +29,7 @@ pub mod media;
 pub mod output;
 /// The one process that runs the browsers for every command of this user's.
 pub mod owner;
+pub(crate) mod parent;
 /// Starting the browser with the debugging protocol on a pipe rather than on a
 /// loopback port. See the module for why it cannot be `std::process::Command`.
 pub(crate) mod pipe;

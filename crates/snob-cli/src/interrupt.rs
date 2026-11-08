@@ -32,6 +32,41 @@ pub fn stop_when_stdin_closes() {
     ON_STDIN_EOF.store(true, Ordering::SeqCst);
 }
 
+/// The parent [`stop_when_parent_exits`] opened, until the handler takes it.
+static PARENT: std::sync::Mutex<Option<crate::parent::Parent>> = std::sync::Mutex::new(None);
+
+/// Makes the parent process going one more way of asking the process to
+/// stop, taken as the system's requests are (no message, exit 130), **when
+/// it is worth watching** (`parent::worth_watching`: a program drives this
+/// process, and nobody detached it on purpose). `detached_command` is
+/// whether the command is one snob starts to outlive its starter. Called by
+/// `main` for every command, before anything installs the handler.
+///
+/// The parent is opened now, while it is known to be this process's, and
+/// waited for once the handler is installed; one that has gone meanwhile is
+/// heard at once then. A command that never installs the handler ends on its
+/// own, soon, and never waits for it.
+pub fn stop_when_parent_exits(detached_command: bool) {
+    if !crate::parent::worth_watching(crate::parent::situation(detached_command)) {
+        return;
+    }
+    let parent = crate::parent::arm();
+    *PARENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(parent);
+}
+
+/// Says so, once, when the parent [`stop_when_parent_exits`] opened is gone.
+/// A thread of its own, as for standard input: waiting on a process cannot
+/// be canceled either.
+fn parent_gone() -> Option<tokio::sync::mpsc::Receiver<()>> {
+    let parent = PARENT.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    let (gone, heard) = tokio::sync::mpsc::channel(1);
+    std::thread::spawn(move || {
+        parent.wait();
+        let _ = gone.blocking_send(());
+    });
+    Some(heard)
+}
+
 /// Says so, once, when standard input has reached its end.
 ///
 /// A thread of its own rather than a blocking task: a read of a pipe cannot be
@@ -160,8 +195,10 @@ enum Asked {
 ///
 /// **The system's requests to stop take the same road as Ctrl+C.** On Unix
 /// that is `SIGTERM`, which `systemctl stop`, `kill` and a shutdown send, and
-/// `SIGHUP`, which a closed terminal sends; on Windows it is the console
-/// closing, the user signing out and the machine shutting down. Left to their
+/// `SIGHUP`, which a closed terminal sends (unless `nohup` left it ignored,
+/// which is kept); on Windows it is the console closing, the user signing
+/// out and the machine shutting down. And everywhere, standard input closing
+/// and the parent going, where `main` asked for them. Left to their
 /// defaults these ended the process where it stood: a walk lost the page in
 /// flight and skipped the orderly stop a Ctrl+C gets. Now each cancels the
 /// same token, so the walk stops the way it stops for a person, and a second
@@ -222,6 +259,9 @@ pub fn install() -> CancelToken {
 struct Requests {
     /// Standard input closing, when [`stop_when_stdin_closes`] asked for it.
     stdin: Option<tokio::sync::mpsc::Receiver<()>>,
+    /// The parent going, when [`stop_when_parent_exits`] found it worth
+    /// watching.
+    parent: Option<tokio::sync::mpsc::Receiver<()>>,
     #[cfg(unix)]
     terminate: Option<tokio::signal::unix::Signal>,
     #[cfg(unix)]
@@ -253,13 +293,23 @@ macro_rules! next_of {
 impl Requests {
     fn listen() -> Self {
         let stdin = ON_STDIN_EOF.load(Ordering::SeqCst).then(stdin_closed);
+        let parent = parent_gone();
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
+            // `nohup` left `SIGHUP` ignored: somebody asked for this process
+            // to outlive its terminal, and listening would undo it. Asked
+            // before the listener replaces the disposition.
+            let hangup = if crate::parent::hangup_ignored() {
+                None
+            } else {
+                signal(SignalKind::hangup()).ok()
+            };
             Self {
                 stdin,
+                parent,
                 terminate: signal(SignalKind::terminate()).ok(),
-                hangup: signal(SignalKind::hangup()).ok(),
+                hangup,
             }
         }
         #[cfg(windows)]
@@ -267,6 +317,7 @@ impl Requests {
             use tokio::signal::windows::{ctrl_close, ctrl_logoff, ctrl_shutdown};
             Self {
                 stdin,
+                parent,
                 close: ctrl_close().ok(),
                 logoff: ctrl_logoff().ok(),
                 shutdown: ctrl_shutdown().ok(),
@@ -281,6 +332,7 @@ impl Requests {
             tokio::select! {
                 heard = tokio::signal::ctrl_c() => heard.ok().map(|()| Asked::Person),
                 () = next_of!(self.stdin) => Some(Asked::System),
+                () = next_of!(self.parent) => Some(Asked::System),
                 () = next_of!(self.terminate) => Some(Asked::System),
                 () = next_of!(self.hangup) => Some(Asked::System),
             }
@@ -290,6 +342,7 @@ impl Requests {
             tokio::select! {
                 heard = tokio::signal::ctrl_c() => heard.ok().map(|()| Asked::Person),
                 () = next_of!(self.stdin) => Some(Asked::System),
+                () = next_of!(self.parent) => Some(Asked::System),
                 () = next_of!(self.close) => Some(Asked::System),
                 () = next_of!(self.logoff) => Some(Asked::System),
                 () = next_of!(self.shutdown) => Some(Asked::System),

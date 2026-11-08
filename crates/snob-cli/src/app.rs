@@ -132,6 +132,10 @@ pub fn max_wait() -> Option<std::time::Duration> {
 /// setting `main` hands every pacer, through the cancellation token.
 pub use crate::interrupt::stop_when_stdin_closes;
 
+/// And stopping when the parent goes, which `main` asks of every command and
+/// which watches only where a program drives the run (`parent`).
+pub use crate::interrupt::stop_when_parent_exits;
+
 /// `--progress-json`, the third: every progress stack this run builds says
 /// how its walks go in JSON lines rather than drawing a bar.
 pub use crate::progress::progress_json;

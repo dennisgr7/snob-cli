@@ -259,6 +259,25 @@ with a documented reason in the same place.
   nothing is sent, not even the counter poll; stored lists are served with a
   dated warning. `SNOB_IGNORE_COOLDOWN` exists only so a bug of ours cannot
   lock anyone out; it stays out of the help.
+- **A run nobody is left to want stops** (`parent.rs`,
+  `interrupt::stop_when_parent_exits`). A parent dying sends its children
+  nothing, so a walk a script, an agent's shell or an app started went on
+  for nobody when that program died, spending the budget and holding the
+  list's claim, and `snob mcp --listen` kept its port for ever. A process
+  a program drives (standard input or output a pipe or a socket) watches
+  its parent, as a process and never as a thread (no `PR_SET_PDEATHSIG`,
+  which fires when the starting thread exits): a `pidfd` on Linux,
+  `kqueue` on macOS, a handle checked to be older than this process on
+  Windows, asking `getppid` each second where none can be opened. Its going
+  is one of the system's requests to stop, the same road as `SIGTERM`.
+  **Not watched**: a run at a terminal (`SIGHUP` says it), one whose output
+  goes to a file, one under `nohup` (whose ignored `SIGHUP` is now kept, not
+  replaced by the listener) or `setsid`, one whose parent is pid 1, and the
+  processes snob detaches to outlive their starter (the owner of the
+  browsers, a job's supervisor). `SNOB_NO_PARENT_WATCH` turns it off and
+  stays out of the help. The owner's browsers need none of it: they leave
+  within two seconds of their pipe closing, the owner killed included
+  (measured with Chromium 156 on Linux, in their own process group).
 - **Cache.** A list's counter is polled before any walk (one request instead
   of a walk when nothing moved, `engine::freshness`). Each walked page commits
   in its own transaction, so stopping is saving.
@@ -841,9 +860,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   vocabulary): 0 worked (a list cut short by `--limit`/`--max-pages` is still
   0), 1 failed or result refused as incomplete, 2 bad command line (clap), 3 no
   or dead session, 4 account needs verifying, 5 throttled or in cooldown, 130
-  stopped (Ctrl+C, a confirmation not given, a wait past `--max-wait`, or
+  stopped (Ctrl+C, a confirmation not given, a wait past `--max-wait`,
   standard input closing under the hidden `--stop-when-stdin-closes`, which
-  is how a parent on Windows stops a child in order). `snob status` exits 5 in
+  is how a parent on Windows stops a child in order, or the program that
+  drove the run going, `parent.rs`). `snob status` exits 5 in
   cooldown, whatever was asked. Errors that know their code carry it as
   `ExitError` (with an optional `with_hint`, printed on its own `hint:` line).
 - The JSON shapes are the types in `snob-core` (`model.rs`), deliberately
@@ -954,7 +974,9 @@ Platform-specific code, all of it reached only by the CI job on that OS:
   hears the end of a session (`owner/end_of_session.rs`), power requests,
   EcoQoS, the data directory's ACL, the keyring's local persistence, the
   language preference, `QueryUnbiasedInterruptTime` for sleep detection
-  (`snob_ig::awake`). Static CRT and `/Brepro` via `.cargo/config.toml`.
+  (`snob_ig::awake`), and a ToolHelp snapshot, `OpenProcess`,
+  `GetProcessTimes` and `WaitForSingleObject` for the parent of a run a
+  program drives (`parent.rs`). Static CRT and `/Brepro` via `.cargo/config.toml`.
 - Unix (`libc`): the CDP pipe made with `pipe2` (on macOS, which has
   none, `pipe` and `fcntl(FD_CLOEXEC)`), its ends put onto fds 3 and 4
   with `dup2` and `fcntl` clearing `FD_CLOEXEC` on one already there, the
@@ -968,7 +990,10 @@ Platform-specific code, all of it reached only by the CI job on that OS:
   user alone: the owner's (`owner/socket.rs`), the relay's
   (`relay/mod.rs`) and `snob mcp --listen socket`'s
   (`commands/mcp/http/socket.rs`, root too); and `geteuid` to refuse
-  starting the browser as root (`headless::refuse_root`).
+  starting the browser as root (`headless::refuse_root`); the parent of a
+  run a program drives watched with `pidfd_open` and `poll` on Linux and
+  `kqueue` on macOS, `getppid` where neither opens, and `fstat`,
+  `sigaction` and `getsid` for whether to watch it at all (`parent.rs`).
   In `snob-store` (`paths.rs`), the scratch root is opened with
   `O_DIRECTORY | O_NOFOLLOW`, made `0700` through the descriptor, and asked
   its owner (`geteuid`) before it is made private or swept.
