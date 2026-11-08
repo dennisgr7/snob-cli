@@ -31,6 +31,10 @@ pub const EVENT_HEADER: &str = "X-Snob-Event";
 pub const DELIVERY_HEADER: &str = "X-Snob-Delivery";
 pub const ATTEMPT_HEADER: &str = "X-Snob-Attempt";
 
+/// The type of snob's own JSON body, and of every row queued before the
+/// queue kept a type of its own (`017_delivery_form.sql`).
+pub const JSON: &str = "application/json";
+
 /// Where a report goes, and what to put on it.
 pub struct Webhook {
     pub url: Url,
@@ -142,8 +146,16 @@ impl WebhookClient {
     ///
     /// `event` is what the body says it is, and the header has to agree: the
     /// point of the header is that a receiver can route on it without parsing
-    /// the body.
-    pub async fn post(&self, body: &str, event: &str, delivery_id: &str, attempt: i64) -> Attempt {
+    /// the body. `content_type` is the body's, which is snob's JSON unless the
+    /// webhook was given another `format` (`wire::outgoing`).
+    pub async fn post(
+        &self,
+        body: &str,
+        content_type: &str,
+        event: &str,
+        delivery_id: &str,
+        attempt: i64,
+    ) -> Attempt {
         // One map for the whole request: snob's headers first, then the user's
         // inserted over them, and the map handed over in one go.
         // `RequestBuilder::header` is `HeaderMap::append`, so two entries of one
@@ -155,7 +167,7 @@ impl WebhookClient {
         // able to replace is refused by `check`, not resolved quietly here.
         let mut headers = reqwest::header::HeaderMap::new();
         let mut own = vec![
-            ("Content-Type".to_string(), "application/json".to_string()),
+            ("Content-Type".to_string(), content_type.to_string()),
             (EVENT_HEADER.to_string(), event.to_string()),
             (DELIVERY_HEADER.to_string(), delivery_id.to_string()),
             (ATTEMPT_HEADER.to_string(), attempt.to_string()),
@@ -1088,7 +1100,7 @@ mod tests {
             "http://127.0.0.1:{port}/api/webhooks/123456/a-secret-token"
         )))
         .unwrap();
-        let attempt = client.post("{}", "watch.changes", "run-1", 1).await;
+        let attempt = client.post("{}", JSON, "watch.changes", "run-1", 1).await;
 
         let Attempt::Failed {
             status: None,

@@ -88,7 +88,10 @@ snob follow someone
 snob unfollow someone
 snob watch                       # keep watching on a schedule, report changes
 snob status                      # budget left, cooldown, stored lists, agents; sends nothing
-snob jobs                        # walks an agent left running, and "snob jobs cancel <id>"
+snob snapshots                   # the captures of your lists stored here; sends nothing
+snob changes --since 7d          # who joined, left or was renamed between two of them
+snob followers --background      # walk as a job and get its id at once; any list command
+snob jobs                        # walks left running, and "snob jobs cancel <id>"
 ```
 
 On a terminal most commands open a full-screen view you move through with the
@@ -121,8 +124,18 @@ can read:
   again, 4 the account needs verifying, 5 rate limited or cooling down, 130
   stopped. When the output was going to be JSON, a failure is also one JSON
   object on the last line of standard error.
-- `snob watch --webhook <url>` posts each report as JSON; `--json` writes them
-  as lines instead.
+- `snob watch --webhook <url>` posts each report as JSON, with a `summary`
+  sentence and ISO dates beside the epoch seconds; `format = "slack"` (or
+  `discord`, `ntfy`, `text`) under `[webhook]` in `watch.toml`, or
+  `--webhook-format`, sends the summary alone, in the shape that service
+  takes. `--json` writes the reports as lines instead. `snob watch deliver`
+  sends what a receiver that was down is still owed, at once, with no
+  request to Instagram.
+- `snob watch unit` prints what to give the system's scheduler (a systemd
+  timer, a crontab line, a launch agent or a `schtasks` command; installs
+  nothing). Each runs `snob watch once --when-due` every 15 minutes, which
+  runs only when the schedule in `watch.toml` says so and otherwise sends
+  nothing.
 - `snob mcp` is an MCP server for AI agents, on standard input and output:
   the status, the lists and profiles, and with `--allow-writes` follow and
   unfollow. Those, and walking another account's lists, run only after a yes

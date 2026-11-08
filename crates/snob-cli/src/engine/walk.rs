@@ -182,6 +182,8 @@ pub async fn fetch(
             snapshot_id: id,
             stopped_by,
             resumable,
+            // A walk reads the list as it is, own writes included.
+            own_changes: 0,
         },
     ))
 }

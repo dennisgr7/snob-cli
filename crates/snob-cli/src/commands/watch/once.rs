@@ -45,6 +45,9 @@ pub(super) async fn once(
     // The file is read here too: `once` on a timer should need no more
     // arguments than the scheduled mode does.
     let configured = config::load(paths)?;
+    if args.when_due && !is_due(paths, configured.as_ref())? {
+        return Ok(ExitCode::Ok);
+    }
     let delivery = delivery_from(&args.delivery, configured.as_ref(), &secrets)?;
 
     let watched = watched_from(args.target.clone(), configured.as_ref(), in_use);
@@ -80,11 +83,53 @@ pub(super) async fn once(
     if let Some(e) = outcome.failed {
         return Err(e);
     }
+    // A run whose own verdict is good but whose report did not arrive is not
+    // a 0: on a timer nothing tries the report again before the next run, and
+    // a status that said all was well left nobody to look. Its own reason, so
+    // a script can tell it from a run that read nothing.
+    if outcome.code == ExitCode::Ok && delivery.as_ref().is_some_and(|d| d.left_undelivered()) {
+        return Err(crate::exit::ExitError::new(
+            ExitCode::Error,
+            "the run went through, but a report did not reach the webhook; it stays queued \
+             for the next run, unless it was given up on as said above",
+        )
+        .with_reason("not_delivered")
+        .into());
+    }
 
     // The run's own verdict, as written into `watch_runs`. The exit codes exist
     // so a caller on a timer can tell "wait" from "log in again" without
     // parsing text, and `once` is the mode that is put on a timer.
     Ok(outcome.code)
+}
+
+/// `--when-due`: whether the schedule in the file says a run is owed now,
+/// asked of the evaluator the scheduled mode sleeps on, from the same last
+/// run (`scheduled::seed_for`), so a timer that asks every quarter of an hour
+/// runs on the schedule `snob watch` would keep, a quarter of an hour late
+/// at most. The jitter is not rolled: the timer's own cadence already keeps
+/// runs off the second the grid names. Not due is said on standard error and
+/// costs nothing: no session is read and nothing is sent.
+fn is_due(paths: &AppPaths, configured: Option<&config::WatchConfig>) -> Result<bool> {
+    use snob_core::watch::schedule::{self, Due};
+
+    let schedule =
+        super::schedule::schedule_from(&crate::cli::WatchRunArgs::default(), configured)?;
+    let now = snob_core::clock::now();
+    let last_run = super::scheduled::seed_for(paths, &schedule, now)?;
+    match schedule::due(&schedule, last_run, now, &chrono::Local) {
+        Due::Now { .. } => Ok(true),
+        Due::At(at) => {
+            ui::info(&format!(
+                "Not due yet: the next run is on {}.",
+                report::stored_on(at)
+            ));
+            Ok(false)
+        }
+        Due::Never => Err(anyhow::anyhow!(
+            "this schedule can never come round: nothing matches it"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -117,8 +162,10 @@ mod tests {
                 header: vec!["X-Snob-Source: homelab".to_string()],
                 sign_with: None,
                 heartbeat: false,
+                webhook_format: None,
             },
             target: None,
+            when_due: false,
             output: crate::cli::StatusOutputArgs { json: false },
             progress: crate::cli::ProgressArgs { no_progress: true },
         };

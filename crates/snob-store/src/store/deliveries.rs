@@ -36,10 +36,11 @@ const MAX_BACKOFF_SECS: i64 = 3_600;
 /// report queued while a receiver was down for an afternoon, and leave
 /// `MAX_AGE_SECS` nothing to judge.
 ///
-/// Thirty-two is what it takes for the age to win: seven doubling waits and
-/// then hourly, which passes a day before this is reached. Every attempt waits,
+/// A hundred and eighty is what it takes for the age to win: six doubling
+/// waits (about an hour together) and then hourly, which passes the week of
+/// [`MAX_AGE_SECS`] (168 hours) before this is reached. Every attempt waits,
 /// so this cannot be burned through quickly by an endpoint that answers fast.
-const MAX_ATTEMPTS: i64 = 32;
+const MAX_ATTEMPTS: i64 = 180;
 
 /// How old a report may get before it is given up on whatever its attempt
 /// count says.
@@ -49,7 +50,15 @@ const MAX_ATTEMPTS: i64 = 32;
 /// and a report about who unfollowed you last Tuesday is no longer news; the
 /// attempt count catches a queue that somehow keeps being tried without the
 /// clock moving. In ordinary running it is the age that decides.
-pub const MAX_AGE_SECS: i64 = 24 * 3_600;
+///
+/// **A week, not a day.** The queue is drained only by a run, and the
+/// schedule people pick most is daily: the next run comes 24 hours later
+/// plus its jitter, so with a day here a report that failed once was given
+/// up on just before the one run that could have sent it, and since its mark
+/// had moved, the unfollowers it named were reported nowhere. A week rides
+/// out a weekly schedule's single retry too, and is how long a settled
+/// delivery is kept anyway ([`KEEP_SETTLED_FOR_SECS`]).
+pub const MAX_AGE_SECS: i64 = 7 * 24 * 3_600;
 
 /// A report waiting to be sent.
 ///
@@ -65,9 +74,23 @@ pub struct Delivery {
     /// The exact bytes to send, and the ones the signature covers.
     pub body: String,
     pub attempts: i64,
+    /// The event and the type it was queued with; `None` for a row queued
+    /// before they were kept, which is snob's JSON (`017_delivery_form.sql`).
+    pub form: Option<Form>,
 }
 
-/// Queues a report.
+/// What a body is, kept beside it because the body itself may not say:
+/// the summary posted to Slack names no event, and plain text is no JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Form {
+    /// What the `X-Snob-Event` header says.
+    pub event: String,
+    /// What the `Content-Type` header says.
+    pub content_type: String,
+}
+
+/// Queues a report of snob's JSON, its event read back from the body when it
+/// is sent. [`enqueue_as`] queues one with its form.
 ///
 /// Takes a `&Connection` rather than opening its own transaction on purpose:
 /// the caller has to be able to put this and the mark it makes stale in **one**
@@ -81,11 +104,33 @@ pub fn enqueue(
     at: Epoch,
     destination: &str,
 ) -> Result<i64, StoreError> {
+    enqueue_as(conn, run_id, account_pk, body, at, destination, None)
+}
+
+/// Queues a report with the event and the type it is to be sent as.
+pub fn enqueue_as(
+    conn: &Connection,
+    run_id: &str,
+    account_pk: Pk,
+    body: &str,
+    at: Epoch,
+    destination: &str,
+    form: Option<&Form>,
+) -> Result<i64, StoreError> {
     conn.execute(
         "INSERT INTO watch_deliveries
-            (run_id, account_pk, created_at, body, next_try_at, destination)
-         VALUES (?1, ?2, ?3, ?4, ?3, ?5)",
-        params![run_id, pk_to_sql(account_pk), at.get(), body, destination],
+            (run_id, account_pk, created_at, body, next_try_at, destination,
+             event, content_type)
+         VALUES (?1, ?2, ?3, ?4, ?3, ?5, ?6, ?7)",
+        params![
+            run_id,
+            pk_to_sql(account_pk),
+            at.get(),
+            body,
+            destination,
+            form.map(|form| form.event.as_str()),
+            form.map(|form| form.content_type.as_str()),
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -178,10 +223,34 @@ pub fn due(
     limit: usize,
     destination: &str,
 ) -> Result<Vec<Delivery>, StoreError> {
+    owed_to(conn, now, limit, destination, false)
+}
+
+/// Every report still owed to `destination`, whether or not its backoff has
+/// ended: for `snob watch deliver`, which a person types to send now. The
+/// backoff spaces the attempts nobody asked for; one asked for is one more
+/// attempt, and is counted and aged like any other.
+pub fn owed_now(
+    conn: &Connection,
+    now: Epoch,
+    limit: usize,
+    destination: &str,
+) -> Result<Vec<Delivery>, StoreError> {
+    owed_to(conn, now, limit, destination, true)
+}
+
+fn owed_to(
+    conn: &Connection,
+    now: Epoch,
+    limit: usize,
+    destination: &str,
+    at_once: bool,
+) -> Result<Vec<Delivery>, StoreError> {
     let mut stmt = conn.prepare(
-        "SELECT id, run_id, body, attempts
+        "SELECT id, run_id, body, attempts, event, content_type
          FROM watch_deliveries
-         WHERE state = 'pending' AND next_try_at IS NOT NULL AND next_try_at <= ?1
+         WHERE state = 'pending' AND next_try_at IS NOT NULL
+           AND (?5 OR next_try_at <= ?1)
            AND created_at > ?3
            AND destination = ?4
          ORDER BY created_at, id
@@ -192,7 +261,8 @@ pub fn due(
             now.get(),
             limit as i64,
             still_news_after(now).get(),
-            destination
+            destination,
+            at_once,
         ],
         |row| {
             Ok(Delivery {
@@ -200,6 +270,13 @@ pub fn due(
                 run_id: row.get(1)?,
                 body: row.get(2)?,
                 attempts: row.get(3)?,
+                form: match (row.get(4)?, row.get(5)?) {
+                    (Some(event), Some(content_type)) => Some(Form {
+                        event,
+                        content_type,
+                    }),
+                    _ => None,
+                },
             })
         },
     )?;
@@ -318,7 +395,7 @@ fn backoff(attempts: i64) -> i64 {
 /// another, one count would have `status` say reports are waiting about rows
 /// `due` can never return, and fail the health verdict over them. Nothing is
 /// lost by refusing an old-destination row — that is the settled rule, and
-/// `store::watch::prune` expires it at a day — but a probe told the wrong
+/// `store::watch::prune` expires it at a week — but a probe told the wrong
 /// number in the alarming direction is one people switch off.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Owed {
@@ -427,7 +504,7 @@ mod tests {
     /// are either given up on within the hour or kept for a year.
     #[test]
     fn the_age_a_report_stops_being_news_at_is_the_documented_one() {
-        assert_eq!(MAX_AGE_SECS, 24 * 3_600);
+        assert_eq!(MAX_AGE_SECS, 7 * 24 * 3_600);
     }
 
     fn queued(db: &Store, run_id: &str, at: Epoch) -> i64 {
@@ -444,6 +521,60 @@ mod tests {
 
         let waiting = due(db.conn(), Epoch::new(1_000), 10, HERE).unwrap();
         assert_eq!(waiting[0].body, body);
+    }
+
+    /// A summary posted as plain text cannot say what it is, so the row does.
+    #[test]
+    fn a_report_queued_with_its_form_comes_back_with_it_and_an_old_one_without() {
+        let db = store();
+        let form = Form {
+            event: "watch.changes".into(),
+            content_type: "text/plain; charset=utf-8".into(),
+        };
+        enqueue_as(
+            db.conn(),
+            "run-1",
+            ME,
+            "Changes for @me",
+            Epoch::new(1_000),
+            HERE,
+            Some(&form),
+        )
+        .unwrap();
+        queued(&db, "run-2", Epoch::new(1_001));
+
+        let waiting = due(db.conn(), Epoch::new(1_001), 10, HERE).unwrap();
+        assert_eq!(waiting[0].form.as_ref(), Some(&form));
+        assert_eq!(waiting[1].form, None, "queued as snob's JSON");
+    }
+
+    #[test]
+    fn a_report_waiting_out_its_backoff_is_owed_now_but_not_due() {
+        let db = store();
+        let id = queued(&db, "run-1", Epoch::new(1_000));
+        failed(db.conn(), id, Some(500), "down", false, Epoch::new(1_000)).unwrap();
+        assert!(
+            due(db.conn(), Epoch::new(1_001), 10, HERE)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            owed_now(db.conn(), Epoch::new(1_001), 10, HERE)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            owed_now(
+                db.conn(),
+                Epoch::new(1_001),
+                10,
+                "https://elsewhere.example"
+            )
+            .unwrap()
+            .is_empty(),
+            "still only to the address it was made for"
+        );
     }
 
     #[test]
@@ -554,7 +685,7 @@ mod tests {
 
         assert!(
             now - queued_at >= MAX_AGE_SECS,
-            "it gave up after {}s, and a day is what the age bound names",
+            "it gave up after {}s, and a week is what the age bound names",
             now - queued_at
         );
         assert!(

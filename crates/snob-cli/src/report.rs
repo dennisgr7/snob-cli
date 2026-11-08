@@ -160,10 +160,13 @@ fn error_json_for(error: &anyhow::Error, viewer: Option<&Viewer>) -> serde_json:
         .map(|at| at.to_epoch_not_before());
     // A wait past `--max-wait` exits as a stop does (130), and is told
     // apart from one by this: it is the one worth trying again later.
-    let reason = ours.and_then(ExitError::reason).or_else(|| {
-        instagram
-            .is_some_and(|e| matches!(e, snob_ig::error::IgError::WaitTooLong { .. }))
-            .then_some("budget_wait")
+    // An account Instagram says does not exist is told apart from any other
+    // failure, which shares its exit code: a typo is the likeliest cause, and
+    // a program should not have to read the sentence to know it.
+    let reason = ours.and_then(ExitError::reason).or(match instagram {
+        Some(snob_ig::error::IgError::WaitTooLong { .. }) => Some("budget_wait"),
+        Some(snob_ig::error::IgError::NotFound { what: Some(_) }) => Some("no_such_account"),
+        _ => None,
     });
 
     serde_json::json!({
@@ -653,10 +656,13 @@ pub fn ask_to_continue(shown: &str) -> String {
 /// monitor keeps its own variant, because "a scheduled run has nobody to ask"
 /// is a different fact from "there is no terminal".
 pub fn refuse_unattended(refused: String, in_advance: String) -> anyhow::Error {
+    // A reason of its own, so a script can tell "nobody could be asked" from
+    // a Ctrl+C, which shares the exit code.
     ExitError::new(
         ExitCode::Interrupted,
         format!("{refused}, and there is no terminal to ask at. {in_advance}"),
     )
+    .with_reason("consent_required")
     .into()
 }
 
@@ -693,7 +699,46 @@ pub fn refuse_declined(shown: &str) -> anyhow::Error {
         ExitCode::Interrupted,
         format!("nothing was done: {shown} was not confirmed"),
     )
+    .with_reason("declined")
     .into()
+}
+
+/// A stored following list handed out with the account's own writes since
+/// its walk applied (`engine::serve_stored`): what was applied, by name, and
+/// that the list was not read again. Never "updated": nothing was walked.
+pub fn own_writes_applied(
+    taken_at: Epoch,
+    applied: &[snob_store::store::own_writes::Applied],
+) -> String {
+    use snob_store::store::own_writes::Verb;
+    let named = |verb: Verb| -> Vec<String> {
+        applied
+            .iter()
+            .filter(|change| change.verb == verb)
+            .map(|change| match &change.username {
+                Some(name) => format!("@{}", printable(name)),
+                None => format!("account {}", change.pk),
+            })
+            .collect()
+    };
+    let mut done = Vec::new();
+    if let Some(names) = and_list(&named(Verb::Unfollow)) {
+        done.push(format!("unfollowed {names}"));
+    }
+    if let Some(names) = and_list(&named(Verb::Follow)) {
+        done.push(format!("followed {names}"));
+    }
+    let changes = if applied.len() == 1 {
+        "1 change".to_string()
+    } else {
+        format!("{} changes", applied.len())
+    };
+    format!(
+        "the following list stored on {} is shown with {changes} you made through snob \
+         since ({}); it was not read again",
+        stored_on(taken_at),
+        done.join(" and ")
+    )
 }
 
 /// Serving a stored list because nothing may be spent.

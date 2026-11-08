@@ -337,6 +337,15 @@ impl SqliteRateBudget {
     /// wins** — a request held back by one budget still spends the others,
     /// because it is still going to be sent.
     ///
+    /// **A reservation is not given back**, even when the process waiting
+    /// out its turn is stopped or killed before it sends: a follow killed
+    /// while it waits for the write bucket has spent that turn, and the next
+    /// one waits behind it. That errs on the slow side by one request at
+    /// most, which is the side the pace is allowed to err on; giving a turn
+    /// back would need its release to be written by a process that may never
+    /// get to write it, and two processes could then both believe the same
+    /// turn was theirs.
+    ///
     /// One transaction for all of them, and it is `IMMEDIATE` for the reason
     /// spelled out below. Charging the write bucket in a second transaction
     /// would let two processes interleave between the two, which is exactly the

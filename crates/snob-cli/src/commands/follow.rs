@@ -170,14 +170,38 @@ pub async fn run(
         Verb::Follow => client.follow(pk, username, &ids).await?,
         Verb::Unfollow => client.unfollow(pk, username, &ids).await?,
     };
-    tell(
-        &args,
-        verb,
-        &profile,
-        &name,
-        outcome(verb, &status),
-        Some(&status),
-    )
+    let outcome = outcome(verb, &status);
+    remember_own_write(&app, &profile, outcome);
+    tell(&args, verb, &profile, &name, outcome, Some(&status))
+}
+
+/// Writes down a write that changed the account's following, so a stored
+/// following list is handed out with it applied until the next walk reads
+/// it (`own_writes`, `engine::serve_stored`). A request a private account
+/// has still to accept changes no list, and nor does a write Instagram
+/// answered as already so.
+///
+/// **Not a reason to fail the run**: the write has happened, and saying it
+/// failed would invite sending it again. A record that could not be written
+/// leaves the stored list as its walk read it, which is what it was before.
+fn remember_own_write(
+    app: &crate::app::App,
+    profile: &snob_ig::model::WebProfileInfo,
+    outcome: Outcome,
+) {
+    use snob_store::store::own_writes::{self, Verb as Written};
+    let verb = match outcome {
+        Outcome::Followed => Written::Follow,
+        Outcome::Unfollowed => Written::Unfollow,
+        _ => return,
+    };
+    let conn = app.db().conn();
+    let user = snob_core::model::User::named(profile.id, profile.username.clone());
+    let recorded = snob_store::store::users::upsert(conn, &user)
+        .and_then(|_| own_writes::record(conn, profile.id, verb, snob_core::clock::now()));
+    if let Err(e) = recorded {
+        tracing::debug!(error = %e, "the write could not be written down for the stored lists");
+    }
 }
 
 /// What a write refused in a cooldown says it did not do.
@@ -215,7 +239,10 @@ fn cannot_write(verb: Verb) -> anyhow::Error {
 /// budget's state and the account's database as `--dry-run` reads them
 /// (`common::standing`). **Not known ahead**: what the profile says (already
 /// so, the viewer's own account, a name that resolves to nothing), and
-/// whatever changes between this and the yes.
+/// whatever changes between this and the yes; except a follow of an account
+/// the following list walked in the last hour holds, which is answered as
+/// already so, `{"would": "nothing", ...}`, so no yes is asked for a write
+/// that would change nothing (`followed_as_stored`).
 fn check_ahead(
     args: &FollowArgs,
     verb: Verb,
@@ -287,8 +314,82 @@ fn check_ahead(
     {
         return Err(snob_ig::error::IgError::WaitTooLong { wait, limit }.into());
     }
+    // A follow of an account a just-walked following list holds would change
+    // nothing, and is answered as such rather than put to the person.
+    if verb == Verb::Follow
+        && let Some((user, taken_at)) =
+            followed_as_stored(&store, paths.pk(), &args.target, now.to_epoch())?
+    {
+        crate::ui::say!(
+            "{}",
+            serde_json::json!({
+                "would": "nothing",
+                "action": verb.present(),
+                "target": {
+                    "pk": user.pk,
+                    "username": printable(&user.username),
+                    "is_private": user.is_private,
+                },
+                "outcome": Outcome::AlreadyFollowing.token(),
+                "changed": false,
+                "following": true,
+                "requested": null,
+                "viewer": crate::report::acting_as().map(|viewer| viewer.json()),
+                "as_stored": taken_at,
+                "message": format!(
+                    "nothing was asked or sent: the following list read at {} (as_stored) \
+                     already has this account. If that has changed since, a walk of the \
+                     following list reads it again.",
+                    crate::report::stored_on(taken_at)
+                ),
+            })
+        );
+        return Ok(ExitCode::Ok);
+    }
     crate::ui::say!("{}", serde_json::json!({ "would": "send" }));
     Ok(ExitCode::Ok)
+}
+
+/// How recent a walk of the following list has to be for `--check-ahead` to
+/// answer a follow as already so from it, with nothing asked. An hour: long
+/// enough for the follow an agent is asked for right after reading the
+/// lists, short enough that the person is unlikely to have unfollowed the
+/// account in the app since, which is the one way this answer is wrong (and
+/// costs a follow not sent, never one sent).
+const FOLLOWED_AS_STORED_FOR: i64 = 3_600;
+
+/// The account `typed` names, when the account's own following list, walked
+/// within [`FOLLOWED_AS_STORED_FOR`] and with its own writes since applied
+/// (`own_writes`), holds it; with when that list was read. **Only for a
+/// follow**: a stored list cannot tell an unfollow that would change nothing
+/// from one that would withdraw a pending request, which no list holds.
+fn followed_as_stored(
+    store: &snob_store::store::Store,
+    viewer: snob_core::Pk,
+    typed: &str,
+    now: snob_core::Epoch,
+) -> Result<Option<(snob_core::model::User, snob_core::Epoch)>> {
+    use snob_store::store::{own_writes, snapshots, users};
+    let conn = store.conn();
+    let Some(pk) = users::pk_named(conn, target::clean(typed))? else {
+        return Ok(None);
+    };
+    let latest = snapshots::latest_complete(conn, viewer, snob_core::model::ListKind::Following)?;
+    let Some(taken_at) = latest.as_ref().and_then(|snapshot| snapshot.taken_at) else {
+        return Ok(None);
+    };
+    if now - taken_at > FOLLOWED_AS_STORED_FOR {
+        return Ok(None);
+    }
+    let Some(snapshot) = latest else {
+        return Ok(None);
+    };
+    let mut members = snapshots::members(conn, snapshot.id)?;
+    own_writes::apply(conn, &mut members, taken_at)?;
+    Ok(members
+        .into_iter()
+        .find(|user| user.pk == pk)
+        .map(|user| (user, taken_at)))
 }
 
 /// How a run ended, as a word a program can match on and a sentence a person

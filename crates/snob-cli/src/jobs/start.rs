@@ -93,6 +93,25 @@ pub async fn run(
     store: &SecretStore,
     account: &AccountPaths,
 ) -> Result<ExitCode> {
+    match start(cli, args, store, account).await? {
+        Some(out) => {
+            crate::ui::say!("{}", serde_json::to_string(&out)?);
+            Ok(ExitCode::Ok)
+        }
+        None => Ok(ExitCode::Interrupted),
+    }
+}
+
+/// What [`run`] prints, or `None` when it was stopped before the job's id
+/// could be handed over (the job it made then asked to stop). For a list
+/// command's `--background` too (`commands::background`), which says it in
+/// words at a terminal.
+pub async fn start(
+    cli: &Cli,
+    args: &JobStartArgs,
+    store: &SecretStore,
+    account: &AccountPaths,
+) -> Result<Option<Value>> {
     let checked = argv::check(&args.command).map_err(refused)?;
     let arguments = match &args.arguments {
         None => json!({}),
@@ -126,12 +145,10 @@ pub async fn run(
             Ok::<_, anyhow::Error>(found)
         })
         .await??;
-        let out = match found {
+        return Ok(Some(match found {
             Found::Free => json!({ "would": "start" }),
             Found::Reuse(id) => json!({ "would": "reuse", "job_id": id.as_str() }),
-        };
-        crate::ui::say!("{}", serde_json::to_string(&out)?);
-        return Ok(ExitCode::Ok);
+        }));
     }
     // What it would cost, said with the job; nothing is sent to know it, and
     // a job is still started when it cannot be told.
@@ -205,7 +222,7 @@ pub async fn run(
                         seen = look()?;
                     }
                 }
-                return Ok(ExitCode::Interrupted);
+                return Ok(None);
             }
             seen = look()?;
         }
@@ -213,8 +230,7 @@ pub async fn run(
 
     let mut out = show::whole(&seen, snob_core::clock::now_ms().get());
     out["reused"] = Value::Bool(!ours);
-    crate::ui::say!("{}", serde_json::to_string(&out)?);
-    Ok(ExitCode::Ok)
+    Ok(Some(out))
 }
 
 /// Whether the walk `checked` may start now among the account's `jobs`, read

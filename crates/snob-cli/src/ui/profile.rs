@@ -379,7 +379,17 @@ pub async fn browse(
                                 }
                             }
                             CardRow::Counts => match state.counts_col {
-                                0 => note = "Posts are not browsable yet".to_string(),
+                                // The grid is a view of its own, with a
+                                // `Tui` of its own, which a card must not
+                                // open over itself (AGENTS.md, "Terminal
+                                // UI"): the command that opens it, without
+                                // an at sign, as every command handed over.
+                                0 => {
+                                    note = format!(
+                                        "Posts open with \"snob posts {}\"",
+                                        snob_core::model::printable(&profile.username)
+                                    )
+                                }
                                 col => {
                                     let kind = if col == 1 {
                                         ListKind::Followers

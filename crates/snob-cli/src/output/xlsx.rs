@@ -45,7 +45,7 @@ pub(crate) enum Cell {
         text: String,
     },
     /// A moment, as epoch seconds, written as a date the spreadsheet
-    /// understands. Only `scan` uses it, and only because a column of epoch
+    /// understands. `scan` and `output::grid` use it, because a column of epoch
     /// integers in a spreadsheet is unreadable where the same number in csv is
     /// exactly what a script wants.
     DateTime(Epoch),
@@ -141,6 +141,12 @@ pub(crate) fn workbook(users: &[User]) -> Result<Vec<u8>> {
 /// accounts.
 pub(crate) fn single_row_workbook(header: &[&str], row: Vec<Cell>) -> Result<Vec<u8>> {
     build(header, &[row])
+}
+
+/// A header and any number of rows, for what is not accounts
+/// (`output::grid`).
+pub(crate) fn many_rows_workbook(header: &[&str], rows: &[Vec<Cell>]) -> Result<Vec<u8>> {
+    build(header, rows)
 }
 
 fn build<R: AsRef<[Cell]>>(header: &[&str], rows: &[R]) -> Result<Vec<u8>> {

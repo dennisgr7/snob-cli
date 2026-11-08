@@ -79,39 +79,43 @@ pub struct Cli {
     // Ordered last, with `verbose`. Both are global, so without this they are
     // propagated into every subcommand and land in the middle of its own
     // options, splitting a list that reads in a deliberate order.
-    #[arg(long, global = true, display_order = 900)]
+    //
+    // **Left out of `-h`** (`hide_short_help`), as `verbose` and the two TLS
+    // flags are: they are in every command's help, and in `-h` they were a
+    // third of each one's options, none of them about the command. `--help`
+    // still lists them, and `-h` says it shows more.
+    #[arg(long, global = true, display_order = 900, hide_short_help = true)]
     pub no_keyring: bool,
 
     /// Show diagnostic traces
     ///
     /// The browsers' own go to browser-owner.log in the data directory, at the
     /// level of the command that started the process that runs them.
-    #[arg(long, global = true, display_order = 901)]
+    #[arg(long, global = true, display_order = 901, hide_short_help = true)]
     pub verbose: bool,
 
     /// Check Instagram's certificate against Mozilla's roots only
     ///
-    /// Off by default, and that default is deliberate rather than lazy.
-    /// reqwest 0.13 made the platform verifier the default, so snob honors
-    /// whatever roots an administrator has installed — which is what makes it
-    /// work on a managed machine, and is also how a laptop carrying a
-    /// TLS-inspecting root lets that middlebox read the session in transit.
-    /// This ends the second at the cost of the first, which is a trade only the
-    /// person running it can make.
-    ///
-    /// It refuses on Windows for ARM64, where the TLS backend is schannel and
-    /// has no way to express "these roots and no others". A security flag that
-    /// silently does nothing is worse than one that is not offered.
-    ///
-    /// **Never applied to the webhook.** A private CA in front of somebody's
-    /// own receiver is legitimate, and `snob_ig::http::plain` has no argument
-    /// for this — the same shape that stops the session reaching a webhook.
-    #[arg(long, global = true, display_order = 904)]
+    /// Off by default: the roots installed on this computer are trusted,
+    /// which is what makes snob work on a managed machine, and also what lets
+    /// a TLS-inspecting root installed there read the session in transit.
+    /// This trusts Mozilla's roots alone instead. Refused on Windows for
+    /// ARM64, where it cannot be done, and never applied to the webhook.
+    // Why each of those, in full: reqwest 0.13 made the platform verifier the
+    // default, and the trade between a managed machine and a middlebox is
+    // only the person running it can make. On Windows ARM64 the TLS backend
+    // is schannel, which has no way to express "these roots and no others",
+    // and a security flag that silently does nothing is worse than one that
+    // is not offered. A private CA in front of somebody's own webhook
+    // receiver is legitimate, and `snob_ig::http::plain` has no argument for
+    // this -- the same shape that stops the session reaching a webhook. That
+    // reasoning was the flag's help once, in every command's `--help`.
+    #[arg(long, global = true, display_order = 904, hide_short_help = true)]
     pub strict_roots: bool,
 
     /// Also trust the certificates in this PEM file
     ///
-    /// The way back out of `--strict-roots`, and it requires it: on the
+    /// The way back out of --strict-roots, and it requires it: on the
     /// platform store there is nothing to add to, because whatever an
     /// administrator installed is already trusted. Repeatable.
     #[arg(
@@ -119,7 +123,8 @@ pub struct Cli {
         global = true,
         display_order = 905,
         requires = "strict_roots",
-        value_name = "PEM"
+        value_name = "PEM",
+        hide_short_help = true
     )]
     pub tls_extra_root: Vec<PathBuf>,
 
@@ -244,6 +249,22 @@ pub(crate) fn signing_secret(value: &str) -> Result<String, String> {
         ));
     }
     Ok(value.to_string())
+}
+
+/// An account named on the command line, refused by clap (exit 2) when it
+/// cannot be a username (`snob_core::model::possible_username`), so the
+/// mistake is told before the consent question and before anything is spent.
+/// The value is kept as typed; the commands take the at sign off themselves.
+pub(crate) fn username(value: &str) -> Result<String, String> {
+    if snob_core::model::possible_username(value) {
+        Ok(value.to_string())
+    } else {
+        Err(format!(
+            "\"{}\" cannot be an Instagram username: letters, digits, '.' and '_', at most {}",
+            snob_core::model::printable(value),
+            snob_core::model::USERNAME_MAX
+        ))
+    }
 }
 
 /// The line of [`EXAMPLES`] that announces `SNOB_MCP_KEY`, in a build that
@@ -462,7 +483,7 @@ pub enum Command {
                       It walks neither of its lists and stores nothing.\n\n\
                       From the browser, finding another account's id costs one more until snob \
                       has walked its lists or a list that names it; your own is the session's. A \
-                      name that cannot be an Instagram username is not found, for no request. \
+                      name that cannot be an Instagram username is refused before any request. \
                       With SNOB_NO_BROWSER the name is asked about as typed, for no extra \
                       request.\n\n\
                       \"snob scan\" is the crossing, and costs both lists."
@@ -472,22 +493,47 @@ pub enum Command {
     /// Summary of the whole account: followers, following, and how they cross
     Scan(ScanArgs),
 
-    /// Accounts you follow that do not follow you back
+    /// Who joined, left or was renamed between two stored captures of a list
+    #[command(
+        after_help = "Reads what earlier walks stored and sends nothing to Instagram, \
+                      so it answers in a cooldown too. Without --since, --from or --to, it \
+                      compares the two newest whole captures of each list. A walk that \
+                      stopped short is never one of the two: the accounts it missed would \
+                      read as departures. \"snob snapshots\" lists the captures and their \
+                      ids.\n\n\
+                      Examples:\n  snob changes\n  snob changes --list followers --since 7d\n  \
+                      snob changes --since 2026-11-01\n  snob changes --from 12 --to 31 \
+                      --format csv -o changes.csv"
+    )]
+    Changes(ChangesArgs),
+
+    /// The captures of an account's lists stored here, and how each walk ended
+    #[command(
+        after_help = "Reads only what is stored, and sends nothing to Instagram. One \
+                      row per capture: its id (what \"snob changes --from\" takes), the \
+                      list, when the walk ended (or began, for one still open), where it came \
+                      from (a walk, or Instagram's own export through \"snob import dyi\"), \
+                      how many accounts it holds and how many Instagram said the list had, \
+                      and why it stopped."
+    )]
+    Snapshots(SnapshotsArgs),
+
+    /// Accounts you follow that do not follow you back, or another account's
     Unfollowers(ListArgs),
 
-    /// Accounts that follow you and you do not follow
+    /// Accounts that follow you that you do not follow back, or another account's
     Fans(ListArgs),
 
-    /// Accounts you and they follow each other
+    /// Accounts that you follow and that follow you back, or another account's
     // `mutuals` is the earlier name, kept as a hidden alias so anything written
     // against it still runs rather than failing at the shell.
     #[command(alias = "mutuals")]
     Friends(ListArgs),
 
-    /// Your followers
+    /// Your followers, or another account's
     Followers(ListArgs),
 
-    /// The accounts you follow
+    /// The accounts you follow, or another account's
     Following(ListArgs),
 
     /// Download a profile picture in high resolution
@@ -1001,6 +1047,7 @@ pub struct PurgeArgs {
 #[derive(Args, Debug)]
 pub struct ListArgs {
     /// Account to analyze. Defaults to your own.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     #[command(flatten)]
@@ -1022,6 +1069,22 @@ pub struct ListArgs {
 
     #[command(flatten)]
     pub agent: AgentArgs,
+
+    /// Walk as a job that outlives this command, and say its id at once:
+    /// "snob jobs show <id>" says how far it is and, once it ends, what it
+    /// found. One job runs at a time per account. Asks first, as the walk
+    /// would, for another account's lists
+    // Refused beside every flag a job's command does not take
+    // (`jobs::argv::ALLOWED`), rather than leaving one out quietly: the job
+    // would walk with the default where somebody typed something else.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "dry_run", "format", "path", "interactive", "hide", "only", "no_verified",
+            "exclude_list", "max_age", "no_resume", "same_day", "confirmed_via",
+        ]
+    )]
+    pub background: bool,
 }
 
 /// `snob scan`: [`ListArgs`] without `--limit`, because a summary of five
@@ -1029,6 +1092,7 @@ pub struct ListArgs {
 #[derive(Args, Debug)]
 pub struct ScanArgs {
     /// Account to summarize. Defaults to your own.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     #[command(flatten)]
@@ -1162,6 +1226,99 @@ pub struct OutputArgs {
     pub path: Option<PathBuf>,
 }
 
+/// Which of the two lists a command is about, when it may be either.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListChoice {
+    Followers,
+    Following,
+}
+
+impl From<ListChoice> for snob_core::model::ListKind {
+    fn from(choice: ListChoice) -> Self {
+        match choice {
+            ListChoice::Followers => Self::Followers,
+            ListChoice::Following => Self::Following,
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct SnapshotsArgs {
+    /// Account whose captures to list. Defaults to your own.
+    #[arg(value_parser = username)]
+    pub target: Option<String>,
+
+    /// Only the captures of this list
+    #[arg(long, value_enum)]
+    pub list: Option<ListChoice>,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct ChangesArgs {
+    /// Account whose lists to compare. Defaults to your own.
+    #[arg(value_parser = username)]
+    pub target: Option<String>,
+
+    /// Only this list
+    #[arg(long, value_enum)]
+    pub list: Option<ListChoice>,
+
+    /// Compare against the newest capture from before this moment: a date
+    /// (2026-11-01) or how long ago (7d, 12h)
+    #[arg(long, value_name = "WHEN", value_parser = since, conflicts_with_all = ["from", "to"])]
+    pub since: Option<Since>,
+
+    /// The earlier capture, by its id in "snob snapshots"
+    #[arg(long, value_name = "ID")]
+    pub from: Option<i64>,
+
+    /// The later capture, by its id; the newest of the same list when left out
+    #[arg(long, value_name = "ID")]
+    pub to: Option<i64>,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+/// The moment `--since` names, kept as typed until the run reads the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Since {
+    /// How long before now.
+    Ago(std::time::Duration),
+    /// The start of a day, in the local zone.
+    Day(chrono::NaiveDate),
+}
+
+impl Since {
+    /// The moment, against `now`.
+    pub fn at(self, now: snob_core::Epoch) -> snob_core::Epoch {
+        match self {
+            Self::Ago(ago) => now - ago,
+            Self::Day(day) => {
+                use chrono::TimeZone;
+                let midnight = day.and_hms_opt(0, 0, 0).unwrap_or_default();
+                let at = chrono::Local
+                    .from_local_datetime(&midnight)
+                    .earliest()
+                    .map_or_else(|| midnight.and_utc().timestamp(), |t| t.timestamp());
+                snob_core::Epoch::new(at)
+            }
+        }
+    }
+}
+
+fn since(text: &str) -> Result<Since, String> {
+    if let Ok(day) = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        return Ok(Since::Day(day));
+    }
+    snob_core::duration::parse(text)
+        .map(Since::Ago)
+        .map_err(|_| format!("\"{text}\" is neither a date (2026-11-01) nor a duration (7d, 12h)"))
+}
+
 /// The one question a command asks, answered in advance.
 ///
 /// One definition for the one convention: each command asks at most one thing
@@ -1291,6 +1448,44 @@ fn duration(text: &str) -> Result<std::time::Duration, String> {
     snob_core::duration::parse(text)
 }
 
+// The schedule's flags are judged here, each by the domain rule that would
+// refuse it later, so a mistake in one is a mistake on the command line:
+// exit 2 and clap's message, before the file is read or anything is
+// settled, as every other value typed wrong is. Whether the flags make a
+// schedule together (`--on` with neither `--at` nor `--every`) is still
+// `schedule_from`'s question, since clap judges values one at a time.
+
+/// `--every`: a duration, and one the monitor may run at
+/// (`Schedule::every`: not twice inside its minimum gap, nor rarer than it
+/// can count).
+fn interval(text: &str) -> Result<std::time::Duration, String> {
+    let interval = duration(text)?;
+    snob_core::watch::schedule::Schedule::every(interval)
+        .map(|_| interval)
+        .map_err(|e| e.to_string())
+}
+
+/// `--at`: a time of day, kept as typed for the file and the banner.
+fn clock_time(text: &str) -> Result<String, String> {
+    snob_core::watch::schedule::parse_time(text)
+        .map(|_| text.trim().to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// `--on`: a day of the week, kept as typed.
+fn weekday(text: &str) -> Result<String, String> {
+    snob_core::watch::schedule::Weekday::parse(text)
+        .map(|_| text.to_string())
+        .ok_or_else(|| format!("\"{text}\" is not a day (try mon, thu)"))
+}
+
+/// `--cron`: five fields that name at least one moment.
+fn cron_expression(text: &str) -> Result<String, String> {
+    snob_core::watch::schedule::Schedule::cron(text)
+        .map(|_| text.to_string())
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Args, Debug)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct WatchArgs {
@@ -1306,14 +1501,15 @@ pub struct WatchArgs {
 #[derive(Args, Debug, Default)]
 pub struct WatchRunArgs {
     /// Account to watch. Defaults to your own.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     /// How often to run: 6h, 2d, 2w
-    #[arg(long, value_name = "DURATION", value_parser = duration)]
+    #[arg(long, value_name = "DURATION", value_parser = interval)]
     pub every: Option<std::time::Duration>,
 
     /// Times of day to run at: 09:00,21:00
-    #[arg(long, value_delimiter = ',', value_name = "HH:MM")]
+    #[arg(long, value_delimiter = ',', value_name = "HH:MM", value_parser = clock_time)]
     pub at: Vec<String>,
 
     /// Days to run on: mon,thu. Defaults to every day.
@@ -1321,12 +1517,13 @@ pub struct WatchRunArgs {
         long,
         value_delimiter = ',',
         value_name = "DAYS",
-        conflicts_with = "cron"
+        conflicts_with = "cron",
+        value_parser = weekday
     )]
     pub on: Vec<String>,
 
     /// A five-field cron expression, for a schedule you already have written
-    #[arg(long, value_name = "EXPR", conflicts_with = "at")]
+    #[arg(long, value_name = "EXPR", conflicts_with = "at", value_parser = cron_expression)]
     pub cron: Option<String>,
 
     /// How far a run may be pushed later, so it does not land on the same
@@ -1392,6 +1589,24 @@ pub struct WebhookArgs {
     /// silence can tell "nothing happened" from "it stopped running"
     #[arg(long)]
     pub heartbeat: bool,
+
+    /// What the body is: json (the report, for a program), or the summary as
+    /// slack, discord, ntfy or text want it posted. The address in watch.toml
+    /// takes its "format" from there.
+    #[arg(long, value_name = "FORMAT", value_parser = webhook_format)]
+    pub webhook_format: Option<snob_store::config::WebhookFormat>,
+}
+
+/// One of the five words `format` under `[webhook]` takes, read as the file
+/// reads it so the two cannot disagree.
+fn webhook_format(text: &str) -> Result<snob_store::config::WebhookFormat, String> {
+    #[derive(serde::Deserialize)]
+    struct One {
+        format: snob_store::config::WebhookFormat,
+    }
+    serde_json::from_value::<One>(serde_json::json!({ "format": text }))
+        .map(|one| one.format)
+        .map_err(|_| format!("\"{text}\" is not json, slack, discord, ntfy or text"))
 }
 
 /// The monitor.
@@ -1457,8 +1672,71 @@ pub enum WatchCommand {
     )]
     Check(WatchCheckArgs),
 
-    /// What is configured, when it last ran, and what is still owed
+    /// What is configured, when it last ran and runs next, and what is still
+    /// owed
     Status(WatchStatusArgs),
+
+    /// Send the reports still owed to the webhook, and nothing else
+    #[command(
+        after_help = "For a receiver that was down and is back: what the monitor queued for it \
+                      goes now, whatever wait the queue had set before the next try, without \
+                      waiting for the next run. Up to ten reports per account at a time; run it \
+                      again for more.\n\n\
+                      It walks nothing and sends no request to Instagram, so it needs no \
+                      session and costs nothing in the budget. Only the reports queued for \
+                      this webhook's address go, in the shape they were queued in.\n\n\
+                      Exits 1 (reason not_delivered) when a report it tried did not arrive."
+    )]
+    Deliver(WatchDeliverArgs),
+
+    /// Print what to give a scheduler: systemd, cron, launchd or schtasks
+    #[command(
+        after_help = "Prints and installs nothing. Every unit runs \"snob watch once \
+                      --when-due\" every 15 minutes, and the run decides whether the schedule \
+                      in watch.toml says it is due, so the schedule is kept in one place and \
+                      a run that is not due sends nothing.\n\n\
+                      With no argument, the unit for this system: systemd on Linux, launchd \
+                      on macOS, schtasks on Windows. The path printed is one that survives an \
+                      upgrade where the installer keeps one."
+    )]
+    Unit(WatchUnitArgs),
+}
+
+#[derive(Args, Debug, Default)]
+pub struct WatchUnitArgs {
+    /// Which scheduler. Defaults to this system's own
+    pub kind: Option<UnitKind>,
+}
+
+/// The schedulers `snob watch unit` prints for.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitKind {
+    Systemd,
+    Cron,
+    Launchd,
+    Schtasks,
+}
+
+impl UnitKind {
+    /// The scheduler this system comes with.
+    pub fn of_this_platform() -> Self {
+        if cfg!(windows) {
+            Self::Schtasks
+        } else if cfg!(target_os = "macos") {
+            Self::Launchd
+        } else {
+            Self::Systemd
+        }
+    }
+}
+
+#[derive(Args, Debug, Default)]
+pub struct WatchDeliverArgs {
+    #[command(flatten)]
+    pub delivery: WebhookArgs,
+
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 }
 
 #[derive(Args, Debug, Default)]
@@ -1469,6 +1747,21 @@ pub struct WatchCheckArgs {
     /// Do not post anything to the webhook
     #[arg(long)]
     pub no_webhook: bool,
+
+    /// Sign the check's message with this secret, as a run given it signs
+    /// its reports. SNOB_SIGNING_KEY is read when it is set.
+    // The same flag and variable as a run's (`WebhookArgs::sign_with`): a
+    // check that ignored the variable a scheduled run signs with posted an
+    // unsigned message and said "ok", so the one path a headless machine
+    // signs by was the one it could not probe.
+    #[arg(
+        long,
+        value_name = "SECRET",
+        value_parser = signing_secret,
+        env = "SNOB_SIGNING_KEY",
+        hide_env_values = true
+    )]
+    pub sign_with: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1487,6 +1780,7 @@ pub struct WatchStatusArgs {
 #[derive(Args, Debug)]
 pub struct WatchDiffArgs {
     /// Account to report on. Defaults to your own.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     #[command(flatten)]
@@ -1505,7 +1799,14 @@ pub struct WatchOnceArgs {
     // entry. Reading another account needs a terminal to ask at, or an
     // `[[account]]` in `watch.toml` carrying the answer somebody gave once,
     // which is the only thing an unattended run accepts.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
+
+    /// Run only if the schedule in watch.toml says a run is due, and
+    /// otherwise exit 0 having sent nothing. For a timer that asks often:
+    /// "snob watch unit" prints one
+    #[arg(long)]
+    pub when_due: bool,
 
     #[command(flatten)]
     pub output: StatusOutputArgs,
@@ -1517,6 +1818,7 @@ pub struct WatchOnceArgs {
 #[derive(Args, Debug)]
 pub struct ProfileArgs {
     /// Account to show. Defaults to your own.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     /// Output format. Defaults to a table on a terminal and JSON in a pipe.
@@ -1558,6 +1860,7 @@ impl ProfileArgs {
 #[derive(Args, Debug)]
 pub struct PfpArgs {
     /// Account whose profile picture to download
+    #[arg(value_parser = username)]
     pub target: String,
 
     /// Destination file; "-" for standard output
@@ -1762,6 +2065,7 @@ pub struct MediaListArgs {
 #[derive(Args, Debug)]
 pub struct StoriesArgs {
     /// Account whose stories to show. Defaults to your own.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     #[command(flatten)]
@@ -1776,6 +2080,7 @@ pub struct HighlightsArgs {
     /// Account whose highlights to show. Defaults to your own — but the first
     /// bare word is always read as an account, so picking a highlight of your
     /// own takes your username in front of the number.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     /// A highlight's number from the tray listing: what -d and -i then act on
@@ -1795,6 +2100,7 @@ pub struct PostsArgs {
     /// Account whose posts to show. Defaults to your own, but the first bare
     /// word is always read as an account, so picking a post of your own takes
     /// your username in front of the number.
+    #[arg(value_parser = username)]
     pub target: Option<String>,
 
     /// A post's number from the grid listing: what -d and -i then act on is
@@ -1846,6 +2152,7 @@ pub struct PostArgs {
 ))]
 pub struct FollowArgs {
     /// The one account to follow or unfollow
+    #[arg(value_parser = username)]
     pub target: String,
 
     #[command(flatten)]
@@ -2906,5 +3213,48 @@ mod tests {
         // Off unless asked, which is the default the audit settled on.
         let plain = Cli::try_parse_from(["snob", "whoami"]).unwrap();
         assert!(!plain.strict_roots);
+    }
+
+    #[test]
+    fn changes_takes_a_date_or_a_duration_and_not_both_ways_of_choosing() {
+        let Command::Changes(by_day) =
+            Cli::try_parse_from(["snob", "changes", "--since", "2026-11-01"])
+                .unwrap()
+                .command
+        else {
+            panic!("not changes");
+        };
+        assert!(matches!(by_day.since, Some(Since::Day(_))));
+        let Command::Changes(ago) = Cli::try_parse_from(["snob", "changes", "--since", "7d"])
+            .unwrap()
+            .command
+        else {
+            panic!("not changes");
+        };
+        assert_eq!(
+            ago.since
+                .map(|since| since.at(snob_core::Epoch::new(700_000))),
+            Some(snob_core::Epoch::new(700_000 - 7 * 86_400))
+        );
+        assert!(Cli::try_parse_from(["snob", "changes", "--since", "soon"]).is_err());
+        assert!(
+            Cli::try_parse_from(["snob", "changes", "--since", "7d", "--from", "3"]).is_err(),
+            "a moment and an id are two answers to one question"
+        );
+    }
+
+    #[test]
+    fn a_schedule_flag_the_monitor_could_never_run_on_is_a_command_line_error() {
+        for line in [
+            ["snob", "watch", "--every", "1m"],
+            ["snob", "watch", "--at", "25:00"],
+            ["snob", "watch", "--on", "someday"],
+            ["snob", "watch", "--cron", "* * *"],
+        ] {
+            let refused = Cli::try_parse_from(line).expect_err("refused at the parser");
+            assert_eq!(refused.exit_code(), 2, "{line:?}");
+        }
+        assert!(Cli::try_parse_from(["snob", "watch", "--every", "6h", "--at", "09:00"]).is_ok());
+        assert!(Cli::try_parse_from(["snob", "watch", "--on", "mon,thu", "--at", "9:00"]).is_ok());
     }
 }

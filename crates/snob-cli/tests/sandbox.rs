@@ -531,6 +531,73 @@ async fn a_change_reaches_the_receiver_signed_and_only_once() {
     );
 }
 
+/// Two stored captures are compared with nothing sent: who left, and who
+/// changed their name, which is no departure and arrival.
+#[tokio::test]
+async fn changes_between_two_captures_name_who_left_and_who_was_renamed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &first);
+    let out = snob(tmp.path(), Some(&first), &["followers", "--format", "json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    a_day_passes(tmp.path());
+
+    // A day later user2 is gone and user0 goes by another name.
+    let second = fake_instagram(2, 2).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"users":[{"pk":1000,"username":"renamed0"},{"pk":1001,"username":"user1"}]}"#,
+        ))
+        .with_priority(1)
+        .mount(&second)
+        .await;
+    let out = snob(
+        tmp.path(),
+        Some(&second),
+        &["followers", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let out = snob(tmp.path(), None, &["snapshots", "--list", "followers"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let listed = json(&out);
+    assert_eq!(listed.as_array().map(Vec::len), Some(2), "{listed}");
+    assert_eq!(listed[0]["accounts"], 2, "newest first: {listed}");
+
+    let out = snob(tmp.path(), None, &["changes", "--list", "followers"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let changes = json(&out);
+    let list = &changes["lists"][0];
+    assert_eq!(list["list"], "followers", "{changes}");
+    assert_eq!(
+        list["gained"].as_array().map(Vec::len),
+        Some(0),
+        "{changes}"
+    );
+    assert_eq!(list["lost"][0]["username"], "user2", "{changes}");
+    assert_eq!(list["renamed"][0]["from"], "user0", "{changes}");
+    assert_eq!(list["renamed"][0]["to"], "renamed0", "{changes}");
+    assert!(
+        stderr(&out).contains("0 gained, 1 lost, 1 renamed"),
+        "{}",
+        stderr(&out)
+    );
+
+    // An id that is no whole capture is refused, not stepped over.
+    let out = snob(
+        tmp.path(),
+        None,
+        &["changes", "--from", "99", "--format", "json"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("no_such_snapshot"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 /// A receiver that is down costs nothing, and the next run picks it up.
 ///
 /// The queue is the reason a restarting receiver does not lose a change, and
@@ -549,9 +616,18 @@ async fn a_report_a_receiver_refused_is_owed_and_then_delivered() {
     a_day_passes(tmp.path());
     let second = fake_instagram(2, 2).await;
     let out = snob(tmp.path(), Some(&second), &["watch", "once"]);
+    // The run went through and its report is owed, but on a timer nothing
+    // tries it again before the next run, so the run says so: exit 1, with a
+    // reason of its own.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a report left undelivered is not a 0: {}",
+        stderr(&out)
+    );
     assert!(
-        out.status.success(),
-        "a receiver that is down does not fail the run: {}",
+        stderr(&out).contains("did not reach the webhook"),
+        "{}",
         stderr(&out)
     );
     let refused = posted(&down).await;
@@ -599,6 +675,163 @@ async fn a_report_a_receiver_refused_is_owed_and_then_delivered() {
     assert!(
         posted(&up).await.is_empty(),
         "and nothing was sent to the new address"
+    );
+}
+
+/// A webhook given another `format` is sent the summary, as plain text for
+/// ntfy, and the header still says which event it is.
+#[tokio::test]
+async fn an_ntfy_webhook_is_sent_the_summary_as_plain_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ntfy = receiver(200).await;
+    let first = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &first);
+    configure(
+        tmp.path(),
+        &format!(
+            "schema = 1\nevery = \"6h\"\n\n[webhook]\nurl = \"{}/webhook/snob\"\nformat = \"ntfy\"\n",
+            ntfy.uri()
+        ),
+    );
+    let out = snob(tmp.path(), Some(&first), &["watch", "once"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    a_day_passes(tmp.path());
+    let second = fake_instagram(2, 2).await;
+    let out = snob(tmp.path(), Some(&second), &["watch", "once"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let sent = posted(&ntfy).await;
+    assert_eq!(sent.len(), 1);
+    let header = |name: &str| {
+        sent[0]
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(
+        header("content-type").starts_with("text/plain"),
+        "{}",
+        header("content-type")
+    );
+    assert_eq!(header("x-snob-event"), "watch.changes");
+    let body = String::from_utf8_lossy(&sent[0].body);
+    assert!(body.starts_with("Changes for"), "{body}");
+    assert!(body.contains("followers lost: 1"), "{body}");
+}
+
+/// A report a receiver refused goes when asked, without waiting for its
+/// backoff or the next run, and asks nothing of Instagram.
+#[tokio::test]
+async fn watch_deliver_sends_what_is_owed_and_nothing_to_instagram() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hook = MockServer::start().await;
+    // Down for the run, back for the delivery.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&hook)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&hook)
+        .await;
+    let first = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &first);
+    configure(
+        tmp.path(),
+        &format!(
+            "schema = 1\nevery = \"6h\"\n\n[webhook]\nurl = \"{}/webhook/snob\"\nformat = \"text\"\n",
+            hook.uri()
+        ),
+    );
+    snob(tmp.path(), Some(&first), &["watch", "once"]);
+    a_day_passes(tmp.path());
+    let second = fake_instagram(2, 2).await;
+    let out = snob(tmp.path(), Some(&second), &["watch", "once"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let asked = second.received_requests().await.unwrap_or_default().len();
+
+    let out = snob(tmp.path(), Some(&second), &["watch", "deliver", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = json(&out);
+    assert_eq!(said["tried"], 1, "{said}");
+    assert_eq!(said["waiting"], 0, "{said}");
+    assert_eq!(
+        second.received_requests().await.unwrap_or_default().len(),
+        asked,
+        "delivering asks Instagram nothing"
+    );
+    let sent = posted(&hook).await;
+    assert_eq!(sent.len(), 2, "refused once, delivered once");
+    assert_eq!(sent[0].body, sent[1].body, "the same bytes, as queued");
+    assert!(String::from_utf8_lossy(&sent[1].body).starts_with("Changes for"));
+
+    // Nothing left, so nothing is sent.
+    let out = snob(tmp.path(), Some(&second), &["watch", "deliver", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(json(&out)["tried"], 0);
+    assert_eq!(posted(&hook).await.len(), 2);
+}
+
+/// A timer that asks before the schedule says a run is due gets a 0 and
+/// spends nothing: the first ask of an interval only starts its clock.
+#[tokio::test]
+async fn a_run_asked_for_before_it_is_due_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    configure(tmp.path(), "schema = 1\nevery = \"6h\"\n");
+    let asked = instagram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .len();
+
+    // Nothing has started the interval's clock yet, and status says so.
+    let said = json(&snob(tmp.path(), None, &["watch", "status", "--json"]));
+    assert_eq!(said["next_run"]["at"], serde_json::Value::Null, "{said}");
+    assert_eq!(said["next_run"]["due_now"], false, "{said}");
+
+    for _ in 0..2 {
+        let out = snob(
+            tmp.path(),
+            Some(&instagram),
+            &["watch", "once", "--when-due"],
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(stderr(&out).contains("Not due yet"), "{}", stderr(&out));
+    }
+
+    // The first ask started it: the next run is six hours on.
+    let said = json(&snob(tmp.path(), None, &["watch", "status", "--json"]));
+    let at = said["next_run"]["at"].as_i64().expect("a moment now");
+    let in_six_hours = snob_core::clock::now().get() + 6 * 3_600;
+    assert!((in_six_hours - at).abs() < 120, "{said}");
+    assert_eq!(
+        instagram
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len(),
+        asked,
+        "nothing was asked of Instagram"
+    );
+
+    // With no schedule anywhere there is nothing to be due on.
+    configure(tmp.path(), "schema = 1\n");
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["watch", "once", "--when-due"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("how often should this run"),
+        "{}",
+        stderr(&out)
     );
 }
 
@@ -5767,6 +6000,45 @@ async fn a_job_that_finishes_within_the_wait_answers_inline() {
     );
 }
 
+/// A person's `--background` is a job like an agent's: started at once, its
+/// id handed back, its answer read with `snob jobs show`. Another account's
+/// lists with nobody to ask and no `-y` make no job at all.
+#[tokio::test]
+async fn a_list_walked_in_the_background_is_a_job_and_asks_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["followers", "someone", "--background"],
+    );
+    assert_eq!(out.status.code(), Some(130), "{}", stderr(&out));
+    assert!(jobs.dirs().is_empty(), "nothing was made");
+
+    let out = snob(tmp.path(), Some(&instagram), &["followers", "--background"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let told = json(&out);
+    let id = told["job_id"].as_str().expect("its id").to_string();
+    assert_eq!(told["command"], "followers", "{told}");
+    assert_eq!(
+        told["tool"],
+        serde_json::Value::Null,
+        "a person's, not a tool's"
+    );
+    let finished = jobs.finished(&id);
+    assert_eq!(finished["finished"]["exit"], "ok", "{finished}");
+    assert!(
+        finished["finished"]["output"].to_string().contains("user0"),
+        "{finished}"
+    );
+}
+
 /// A walk that takes longer than the wait is answered with its record while
 /// it runs, and asked about later gives what the walk answered.
 #[tokio::test]
@@ -6423,6 +6695,14 @@ async fn the_mcp_server_answers_a_quick_walk_inline_with_its_job_id() {
         "{job}"
     );
     assert_eq!(job["started_by"], "test 0", "{job}");
+    assert!(
+        job.get("estimate").is_none(),
+        "a row of the list leaves the whole estimate to show: {job}"
+    );
+    assert!(
+        jobs.ask(&["show", &id, "--json"]).get("estimate").is_some(),
+        "and show still gives it"
+    );
     let record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(jobs.dirs()[0].join("job.json")).unwrap()).unwrap();
     // A job waits for the budget an hour when the server was given no wait.

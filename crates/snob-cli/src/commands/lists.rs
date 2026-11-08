@@ -302,6 +302,7 @@ mod tests {
                 ..WalkArgs::default()
             },
             agent: Default::default(),
+            background: false,
         };
         let filter = Filter::default();
         let mut me = app_as(&server, 42, "me");

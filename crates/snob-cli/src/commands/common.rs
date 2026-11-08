@@ -664,6 +664,7 @@ pub async fn walk_named(
                 outcome.taken_at,
                 lifts,
                 outcome.reason,
+                outcome.own_changes,
             );
         }
     }

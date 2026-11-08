@@ -32,6 +32,7 @@ pub(crate) const USER_COLUMNS: [&str; 6] = [
 ];
 
 pub(crate) mod csv;
+pub(crate) mod grid;
 pub(crate) mod md;
 pub(crate) mod table;
 #[cfg(feature = "xlsx")]
@@ -569,7 +570,7 @@ fn write_stdout(bytes: &[u8]) -> Result<()> {
 /// Markdown and CSV already filter both names; this is the same filter, so no
 /// format is the one left uncovered. The picture address is left alone: it is
 /// Instagram's, not a person's.
-fn readable(users: &[User]) -> Vec<User> {
+pub(crate) fn readable(users: &[User]) -> Vec<User> {
     users
         .iter()
         .map(|user| User {

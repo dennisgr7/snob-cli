@@ -74,6 +74,13 @@ pub async fn run(args: PfpArgs, store: SecretStore, paths: &AccountPaths) -> Res
             output::one_file_to_stdout(1)?;
             output::write_rendered(&rendered, None)?;
         }
+        // A directory that is there already: the picture goes into it under
+        // the name it would get in the working directory, never replacing
+        // one. Taken as a file name, it failed with "Is a directory".
+        Some(dir) if dir.is_dir() => {
+            let path = dir.join(output::default_path(&dir, &username, extension)?);
+            output::write_new(&rendered, &path)?;
+        }
         // The user named it, so replacing what is there is their call.
         Some(path) => output::write_rendered(&rendered, Some(&path))?,
         // A JPEG dumped into a terminal is unreadable noise, so on a terminal

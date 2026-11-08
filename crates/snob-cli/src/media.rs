@@ -227,8 +227,9 @@ pub(crate) fn numbers_of(
 
 /// Downloads items of one listing by the numbers it printed.
 ///
-/// One number keeps the single-download contract: `-o` names a file and a
-/// failure is the run's failure; without `-o` the file lands in the working
+/// One number keeps the single-download contract: `-o` names a file (or a
+/// directory that exists, which it is saved into) and a failure is the run's
+/// failure; without `-o` the file lands in the working
 /// directory under the listing's name, and one already there is an answer
 /// rather than a second copy. Several go through [`download_many`]: `-o`
 /// names a directory and the loop keeps going past one that fails.
@@ -263,6 +264,15 @@ pub(crate) async fn download_selected(
         Some(_) if to_stdout => {
             let bytes = bytes_of(&client, story).await?;
             output::write_bytes(&bytes, None)?;
+        }
+        // A directory that is there already: the file goes into it under
+        // the listing's name, as several would. Taken as a file name, it
+        // failed with "Is a directory" after the story had been fetched.
+        Some(dir) if dir.is_dir() => {
+            match save_story(&client, &stem_base, items, number, dir).await? {
+                Saved::Now(path) => ui::info(&format!("Saved {}", path.display())),
+                Saved::Already(path) => ui::info(&format!("Already saved {}", path.display())),
+            }
         }
         // The user named it, so replacing what is there is their call -- and
         // so is downloading it again. Held whole: a named destination may be
