@@ -2218,6 +2218,7 @@ fn without_the_runs_times(text: &str, from: u64, to: u64) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
+    let text = &without_iso_times(text, from, to);
     let mut digits = String::new();
     let mut out = String::new();
     for c in text.chars().chain(std::iter::once('\0')) {
@@ -2271,6 +2272,37 @@ fn without_the_runs_times(text: &str, from: u64, to: u64) -> String {
         .collect();
     let trailing = if text.ends_with('\n') { "\n" } else { "" };
     lines.join("\n") + trailing
+}
+
+/// `text` with each RFC 3339 moment in UTC (`2026-11-08T01:00:42Z`, what the
+/// monitor's JSON gives beside its epochs) that falls within `from..=to`
+/// made [`A_MOMENT`], as its epoch beside it is.
+fn without_iso_times(text: &str, from: u64, to: u64) -> String {
+    const LONG: usize = "2026-11-08T01:00:42Z".len();
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find('T') {
+        let start = at.saturating_sub(10);
+        let moment = (at >= 10)
+            .then(|| rest.get(start..start + LONG))
+            .flatten()
+            .and_then(|candidate| chrono::DateTime::parse_from_rfc3339(candidate).ok())
+            .map(|moment| moment.timestamp())
+            .filter(|&moment| u64::try_from(moment).is_ok_and(|m| (from..=to).contains(&m)));
+        match moment {
+            Some(_) => {
+                out.push_str(&rest[..start]);
+                out.push_str(A_MOMENT);
+                rest = &rest[start + LONG..];
+            }
+            None => {
+                out.push_str(&rest[..=at]);
+                rest = &rest[at + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `text` with each count of requests it prints made `<n>`: what a path
