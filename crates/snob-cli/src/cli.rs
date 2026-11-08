@@ -1069,6 +1069,22 @@ pub struct ListArgs {
 
     #[command(flatten)]
     pub agent: AgentArgs,
+
+    /// Walk as a job that outlives this command, and say its id at once:
+    /// "snob jobs show <id>" says how far it is and, once it ends, what it
+    /// found. One job runs at a time per account. Asks first, as the walk
+    /// would, for another account's lists
+    // Refused beside every flag a job's command does not take
+    // (`jobs::argv::ALLOWED`), rather than leaving one out quietly: the job
+    // would walk with the default where somebody typed something else.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "dry_run", "format", "path", "interactive", "hide", "only", "no_verified",
+            "exclude_list", "max_age", "no_resume", "same_day", "confirmed_via",
+        ]
+    )]
+    pub background: bool,
 }
 
 /// `snob scan`: [`ListArgs`] without `--limit`, because a summary of five

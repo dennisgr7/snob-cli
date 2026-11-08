@@ -632,7 +632,12 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   when its lists were walked far apart. Not held, the page is read from the
   store; for a call given `max_pages`, it is refused as `page_unavailable`.
 - **A walk can outlive the call that started it, as a job** (`jobs/`, in
-  every build: `std` processes and threads, no `mcp` feature). `snob __job
+  every build: `std` processes and threads, no `mcp` feature). A person
+  starts one with `--background` on a list command
+  (`commands/background.rs`): consent is asked first, in this process, as
+  the walk would ask it, and no job is made on a no; the job's command
+  then carries `-y`, and `--background` is refused beside every flag a
+  job's command does not take (`argv::ALLOWED`). `snob __job
   start` checks the walk, makes the job under the account's `jobs/.lock`
   (one running per account: the same command again is `reused`, the
   `--confirmed-*` aside, another is `too_many_jobs`, and one asked to stop

@@ -6000,6 +6000,45 @@ async fn a_job_that_finishes_within_the_wait_answers_inline() {
     );
 }
 
+/// A person's `--background` is a job like an agent's: started at once, its
+/// id handed back, its answer read with `snob jobs show`. Another account's
+/// lists with nobody to ask and no `-y` make no job at all.
+#[tokio::test]
+async fn a_list_walked_in_the_background_is_a_job_and_asks_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &instagram);
+    let jobs = Jobs {
+        root: tmp.path(),
+        instagram: &instagram,
+    };
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["followers", "someone", "--background"],
+    );
+    assert_eq!(out.status.code(), Some(130), "{}", stderr(&out));
+    assert!(jobs.dirs().is_empty(), "nothing was made");
+
+    let out = snob(tmp.path(), Some(&instagram), &["followers", "--background"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let told = json(&out);
+    let id = told["job_id"].as_str().expect("its id").to_string();
+    assert_eq!(told["command"], "followers", "{told}");
+    assert_eq!(
+        told["tool"],
+        serde_json::Value::Null,
+        "a person's, not a tool's"
+    );
+    let finished = jobs.finished(&id);
+    assert_eq!(finished["finished"]["exit"], "ok", "{finished}");
+    assert!(
+        finished["finished"]["output"].to_string().contains("user0"),
+        "{finished}"
+    );
+}
+
 /// A walk that takes longer than the wait is answered with its record while
 /// it runs, and asked about later gives what the walk answered.
 #[tokio::test]

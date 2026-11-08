@@ -90,7 +90,8 @@ snob watch                       # keep watching on a schedule, report changes
 snob status                      # budget left, cooldown, stored lists, agents; sends nothing
 snob snapshots                   # the captures of your lists stored here; sends nothing
 snob changes --since 7d          # who joined, left or was renamed between two of them
-snob jobs                        # walks an agent left running, and "snob jobs cancel <id>"
+snob followers --background      # walk as a job and get its id at once; any list command
+snob jobs                        # walks left running, and "snob jobs cancel <id>"
 ```
 
 On a terminal most commands open a full-screen view you move through with the

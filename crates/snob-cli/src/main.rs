@@ -56,6 +56,19 @@ async fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(snob_cli::exit::code(code))
 }
 
+/// The list command and its arguments, when it was given `--background`.
+fn in_the_background(command: &Command) -> Option<(&'static str, &snob_cli::cli::ListArgs)> {
+    let (name, args) = match command {
+        Command::Followers(args) => ("followers", args),
+        Command::Following(args) => ("following", args),
+        Command::Unfollowers(args) => ("unfollowers", args),
+        Command::Fans(args) => ("fans", args),
+        Command::Friends(args) => ("friends", args),
+        _ => return None,
+    };
+    args.background.then_some((name, args))
+}
+
 /// `snob` typed with no command.
 ///
 /// On a terminal, where to start (`commands::start`). Anywhere else, the
@@ -482,6 +495,13 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
     // Whether this run was told which account, rather than left to the
     // registry.
     let named = snob_cli::account::given(cli.account.as_deref(), env.as_deref()).is_some();
+
+    // A list walk asked for in the background is a job's to run, and needs
+    // the whole command line (`jobs::argv::globals`), which the match below
+    // takes apart.
+    if let Some((command, args)) = in_the_background(&cli.command) {
+        return commands::background::run(&cli, command, args, &store, &required()?).await;
+    }
 
     match cli.command {
         Command::Login(args) => {

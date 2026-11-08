@@ -1,4 +1,5 @@
 pub mod account;
+pub mod background;
 pub mod changes;
 pub mod common;
 pub mod dry_run;
