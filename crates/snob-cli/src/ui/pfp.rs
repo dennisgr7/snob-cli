@@ -118,7 +118,7 @@ fn draw(frame: &mut Frame<'_>, picture: &Picture, viewer: &Viewer, note: &str, c
     )
     .title_bottom(tui::footer(
         note,
-        "enter open · d save here · a account · q quit",
+        "enter open · d save · a account · q quit",
         colors,
     ));
     let inner = block.inner(area);
@@ -226,6 +226,6 @@ mod tests {
         assert!(row(0).ends_with(" as @me ╮"));
         assert!(row(1).contains("(243 KB)"));
         assert!(row(1).contains("> "));
-        assert!(row(5).contains("d save here"));
+        assert!(row(5).contains("d save ·"));
     }
 }

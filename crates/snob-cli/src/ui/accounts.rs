@@ -316,7 +316,7 @@ fn draw(frame: &mut Frame<'_>, picker: &Picker, current: &Viewer, colors: bool) 
         )))
         .collect();
     let hint = if picker.on_add() {
-        "enter log in · Ctrl+C during the login also ends this view · esc back"
+        "enter log in · ctrl+c during the login also ends this view · esc back"
     } else {
         "enter use in this view · u make active · esc back"
     };
@@ -541,7 +541,7 @@ mod tests {
         let mut picker = picker();
         press(&mut picker, KeyCode::End);
         let screen = rendered(&picker);
-        assert!(screen.contains("Ctrl+C during the login"), "{screen}");
+        assert!(screen.contains("ctrl+c during the login"), "{screen}");
     }
 
     /// A view that ended on a pick switches to it, whatever its code; one

@@ -57,7 +57,7 @@ use crate::report;
 use crate::ui::accounts::{self, Browsed, Picked};
 use crate::ui::browser::input::{self, Action, Raw, action_of, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
-use crate::ui::highlights::{Folder, empty_note, keep_folder, stem_of, walk_in};
+use crate::ui::highlights::{Folder, empty_note, folder_title, keep_folder, stem_of, walk_in};
 use crate::ui::people::Shelf;
 use crate::ui::tui::{self, Tui};
 
@@ -698,11 +698,11 @@ fn draw_level(
             let items = folder.items.as_deref().unwrap_or_default();
             crate::ui::stories::draw_items_view(
                 frame,
-                format!(
-                    "@{} · {} · {} items",
-                    printable(&profile.username),
-                    entry_title(&media.tray.entries[index]),
-                    items.len()
+                folder_title(
+                    &profile.username,
+                    &media.tray.entries[index],
+                    index,
+                    items.len(),
                 ),
                 crate::ui::stories::FOLDER_HINT,
                 items,
@@ -800,8 +800,8 @@ async fn list_open(
             return Ok(After::Leave(code));
         }
         return Ok(After::Stay(format!(
-            "{} accounts, from the stored list",
-            people.len()
+            "{}, from the stored list",
+            report::accounts(people.len())
         )));
     }
     state.ask = Ask::List(kind);
@@ -843,8 +843,8 @@ async fn walk_and_open(
         return Ok(After::Leave(code));
     }
     Ok(After::Stay(format!(
-        "{} accounts - {}",
-        people.len(),
+        "{} · {}",
+        report::accounts(people.len()),
         report::requests(outcome.requests)
     )))
 }
@@ -901,7 +901,7 @@ async fn scan_and_open(
         return Ok(After::Leave(code));
     }
     Ok(After::Stay(format!(
-        "Scanned - {}",
+        "Scanned · {}",
         report::requests(followers_outcome.requests + following_outcome.requests)
     )))
 }
@@ -922,7 +922,10 @@ async fn followed_by_open(
         let _ = tui.suspend();
         // No bar draws for this walk, so one line says why the terminal is
         // quiet while the pacer spaces the pages out.
-        eprintln!("walking the accounts you follow that follow them...");
+        eprintln!(
+            "Walking the accounts you follow that follow @{}...",
+            printable(&profile.username)
+        );
         let walked = crate::commands::profile::mutuals(
             app.client(),
             profile.pk,
@@ -954,7 +957,10 @@ async fn followed_by_open(
     if code == ExitCode::Interrupted {
         return Ok(After::Leave(code));
     }
-    Ok(After::Stay(format!("{} accounts you follow", people.len())))
+    Ok(After::Stay(format!(
+        "{} you follow",
+        report::accounts(people.len())
+    )))
 }
 
 /// A failure while suspended: back on the card with the reason in the note —
@@ -1517,7 +1523,7 @@ fn counted(n: Option<u64>) -> String {
 fn card_footer_line(here: CardRow, note: &str, colors: bool) -> Line<'static> {
     let mut hint = String::from("↑↓ move · ←→ pick · enter open");
     if here == CardRow::Highlights {
-        hint.push_str(" · d save all of it");
+        hint.push_str(" · d save all");
     }
     hint.push_str(" · a account · q quit");
     tui::footer(note, &hint, colors)
@@ -1649,7 +1655,7 @@ fn draw_actions_panel(
         )
         .title_bottom(tui::footer(
             note,
-            "enter open · d save the picture here · esc back",
+            "enter open · d save the picture · esc back",
             colors,
         ));
     let inner = tui::open_modal(frame, area, block);

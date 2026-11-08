@@ -198,7 +198,7 @@ fn draw(
             printable(&stories.username),
             stories.items.len()
         ),
-        "↑↓ move · enter open · d download · a account · q quit",
+        "↑↓ move · enter open · d save · a account · q quit",
         &stories.items,
         true,
         viewer,
@@ -211,8 +211,7 @@ fn draw(
 
 /// The hints of a list of items inside something: a highlight folder, and
 /// the profile card's stories and folders, which `←` leaves.
-pub(crate) const FOLDER_HINT: &str =
-    "↑↓ move · enter open · d download · ← back · a account · q quit";
+pub(crate) const FOLDER_HINT: &str = "↑↓ move · enter open · d save · ← back · a account · q quit";
 
 /// The one items view, drawn under whatever title and hints its owner gives
 /// it. The story browser, the inside of a highlight folder, and the profile
@@ -309,7 +308,7 @@ fn story_widths(items: &[Story], with_left: bool) -> Vec<Constraint> {
             .max(5) as u16
     };
     let mut widths = vec![
-        Constraint::Length(3),
+        Constraint::Length(number_width(items.len())),
         Constraint::Length(kind.max(4)),
         Constraint::Length(when),
     ];
@@ -319,6 +318,14 @@ fn story_widths(items: &[Story], with_left: bool) -> Vec<Constraint> {
     }
     widths.push(Constraint::Fill(1));
     widths
+}
+
+/// The width of a list's number column: as wide as its last number and its
+/// dot, `100.` in a folder of a hundred, and never under the three columns
+/// `12.` takes, so short lists keep the rail they always had.
+pub(crate) fn number_width(total: usize) -> u16 {
+    let digits = total.max(1).ilog10() as u16 + 1;
+    (digits + 1).max(3)
 }
 
 /// The row of every items view. What varies between the views is only the
@@ -542,6 +549,20 @@ mod tests {
         // Short terminal: the padding is waived, rows start under the header.
         let (terminal, _) = rendered(&stories, 0, "", false, (60, 6));
         assert!(tui::row_text(&terminal, 2).contains("@ana @bob"));
+    }
+
+    /// The number column grows with the list: a hundredth row is `100.`,
+    /// four columns, where the old fixed three cut it to `100`.
+    #[test]
+    fn the_number_column_fits_the_last_number() {
+        assert_eq!(number_width(0), 3);
+        assert_eq!(number_width(9), 3);
+        assert_eq!(number_width(99), 3);
+        assert_eq!(number_width(100), 4);
+        assert_eq!(number_width(1000), 5);
+        let (terminal, _) = rendered(&listing(100), 99, "", false, (50, 10));
+        let screen: String = (0..10).map(|y| tui::row_text(&terminal, y)).collect();
+        assert!(screen.contains("100."), "{screen}");
     }
 
     /// The widths come off the items: a countdown column is as wide as its
