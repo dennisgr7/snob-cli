@@ -445,6 +445,23 @@ pub(super) fn preflight_body(run_id: &str, at: Epoch) -> serde_json::Value {
     })
 }
 
+/// What `snob watch deliver` did: how many owed reports it tried, at which
+/// address (as `check` shows it, any path secret cut), and what is still
+/// queued, for this address and for others. Printed with `--json` only, and
+/// never sent.
+pub(super) fn deliver_json(
+    destination: &str,
+    tried: usize,
+    left: &snob_store::store::deliveries::Owed,
+) -> serde_json::Value {
+    serde_json::json!({
+        "destination": destination,
+        "tried": tried,
+        "waiting": left.waiting,
+        "elsewhere": left.elsewhere,
+    })
+}
+
 /// What a preflight says to a person, in every format: in `json` beside
 /// `note`, and alone where the format is the summary.
 pub(super) const PREFLIGHT_SUMMARY: &str =

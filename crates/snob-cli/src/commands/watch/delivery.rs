@@ -592,23 +592,39 @@ fn event_of(body: &str) -> &'static str {
 /// and stalls would buy several more minutes of a run the terminal has already
 /// said is stopping. Nothing is gained by finishing: the rows stay pending and
 /// the next run drains them, which is the whole point of the queue.
-pub(super) async fn drain(db: &Store, cancel: &CancelToken, delivery: &Delivery) {
+///
+/// `at_once` is `snob watch deliver`'s: a person asked to send now, so the
+/// rows still waiting out their backoff go too (`deliveries::owed_now`).
+/// Returns how many it tried.
+pub(super) async fn drain(
+    db: &Store,
+    cancel: &CancelToken,
+    delivery: &Delivery,
+    at_once: bool,
+) -> usize {
     let now = snob_core::clock::now();
-    let owed = match deliveries::due(db.conn(), now, DRAIN_LIMIT, &delivery.destination) {
+    let owing = if at_once {
+        deliveries::owed_now
+    } else {
+        deliveries::due
+    };
+    let owed = match owing(db.conn(), now, DRAIN_LIMIT, &delivery.destination) {
         Ok(owed) => owed,
         Err(e) => {
             ui::warn(&format!("could not read the queue of owed reports: {e}"));
-            return;
+            return 0;
         }
     };
 
+    let mut tried = 0;
     for report in owed {
         // Asked before each one rather than only before the first. A POST has
         // its own timeout, so the token can be set at any point in this loop,
         // and the answer has to be read where the next request would go out.
         if cancel.is_canceled() {
-            return;
+            return tried;
         }
+        tried += 1;
         send_one(
             db,
             delivery,
@@ -620,6 +636,7 @@ pub(super) async fn drain(db: &Store, cancel: &CancelToken, delivery: &Delivery)
         )
         .await;
     }
+    tried
 }
 
 /// How many owed reports one run will try before leaving the rest.
@@ -769,7 +786,7 @@ mod tests {
         let now = snob_core::clock::now();
         owe(&app, &delivery, 2, now);
 
-        drain(app.db(), app.cancel(), &delivery).await;
+        drain(app.db(), app.cancel(), &delivery, false).await;
 
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
         assert_eq!(deliveries::pending(app.db().conn()).unwrap(), 0);
@@ -789,7 +806,7 @@ mod tests {
         let owed = 25;
         owe(&app, &delivery, owed, now);
 
-        drain(app.db(), app.cancel(), &delivery).await;
+        drain(app.db(), app.cancel(), &delivery, false).await;
 
         let sent = server.received_requests().await.unwrap().len();
         assert!(
@@ -868,7 +885,7 @@ mod tests {
         owe(&app, &delivery, owed, snob_core::clock::now());
 
         app.cancel().cancel();
-        drain(app.db(), app.cancel(), &delivery).await;
+        drain(app.db(), app.cancel(), &delivery, false).await;
 
         assert_eq!(
             server.received_requests().await.unwrap().len(),

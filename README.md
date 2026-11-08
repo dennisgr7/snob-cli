@@ -127,7 +127,9 @@ can read:
   sentence and ISO dates beside the epoch seconds; `format = "slack"` (or
   `discord`, `ntfy`, `text`) under `[webhook]` in `watch.toml`, or
   `--webhook-format`, sends the summary alone, in the shape that service
-  takes. `--json` writes the reports as lines instead.
+  takes. `--json` writes the reports as lines instead. `snob watch deliver`
+  sends what a receiver that was down is still owed, at once, with no
+  request to Instagram.
 - `snob mcp` is an MCP server for AI agents, on standard input and output:
   the status, the lists and profiles, and with `--allow-writes` follow and
   unfollow. Those, and walking another account's lists, run only after a yes

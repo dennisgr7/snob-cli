@@ -223,10 +223,34 @@ pub fn due(
     limit: usize,
     destination: &str,
 ) -> Result<Vec<Delivery>, StoreError> {
+    owed_to(conn, now, limit, destination, false)
+}
+
+/// Every report still owed to `destination`, whether or not its backoff has
+/// ended: for `snob watch deliver`, which a person types to send now. The
+/// backoff spaces the attempts nobody asked for; one asked for is one more
+/// attempt, and is counted and aged like any other.
+pub fn owed_now(
+    conn: &Connection,
+    now: Epoch,
+    limit: usize,
+    destination: &str,
+) -> Result<Vec<Delivery>, StoreError> {
+    owed_to(conn, now, limit, destination, true)
+}
+
+fn owed_to(
+    conn: &Connection,
+    now: Epoch,
+    limit: usize,
+    destination: &str,
+    at_once: bool,
+) -> Result<Vec<Delivery>, StoreError> {
     let mut stmt = conn.prepare(
         "SELECT id, run_id, body, attempts, event, content_type
          FROM watch_deliveries
-         WHERE state = 'pending' AND next_try_at IS NOT NULL AND next_try_at <= ?1
+         WHERE state = 'pending' AND next_try_at IS NOT NULL
+           AND (?5 OR next_try_at <= ?1)
            AND created_at > ?3
            AND destination = ?4
          ORDER BY created_at, id
@@ -237,7 +261,8 @@ pub fn due(
             now.get(),
             limit as i64,
             still_news_after(now).get(),
-            destination
+            destination,
+            at_once,
         ],
         |row| {
             Ok(Delivery {
@@ -521,6 +546,35 @@ mod tests {
         let waiting = due(db.conn(), Epoch::new(1_001), 10, HERE).unwrap();
         assert_eq!(waiting[0].form.as_ref(), Some(&form));
         assert_eq!(waiting[1].form, None, "queued as snob's JSON");
+    }
+
+    #[test]
+    fn a_report_waiting_out_its_backoff_is_owed_now_but_not_due() {
+        let db = store();
+        let id = queued(&db, "run-1", Epoch::new(1_000));
+        failed(db.conn(), id, Some(500), "down", false, Epoch::new(1_000)).unwrap();
+        assert!(
+            due(db.conn(), Epoch::new(1_001), 10, HERE)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            owed_now(db.conn(), Epoch::new(1_001), 10, HERE)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            owed_now(
+                db.conn(),
+                Epoch::new(1_001),
+                10,
+                "https://elsewhere.example"
+            )
+            .unwrap()
+            .is_empty(),
+            "still only to the address it was made for"
+        );
     }
 
     #[test]

@@ -1619,6 +1619,28 @@ pub enum WatchCommand {
 
     /// What is configured, when it last ran, and what is still owed
     Status(WatchStatusArgs),
+
+    /// Send the reports still owed to the webhook, and nothing else
+    #[command(
+        after_help = "For a receiver that was down and is back: what the monitor queued for it \
+                      goes now, whatever wait the queue had set before the next try, without \
+                      waiting for the next run. Up to ten reports per account at a time; run it \
+                      again for more.\n\n\
+                      It walks nothing and sends no request to Instagram, so it needs no \
+                      session and costs nothing in the budget. Only the reports queued for \
+                      this webhook's address go, in the shape they were queued in.\n\n\
+                      Exits 1 (reason not_delivered) when a report it tried did not arrive."
+    )]
+    Deliver(WatchDeliverArgs),
+}
+
+#[derive(Args, Debug, Default)]
+pub struct WatchDeliverArgs {
+    #[command(flatten)]
+    pub delivery: WebhookArgs,
+
+    #[command(flatten)]
+    pub output: StatusOutputArgs,
 }
 
 #[derive(Args, Debug, Default)]

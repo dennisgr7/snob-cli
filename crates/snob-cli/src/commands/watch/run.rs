@@ -149,7 +149,7 @@ async fn run_groups(
     if let Some(delivery) = delivery
         && !cancel.is_canceled()
     {
-        drain_all(paths, cancel, delivery).await;
+        drain_all(paths, cancel, delivery, false).await;
     }
     settle_all(paths);
 
@@ -166,14 +166,21 @@ pub(super) fn account_databases(paths: &AppPaths) -> Vec<AccountPaths> {
         .collect()
 }
 
-/// Sends what every account owes, each account's queue once.
-async fn drain_all(paths: &AppPaths, cancel: &CancelToken, delivery: &Delivery) {
+/// Sends what every account owes, each account's queue once, and says how
+/// many reports it tried. `at_once` is `watch deliver`'s, for `drain`.
+pub(super) async fn drain_all(
+    paths: &AppPaths,
+    cancel: &CancelToken,
+    delivery: &Delivery,
+    at_once: bool,
+) -> usize {
+    let mut tried = 0;
     for account in account_databases(paths) {
         if cancel.is_canceled() {
-            return;
+            return tried;
         }
         match Store::open_existing(&account) {
-            Ok(Some(db)) => drain(&db, cancel, delivery).await,
+            Ok(Some(db)) => tried += drain(&db, cancel, delivery, at_once).await,
             Ok(None) => {}
             Err(e) => ui::warn(&format!(
                 "could not read what account {} owes: {e}",
@@ -181,6 +188,7 @@ async fn drain_all(paths: &AppPaths, cancel: &CancelToken, delivery: &Delivery) 
             )),
         }
     }
+    tried
 }
 
 /// Retention for every account's database, with no session needed.

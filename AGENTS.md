@@ -906,7 +906,11 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   account (`commands/watch/run.rs`), and a report is owed for a week
   (`deliveries::MAX_AGE_SECS`), so a daily run's single retry is never too
   late; `watch once` exits 1 (`not_delivered`) when a report it tried did
-  not arrive; what a run reports as spent is what the
+  not arrive; `watch deliver` (`commands/watch/deliver.rs`) is that drain
+  alone, with no session and no request to Instagram, sending what is owed
+  to the webhook's address without waiting out each row's backoff
+  (`deliveries::owed_now`), and exits 1 the same way; what a run reports
+  as spent is what the
   pacer was charged, measured around the tick. Schedules: `--every` is a floor
   from the previous run and `--on/--at` or `--cron` a calendar; the next run
   is on the calendar and past the floor, both (`--every 2w --on mon` is legal

@@ -145,6 +145,7 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
             Some(WatchCommand::Once(once)) => once.output.json,
             Some(WatchCommand::Check(check)) => check.output.json,
             Some(WatchCommand::Status(status)) => status.output.json,
+            Some(WatchCommand::Deliver(deliver)) => deliver.output.json,
             Some(WatchCommand::Diff(diff)) => diff.output.json,
             Some(WatchCommand::Setup(_)) => false,
         },

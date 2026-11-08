@@ -721,6 +721,61 @@ async fn an_ntfy_webhook_is_sent_the_summary_as_plain_text() {
     assert!(body.contains("followers lost: 1"), "{body}");
 }
 
+/// A report a receiver refused goes when asked, without waiting for its
+/// backoff or the next run, and asks nothing of Instagram.
+#[tokio::test]
+async fn watch_deliver_sends_what_is_owed_and_nothing_to_instagram() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hook = MockServer::start().await;
+    // Down for the run, back for the delivery.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&hook)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&hook)
+        .await;
+    let first = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &first);
+    configure(
+        tmp.path(),
+        &format!(
+            "schema = 1\nevery = \"6h\"\n\n[webhook]\nurl = \"{}/webhook/snob\"\nformat = \"text\"\n",
+            hook.uri()
+        ),
+    );
+    snob(tmp.path(), Some(&first), &["watch", "once"]);
+    a_day_passes(tmp.path());
+    let second = fake_instagram(2, 2).await;
+    let out = snob(tmp.path(), Some(&second), &["watch", "once"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let asked = second.received_requests().await.unwrap_or_default().len();
+
+    let out = snob(tmp.path(), Some(&second), &["watch", "deliver", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = json(&out);
+    assert_eq!(said["tried"], 1, "{said}");
+    assert_eq!(said["waiting"], 0, "{said}");
+    assert_eq!(
+        second.received_requests().await.unwrap_or_default().len(),
+        asked,
+        "delivering asks Instagram nothing"
+    );
+    let sent = posted(&hook).await;
+    assert_eq!(sent.len(), 2, "refused once, delivered once");
+    assert_eq!(sent[0].body, sent[1].body, "the same bytes, as queued");
+    assert!(String::from_utf8_lossy(&sent[1].body).starts_with("Changes for"));
+
+    // Nothing left, so nothing is sent.
+    let out = snob(tmp.path(), Some(&second), &["watch", "deliver", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(json(&out)["tried"], 0);
+    assert_eq!(posted(&hook).await.len(), 2);
+}
+
 /// A stranger's lists are not read on an answer nobody gave.
 ///
 /// The domain rule, asserted of the program rather than of a function: an

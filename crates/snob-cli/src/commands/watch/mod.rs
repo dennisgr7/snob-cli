@@ -42,6 +42,7 @@ pub(super) mod wire;
 /// the monitor over the accounts it watches, which is the whole of `once` and
 /// one turn of `scheduled`.
 mod check;
+mod deliver;
 mod diff;
 mod once;
 mod run;
@@ -60,6 +61,7 @@ mod watched;
 mod fixtures;
 
 use check::check;
+use deliver::deliver;
 use diff::diff;
 use once::once;
 use scheduled::scheduled;
@@ -80,6 +82,7 @@ pub async fn run(
         Some(WatchCommand::Check(args)) => check(args, secrets, paths, account).await,
         Some(WatchCommand::Setup(args)) => setup::setup(args, secrets, paths, account).await,
         Some(WatchCommand::Status(args)) => status::status(args, paths, account),
+        Some(WatchCommand::Deliver(args)) => deliver(args, secrets, paths).await,
         // With nobody signed in there is nobody to read any entry as, and a
         // service started then would read the entries that name no viewer as
         // nobody for as long as it ran.
