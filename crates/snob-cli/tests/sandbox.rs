@@ -6645,6 +6645,14 @@ async fn the_mcp_server_answers_a_quick_walk_inline_with_its_job_id() {
         "{job}"
     );
     assert_eq!(job["started_by"], "test 0", "{job}");
+    assert!(
+        job.get("estimate").is_none(),
+        "a row of the list leaves the whole estimate to show: {job}"
+    );
+    assert!(
+        jobs.ask(&["show", &id, "--json"]).get("estimate").is_some(),
+        "and show still gives it"
+    );
     let record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(jobs.dirs()[0].join("job.json")).unwrap()).unwrap();
     // A job waits for the budget an hour when the server was given no wait.

@@ -674,9 +674,11 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   would, with `job_id` beside it and its pages held as any list's; otherwise
   with `{status: "running", done: false, job_id, progress, eta_seconds,
   detached, poll_with: "snob_job"}` and a sentence (`commands/mcp/job.rs`).
-  `snob_job` (`__job show <id> --wait`), `snob_jobs` (`__job list`) and
-  `snob_job_cancel` (`__job cancel <id>`) are offered always, spend nothing,
-  and take a `job_id` only as `JobId::parse` reads it. A finished job answers
+  `snob_job` (`__job show <id> --wait`), `snob_jobs` (`__job list`, each
+  row without the `estimate` a job is started with, which `snob_job`
+  gives) and `snob_job_cancel` (`__job cancel <id>`) are offered always,
+  spend nothing, and take a `job_id` only as `JobId::parse` reads it. A
+  finished job answers
   through `answer::from` with the plan rebuilt from the tool and arguments it
   recorded, its pages read again from the job's `out.json` (`offset`); a
   result swept a day later is `result_gone`, a lost job `job_lost`. **All job

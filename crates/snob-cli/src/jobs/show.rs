@@ -511,6 +511,19 @@ fn ended(finished: &Value, id: &str) -> String {
     }
 }
 
+/// A job as `list` gives it: its [`record`] without `estimate`, the whole
+/// dry run the walk was started with (every list, its pages, the budget and
+/// the sitting), which an agent listing its jobs pays for in its context
+/// once per job and never needs there: `eta_seconds` is what it is for, and
+/// `show` (`snob_job`) still gives it whole.
+fn row(seen: &Seen, now: i64) -> Value {
+    let mut row = record(seen, now);
+    if let Some(fields) = row.as_object_mut() {
+        fields.remove("estimate");
+    }
+    row
+}
+
 /// `list`: the jobs not yet finished, or every one kept with `all`.
 pub fn list(account: &AccountPaths, all: bool, json: bool) -> Result<ExitCode> {
     let now = now();
@@ -519,7 +532,7 @@ pub fn list(account: &AccountPaths, all: bool, json: bool) -> Result<ExitCode> {
         .filter(|seen| all || !seen.status.finished())
         .collect();
     if json {
-        let records: Vec<Value> = jobs.iter().map(|seen| record(seen, now)).collect();
+        let records: Vec<Value> = jobs.iter().map(|seen| row(seen, now)).collect();
         crate::ui::say!("{}", serde_json::to_string(&json!({ "jobs": records }))?);
     } else if jobs.is_empty() {
         crate::ui::say!(
