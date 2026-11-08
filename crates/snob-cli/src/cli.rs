@@ -1432,6 +1432,44 @@ fn duration(text: &str) -> Result<std::time::Duration, String> {
     snob_core::duration::parse(text)
 }
 
+// The schedule's flags are judged here, each by the domain rule that would
+// refuse it later, so a mistake in one is a mistake on the command line:
+// exit 2 and clap's message, before the file is read or anything is
+// settled, as every other value typed wrong is. Whether the flags make a
+// schedule together (`--on` with neither `--at` nor `--every`) is still
+// `schedule_from`'s question, since clap judges values one at a time.
+
+/// `--every`: a duration, and one the monitor may run at
+/// (`Schedule::every`: not twice inside its minimum gap, nor rarer than it
+/// can count).
+fn interval(text: &str) -> Result<std::time::Duration, String> {
+    let interval = duration(text)?;
+    snob_core::watch::schedule::Schedule::every(interval)
+        .map(|_| interval)
+        .map_err(|e| e.to_string())
+}
+
+/// `--at`: a time of day, kept as typed for the file and the banner.
+fn clock_time(text: &str) -> Result<String, String> {
+    snob_core::watch::schedule::parse_time(text)
+        .map(|_| text.trim().to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// `--on`: a day of the week, kept as typed.
+fn weekday(text: &str) -> Result<String, String> {
+    snob_core::watch::schedule::Weekday::parse(text)
+        .map(|_| text.to_string())
+        .ok_or_else(|| format!("\"{text}\" is not a day (try mon, thu)"))
+}
+
+/// `--cron`: five fields that name at least one moment.
+fn cron_expression(text: &str) -> Result<String, String> {
+    snob_core::watch::schedule::Schedule::cron(text)
+        .map(|_| text.to_string())
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Args, Debug)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct WatchArgs {
@@ -1451,11 +1489,11 @@ pub struct WatchRunArgs {
     pub target: Option<String>,
 
     /// How often to run: 6h, 2d, 2w
-    #[arg(long, value_name = "DURATION", value_parser = duration)]
+    #[arg(long, value_name = "DURATION", value_parser = interval)]
     pub every: Option<std::time::Duration>,
 
     /// Times of day to run at: 09:00,21:00
-    #[arg(long, value_delimiter = ',', value_name = "HH:MM")]
+    #[arg(long, value_delimiter = ',', value_name = "HH:MM", value_parser = clock_time)]
     pub at: Vec<String>,
 
     /// Days to run on: mon,thu. Defaults to every day.
@@ -1463,12 +1501,13 @@ pub struct WatchRunArgs {
         long,
         value_delimiter = ',',
         value_name = "DAYS",
-        conflicts_with = "cron"
+        conflicts_with = "cron",
+        value_parser = weekday
     )]
     pub on: Vec<String>,
 
     /// A five-field cron expression, for a schedule you already have written
-    #[arg(long, value_name = "EXPR", conflicts_with = "at")]
+    #[arg(long, value_name = "EXPR", conflicts_with = "at", value_parser = cron_expression)]
     pub cron: Option<String>,
 
     /// How far a run may be pushed later, so it does not land on the same
@@ -3185,5 +3224,20 @@ mod tests {
             Cli::try_parse_from(["snob", "changes", "--since", "7d", "--from", "3"]).is_err(),
             "a moment and an id are two answers to one question"
         );
+    }
+
+    #[test]
+    fn a_schedule_flag_the_monitor_could_never_run_on_is_a_command_line_error() {
+        for line in [
+            ["snob", "watch", "--every", "1m"],
+            ["snob", "watch", "--at", "25:00"],
+            ["snob", "watch", "--on", "someday"],
+            ["snob", "watch", "--cron", "* * *"],
+        ] {
+            let refused = Cli::try_parse_from(line).expect_err("refused at the parser");
+            assert_eq!(refused.exit_code(), 2, "{line:?}");
+        }
+        assert!(Cli::try_parse_from(["snob", "watch", "--every", "6h", "--at", "09:00"]).is_ok());
+        assert!(Cli::try_parse_from(["snob", "watch", "--on", "mon,thu", "--at", "9:00"]).is_ok());
     }
 }
