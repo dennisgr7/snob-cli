@@ -30,12 +30,16 @@ use crate::cli::{StatusArgs, StatusSections};
 use crate::exit::ExitCode;
 use crate::report;
 
-/// Reports on `account`, the account resolved for this run.
+/// Reports on `account`, the account resolved for this run, and with
+/// `--json` and no section named on the updater as well (`update::report`,
+/// read from its file), `sandboxed` saying whether this run is a sandbox's.
+/// A section named narrows the report to it, as it always has.
 pub fn run(
     args: StatusArgs,
     secrets: &SecretStore,
     paths: &AppPaths,
     account: Option<AccountPaths>,
+    sandboxed: bool,
 ) -> Result<ExitCode> {
     let viewer = report::acting_as().map(|viewer| viewer.json());
     // Where the session was found, not where this run would put a new one:
@@ -46,13 +50,19 @@ pub fn run(
         None => None,
     };
     let (Some((session, storage)), Some(account)) = (located, account) else {
-        return no_session(&args, viewer, "no session is stored on this computer");
+        return no_session(
+            &args,
+            viewer,
+            "no session is stored on this computer",
+            paths,
+            sandboxed,
+        );
     };
     // A session this computer no longer sends as is no session to report on
     // either, and is said as what it is: every command refuses it at its
     // start (`App::open`), with the same code.
     if crate::owner::signed_out(paths, &session) {
-        return no_session(&args, viewer, report::SIGNED_OUT_HERE);
+        return no_session(&args, viewer, report::SIGNED_OUT_HERE, paths, sandboxed);
     }
 
     let now = snob_core::clock::now_ms();
@@ -141,6 +151,9 @@ pub fn run(
     if args.output.json {
         let mut out = found.json();
         out["viewer"] = viewer.unwrap_or(Value::Null);
+        if !args.names_a_section() {
+            out["update"] = crate::update::report(paths, sandboxed);
+        }
         crate::ui::say!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         crate::ui::say!("{}", found.text());
@@ -159,7 +172,13 @@ pub fn run(
 /// sentence on standard error with its advice, and with `--json` every
 /// section asked for there and null, as `whoami` gives every field with no
 /// session, beside the error.
-fn no_session(args: &StatusArgs, viewer: Option<Value>, why: &str) -> Result<ExitCode> {
+fn no_session(
+    args: &StatusArgs,
+    viewer: Option<Value>,
+    why: &str,
+    paths: &AppPaths,
+    sandboxed: bool,
+) -> Result<ExitCode> {
     let mut said = format!("{why}.");
     said[..1].make_ascii_uppercase();
     eprintln!("{said} Run \"snob login\".");
@@ -176,6 +195,9 @@ fn no_session(args: &StatusArgs, viewer: Option<Value>, why: &str) -> Result<Exi
             }),
         );
         out.insert("viewer".into(), viewer.unwrap_or(Value::Null));
+        if !args.names_a_section() {
+            out.insert("update".into(), crate::update::report(paths, sandboxed));
+        }
         crate::ui::say!("{}", serde_json::to_string_pretty(&Value::Object(out))?);
     }
     Ok(ExitCode::NoSession)

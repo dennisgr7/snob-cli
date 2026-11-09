@@ -420,7 +420,7 @@ pub enum Command {
 
     /// Where the account stands: session, budget, answers, cooldown, lists, monitor, agents, jobs
     #[command(
-        after_help = "Read from what is stored here; nothing is sent and nothing stored is \
+        after_help = "Read from what is stored here; nothing is sent to Instagram and nothing stored is \
                       changed, not even a database an older snob left, which is read as the \
                       current one without being migrated. With no section named, all of \
                       them; --budget, --cooldown, --session, --lists, --watch, --agents and \
@@ -651,7 +651,8 @@ pub enum Command {
                       talking to Instagram on your behalf: request \"Followers and following\" \
                       as HTML or JSON from Accounts Center, \"Download your information\", and \
                       point this at the zip, or the folder it was extracted into. It reads the \
-                      export and prints the answer; nothing is stored and nothing is sent. What \
+                      export and prints the answer; nothing is stored and nothing is sent to \
+                      Instagram. What \
                       it shows describes the moment Instagram built the export."
     )]
     Import(crate::commands::import::ImportCommand),
@@ -674,15 +675,84 @@ pub enum Command {
     )]
     Mcp(McpArgs),
 
+    /// Update snob to its latest release, the way it was installed
+    #[command(
+        after_help = "Without an option, asks GitHub for the latest release and, when it is newer, \
+                      updates this copy of snob after asking: with the package manager that \
+                      installed it (Homebrew, Scoop, WinGet, Cargo), by replacing itself where \
+                      the install script put it, or, for the .deb, with the apt command it \
+                      prints. Every download is checked against the release's SHA256SUMS.\n\n\
+                      snob also checks once a day on its own, downloads a newer release, and \
+                      applies it the next time it starts with no other snob running (or after \
+                      a restart); \"--auto\" says how much of that it does, and \
+                      SNOB_NO_UPDATE_CHECK=1 turns it off. Nothing here talks to Instagram."
+    )]
+    Update(UpdateArgs),
+
     /// The process that runs the browsers for every command (`owner`).
     /// Started by the commands themselves; nobody types it.
     #[command(name = crate::owner::COMMAND, hide = true)]
     BrowserOwner,
 
+    /// The updater's own processes (`update`): started by the commands;
+    /// nobody types them.
+    #[command(name = crate::update::COMMAND, hide = true, subcommand)]
+    Updater(UpdaterCommand),
+
     /// A job's own processes (`jobs`): started by the commands and by
     /// `snob mcp`; nobody types them.
     #[command(name = crate::jobs::start::COMMAND, hide = true, subcommand)]
     Job(JobCommand),
+}
+
+/// `snob update`.
+#[derive(Args, Debug)]
+pub struct UpdateArgs {
+    /// Only say whether a newer release is out; download nothing
+    #[arg(long, conflicts_with_all = ["status", "auto"])]
+    pub check: bool,
+
+    /// Say what the updater knows and has done, asking nobody
+    #[arg(long, conflicts_with = "auto")]
+    pub status: bool,
+
+    /// How much snob does on its own: off, notify (say a release is out),
+    /// download (and fetch it), or apply (and apply it when snob next starts
+    /// alone; the default)
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub auto: Option<AutoUpdate>,
+
+    /// Print the updater's state as JSON once done
+    #[arg(long)]
+    pub json: bool,
+
+    #[command(flatten)]
+    pub consent: ConsentArgs,
+}
+
+/// `snob update --auto`.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoUpdate {
+    Off,
+    Notify,
+    Download,
+    Apply,
+}
+
+/// `snob __update`: the updater's background processes (`update`).
+#[derive(Subcommand, Debug)]
+pub enum UpdaterCommand {
+    /// Ask GitHub for the latest release, and fetch it when it is newer
+    Fetch,
+    /// Run the package manager's upgrade, once no snob runs
+    Apply(UpdaterApplyArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct UpdaterApplyArgs {
+    /// The binary the upgrade is for, which says how snob was installed
+    #[arg(long = "for", value_name = "PATH")]
+    pub exe: std::path::PathBuf,
 }
 
 /// `snob __job`: what starts, runs and reads a job (`jobs`).
@@ -952,8 +1022,15 @@ impl StatusSections {
 
 impl StatusArgs {
     /// The sections named, or every one when none was.
-    pub fn sections(&self) -> StatusSections {
-        let named = StatusSections {
+    /// Whether a section was named, which narrows the report to those
+    /// named; otherwise it is the whole report, the updater's state included.
+    pub fn names_a_section(&self) -> bool {
+        let s = self.sections_named();
+        s.session || s.budget || s.answers || s.cooldown || s.lists || s.watch || s.agents || s.jobs
+    }
+
+    fn sections_named(&self) -> StatusSections {
+        StatusSections {
             session: self.session,
             budget: self.budget,
             answers: self.answers,
@@ -962,17 +1039,12 @@ impl StatusArgs {
             watch: self.watch,
             agents: self.agents,
             jobs: self.jobs,
-        };
-        if named.session
-            || named.budget
-            || named.answers
-            || named.cooldown
-            || named.lists
-            || named.watch
-            || named.agents
-            || named.jobs
-        {
-            named
+        }
+    }
+
+    pub fn sections(&self) -> StatusSections {
+        if self.names_a_section() {
+            self.sections_named()
         } else {
             StatusSections {
                 session: true,

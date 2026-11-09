@@ -40,4 +40,6 @@ pub(crate) mod relay;
 pub mod report;
 pub mod seat;
 pub mod ui;
+/// Keeping snob up to date, from GitHub's releases, the way it was installed.
+pub mod update;
 pub mod watch;

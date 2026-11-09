@@ -170,6 +170,9 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
         | Command::Pfp(_)
         | Command::Fetch(_)
         | Command::BrowserOwner => false,
+        Command::Update(args) => args.json,
+        // Detached, with nobody reading: their errors go to the log.
+        Command::Updater(_) => false,
         // A job's own processes answer in JSON, as the server reading them
         // does (`jobs::start`); the supervisor's errors go to its log.
         Command::Job(snob_cli::cli::JobCommand::Run(_)) => false,
@@ -321,6 +324,44 @@ fn sandbox_keyring_namespace(root: &std::path::Path) -> String {
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let (paths, no_keyring, keyring_namespace) = wiring(&cli)?;
     snob_cli::app::wait_at_most(cli.max_wait);
+    let sandboxed = keyring_namespace.is_some();
+
+    // The updater: its own processes, `snob update`, and every other command
+    // taking part (`update::at_start`), first, since applying a version may
+    // run this command again from the new binary. `snob mcp` and the owner
+    // of the browsers do not count as running (`update::running`); a job's
+    // supervisor counts and does nothing more.
+    match &cli.command {
+        Command::Updater(snob_cli::cli::UpdaterCommand::Fetch) => {
+            snob_cli::update::fetch(&paths).await?;
+            return Ok(ExitCode::Ok);
+        }
+        Command::Updater(snob_cli::cli::UpdaterCommand::Apply(apply)) => {
+            snob_cli::update::apply_detached(&paths, &apply.exe)?;
+            return Ok(ExitCode::Ok);
+        }
+        _ => {}
+    }
+    if let Command::Update(args) = cli.command {
+        return commands::update::run(args, &paths, sandboxed).await;
+    }
+    let role = match &cli.command {
+        Command::BrowserOwner | Command::Updater(_) | Command::Update(_) => None,
+        #[cfg(feature = "mcp")]
+        Command::Mcp(_) => None,
+        Command::Job(snob_cli::cli::JobCommand::Run(_)) => Some(snob_cli::update::Role::Counted),
+        Command::Job(_) => None,
+        _ => Some(snob_cli::update::Role::Command),
+    };
+    let _updating = match role {
+        Some(role) => Some(snob_cli::update::at_start(
+            &paths,
+            sandboxed,
+            role,
+            &detached_globals(&cli)?,
+        )),
+        None => None,
+    };
     if cli.stop_when_stdin_closes {
         snob_cli::app::stop_when_stdin_closes();
     }
@@ -329,7 +370,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // with a program that drove it and went (`parent`).
     snob_cli::app::stop_when_parent_exits(matches!(
         cli.command,
-        Command::BrowserOwner | Command::Job(snob_cli::cli::JobCommand::Run(_))
+        Command::BrowserOwner
+            | Command::Job(snob_cli::cli::JobCommand::Run(_))
+            | Command::Updater(_)
     ));
     if cli.spend_alone {
         snob_cli::app::spend_alone();
@@ -457,7 +500,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     snob_cli::owner::attended(somebody_waits(&cli));
     // A copy for the command, which consumes its store; the write-back needs
     // the same store, on the same keyring service, once it is done.
-    let outcome = dispatch(cli, store.clone(), &paths).await;
+    let outcome = dispatch(cli, store.clone(), &paths, sandboxed).await;
     // Whatever the command came to: the browser kept the session current
     // while it ran, and the stored copy learns what it kept.
     snob_cli::owner::finish(&store, &paths).await;
@@ -478,7 +521,12 @@ fn somebody_waits(cli: &Cli) -> bool {
 /// Every command that acts as an account is handed that account's paths and
 /// session, and nothing else of any account's: `account::resolve` is the one
 /// place that decides which.
-async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Result<ExitCode> {
+async fn dispatch(
+    cli: Cli,
+    store: SecretStore,
+    paths: &AppPaths,
+    sandboxed: bool,
+) -> anyhow::Result<ExitCode> {
     // Read here rather than by clap: `purge` is narrowed to one account only
     // by a flag somebody typed, never by the environment.
     let env = std::env::var("SNOB_ACCOUNT").ok();
@@ -531,7 +579,7 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
             commands::login::run(args, store, paths, renewing, named).await
         }
         Command::Whoami(args) => commands::whoami::run(args, store, resolved()?).await,
-        Command::Status(args) => commands::status::run(args, &store, paths, resolved()?),
+        Command::Status(args) => commands::status::run(args, &store, paths, resolved()?, sandboxed),
         Command::Logout(args) => {
             let account = if args.all { None } else { resolved()? };
             commands::logout::run(args, store, paths, account).await
@@ -606,7 +654,11 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
             commands::fetch::run(args, account_ua).await
         }
         // Answered at the top, and in `run`.
-        Command::BrowserOwner | Command::Job(_) | Command::Jobs(_) => Ok(ExitCode::Ok),
+        Command::BrowserOwner
+        | Command::Job(_)
+        | Command::Jobs(_)
+        | Command::Update(_)
+        | Command::Updater(_) => Ok(ExitCode::Ok),
         // Answered in `run`.
         #[cfg(feature = "mcp")]
         Command::Mcp(_) => Ok(ExitCode::Ok),
@@ -620,6 +672,16 @@ async fn dispatch(cli: Cli, store: SecretStore, paths: &AppPaths) -> anyhow::Res
 /// every command that owner serves, and for none it serves when the command
 /// that started it did not ask.
 fn owner_args(cli: &Cli) -> anyhow::Result<Vec<std::ffi::OsString>> {
+    let mut args = detached_globals(cli)?;
+    args.push(snob_cli::owner::COMMAND.into());
+    Ok(args)
+}
+
+/// The global flags a process started detached is given ahead of its hidden
+/// command, the owner's and the updater's alike: where its files are, so it
+/// lands on the same ones (a sandbox root made absolute, since it does not
+/// run from here, `detach`), and `--verbose`.
+fn detached_globals(cli: &Cli) -> anyhow::Result<Vec<std::ffi::OsString>> {
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     #[cfg(feature = "testing")]
     if let Some(root) = &cli.sandbox_root {
@@ -629,7 +691,6 @@ fn owner_args(cli: &Cli) -> anyhow::Result<Vec<std::ffi::OsString>> {
     if cli.verbose {
         args.push("--verbose".into());
     }
-    args.push(snob_cli::owner::COMMAND.into());
     Ok(args)
 }
 

@@ -89,6 +89,7 @@ fn command_of(program: &Path, root: &Path, instagram: Option<&MockServer>) -> Co
         "SSH_CONNECTION",
         "SSH_CLIENT",
         "SSH_TTY",
+        "SNOB_TEST_UPDATE_ORIGIN",
     ] {
         command.env_remove(inherited);
     }
@@ -8914,4 +8915,213 @@ async fn stopped_during_a_call(in_a_session: bool) {
         "{}",
         server.said()
     );
+}
+
+/// The release target snob updates from on this machine, as
+/// `update::TARGET` names it.
+#[cfg(unix)]
+fn release_target() -> Option<&'static str> {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("x86_64-unknown-linux-musl")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some("aarch64-unknown-linux-musl")
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("aarch64-apple-darwin")
+    } else {
+        None
+    }
+}
+
+/// A copy of snob where the install script would put it (a directory this
+/// user writes, outside `target`), and a fake GitHub whose latest release,
+/// 9.9.9, is a script that says its version and the arguments it was given.
+#[cfg(unix)]
+struct FakeRelease {
+    github: MockServer,
+    bin: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeRelease {
+    async fn new(tmp: &Path) -> Option<Self> {
+        use sha2::Digest;
+        let target = release_target()?;
+        let bin_dir = tmp.join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let bin = bin_dir.join("snob");
+        std::fs::copy(env!("CARGO_BIN_EXE_snob"), &bin).unwrap();
+
+        let top = format!("snob-v9.9.9-{target}");
+        let staging = tmp.join("release");
+        std::fs::create_dir_all(staging.join(&top)).unwrap();
+        let fake = staging.join(&top).join("snob");
+        std::fs::write(&fake, "#!/bin/sh\necho \"snob 9.9.9 $*\"\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let name = format!("{top}.tar.gz");
+        let archive = staging.join(&name);
+        let made = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&staging)
+            .arg(&top)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let bytes = std::fs::read(&archive).unwrap();
+        let sum: String = sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        let github = MockServer::start().await;
+        let release = "/dennisgr7/snob-cli/releases/download/v9.9.9";
+        Mock::given(method("GET"))
+            .and(url_path("/repos/dennisgr7/snob-cli/releases/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"tag_name":"v9.9.9"}"#))
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(url_path(format!("{release}/SHA256SUMS")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!("{sum}  {name}\n")))
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(url_path(format!("{release}/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(&github)
+            .await;
+        Some(Self { github, bin })
+    }
+
+    /// The copy, on the sandbox at `root`, told where GitHub is.
+    fn command(&self, root: &Path) -> Command {
+        let mut command = command_of(&self.bin, root, None);
+        command
+            .env("SNOB_TEST_UPDATE_ORIGIN", self.github.uri())
+            .env_remove("CI")
+            .env_remove("SNOB_NO_UPDATE_CHECK")
+            .stdin(std::process::Stdio::null());
+        command
+    }
+
+    /// What the copy now says its version is.
+    fn version(&self) -> String {
+        let out = Command::new(&self.bin).arg("--version").output().unwrap();
+        stdout(&out).trim().to_string()
+    }
+}
+
+/// `snob update` asks GitHub, downloads the release, checks it against its
+/// `SHA256SUMS`, and puts it in place of a copy the install script put
+/// there.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn snob_update_replaces_a_script_install_with_the_latest_release() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(release) = FakeRelease::new(tmp.path()).await else {
+        return;
+    };
+    let root = tmp.path().join("root");
+    assert!(
+        release.version().starts_with("snob 0."),
+        "{}",
+        release.version()
+    );
+
+    let out = release
+        .command(&root)
+        .args(["update", "--check"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("snob 9.9.9 is out"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        release.version().starts_with("snob 0."),
+        "--check changed nothing"
+    );
+
+    // No terminal and no -y: refused, with nothing changed.
+    let out = release.command(&root).arg("update").output().unwrap();
+    assert_eq!(out.status.code(), Some(130), "{}", stderr(&out));
+
+    let out = release
+        .command(&root)
+        .args(["update", "-y", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("Downloading snob 9.9.9"),
+        "{}",
+        stderr(&out)
+    );
+    let state = json(&out);
+    assert_eq!(state["applied"]["to"], "9.9.9", "{state}");
+    assert_eq!(state["method"], "script", "{state}");
+    assert_eq!(state["current"], "9.9.9", "{state}");
+    assert!(state["available"].is_null(), "{state}");
+    assert_eq!(release.version(), "snob 9.9.9 --version");
+}
+
+/// A command finds a newer release on its own, detached, and downloads it;
+/// the next command that starts with no other snob running puts it in place
+/// and runs again from it, with the same arguments.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_is_fetched_in_the_background_and_applied_on_a_cold_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(release) = FakeRelease::new(tmp.path()).await else {
+        return;
+    };
+    let root = tmp.path().join("root");
+
+    // No session: it says so and exits 3, and has started the day's check.
+    let out = release.command(&root).arg("status").output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+
+    let state = root.join("data").join("update.json");
+    let log = root.join("data").join("update").join("update.log");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let text = std::fs::read_to_string(&state).unwrap_or_default();
+        let staged: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        if staged["staged"]["version"] == "9.9.9" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing was staged: {text}\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        release.version().starts_with("snob 0."),
+        "staged, not applied yet"
+    );
+
+    let out = release
+        .command(&root)
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    let said = stdout(&out);
+    assert!(
+        said.starts_with("snob 9.9.9 ") && said.contains("status --json"),
+        "the command did not run again from the new release: {said}{}",
+        stderr(&out)
+    );
+    assert_eq!(release.version(), "snob 9.9.9 --version");
+    let text = std::fs::read_to_string(&state).unwrap();
+    let after: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(after["applied"]["to"], "9.9.9", "{text}");
+    assert!(after["staged"].is_null(), "{text}");
 }

@@ -18,8 +18,10 @@ that span files; it does not repeat what a header already says.
 `[workspace.package]` of `Cargo.toml`). It walks followers and following lists
 and crosses them (`unfollowers`, `fans`, `friends`, `scan`), shows profiles,
 stories, highlights, posts and reels and downloads their media, imports
-Instagram's own data export (`import dyi`, no network at all), compares the
-lists it stored (`snapshots`, `changes`, no network either), and monitors
+Instagram's own data export (`import dyi`, nothing sent to Instagram),
+compares the lists it stored (`snapshots`, `changes`, nothing sent to
+Instagram either), keeps itself up to date from GitHub's releases
+(`update`, `snob update`), and monitors
 accounts over time (`watch`, with webhooks). It signs in as the user, through
 Instagram's own **web** API (`www.instagram.com`, never the mobile API), and by
 default sends every request from a Chromium-based browser installed on the
@@ -62,14 +64,15 @@ Rust 2024 edition, resolver 3. Dependency direction is one-way:
 | `crates/snob-core` | Domain: `Pk`, models (the JSON contract), set arithmetic, `watch` diff, schedule (cron and `--on/--at/--every`), webhook signing (HMAC-SHA256) and the one constant-time comparison (`watch::sign::same`), `Secret`, `Session`, the `RateBudget` trait and cooldown policy, `clock` | **No I/O.** No file, database, network or directory; `clock` is the single exception |
 | `crates/snob-ig` | Instagram web client: `client/` (`read.rs`, `write.rs`, `transport.rs`, `headers.rs`, `cdn.rs`, `media.rs`, `page.rs`, `ask.rs`, `posts.rs`), `web.rs` (calls built as the web app builds them), `allowlist.rs`, `pager.rs` (list walks), `pace.rs`, `graphql.rs`, `error.rs` (classifying answers), `http.rs` (the only place `reqwest` is configured; re-exported) | No SQLite, no keyring, no browser driving (it defines the page request shape only) |
 | `crates/snob-store` | SQLite (`store/`, migrations in `store/sql/`), platform paths, keyring/file secret store, account registry (`accounts.toml`), the monitor's `watch.toml`, layout migration | Domain logic that belongs in `snob-core` |
-| `crates/snob-cli` | `cli.rs` (clap), `main.rs`, `app.rs` (wires everything), `commands/`, `engine/` (rules: cache, consent, cooldown, walks, estimates, monitor), `output/`, `report.rs` (shared sentences), `ui/` (ratatui views), `headless/` + `cdp/` + `pipe.rs` (the browser), `owner/` (one background process that owns the browsers), `detach.rs` (starting a process that outlives its command, with nothing of the command's), `exe.rs` (the path to this binary that survives an upgrade, for what `mcp config` and `watch unit` print), `jobs/` (a list walk run as a job that outlives the call that started it: the hidden `__job start|run|show|list|cancel`, and `snob jobs`), `relay/` (`login --remote`), `power/`, `watch/webhook.rs`, `commands/mcp/` (the MCP server, feature `mcp`; over HTTP, `mcp-http`) | |
+| `crates/snob-cli` | `cli.rs` (clap), `main.rs`, `app.rs` (wires everything), `commands/`, `engine/` (rules: cache, consent, cooldown, walks, estimates, monitor), `output/`, `report.rs` (shared sentences), `ui/` (ratatui views), `headless/` + `cdp/` + `pipe.rs` (the browser), `owner/` (one background process that owns the browsers), `detach.rs` (starting a process that outlives its command, with nothing of the command's), `exe.rs` (the path to this binary that survives an upgrade, for what `mcp config` and `watch unit` print), `jobs/` (a list walk run as a job that outlives the call that started it: the hidden `__job start|run|show|list|cancel`, and `snob jobs`), `relay/` (`login --remote`), `parent.rs` (stopping with the program that started the run), `update/` (keeping snob up to date: `snob update`, the hidden `__update fetch|apply`), `power/`, `watch/webhook.rs`, `commands/mcp/` (the MCP server, feature `mcp`; over HTTP, `mcp-http`) | |
 
 Layering rules inside `snob-cli`:
 
 - **Commands take an `App`** and orchestrate; they never build a client or
   open a database themselves. The exceptions say so in their header
-  (`status`, `--dry-run`, `fetch`, and `snapshots` and `changes`, which read
-  the stored captures with `Store::read_existing` and send nothing).
+  (`status`, `--dry-run`, `fetch`, `update`, and `snapshots` and `changes`,
+  which read the stored captures with `Store::read_existing` and send
+  nothing).
 - **`engine` returns data and where it came from; it never decides how
   anything looks.** Wording and exit codes for those outcomes live in
   `commands` and `report.rs`. `engine::list` is the one place every list comes
@@ -335,9 +338,11 @@ with a documented reason in the same place.
   explicit header on the one client meant to carry it. `reqwest` is
   configured only in `snob_ig::http` and re-exported from there.
 - **Clients that can never carry the session**: the CDN client
-  (`client/cdn.rs`: HTTPS, CDN hosts only, never instagram.com) and the
+  (`client/cdn.rs`: HTTPS, CDN hosts only, never instagram.com), the
   webhook client (`watch/webhook.rs`), both built by `http::plain`, which has
-  no argument for a credential. The webhook follows no redirect, says
+  no argument for a credential, and the updater's (`update/github.rs`,
+  `http::plain_download`: HTTPS to GitHub's release hosts only, every
+  redirect held to them). The webhook follows no redirect, says
   `User-Agent: snob`, refuses `http://` outside private networks, signs with
   `X-Snob-Signature: sha256=<hex>`, and its token and key live in the
   keyring, never in `watch.toml`. Retries are allowed there (it is the user's
@@ -434,7 +439,9 @@ with a documented reason in the same place.
   `accounts.toml` changed only
   through `Registry::update` (file lock). `watch.toml` and `accounts.toml`
   are read with serde and written from a hand-written template, tested to
-  round-trip. `snob status` and `--dry-run` write nothing. `snob purge`
+  round-trip. `snob status` and `--dry-run` write nothing of the account's
+  (the updater's start, which every command shares, is the machine's,
+  "Updates" below). `snob purge`
   removes everything but the binary.
 - **Migrations** (`snob-store/src/store/migrations.rs`): a published migration
   is never edited; add the next numbered file in `store/sql/` (and
@@ -823,6 +830,53 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   `--confirm-in-chat`, `--max-writes-per-day`) are refused with it, since
   they describe a process this does not start.
 
+## Updates (`update/`, `snob update`)
+
+- **How snob was installed decides how it is updated** (`update/how.rs`,
+  from the binary's real path, as `exe::stable_exe` reads it): Homebrew,
+  Scoop, WinGet and Cargo by their own command (the prefix's `brew`, the
+  root's `scoop.cmd`, the `cargo` beside the binary); a copy in a directory
+  this user writes, as the install scripts leave it, by replacing itself;
+  the `.deb` (known by `/var/lib/dpkg/info/snob.list`) only by the `apt`
+  command root runs, which `snob update` runs on a terminal and prints
+  otherwise. A build in a Cargo `target` directory is never updated nor
+  checked for, and an install that matches nothing is only told about.
+- **Every command takes part, first** (`update::at_start`, from `main`):
+  it applies a staged version when it is alone, says once on a terminal
+  what was applied or is waiting (standard error), and starts the day's
+  check, detached (`snob __update fetch`), when one is due. `snob mcp`, the
+  owner of the browsers and a job's plumbing take no part; a job's
+  supervisor only counts as running.
+- **A cold start is one with no other snob running** (`update/running.rs`):
+  every snob that counts holds `running.lock` shared for its life, and the
+  applier asks for it alone without waiting. `snob mcp` does not count,
+  since it refuses every call once its binary changed (`upgraded`), nor
+  does the owner, which a newer build retires. A restart releases every
+  lock, so "or after a restart" needs nothing of its own.
+- **Applied**: a script install's binary is written beside the old one,
+  synced and renamed over it (on Windows, the old renamed to `.old`, swept
+  by a later start), and on Unix the command runs again from the new one
+  with the same arguments (`exec`). A package manager's upgrade runs
+  detached (`snob __update apply`), once the command that found it alone
+  has ended, from a copy of the binary on Windows (Scoop and WinGet refuse
+  while their `snob.exe` runs). `snob update` applies at once, after asking
+  (`-y`).
+- **Checked against the release's `SHA256SUMS`** as it downloads, as the
+  install scripts check, and again before it is applied; unpacked by the
+  system's `tar` (bsdtar, `System32\tar.exe`, on Windows, which reads a
+  zip), so no archive crate is built in. A version never moves back
+  (`latest` only grows), and no pre-release is ever one.
+- **The state is `update.json`** in the data directory (`update/state.rs`,
+  written whole under `update.lock`), shown by `snob update --status
+  [--json]` and as `update` in `snob status --json` with no section named
+  (additive), for
+  anything that shows it, an app around snob included. `--auto
+  off|notify|download|apply` (`apply` by default) is kept there.
+- **Never**: in a sandbox (unless a `testing` build is pointed at a fake
+  GitHub with `SNOB_TEST_UPDATE_ORIGIN`), with `CI` or
+  `SNOB_NO_UPDATE_CHECK` set, on a pre-release build or a machine with no
+  release. No retry: the next day's check is one.
+
 ## Output contract
 
 - **Standard output carries data only**; progress bars, prompts, warnings and
@@ -993,7 +1047,9 @@ Platform-specific code, all of it reached only by the CI job on that OS:
   starting the browser as root (`headless::refuse_root`); the parent of a
   run a program drives watched with `pidfd_open` and `poll` on Linux and
   `kqueue` on macOS, `getppid` where neither opens, and `fstat`,
-  `sigaction` and `getsid` for whether to watch it at all (`parent.rs`).
+  `sigaction` and `getsid` for whether to watch it at all (`parent.rs`);
+  `access(W_OK)` for whether snob may replace itself, and `exec` to run a
+  command again from the binary just applied (`update/`).
   In `snob-store` (`paths.rs`), the scratch root is opened with
   `O_DIRECTORY | O_NOFOLLOW`, made `0700` through the descriptor, and asked
   its owner (`geteuid`) before it is made private or swept.

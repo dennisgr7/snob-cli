@@ -53,6 +53,16 @@ Builds exist for Windows 11 and Linux on x86_64 and ARM64, and macOS on Apple
 Silicon. Everything that talks to Instagram needs a Chromium-based browser
 installed; no window is ever shown.
 
+**Updating.** `snob update` updates snob the way it was installed: through
+Homebrew, Scoop, WinGet or Cargo, by replacing itself where the install script
+put it, or, for the `.deb`, with the `apt` command it runs or prints. On its
+own, snob also asks GitHub once a day whether a release is out, downloads it
+(checked against the release's `SHA256SUMS`), and applies it the next time it
+starts with no other snob running, or after a restart. `snob update --auto
+off|notify|download|apply` says how much of that it does, `snob update
+--status` what it has done, and `SNOB_NO_UPDATE_CHECK=1` turns it off. None of
+it talks to Instagram.
+
 ## Getting started
 
 ```bash
@@ -87,8 +97,8 @@ snob fetch <cdn-address>         # one file by its address, no account needed
 snob follow someone
 snob unfollow someone
 snob watch                       # keep watching on a schedule, report changes
-snob status                      # budget left, cooldown, stored lists, agents; sends nothing
-snob snapshots                   # the captures of your lists stored here; sends nothing
+snob status                      # budget left, cooldown, stored lists, agents; sends nothing to Instagram
+snob snapshots                   # the captures of your lists stored here; sends nothing to Instagram
 snob changes --since 7d          # who joined, left or was renamed between two of them
 snob followers --background      # walk as a job and get its id at once; any list command
 snob jobs                        # walks left running, and "snob jobs cancel <id>"

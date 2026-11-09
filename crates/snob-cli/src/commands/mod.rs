@@ -23,5 +23,6 @@ pub mod snapshots;
 pub mod start;
 pub mod status;
 pub mod stories;
+pub mod update;
 pub mod watch;
 pub mod whoami;

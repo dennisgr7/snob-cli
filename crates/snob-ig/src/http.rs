@@ -212,6 +212,31 @@ pub fn plain(
     .build()
 }
 
+/// [`plain`] for a file rather than an answer: no limit on the whole
+/// request, only on the wait for the next bytes ([`Deadline::BetweenReads`]),
+/// since a release archive on a slow link is still arriving well after the
+/// thirty seconds an answer gets. The caller bounds its size.
+///
+/// For snob's own update (`snob_cli::update`), which downloads from GitHub
+/// and nothing else; it carries no credential for the same reason [`plain`]
+/// carries none.
+pub fn plain_download(
+    user_agent: &str,
+    redirect: reqwest::redirect::Policy,
+) -> reqwest::Result<reqwest::Client> {
+    // `Trust::Platform` for the same reason as [`plain`]: what is worth
+    // keeping from a middlebox is the session, which this does not carry, and
+    // what it downloads is checked against its published checksum.
+    builder(
+        user_agent,
+        redirect,
+        CONNECT_TIMEOUT,
+        Deadline::BetweenReads(REQUEST_TIMEOUT),
+        &Trust::Platform,
+    )?
+    .build()
+}
+
 /// The same, for a destination that is only allowed to be plain `http://`
 /// **because it is on the user's own network** — and which therefore must not
 /// be sent through a proxy.

@@ -126,6 +126,10 @@ fastrand.workspace = true
 # not parse as an address. The tests also point the client at a mock server
 # with it.
 url.workspace = true
+# Already in the tree through snob-core, where it signs the monitor's
+# webhook. Here it checks a downloaded release against its `SHA256SUMS`
+# (`update::github`), as the install scripts do.
+sha2.workspace = true
 # Already in the tree through snob-store. The tab's guard reads a paused
 # request's form, which the browser may hand over in base64 pieces
 # (`headless::guard`).
