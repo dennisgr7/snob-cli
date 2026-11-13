@@ -135,6 +135,9 @@ pub struct Person {
     /// Its profile query names its full-size picture.
     pub full_size_picture: bool,
     pub posts: u64,
+    /// The posts it pinned, each by its number counted from its newest (0):
+    /// its grid serves them first, in this order, however old they are.
+    pub pinned: Vec<u64>,
 }
 
 impl Person {
@@ -152,6 +155,7 @@ impl Person {
             anonymous_picture: false,
             full_size_picture: true,
             posts: 3,
+            pinned: Vec::new(),
         }
     }
 }
@@ -1519,7 +1523,7 @@ impl State {
                     .and_then(Value::as_str)
                     .and_then(|name| self.named(name).map(|p| p.pk))
                     .filter(|pk| self.may_see(viewer, *pk));
-                let posts: Vec<Value> = shown.map(|pk| self.posts_of(pk)).unwrap_or_default();
+                let posts: Vec<Value> = shown.map(|pk| self.grid_of(pk)).unwrap_or_default();
                 let page: Vec<Value> = posts
                     .iter()
                     .skip(after)
@@ -1665,6 +1669,8 @@ impl State {
                     "usertags": null,
                     "coauthor_producers": [],
                     "user": { "pk": pk.to_string(), "username": person.username },
+                    "timeline_pinned_user_ids":
+                        if person.pinned.contains(&n) { vec![pk] } else { Vec::new() },
                     "image_versions2": picture(&media.to_string()),
                     "video_versions": null,
                     "carousel_media": null,
@@ -1713,6 +1719,20 @@ impl State {
                 }
                 post
             })
+            .collect()
+    }
+
+    /// The posts of account `pk` in its grid's order: the ones it pinned
+    /// first, then the rest from the newest.
+    fn grid_of(&self, pk: u64) -> Vec<Value> {
+        let pinned = self.account(pk).pinned;
+        let posts = self.posts_of(pk);
+        let at = |n: &u64| posts.get(*n as usize).cloned();
+        let rest = (0..posts.len() as u64).filter(|n| !pinned.contains(n));
+        pinned
+            .iter()
+            .filter_map(at)
+            .chain(rest.filter_map(|n| at(&n)))
             .collect()
     }
 

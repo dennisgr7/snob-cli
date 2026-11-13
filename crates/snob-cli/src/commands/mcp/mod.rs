@@ -529,9 +529,11 @@ impl ServerHandler for Server {
         // store, unless the walk that read it may have stopped short.
         if let Some(page) = plan.page.as_ref().filter(|page| page.offset > 0) {
             if let Some(whole) = self.pages.get(&page.of) {
-                return Ok(
-                    result(answer::held(&whole, page.offset, page.limit), &request.name).into(),
-                );
+                return Ok(result(
+                    answer::held(&whole, page.offset, page.limit, page.brief),
+                    &request.name,
+                )
+                .into());
             }
             if page.held_only {
                 return Ok(refusal(

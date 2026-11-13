@@ -1613,6 +1613,72 @@ async fn a_grid_is_the_posts_query_and_then_its_next_page() {
     assert!(found.is_empty(), "{found:?}");
 }
 
+/// A reader that names the posts it has pays for the new ones: no page of
+/// the grid is asked for past the first that holds one of them, a post the
+/// owner pinned never stops the read, and one that is nowhere costs the
+/// pages allowed and is said not to have been reached.
+#[tokio::test]
+async fn a_grid_read_stops_at_the_page_that_holds_a_known_post() {
+    use snob_cli::posts::{Fetched, read_grid};
+    use snob_ig::shortcode::MediaPk;
+
+    let world = World::new();
+    // Thirty posts, of which the owner pinned an old one, the twentieth.
+    world.person(ig::SOMEONE, |p| {
+        p.posts = 30;
+        p.pinned = vec![20];
+    });
+    let server = world.serve_web().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app_on(&server, &world, tmp.path());
+    let post = |n: u64| MediaPk::new(ig::post_pk(ig::SOMEONE, n));
+    let pages_asked = |queries: Vec<String>| {
+        queries
+            .iter()
+            .filter(|q| q.contains("ProfilePosts"))
+            .count()
+    };
+    let read = |until: Vec<MediaPk>| {
+        let (app, server) = (&app, &server);
+        async move {
+            let since = common::requests(server).await;
+            let (fetched, how) = read_grid(app.client(), "someone", common::ME, None, 3, 0, &until)
+                .await
+                .unwrap();
+            let Fetched::Grid(grid) = fetched else {
+                panic!("someone's grid is shown");
+            };
+            (grid, how, pages_asked(queries_since(server, since).await))
+        }
+    };
+
+    // The fourth newest is known: it is on the first page, and that is all.
+    let (grid, how, asked) = read(vec![post(3)]).await;
+    assert_eq!((how.pages, asked), (1, 1));
+    assert_eq!(how.reached, Some(post(3)));
+    assert_eq!(grid.posts.len(), 12);
+    assert!(grid.posts[0].pinned, "the pinned post comes first");
+    assert_eq!(grid.posts[0].pk, post(20));
+
+    // The pinned post is known, and is on the first page: it stops nothing.
+    // The other known one is on the second page.
+    let (grid, how, asked) = read(vec![post(20), post(14)]).await;
+    assert_eq!((how.pages, asked), (2, 2));
+    assert_eq!(how.reached, Some(post(14)));
+    assert_eq!(grid.posts.len(), 24);
+
+    // A post that is nowhere: the pages allowed, and not reached.
+    let (grid, how, asked) = read(vec![MediaPk::new(7)]).await;
+    assert_eq!((how.pages, asked), (3, 3));
+    assert_eq!(how.reached, None);
+    assert_eq!(grid.posts.len(), 30);
+
+    // With no post named, the pages asked for, as before.
+    let (_, how, asked) = read(Vec::new()).await;
+    assert_eq!((how.pages, asked), (3, 3));
+    assert_eq!(how.reached, None);
+}
+
 /// A private account the viewer does not follow is answered from its profile:
 /// its grid is never asked for.
 #[tokio::test]

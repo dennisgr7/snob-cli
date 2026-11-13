@@ -570,7 +570,10 @@ pub enum Command {
                       -d, -o and -i as \"highlights\" does. Without the number, -d takes whole \
                       posts: \"-d 3\" saves everything in the third, \"-d all\" every post the \
                       listing read. --pages reads more than the first page; the view reads the \
-                      next one as you scroll to it. Each page is one request, and opening a post \
+                      next one as you scroll to it. --until <link> stops the listing at the \
+                      first page that holds that post, for a reader that already has the posts \
+                      from there on; give the newest few it has, since a pinned post never \
+                      stops it. Each page is one request, and opening a post \
                       in the view is two more: the post and its comments, as the app asks them. \
                       Videos are saved at their best when ffmpeg is installed, as \"post\" says. \
                       Listing and downloading a post does not tell the account you looked."
@@ -2218,6 +2221,21 @@ pub struct PostsArgs {
     )]
     pub pages: Option<u32>,
 
+    /// Stop reading pages once one holds this post, by its link or the code
+    /// in it: for a reader that already has the posts from there on.
+    /// Repeatable; --pages is then the most that is read, three when not
+    /// given
+    // A pinned post never stops the read (`posts::reached`), which is why
+    // it is repeatable: the newest few posts a reader has, of which one
+    // pinned or deleted since does not make the read go to its end.
+    #[arg(
+        long,
+        value_name = "LINK",
+        value_parser = post_link,
+        conflicts_with = "interactive"
+    )]
+    pub until: Vec<snob_ig::shortcode::Shortcode>,
+
     #[command(flatten)]
     pub action: MediaActionArgs,
 
@@ -2226,6 +2244,15 @@ pub struct PostsArgs {
 
     #[command(flatten)]
     pub video: VideoArgs,
+}
+
+/// A post named on the command line by its link or its code, refused by
+/// clap (exit 2) when it is neither, before anything is asked of Instagram.
+/// **The value is not repeated in the refusal**: a link can carry the share
+/// token of whoever sent it.
+fn post_link(value: &str) -> Result<snob_ig::shortcode::Shortcode, String> {
+    snob_ig::shortcode::Shortcode::parse(value)
+        .map_err(|e| format!("{e}: give a post's or a reel's link, or the code in one"))
 }
 
 #[derive(Args, Debug)]

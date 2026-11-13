@@ -124,6 +124,7 @@ pub fn plan_of(doc: &Value, offset: usize) -> Plan {
         held_only: false,
         limit,
         rows: None,
+        brief: false,
     });
     plan
 }

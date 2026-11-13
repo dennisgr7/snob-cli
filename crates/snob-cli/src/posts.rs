@@ -615,6 +615,55 @@ pub async fn fetch_grid(
     pages: u32,
     at_least: usize,
 ) -> Result<Fetched> {
+    let (fetched, _) = read_grid(client, typed, viewer, known, pages, at_least, &[]).await?;
+    Ok(fetched)
+}
+
+/// How many pages a grid read with `--until` reads at most when `--pages`
+/// does not say: three, 36 posts, which is days of most accounts' posting.
+/// A reader that keeps the posts it has seen comes back for the new ones,
+/// and those are on the first page as a rule.
+pub const UNTIL_PAGES: u32 = 3;
+
+/// How a grid's read went: what it cost, and whether it reached a post the
+/// reader already had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GridRead {
+    /// How many pages of the grid were asked for, one request each. The
+    /// profile read before them is not counted here.
+    pub pages: u32,
+    /// The first of the posts named to stop at that the pages read hold,
+    /// when one was named and found.
+    pub reached: Option<MediaPk>,
+}
+
+/// The first post of `posts` that is one of `until` and is not pinned.
+///
+/// **A pinned post never stops a read.** The grid runs from the newest post
+/// to the oldest, except for the posts its owner pinned, up to three, which
+/// come first however old they are: one of those the reader already has
+/// says nothing about the posts after it, and stopping there would hide
+/// every new post under it.
+pub fn reached(posts: &[Post], until: &[MediaPk]) -> Option<MediaPk> {
+    posts
+        .iter()
+        .find(|post| !post.pinned && until.contains(&post.pk))
+        .map(|post| post.pk)
+}
+
+/// [`fetch_grid`], stopping early at a post the reader already has: no page
+/// is asked for once the pages read hold one of `until` ([`reached`]), so a
+/// reader that comes back each day pays for the new posts and not for the
+/// grid. `pages` is then the most it reads. With how the read went.
+pub async fn read_grid(
+    client: &IgClient,
+    typed: &str,
+    viewer: snob_core::Pk,
+    known: Option<snob_core::Pk>,
+    pages: u32,
+    at_least: usize,
+    until: &[MediaPk],
+) -> Result<(Fetched, GridRead)> {
     let info = client
         .profile_named(crate::engine::target::clean(typed), known)
         .await?;
@@ -622,9 +671,12 @@ pub async fn fetch_grid(
     let is_private = info.is_private.unwrap_or(false);
     let you_follow = info.followed_by_viewer.unwrap_or(false);
     if !(own || !is_private || you_follow) {
-        return Ok(Fetched::Hidden {
-            username: info.username,
-        });
+        return Ok((
+            Fetched::Hidden {
+                username: info.username,
+            },
+            GridRead::default(),
+        ));
     }
     let declared = info.posts.map(|p| p.count);
     let mut grid = Grid {
@@ -635,18 +687,26 @@ pub async fn fetch_grid(
     };
     // Zero is an answer the profile already gave, as in `highlights`.
     if declared == Some(0) {
-        return Ok(Fetched::Grid(grid));
+        return Ok((Fetched::Grid(grid), GridRead::default()));
     }
     let first = client.profile_posts(&grid.username, None).await?;
     grid.take(first);
     let mut read = 1;
-    while (read < pages || grid.posts.len() < at_least) && read < MOST_PAGES {
+    // A post's number asked for is read up to, whatever `until` says; past
+    // it, a page is asked for only while none of `until` has come.
+    while read < MOST_PAGES
+        && (grid.posts.len() < at_least || (read < pages && reached(&grid.posts, until).is_none()))
+    {
         if rest_before_a_page(client, "the grid").await? || !more(client, &mut grid).await? {
             break;
         }
         read += 1;
     }
-    Ok(Fetched::Grid(grid))
+    let how = GridRead {
+        pages: read,
+        reached: reached(&grid.posts, until),
+    };
+    Ok((Fetched::Grid(grid), how))
 }
 
 impl Grid {
@@ -1097,6 +1157,24 @@ mod tests {
 
     fn media(json: &str) -> Media {
         serde_json::from_str(json).unwrap()
+    }
+
+    /// A read stops at a post the reader has, the first in the grid's order,
+    /// and never at one its owner pinned, which comes first however old.
+    #[test]
+    fn a_pinned_post_never_stops_a_read() {
+        let post = |pk: u64, pinned: bool| {
+            let ids = if pinned { "[42]" } else { "[]" };
+            let json =
+                format!(r#"{{"pk":"{pk}","user":{{"pk":"42"}},"timeline_pinned_user_ids":{ids}}}"#);
+            Post::from_media(&media(&json), "x")
+        };
+        let grid = [post(9, true), post(5, false), post(4, false)];
+        let pk = MediaPk::new;
+        assert_eq!(reached(&grid, &[pk(9)]), None);
+        assert_eq!(reached(&grid, &[pk(9), pk(4)]), Some(pk(4)));
+        assert_eq!(reached(&grid, &[pk(4), pk(5)]), Some(pk(5)));
+        assert_eq!(reached(&grid, &[]), None);
     }
 
     /// A one-item post whose pictures are `candidates`, a JSON array.

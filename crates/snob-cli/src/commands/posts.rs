@@ -13,6 +13,12 @@
 //! answer carries every item of every post; the view, which shows a post's
 //! comments, opens one with the two reads the app opens it with.
 //!
+//! **A reader that comes back** names the newest posts it already has with
+//! `--until`, and the read stops at the first page that holds one
+//! ([`posts::reached`]): the listing then says how many pages it asked for
+//! (`pages_read`) and whether it got there (`until`), so what is new is told
+//! from what was only not read.
+//!
 //! **A private account the viewer does not follow is told apart from an
 //! account with no posts**, as `highlights` tells it.
 
@@ -32,7 +38,7 @@ use crate::exit::ExitCode;
 use crate::media::{self, empty_document};
 use crate::output;
 use crate::output::Presentation;
-use crate::posts::{self, Fetched, Grid, Post, Videos, fetch_grid, files_of, post_json};
+use crate::posts::{self, Fetched, Grid, GridRead, Post, Videos, files_of, post_json, read_grid};
 use crate::report;
 use crate::ui;
 
@@ -47,25 +53,38 @@ pub async fn run(args: PostsArgs, store: SecretStore, paths: &AccountPaths) -> R
     // view reads the first page and the next as it is scrolled to, and the
     // printed form what `--pages` says. `--pages` asks for the printed form
     // as a format does.
+    // `--until` asks for the printed form too: it is about how far a
+    // listing reads.
     let browses = args.action.browses(
-        args.list.format.is_some() || args.pages.is_some(),
+        args.list.format.is_some() || args.pages.is_some() || !args.until.is_empty(),
         ui::a_human_would_watch_the_listing_scroll_by(),
     );
-    let pages = if browses { 1 } else { args.pages.unwrap_or(1) };
+    let until: Vec<_> = args.until.iter().map(|link| link.pk()).collect();
+    let pages = match args.pages {
+        _ if browses => 1,
+        Some(pages) => pages,
+        None if until.is_empty() => 1,
+        None => posts::UNTIL_PAGES,
+    };
     let at_least = args
         .post
         .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX));
 
-    let grid = match fetch_grid(
+    let (fetched, read) = read_grid(
         app.client(),
         &typed,
         app.viewer().pk,
         known,
         pages,
         at_least,
+        &until,
     )
-    .await?
-    {
+    .await?;
+    let asked = Asked {
+        until: !until.is_empty(),
+        read,
+    };
+    let grid = match fetched {
         Fetched::Grid(grid) => grid,
         Fetched::Hidden { username } => {
             ui::info(&format!(
@@ -95,7 +114,9 @@ pub async fn run(args: PostsArgs, store: SecretStore, paths: &AccountPaths) -> R
         if args.action.selection().is_none() && !args.action.interactive {
             let destination = args.action.output.as_deref();
             let format = common::checked_format(args.list.format, destination, "a grid")?;
-            empty_document(format, destination, || grid_json(&grid, Format::Json))?;
+            empty_document(format, destination, || {
+                grid_json(&grid, &asked, Format::Json)
+            })?;
         }
         return Ok(ExitCode::Ok);
     }
@@ -120,7 +141,7 @@ pub async fn run(args: PostsArgs, store: SecretStore, paths: &AccountPaths) -> R
             let files = videos.prepare(files_of(&chosen));
             posts::download(app.client_shared(), files, destination).await
         }
-        (None, None) => list_grid(&grid, args.list.format, destination),
+        (None, None) => list_grid(&grid, &asked, args.list.format, destination),
         (Some(number), selection) => {
             let post = &grid.posts[number as usize - 1];
             match selection {
@@ -201,18 +222,56 @@ pub(crate) fn no_such_item(post: &Post, asked: usize) -> anyhow::Error {
     )
 }
 
+/// How a grid's listing was asked for and read: whether `--until` named a
+/// post to stop at, and how the read went.
+#[derive(Debug, Clone, Copy, Default)]
+struct Asked {
+    until: bool,
+    read: GridRead,
+}
+
+impl Asked {
+    /// What a person is told of a read `--until` shaped, on standard error:
+    /// a listing that stopped where it was asked to, or one that never got
+    /// there, looks the same in a table.
+    fn say(&self, grid: &Grid) {
+        if !self.until {
+            return;
+        }
+        let pages = match self.read.pages {
+            1 => "one page".to_string(),
+            n => format!("{n} pages"),
+        };
+        match self.read.reached {
+            Some(pk) => ui::info(&format!(
+                "Read {pages}, as far as the post {}.",
+                snob_ig::shortcode::code_of(pk)
+            )),
+            None if grid.next.is_some() => ui::info(&format!(
+                "Read {pages} and none holds a post named with --until: there are more \
+                 new posts than these, or that post is gone or pinned. --pages reads further."
+            )),
+            None => ui::info(&format!(
+                "Read {pages}, the whole grid, and none holds a post named with --until."
+            )),
+        }
+    }
+}
+
 /// Prints the grid. The numbers here are what the second positional and a
 /// grid-level `-d` take.
 fn list_grid(
     grid: &Grid,
+    asked: &Asked,
     format: Option<StoryFormat>,
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
     let format = common::checked_format(format, destination, "a grid")?;
     let text = match format {
-        Format::Json | Format::Ndjson => grid_json(grid, format)?,
+        Format::Json | Format::Ndjson => grid_json(grid, asked, format)?,
         _ => grid_table(grid, Presentation::detect(destination)),
     };
+    asked.say(grid);
     let hint = format!(
         "snob posts {} <number> to look inside one, -d <number> to save one whole, or -i to browse",
         printable(&grid.username)
@@ -412,18 +471,32 @@ pub(crate) fn clipped(text: &str, width: usize) -> String {
     }
 }
 
-fn grid_json(grid: &Grid, format: Format) -> Result<String> {
+/// The grid's JSON document: the posts under `posts`, and beside them how
+/// many the profile says it has, whether the grid goes on past what was
+/// read, how many pages were asked for (`pages_read`, one request each, the
+/// profile's own reads apart), and for a read `--until` shaped, whether it
+/// reached one of the posts named and which (`until`, `null` when none was
+/// named).
+fn grid_json(grid: &Grid, asked: &Asked, format: Format) -> Result<String> {
     let rows: Vec<serde_json::Value> = grid
         .posts
         .iter()
         .enumerate()
         .map(|(index, post)| post_json(post, Some(index + 1)))
         .collect();
+    let until = asked.until.then(|| {
+        serde_json::json!({
+            "reached": asked.read.reached.is_some(),
+            "code": asked.read.reached.map(snob_ig::shortcode::code_of),
+        })
+    });
     media::rows_or_envelope(rows, format, |rows| {
         serde_json::json!({
             "username": grid.username,
             "declared_posts": grid.declared,
             "more": grid.next.is_some(),
+            "pages_read": asked.read.pages,
+            "until": until,
             "posts": rows,
         })
     })

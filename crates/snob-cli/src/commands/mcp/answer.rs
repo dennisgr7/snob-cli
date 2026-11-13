@@ -174,7 +174,8 @@ pub fn from(plan: &Plan, mut finished: Finished) -> Answer {
                         if let Some(refused) = past_the_end(items.len(), offset, limit) {
                             return refused;
                         }
-                        let mut body = page(&items, offset, limit, true);
+                        let brief = plan.page.as_ref().is_some_and(|page| page.brief);
+                        let mut body = page(&shaped(&items, brief), offset, limit, true);
                         if !body["next_offset"].is_null() {
                             whole_items = Some(items);
                         }
@@ -346,11 +347,14 @@ pub fn from(plan: &Plan, mut finished: Finished) -> Answer {
 /// The page at `offset` of a list the server holds (`pages.rs`), as the
 /// answer of a call that ran nothing, saying what the first page said of
 /// the whole list.
-pub fn held(whole: &Whole, offset: usize, limit: Option<usize>) -> Answer {
+///
+/// `brief`: each item as [`briefly`] leaves it. The list is held whole, so a
+/// page may be asked for either way whichever way the first one was.
+pub fn held(whole: &Whole, offset: usize, limit: Option<usize>, brief: bool) -> Answer {
     if let Some(refused) = past_the_end(whole.items.len(), offset, limit) {
         return refused;
     }
-    let mut body = page(&whole.items, offset, limit, true);
+    let mut body = page(&shaped(&whole.items, brief), offset, limit, true);
     if let Some(fields) = body.as_object_mut() {
         fields.extend(whole.about.clone());
     }
@@ -446,6 +450,38 @@ fn compact(items: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// What `brief` keeps of a post: what tells it from every other, where it
+/// is, and what orders it. Everything an agent needs to say which posts it
+/// does not have yet, and a tenth of what a post's answer weighs.
+const BRIEF: [&str; 7] = ["pk", "code", "url", "owner", "kind", "taken_at", "pinned"];
+
+/// `items` as a page hands them back: as they are, or each as [`briefly`]
+/// leaves it.
+fn shaped(items: &[String], brief: bool) -> std::borrow::Cow<'_, [String]> {
+    if brief {
+        items.iter().map(|item| briefly(item)).collect()
+    } else {
+        items.into()
+    }
+}
+
+/// One item, as its compact JSON, with only the keys of [`BRIEF`] and how
+/// many items it holds (`item_count`). One that is no object stays as it
+/// is. Read with `get`, never indexed, for the reason [`from`] gives.
+fn briefly(item: &str) -> String {
+    let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(item) else {
+        return item.to_string();
+    };
+    let mut kept: serde_json::Map<String, Value> = BRIEF
+        .iter()
+        .filter_map(|key| Some(((*key).to_string(), fields.get(*key)?.clone())))
+        .collect();
+    if let Some(items) = fields.get("items").and_then(Value::as_array) {
+        kept.insert("item_count".into(), json!(items.len()));
+    }
+    Value::Object(kept).to_string()
+}
+
 /// The page of `items` that starts at `offset`: as many as fit in
 /// [`PAGE_BYTES`], at most [`PAGE`] and at least one, so a page always moves
 /// on. `{total, count, offset, items, next_offset}`, where `total` is how
@@ -509,8 +545,14 @@ pub fn next_page(body: &Value, tool: &str) -> Option<String> {
     } else {
         ""
     };
+    // What a page is of: a grid's are posts.
+    let what = if tool == "snob_posts" {
+        "Posts"
+    } else {
+        "Accounts"
+    };
     Some(format!(
-        "Accounts {first} to {next} of {of}. For the next ones, call {tool} again with \
+        "{what} {first} to {next} of {of}. For the next ones, call {tool} again with \
          the same arguments{and} and \"offset\": {next}; a later page is handed back from \
          what was already read, and sends nothing and asks nothing.",
         first = offset + 1,
@@ -785,9 +827,72 @@ mod tests {
                 held_only: true,
                 limit: None,
                 rows: Some("posts"),
+                brief: false,
             }),
             ..plan(&[ExitCode::Ok])
         }
+    }
+
+    /// A brief page holds what tells its posts apart and nothing else, and
+    /// the list is held whole all the same: the next page may be asked for
+    /// in full.
+    #[test]
+    fn a_brief_page_keeps_what_tells_posts_apart() {
+        let caption = "x".repeat(4_000);
+        let posts: Vec<Value> = (0..20)
+            .map(|n| {
+                json!({
+                    "pk": n.to_string(), "code": format!("code{n}"), "taken_at": 1_790_000_000 - n,
+                    "url": format!("https://www.instagram.com/p/code{n}/"), "owner": "someone",
+                    "kind": "carousel", "pinned": n == 0, "caption": caption,
+                    "items": [{ "number": 1 }, { "number": 2 }],
+                })
+            })
+            .collect();
+        let mut brief = grid_at(0);
+        brief.page.as_mut().unwrap().brief = true;
+        let told = from(
+            &brief,
+            finished(
+                ExitCode::Ok,
+                Some(json!({
+                    "username": "someone", "pages_read": 2,
+                    "until": { "reached": true, "code": "code7" }, "posts": posts,
+                })),
+                None,
+            ),
+        );
+        assert_eq!(told.body["count"], 20);
+        assert_eq!(told.body["next_offset"], Value::Null, "all twenty fit");
+        assert_eq!(
+            told.body["items"][0],
+            json!({
+                "pk": "0", "code": "code0", "taken_at": 1_790_000_000,
+                "url": "https://www.instagram.com/p/code0/", "owner": "someone",
+                "kind": "carousel", "pinned": true, "item_count": 2,
+            })
+        );
+        assert_eq!(told.body["pages_read"], 2);
+        assert_eq!(told.body["until"]["reached"], true);
+
+        // The same read in full takes several pages, held whole, and a page
+        // of it is handed back either way.
+        let full = from(
+            &grid_at(0),
+            finished(
+                ExitCode::Ok,
+                Some(json!({ "username": "someone", "posts": posts })),
+                None,
+            ),
+        );
+        let whole = full.whole.expect("held");
+        let later = held(&whole, 10, None, true);
+        assert_eq!(later.body["items"][0]["pk"], "10");
+        assert!(later.body["items"][0].get("caption").is_none());
+        assert_eq!(
+            held(&whole, 10, None, false).body["items"][0]["caption"],
+            caption
+        );
     }
 
     /// No answer about posts holds a media address, wherever it was: the
@@ -848,7 +953,7 @@ mod tests {
         let next = told.body["next_offset"].as_u64().expect("another page");
         assert!(next < 20);
         let whole = told.whole.expect("held for the next page");
-        let later = held(&whole, next as usize, None);
+        let later = held(&whole, next as usize, None, false);
         assert_eq!(later.body["username"], "someone");
         assert_eq!(later.body["items"][0]["number"], next);
         // An account with none prints `"posts": null`, answered as it came.
@@ -877,6 +982,7 @@ mod tests {
                 held_only: false,
                 limit,
                 rows: None,
+                brief: false,
             }),
             ..plan(&[ExitCode::Ok])
         }
@@ -987,7 +1093,7 @@ mod tests {
             read.extend(page);
             if let Some(whole) = told.whole {
                 // What the server holds pages the same as the command did.
-                assert_eq!(held(&whole, offset, None).body, told.body);
+                assert_eq!(held(&whole, offset, None, false).body, told.body);
                 kept = Some(whole);
             }
             match told.body["next_offset"].as_u64() {
@@ -1059,7 +1165,7 @@ mod tests {
         );
         let whole = first.whole.unwrap();
         assert_eq!(whole.items.len(), 450, "the whole list is held");
-        let last = held(&whole, PAGE, Some(300));
+        let last = held(&whole, PAGE, Some(300), false);
         assert_eq!(usernames(&last.body).len(), 300 - PAGE);
         assert!(last.body["next_offset"].is_null());
         assert_eq!(last.body["total"], 450);
@@ -1134,7 +1240,7 @@ mod tests {
                 items: vec![],
                 about: serde_json::Map::new(),
             };
-            assert!(held(&none, offset, None).failed, "{offset}");
+            assert!(held(&none, offset, None, false).failed, "{offset}");
         }
         // The first page of an empty list is a page, not a refusal.
         let empty = from(&list_at(0), finished(ExitCode::Ok, Some(accounts(0)), None));
@@ -1326,7 +1432,7 @@ mod tests {
 
         // The next page, handed back from what the server holds, says it too.
         let whole = told.whole.expect("a page after this one");
-        let later = held(&whole, 200, None);
+        let later = held(&whole, 200, None, false);
         assert_eq!(later.body["complete"], false);
         assert_eq!(later.body["served"], told.body["served"]);
         assert!(incomplete(&later.body).is_some());
