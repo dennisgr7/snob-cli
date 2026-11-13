@@ -105,7 +105,7 @@ pub(crate) fn print_listing(
 /// The table a listing is drawn in, with its header and nothing else yet.
 pub(crate) fn listing_table(headers: &[&str], presentation: Presentation) -> Table {
     let mut table = Table::new();
-    table.load_preset(presets::UTF8_FULL_CONDENSED);
+    table.load_style(presets::UTF8_FULL_CONDENSED);
     table.set_content_arrangement(ContentArrangement::Dynamic);
     if let Some(width) = presentation.width {
         table.set_width(width);

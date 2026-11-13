@@ -719,7 +719,7 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   I/O goes through those `__job` children**, so the server still opens no
   store and reads no job's file.
 - **A client that takes MCP Tasks gets a task for that job**
-  (`commands/mcp/tasks.rs`; SEP-2663 as rmcp 3.8.0 has it: `tasks/get`,
+  (`commands/mcp/tasks.rs`; SEP-2663 as rmcp 3.10.0 has it: `tasks/get`,
   `tasks/update`, `tasks/cancel`, and no `tasks/result` or `tasks/list`, so
   jobs are listed by `snob_jobs`). The server declares the extension. A
   `snob_list` run as a job, for a client that declared it (at `initialize`,

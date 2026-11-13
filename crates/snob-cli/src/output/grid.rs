@@ -132,7 +132,7 @@ impl Grid {
         }
         let mut table = Table::new();
         table
-            .load_preset(presets::UTF8_FULL_CONDENSED)
+            .load_style(presets::UTF8_FULL_CONDENSED)
             .set_content_arrangement(ContentArrangement::Dynamic)
             .set_header(super::table::header_cells(&self.titles(), presentation));
         if let Some(width) = presentation.width {

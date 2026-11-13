@@ -60,6 +60,10 @@ allow = [
   # `brotli`, `brotli-decompressor`, `subtle`, the two `alloc-*` crates, and
   # one of `aws-lc-sys`'s expressions.
   "BSD-3-Clause",
+  # `zstd-sys`, which builds the zstd C library for reqwest's `zstd`
+  # decoding. From 2.1.3 it declares that bundled code's licenses
+  # (`BSD-3-Clause AND BSD-2-Clause`) instead of only its own bindings'.
+  "BSD-2-Clause",
   # `ryu`, which serde_json formats floats with.
   "BSL-1.0",
   # `dunce`, which `opener` normalizes Windows paths with.

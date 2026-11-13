@@ -144,7 +144,7 @@ pub(crate) fn header_cells(names: &[&str], presentation: Presentation) -> Vec<Ce
 
 fn draw(users: &[User], presentation: Presentation) -> String {
     let mut table = Table::new();
-    table.load_preset(presets::UTF8_FULL_CONDENSED);
+    table.load_style(presets::UTF8_FULL_CONDENSED);
     table.set_content_arrangement(ContentArrangement::Dynamic);
     if let Some(width) = presentation.width {
         table.set_width(width);

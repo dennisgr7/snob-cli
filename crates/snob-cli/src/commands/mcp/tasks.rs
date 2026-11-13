@@ -17,7 +17,7 @@
 //! job starts (`mod.rs`, `consent`), so no task is ever `input_required`, and
 //! `tasks/update` has nothing to answer.
 //!
-//! The extension as rmcp 3.8.0 has it has no `tasks/result` and no
+//! The extension as rmcp 3.10.0 has it has no `tasks/result` and no
 //! `tasks/list`: a finished task carries its result in `tasks/get`, and the
 //! jobs are listed by `snob_jobs`.
 

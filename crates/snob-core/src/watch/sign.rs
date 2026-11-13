@@ -9,7 +9,7 @@
 //! the body is readable by anything on the path — which is why an `http://`
 //! address to anywhere but a private network is refused rather than signed.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::secret::Secret;

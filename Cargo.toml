@@ -78,8 +78,8 @@ clap = { version = "4", features = ["derive", "env"] }
 # dependency: `snob status` reads a database an older snob left by copying it
 # into memory and migrating the copy, since migrating the file would be a
 # write (`store::read_only`).
-rusqlite = { version = "0.40", features = ["bundled", "backup"] }
-rusqlite_migration = "2.6"
+rusqlite = { version = "0.41", features = ["bundled", "backup"] }
+rusqlite_migration = "2.7"
 fastrand = "2.5"
 chrono = "0.4"
 directories = "6"
@@ -115,7 +115,7 @@ zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] 
 # backend already compiles it, with these same default features, on every
 # Linux build.
 zbus = "5"
-comfy-table = "7"
+comfy-table = "8"
 indicatif = "0.18"
 supports-hyperlinks = "3"
 csv = "1"
@@ -125,7 +125,7 @@ rust_xlsxwriter = "0.102"
 # the protocol revision it speaks is part of what `snob mcp` promises a
 # client, and a minor bump is a change to read before taking. No default
 # features: those add the tool macros, which this crate does without.
-rmcp = { version = "=3.8.0", default-features = false }
+rmcp = { version = "=3.10.0", default-features = false }
 # What `snob mcp --listen` serves HTTP with (`commands::mcp::http`), and
 # nothing else: **every one of these was already in the tree** through
 # reqwest, which builds hyper's client and `http1` on every target. What is
@@ -221,7 +221,7 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 # obvious dependency-free answer and is worse: on Windows it puts a command line
 # between this program and a file name, and `ShellExecuteW` -- which this crate
 # calls -- takes the path as a path.
-opener = { version = "0.8", default-features = false }
+opener = { version = "0.9", default-features = false }
 url = "2"
 # Talking to a browser we launched, over the DevTools protocol on two inherited
 # pipes: they have no address for anything else on the machine to connect to,
@@ -237,7 +237,7 @@ url = "2"
 # the scratch root is opened without following a link, made `0700` through
 # that descriptor, and asked who owns it (`paths.rs`).
 libc = "0.2"
-base64 = "0.22"
+base64 = "0.23"
 # The monitor's configuration file. Reading only: the file is written by hand
 # from a template, because a serializer cannot put the reason for a value next
 # to it and this project puts the reason next to the thing it governs.
@@ -250,8 +250,8 @@ toml = { version = "1", default-features = false, features = ["parse", "serde", 
 # alternatives and are exactly the two crates that do not build there.
 # On Linux both are already in the tree, through the keyring's Secret Service
 # backend; on Windows and macOS they are a few hundred lines of new code.
-hmac = "0.12"
-sha2 = { version = "0.10", default-features = false }
+hmac = "0.13"
+sha2 = { version = "0.11", default-features = false }
 # Already in the tree under `url`, so this costs no extra compilation.
 percent-encoding = "2"
 # Already in the tree through rustls and the Windows keyring store, so this

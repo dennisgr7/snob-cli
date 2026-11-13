@@ -247,9 +247,23 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 /// The SHA-256 of the file at `path`, in lowercase hex.
 pub(crate) fn sha256_of(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
     let mut file = std::fs::File::open(path)?;
     let mut hash = Sha256::new();
-    std::io::copy(&mut file, &mut hash)?;
+    // Read a buffer at a time: since sha2 0.11 a hash is no `io::Write`
+    // (digest 0.11 has no `std` feature to make it one), so `io::copy`
+    // cannot feed it. The buffer is on the heap: 64 KiB is a lot to ask of
+    // the stack of whichever thread calls this.
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hash.update(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
     Ok(hex(&hash.finalize()))
 }
 
