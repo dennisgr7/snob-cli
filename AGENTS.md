@@ -1008,6 +1008,15 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   going on and that `q` or Ctrl+C stops it, shown once the wait has lasted a
   tick; never call `input::watching_cancel_keys` from a view with nothing on
   screen saying so.
+- **A view's keys are in a table beside its binding** (`KEYS`, shown by `?`
+  through `ui/help.rs`), and a test in the view presses every key the table
+  names: a key added or taken away goes into the table in the same change.
+  The keys that mean the same in every view are worded once, in `ui::help`.
+  `h j k l` are the four arrows; `w` hands the account's page on
+  instagram.com to the system's browser, and is `w` because in the posts
+  browser `o` opens the item in the viewer; in the account list's filter
+  every key is a letter of the query but Ctrl+U, Ctrl+W, the arrows and
+  Enter, which opens the match under the selection.
 - **Stories are handed to the system viewer.** Media is never rendered in the
   terminal: a view writes the file into the session's scratch directory
   (`ui/browser/scratch.rs`, swept when abandoned) and opens it with `opener`

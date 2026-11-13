@@ -497,6 +497,34 @@ pub fn saved_note(result: anyhow::Result<PathBuf>, receipts: &mut Vec<String>) -
     }
 }
 
+/// The public page of an account: what `w` hands to the system's browser.
+/// Encoded and never filtered, like every name that goes into a path.
+///
+/// `snob_core::model::User::profile_url`, for the views that hold a name
+/// and no `User`: the stories, the highlights, the picture, the card. A test
+/// below holds the two to the same address.
+pub fn page_of(username: &str) -> String {
+    format!(
+        "https://www.instagram.com/{}/",
+        snob_core::model::in_a_path(username)
+    )
+}
+
+/// Hands `url` to whatever the system opens addresses with, and says so: a
+/// note and a receipt, for [`saved_note`]'s reason. An address of a page, of
+/// snob's own making; never a CDN address, which is somebody's signed link
+/// and belongs in no browser history.
+pub fn web_note(url: &str, receipts: &mut Vec<String>) -> String {
+    match opener::open(url) {
+        Ok(()) => {
+            let line = format!("Opened {url}");
+            receipts.push(line.clone());
+            line
+        }
+        Err(e) => format!("Could not open it: {e}"),
+    }
+}
+
 /// The scroll position, drawn over the right border. Only called when the
 /// list overflows; a scrollbar on a list that fits is furniture. The thumb
 /// is sized against the viewport, and the arrow caps are dropped: they would
@@ -835,6 +863,25 @@ mod tests {
             1,
             "and no write for either, colors off {off}: {all:?}"
         );
+    }
+
+    /// The address `w` opens is the public page, the name encoded, and the
+    /// very one the printed table puts behind a username.
+    #[test]
+    fn the_browser_gets_the_public_page() {
+        assert_eq!(page_of("someone"), "https://www.instagram.com/someone/");
+        assert_eq!(page_of("a b"), "https://www.instagram.com/a%20b/");
+        for name in ["someone", "a b", "søren", "x\x1b]8;;http://evil.test"] {
+            let user = snob_core::model::User {
+                pk: 1.into(),
+                username: name.to_string(),
+                full_name: None,
+                is_private: None,
+                is_verified: None,
+                pfp_url: None,
+            };
+            assert_eq!(page_of(name), user.profile_url(), "{name:?}");
+        }
     }
 
     /// Walking the selection from end to end keeps two rows of margin

@@ -43,6 +43,7 @@ use crate::ui::accounts::{self, Browsed, Picked};
 use crate::ui::browser::busy::Busy;
 use crate::ui::browser::input::{self, Action, Raw, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
+use crate::ui::help;
 use crate::ui::tui::{self, Tui};
 
 /// Where the browser is, and what the arrow keys therefore move.
@@ -350,6 +351,38 @@ pub async fn browse(
                         Picked::Leave(code) => break Ok(code),
                     }
                 }
+                Action::Web => {
+                    note = tui::web_note(&tui::page_of(&tray.username), &mut receipts);
+                }
+                Action::Help => {
+                    let (title, keys) = match level {
+                        Level::Tray => ("Highlights", TRAY_KEYS),
+                        Level::Inside(_) => ("A highlight", crate::ui::stories::FOLDER_KEYS),
+                    };
+                    help::show(&mut tui, title, keys, |frame| match level {
+                        Level::Tray => draw_tray(
+                            frame,
+                            tray,
+                            &folders,
+                            viewer,
+                            &mut list,
+                            &note,
+                            colors,
+                            &mut page_rows,
+                        ),
+                        Level::Inside(index) => draw_items(
+                            frame,
+                            tray,
+                            index,
+                            &folders[index],
+                            viewer,
+                            &mut list,
+                            &note,
+                            colors,
+                            &mut page_rows,
+                        ),
+                    })?;
+                }
                 Action::None => {}
             }
             // The write-back. Skipped when the arm changed levels: `selected`
@@ -393,6 +426,21 @@ fn bound_at(level: Level, key: KeyEvent) -> Action {
         (_, action) => action,
     }
 }
+
+/// What `?` shows over the tray. Inside a highlight the keys are those of
+/// any list of items, `stories::FOLDER_KEYS`.
+const TRAY_KEYS: &[help::Key] = &[
+    help::MOVE,
+    help::PAGE,
+    help::ENDS,
+    help::key("enter → l", "open the highlight", KeyCode::Enter),
+    help::key("d", "save all of it here", KeyCode::Char('d')),
+    help::ACCOUNT,
+    help::WEB,
+    help::REDRAW,
+    help::QUIT,
+    help::STOP,
+];
 
 /// `someone-2` for the entry at `index`: the command's own stem, so the
 /// browser and `-d` write the very same names. The command counts from one
@@ -568,7 +616,7 @@ fn draw_tray(
     );
     block = block.title_bottom(tui::footer(
         note,
-        "↑↓ move · enter open · d save all · a account · q quit",
+        "↑↓ move · enter open · d save all · a account · ? keys · q quit",
         colors,
     ));
     frame.render_widget(block, area);
@@ -831,5 +879,13 @@ mod tests {
         assert!(first.contains("1."), "{first}");
         assert!(first.contains("photo"), "{first}");
         assert!(tui::row_text(&terminal, 7).contains("← back"));
+    }
+
+    /// Every key the tray's box names is bound to something.
+    #[test]
+    fn every_key_the_help_names_does_something() {
+        for key in TRAY_KEYS {
+            assert_ne!(input::action_of(key.press), Action::None, "{}", key.keys);
+        }
     }
 }

@@ -30,6 +30,7 @@ use crate::output;
 use crate::ui::accounts::{self, Browsed, Picked};
 use crate::ui::browser::input::{self, Action, next};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
+use crate::ui::help;
 use crate::ui::tui;
 
 /// Drives the row until the user leaves it, or picks another account to see
@@ -87,6 +88,12 @@ pub(crate) async fn browse(
                         Picked::Leave(code) => break Ok(code),
                     }
                 }
+                Action::Web => {
+                    note = tui::web_note(&tui::page_of(&picture.username), &mut receipts);
+                }
+                Action::Help => help::show(&mut tui, "Profile picture", KEYS, |frame| {
+                    draw(frame, picture, viewer, &note, colors);
+                })?,
                 // One row: there is nowhere for the selection to move, and
                 // Back is not a way out — leaving a view and leaving the
                 // program are different intentions, the way `input::Action`'s
@@ -103,6 +110,17 @@ pub(crate) async fn browse(
     outcome.map(|code| Browsed::of(code, switch_to))
 }
 
+/// What `?` shows over the one row.
+const KEYS: &[help::Key] = &[
+    crate::ui::stories::OPEN_KEY,
+    crate::ui::stories::SAVE_KEY,
+    help::ACCOUNT,
+    help::WEB,
+    help::REDRAW,
+    help::QUIT,
+    help::STOP,
+];
+
 /// Draws the one row inside the shared chrome. The row is always the
 /// selection — there is nothing else to select.
 fn draw(frame: &mut Frame<'_>, picture: &Picture, viewer: &Viewer, note: &str, colors: bool) {
@@ -118,7 +136,7 @@ fn draw(frame: &mut Frame<'_>, picture: &Picture, viewer: &Viewer, note: &str, c
     )
     .title_bottom(tui::footer(
         note,
-        "enter open · d save · a account · q quit",
+        "enter open · d save · a account · ? keys · q quit",
         colors,
     ));
     let inner = block.inner(area);
@@ -227,5 +245,13 @@ mod tests {
         assert!(row(1).contains("(243 KB)"));
         assert!(row(1).contains("> "));
         assert!(row(5).contains("d save ·"));
+    }
+
+    /// Every key the box names is bound to something.
+    #[test]
+    fn every_key_the_help_names_does_something() {
+        for key in KEYS {
+            assert_ne!(input::action_of(key.press), Action::None, "{}", key.keys);
+        }
     }
 }

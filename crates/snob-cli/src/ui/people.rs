@@ -35,8 +35,9 @@
 //! found, private, cooldown, rate limit) is a red note on the list's bottom
 //! edge, and the list is where it was. The profile itself is the read-only
 //! card of `ui::profile::peek`: Esc, `q`, Backspace or Left come back to the
-//! list with its selection and its filter untouched, and `o` hands the
-//! address to the system browser, which is `User::profile_url` the way the
+//! list with its selection and its filter untouched, and `w`, there and on
+//! the list itself for the account under the selection, hands the address
+//! to the system browser, which is `User::profile_url` the way the
 //! printed table already puts it behind every username: encoded, never
 //! filtered, so a name with an odd character in it opens the account it
 //! names. That differs from the story browser's refusal to hand over CDN
@@ -50,7 +51,9 @@
 //! fast and text pasted mean the same thing in a search box — with anything
 //! below space dropped, so a multi-line paste cannot smuggle an Enter. While
 //! the query owns the keyboard the frame shows a real cursor at the end of
-//! it, which is the terminal's own way of saying where typing goes.
+//! it, which is the terminal's own way of saying where typing goes. Enter
+//! there opens the account the query was steering toward, and Ctrl+U and
+//! Ctrl+W edit the query as a shell's line editor does.
 
 use anyhow::Result;
 use console::measure_text_width;
@@ -73,6 +76,7 @@ use crate::ui::accounts::{self, Browsed, Picked};
 use crate::ui::browser::busy::Busy;
 use crate::ui::browser::input::Action;
 use crate::ui::browser::input::{self, Raw, action_of, page};
+use crate::ui::help;
 use crate::ui::profile::{self, Answer, answer, question_modal};
 use crate::ui::tui::{self, Tui};
 
@@ -414,6 +418,22 @@ async fn run(
                     Picked::Leave(code) => return Ok((code, None)),
                 }
             }
+            Step::Web(address) => note = tui::web_note(&address, receipts),
+            Step::Help => {
+                let keys = keys_of(&state, flat, rewalk.is_some());
+                help::show(tui, &capitalized(&shelf.title), &keys, |frame| {
+                    draw(
+                        frame,
+                        shelf,
+                        &state,
+                        &note,
+                        rewalk.is_some(),
+                        colors,
+                        &mut list,
+                        &mut page_rows,
+                    );
+                })?;
+            }
         }
     }
 }
@@ -427,6 +447,11 @@ enum Step {
     Leave(ExitCode),
     /// The account picker, over the list.
     Accounts,
+    /// `w` on an account: its page, at this address, in the system's
+    /// browser.
+    Web(String),
+    /// `?`: the keys of the level on screen.
+    Help,
 }
 
 /// What a key did to the question about walking the list as `to`.
@@ -580,10 +605,52 @@ fn moving(shelf: &Shelf<'_>, state: &mut State, flat: bool, page_rows: usize, ev
         Action::Quit => return Step::Leave(ExitCode::Ok),
         Action::Interrupt => return Step::Leave(ExitCode::Interrupted),
         Action::Accounts => return Step::Accounts,
+        Action::Web => {
+            if let Some(person) = selected_person(shelf, state) {
+                return Step::Web(person.profile_url());
+            }
+        }
+        Action::Help => return Step::Help,
         Action::Download | Action::None => {}
     }
     Step::Go
 }
+
+/// The account under the selection, inside a list that has one.
+fn selected_person<'a>(shelf: &'a Shelf<'_>, state: &State) -> Option<&'a User> {
+    let Level::Inside(index) = state.level else {
+        return None;
+    };
+    let person = *state.shown.get(state.selected)?;
+    shelf.sets.get(index)?.people.get(person)
+}
+
+/// What `?` shows, for the level and the list it is pressed at: a key that
+/// does nothing here, the way back out of a list that is the only one, is
+/// not named.
+fn keys_of(state: &State, flat: bool, switches: bool) -> Vec<help::Key> {
+    let mut keys = vec![help::MOVE, help::PAGE, help::ENDS];
+    match state.level {
+        Level::Tray => keys.push(help::key("enter → l", "open the list", KeyCode::Enter)),
+        Level::Inside(_) => {
+            keys.push(help::key("enter → l", "read the profile", KeyCode::Enter));
+            keys.push(FILTER_KEY);
+            keys.push(help::WEB);
+            if !flat {
+                keys.push(help::BACK);
+            }
+        }
+    }
+    if switches {
+        keys.push(help::ACCOUNT);
+    }
+    keys.extend([help::REDRAW, help::QUIT, help::STOP]);
+    keys
+}
+
+/// `/`, which only this view has. While the query is being typed every key
+/// is a letter of it, `?` among them, so the box is not offered there.
+const FILTER_KEY: help::Key = help::key("/", "filter by name", KeyCode::Char('/'));
 
 /// Enter, wherever the selection is.
 fn open(shelf: &Shelf<'_>, state: &mut State) -> Step {
@@ -627,6 +694,17 @@ fn could_not_read(person: &User, error: &anyhow::Error) -> String {
     format!("Could not open @{}: {why}", person.safe_username())
 }
 
+/// Ctrl+W: the query less its last word and whatever blank follows it.
+fn drop_last_word(query: &mut String) {
+    let kept = query.trim_end();
+    let cut = kept
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(at, blank)| at + blank.len_utf8());
+    query.truncate(cut);
+}
+
 /// One key while the query owns the keyboard.
 fn filtering(shelf: &Shelf<'_>, state: &mut State, event: Raw) -> Step {
     match event {
@@ -650,16 +728,35 @@ fn filtering_key(shelf: &Shelf<'_>, state: &mut State, key: KeyEvent) -> Step {
     if ctrl && key.code == KeyCode::Char('l') {
         return Step::Redraw;
     }
+    // The two a shell's line editor has taught every hand: Ctrl+U empties
+    // the line and Ctrl+W takes the last word, which a full name has. No
+    // other key with Ctrl is this box's: a letter typed with it is not a
+    // letter of anybody's name.
+    if ctrl {
+        match key.code {
+            KeyCode::Char('u') => state.query.clear(),
+            KeyCode::Char('w') => drop_last_word(&mut state.query),
+            _ => return Step::Go,
+        }
+        refilter(shelf, state);
+        return Step::Go;
+    }
     let rows = rows_in(shelf, state);
     match key.code {
-        // Esc gives the whole list back; Enter keeps what the query narrowed
-        // it to. Both put the arrows back in charge.
+        // Esc gives the whole list back. Enter opens the account the query
+        // was steering toward, the one under the selection, and leaves the
+        // list narrowed for the way back: typing a name and seeing its
+        // profile is one motion, not a mode change and a second Enter. Both
+        // put the arrows back in charge.
         KeyCode::Esc => {
             state.mode = Mode::Moving;
             state.query.clear();
             refilter(shelf, state);
         }
-        KeyCode::Enter => state.mode = Mode::Moving,
+        KeyCode::Enter => {
+            state.mode = Mode::Moving;
+            return open(shelf, state);
+        }
         KeyCode::Backspace => {
             if state.query.pop().is_some() {
                 refilter(shelf, state);
@@ -838,7 +935,7 @@ fn footer_line(
         return tui::outcome_line(note.to_string(), colors);
     }
     if state.mode == Mode::Filtering {
-        let hint = "  enter keep · esc clear ";
+        let hint = "  enter open · esc clear ";
         return Line::from(vec![
             Span::raw(FILTER_PREFIX),
             Span::raw(state.query.clone()),
@@ -859,7 +956,7 @@ fn footer_line(
     if switches {
         hint.push_str(" · a account");
     }
-    hint.push_str(" · q quit");
+    hint.push_str(" · ? keys · q quit");
     tui::hint_line(hint, colors)
 }
 
@@ -1198,10 +1295,11 @@ mod tests {
         );
     }
 
-    /// Esc empties the query and hands the keys back; Enter keeps the
-    /// narrowed list. Both put the arrows back in charge.
+    /// Esc empties the query and hands the keys back; Enter opens the
+    /// account the query narrowed to and keeps the narrowed list for the
+    /// way back. Both put the arrows back in charge.
     #[test]
-    fn esc_clears_and_enter_keeps() {
+    fn enter_on_a_narrowed_list_opens_the_first_match() {
         let people = [person(1, "anna", None), person(2, "bob", None)];
         let shelf = shelf_of(&people);
         let mut state = inside(&shelf);
@@ -1209,13 +1307,32 @@ mod tests {
         state.query = "b".to_string();
         refilter(&shelf, &mut state);
 
-        filtering_key(
+        let step = filtering_key(
             &shelf,
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
+        assert!(
+            matches!(&step, Step::Profile(person) if person.username == "bob"),
+            "one Enter, not two"
+        );
         assert_eq!(state.mode, Mode::Moving);
         assert_eq!(state.shown, vec![1], "Enter keeps what was narrowed");
+        assert_eq!(state.query, "b");
+
+        // With nobody left to open, Enter only hands the keys back.
+        state.mode = Mode::Filtering;
+        state.query = "zzz".to_string();
+        refilter(&shelf, &mut state);
+        let step = filtering_key(
+            &shelf,
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(step, Step::Go));
+        assert_eq!(state.mode, Mode::Moving);
+        state.query = "b".to_string();
+        refilter(&shelf, &mut state);
 
         state.mode = Mode::Filtering;
         filtering_key(
@@ -1225,6 +1342,97 @@ mod tests {
         );
         assert_eq!(state.mode, Mode::Moving);
         assert_eq!(state.shown, vec![0, 1], "Esc gives the whole list back");
+    }
+
+    /// The line editor's two: Ctrl+U empties the query and Ctrl+W takes its
+    /// last word, and the list follows both. Neither leaves the filter, and
+    /// no other letter with Ctrl is typed into it.
+    #[test]
+    fn control_u_empties_the_query_and_control_w_drops_a_word() {
+        let people = [
+            person(1, "anna", Some("Anna Maria Lopez")),
+            person(2, "bob", None),
+        ];
+        let shelf = shelf_of(&people);
+        let mut state = inside(&shelf);
+        state.mode = Mode::Filtering;
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+
+        state.query = "anna maria ".to_string();
+        refilter(&shelf, &mut state);
+        filtering_key(&shelf, &mut state, ctrl('w'));
+        assert_eq!(state.query, "anna ", "the word and the blank after it");
+        filtering_key(&shelf, &mut state, ctrl('w'));
+        assert_eq!(state.query, "");
+        assert_eq!(state.shown, vec![0, 1], "the list follows the query");
+        filtering_key(&shelf, &mut state, ctrl('w'));
+        assert_eq!(state.query, "", "nothing left to take");
+
+        state.query = "bob".to_string();
+        refilter(&shelf, &mut state);
+        assert_eq!(state.shown, vec![1]);
+        filtering_key(&shelf, &mut state, ctrl('u'));
+        assert_eq!(state.query, "");
+        assert_eq!(state.shown, vec![0, 1]);
+        assert_eq!(state.mode, Mode::Filtering);
+
+        filtering_key(&shelf, &mut state, ctrl('a'));
+        assert_eq!(state.query, "", "a letter with Ctrl is not typed");
+    }
+
+    /// `w` on an account is its page on the web; on a tray row, which is
+    /// no account, it is nothing.
+    #[test]
+    fn w_opens_the_page_of_the_account_under_the_selection() {
+        let people = [person(1, "anna", None), person(2, "a b", None)];
+        let shelf = shelf_of(&people);
+        let mut state = inside(&shelf);
+        state.selected = 1;
+        let step = moving(&shelf, &mut state, true, 10, key(KeyCode::Char('w')));
+        assert!(
+            matches!(&step, Step::Web(address) if address == "https://www.instagram.com/a%20b/")
+        );
+
+        state.level = Level::Tray;
+        let step = moving(&shelf, &mut state, false, 10, key(KeyCode::Char('w')));
+        assert!(matches!(step, Step::Go));
+    }
+
+    /// `?` asks for the keys, and every key the box then names is one the
+    /// view answers: by the shared binding, or `/` by starting a query. The
+    /// way back is named only where there is a tray to go back to.
+    #[test]
+    fn every_key_the_help_names_does_something() {
+        let people = [person(1, "anna", None)];
+        let shelf = shelf_of(&people);
+        let mut state = inside(&shelf);
+        let step = moving(&shelf, &mut state, true, 10, key(KeyCode::Char('?')));
+        assert!(matches!(step, Step::Help));
+
+        for (flat, switches) in [(true, true), (false, false)] {
+            for level in [Level::Tray, Level::Inside(0)] {
+                state.level = level;
+                for named in keys_of(&state, flat, switches) {
+                    let bound = action_of(named.press) != Action::None;
+                    let filters = named.press.code == KeyCode::Char('/');
+                    assert!(bound || filters, "{}", named.keys);
+                }
+            }
+        }
+        state.level = Level::Inside(0);
+        let names = |flat, switches| -> Vec<&str> {
+            keys_of(&state, flat, switches)
+                .iter()
+                .map(|k| k.keys)
+                .collect()
+        };
+        assert!(!names(true, true).contains(&help::BACK.keys));
+        assert!(names(false, true).contains(&help::BACK.keys));
+        assert!(!names(true, false).contains(&help::ACCOUNT.keys));
+
+        // And `/` does start one.
+        moving(&shelf, &mut state, true, 10, key(KeyCode::Char('/')));
+        assert_eq!(state.mode, Mode::Filtering);
     }
 
     /// A paste is typing fast — it lands in the query, minus anything below

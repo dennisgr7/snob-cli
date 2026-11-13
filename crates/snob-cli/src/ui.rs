@@ -625,6 +625,7 @@ mod tests {
 
 pub mod accounts;
 pub mod browser;
+pub mod help;
 pub mod highlights;
 pub mod menu;
 pub mod notify;

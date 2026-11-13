@@ -12,6 +12,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::Constraint;
 use ratatui::style::{Color, Style};
@@ -30,6 +31,7 @@ use crate::ui::accounts::{self, Browsed, Picked};
 use crate::ui::browser::busy::Busy;
 use crate::ui::browser::input::{self, Action, next, page};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
+use crate::ui::help;
 use crate::ui::tui;
 
 /// Drives the list until the user leaves it, or picks another account to see
@@ -200,6 +202,20 @@ pub async fn browse(
                         Picked::Leave(code) => break Ok(code),
                     }
                 }
+                Action::Web => {
+                    note = tui::web_note(&tui::page_of(&stories.username), &mut receipts);
+                }
+                Action::Help => help::show(&mut tui, "Stories", KEYS, |frame| {
+                    draw(
+                        frame,
+                        stories,
+                        viewer,
+                        &mut list,
+                        &note,
+                        colors,
+                        &mut page_rows,
+                    );
+                })?,
                 Action::None => {}
             }
         }
@@ -210,6 +226,41 @@ pub async fn browse(
     tui::print_receipts(&receipts);
     outcome.map(|code| Browsed::of(code, switch_to))
 }
+
+/// What `?` shows over the story list.
+const KEYS: &[help::Key] = &[
+    help::MOVE,
+    help::PAGE,
+    help::ENDS,
+    OPEN_KEY,
+    SAVE_KEY,
+    help::ACCOUNT,
+    help::WEB,
+    help::REDRAW,
+    help::QUIT,
+    help::STOP,
+];
+
+/// The two verbs of a list of items, worded once for every view that has
+/// one.
+pub(crate) const OPEN_KEY: help::Key =
+    help::key("enter → l", "open in the system viewer", KeyCode::Enter);
+pub(crate) const SAVE_KEY: help::Key = help::key("d", "save a copy here", KeyCode::Char('d'));
+
+/// What `?` shows over a list of items inside something ([`FOLDER_HINT`]).
+pub(crate) const FOLDER_KEYS: &[help::Key] = &[
+    help::MOVE,
+    help::PAGE,
+    help::ENDS,
+    OPEN_KEY,
+    SAVE_KEY,
+    help::BACK,
+    help::ACCOUNT,
+    help::WEB,
+    help::REDRAW,
+    help::QUIT,
+    help::STOP,
+];
 
 /// Draws one frame: the shared chrome, the table, and the scrollbar when the
 /// table does not fit.
@@ -233,7 +284,7 @@ fn draw(
             printable(&stories.username),
             stories.items.len()
         ),
-        "↑↓ move · enter open · d save · a account · q quit",
+        "↑↓ move · enter open · d save · a account · ? keys · q quit",
         &stories.items,
         true,
         viewer,
@@ -246,7 +297,8 @@ fn draw(
 
 /// The hints of a list of items inside something: a highlight folder, and
 /// the profile card's stories and folders, which `←` leaves.
-pub(crate) const FOLDER_HINT: &str = "↑↓ move · enter open · d save · ← back · a account · q quit";
+pub(crate) const FOLDER_HINT: &str =
+    "↑↓ move · enter open · d save · ← back · a account · ? keys · q quit";
 
 /// The one items view, drawn under whatever title and hints its owner gives
 /// it. The story browser, the inside of a highlight folder, and the profile
@@ -615,5 +667,14 @@ mod tests {
             Constraint::Length(crate::report::dated(taken).len().max(5) as u16),
             "a kept story's date is measured as `report::dated` writes it"
         );
+    }
+
+    /// Every key the two boxes name, the list's and a folder's, is bound to
+    /// something.
+    #[test]
+    fn every_key_the_help_names_does_something() {
+        for key in KEYS.iter().chain(FOLDER_KEYS) {
+            assert_ne!(input::action_of(key.press), Action::None, "{}", key.keys);
+        }
     }
 }

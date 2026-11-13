@@ -129,6 +129,12 @@ pub enum Action {
     Download,
     /// The account picker: which account this view acts as.
     Accounts,
+    /// The page of what is under the cursor, on instagram.com, in the
+    /// browser the system opens addresses with. `w` and not `o`: in the posts
+    /// browser `o` already opens the item in the viewer.
+    Web,
+    /// The keys of the view on screen, in a box over it (`ui::help`).
+    Help,
     Redraw,
     Quit,
     Interrupt,
@@ -253,10 +259,16 @@ pub fn action_of(key: KeyEvent) -> Action {
         // with levels the arrows walk into and out of a folder, the way every
         // two-pane file view binds them. In the flat story list Right opens,
         // which is what Enter does, and Left does nothing.
-        KeyCode::Right if plain => Action::Open,
-        KeyCode::Left | KeyCode::Backspace if plain => Action::Back,
+        //
+        // `l` and `h` are the same two arrows for a hand that stays on the
+        // home row, as `j` and `k` are the other two. Ctrl+L is matched
+        // above, so it stays the redraw.
+        KeyCode::Right | KeyCode::Char('l') if plain => Action::Open,
+        KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') if plain => Action::Back,
         KeyCode::Char('d') | KeyCode::Char('D') if plain => Action::Download,
         KeyCode::Char('a') if plain => Action::Accounts,
+        KeyCode::Char('w') if plain => Action::Web,
+        KeyCode::Char('?') if plain => Action::Help,
         KeyCode::Esc | KeyCode::Char('q') if plain => Action::Quit,
         _ => Action::None,
     }
@@ -402,6 +414,50 @@ mod tests {
         assert_eq!(
             action_of(key(KeyCode::Esc, KeyModifiers::NONE)),
             Action::Quit
+        );
+    }
+
+    /// The home row's arrows: `h` walks out and `l` walks in, as Left and
+    /// Right do, and Ctrl+L is still the redraw and not an open.
+    #[test]
+    fn h_and_l_walk_out_and_in() {
+        assert_eq!(
+            action_of(key(KeyCode::Char('h'), KeyModifiers::NONE)),
+            Action::Back
+        );
+        assert_eq!(
+            action_of(key(KeyCode::Char('l'), KeyModifiers::NONE)),
+            Action::Open
+        );
+        assert_eq!(
+            action_of(key(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            Action::Redraw
+        );
+        assert_eq!(
+            action_of(key(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+            Action::None
+        );
+    }
+
+    /// `?` asks for the keys, which most keyboards type with shift, and `w`
+    /// for the page on the web.
+    #[test]
+    fn a_question_mark_asks_for_the_keys_and_w_for_the_web() {
+        assert_eq!(
+            action_of(key(KeyCode::Char('?'), KeyModifiers::SHIFT)),
+            Action::Help
+        );
+        assert_eq!(
+            action_of(key(KeyCode::Char('?'), KeyModifiers::NONE)),
+            Action::Help
+        );
+        assert_eq!(
+            action_of(key(KeyCode::Char('w'), KeyModifiers::NONE)),
+            Action::Web
+        );
+        assert_eq!(
+            action_of(key(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+            Action::None
         );
     }
 

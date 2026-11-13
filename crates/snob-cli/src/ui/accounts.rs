@@ -141,7 +141,10 @@ impl Picker {
             Action::Redraw => return Step::Redraw,
             Action::Quit => return Step::Leave(ExitCode::Ok),
             Action::Interrupt => return Step::Leave(ExitCode::Interrupted),
-            Action::Download | Action::None => {}
+            // The picker is itself a box over a view, with its own keys on
+            // its bottom edge: it takes neither a second box nor the page
+            // of an account, which is the view's to open.
+            Action::Download | Action::Web | Action::Help | Action::None => {}
         }
         Step::Stay
     }

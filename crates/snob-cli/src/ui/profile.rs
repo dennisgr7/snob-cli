@@ -58,6 +58,7 @@ use crate::ui::accounts::{self, Browsed, Picked};
 use crate::ui::browser::busy::Busy;
 use crate::ui::browser::input::{self, Action, Raw, action_of, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
+use crate::ui::help;
 use crate::ui::highlights::{Folder, empty_note, folder_title, keep_folder, stem_of, walk_in};
 use crate::ui::people::Shelf;
 use crate::ui::tui::{self, Tui};
@@ -356,13 +357,32 @@ pub async fn browse(
                 continue;
             }
 
+            // So do the account's page on the web and the keys of the level.
+            match action_of(key) {
+                Action::Web => {
+                    note = tui::web_note(&tui::page_of(&profile.username), &mut receipts);
+                    continue;
+                }
+                Action::Help => {
+                    let (title, keys) = match state.level {
+                        Level::Card => ("Profile", CARD_KEYS),
+                        Level::Actions { .. } => ("Actions", ACTIONS_KEYS),
+                        Level::Stories => ("Stories", crate::ui::stories::FOLDER_KEYS),
+                        Level::Inside { .. } => ("A highlight", crate::ui::stories::FOLDER_KEYS),
+                    };
+                    help::show(&mut tui, title, keys, level_frame!())?;
+                    continue;
+                }
+                _ => {}
+            }
+
             let level_before = state.level;
             match state.level {
                 Level::Card => {
                     let here = rows[state.row.min(rows.len() - 1)];
-                    // Left and Right move the column on the horizontal rows, and
-                    // must not reach `action_of`, whose Left is Back and whose
-                    // Right is Open.
+                    // Left and Right, and `h` and `l` with them, move the
+                    // column on the horizontal rows, and must not reach
+                    // `action_of`, whose Left is Back and whose Right is Open.
                     if plain && matches!(here, CardRow::Counts | CardRow::Highlights) {
                         let (col, len) = match here {
                             CardRow::Counts => (&mut state.counts_col, 3),
@@ -370,11 +390,11 @@ pub async fn browse(
                             _ => unreachable!(),
                         };
                         match key.code {
-                            KeyCode::Left => {
+                            KeyCode::Left | KeyCode::Char('h') => {
                                 *col = col.saturating_sub(1);
                                 continue;
                             }
-                            KeyCode::Right => {
+                            KeyCode::Right | KeyCode::Char('l') => {
                                 *col = (*col + 1).min(len.saturating_sub(1));
                                 continue;
                             }
@@ -489,10 +509,14 @@ pub async fn browse(
                         Action::Redraw => tui.terminal.clear()?,
                         Action::Quit => break Ok(ExitCode::Ok),
                         Action::Interrupt => break Ok(ExitCode::Interrupted),
+                        // The last three are answered above, for every
+                        // level at once.
                         Action::Back
                         | Action::PageUp
                         | Action::PageDown
                         | Action::Accounts
+                        | Action::Web
+                        | Action::Help
                         | Action::None => {}
                     }
                 }
@@ -630,7 +654,7 @@ pub async fn browse(
                         Action::Redraw => tui.terminal.clear()?,
                         Action::Quit => break Ok(ExitCode::Ok),
                         Action::Interrupt => break Ok(ExitCode::Interrupted),
-                        Action::Accounts | Action::None => {}
+                        Action::Accounts | Action::Web | Action::Help | Action::None => {}
                     }
                 }
                 Level::Inside { index } => {
@@ -715,7 +739,7 @@ pub async fn browse(
                         Action::Redraw => tui.terminal.clear()?,
                         Action::Quit => break Ok(ExitCode::Ok),
                         Action::Interrupt => break Ok(ExitCode::Interrupted),
-                        Action::Accounts | Action::None => {}
+                        Action::Accounts | Action::Web | Action::Help | Action::None => {}
                     }
                 }
             }
@@ -1110,17 +1134,59 @@ async fn ensure_pfp(app: &App, profile: &Profile, media: &mut Media) -> Result<(
 // The read-only card an account list opens.
 
 /// The bottom edge of the read-only card.
-pub(crate) const PEEK_HINT: &str = "o open in browser · esc back";
+pub(crate) const PEEK_HINT: &str = "w open on the web · ? keys · esc back";
+
+/// What `?` shows over the read-only card.
+const PEEK_KEYS: &[help::Key] = &[
+    help::WEB,
+    help::key("esc q ← h backspace", "back to the list", KeyCode::Esc),
+    help::REDRAW,
+    help::STOP,
+];
+
+/// What `?` shows over the card.
+const CARD_KEYS: &[help::Key] = &[
+    help::key("↑ ↓ j k", "move between the rows", KeyCode::Down),
+    help::key("← → h l", "pick within a row", KeyCode::Right),
+    help::key("g G home end", "the first row, the last", KeyCode::Home),
+    help::key("enter", "open what is under the cursor", KeyCode::Enter),
+    help::key("d", "save all of a highlight here", KeyCode::Char('d')),
+    help::ACCOUNT,
+    help::WEB,
+    help::REDRAW,
+    help::QUIT,
+    help::STOP,
+];
+
+/// What `?` shows over the actions panel.
+const ACTIONS_KEYS: &[help::Key] = &[
+    help::MOVE,
+    help::key(
+        "enter → l",
+        "open the picture, or start the scan",
+        KeyCode::Enter,
+    ),
+    help::key("d", "save the picture here", KeyCode::Char('d')),
+    help::key("esc ← h backspace", "back to the card", KeyCode::Left),
+    help::ACCOUNT,
+    help::WEB,
+    help::REDRAW,
+    help::QUIT,
+    help::STOP,
+];
 
 /// What a key did to the read-only card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Peeked {
-    /// Esc, `q`, Backspace or Left: back to the list it came from.
+    /// Esc, `q`, Backspace, Left or `h`: back to the list it came from.
     Back,
     /// Ctrl+C: out of the whole view.
     Interrupt,
-    /// `o`: hand the profile address to the system browser.
+    /// `w`, and `o` as it was before `w` meant this everywhere: hand the
+    /// profile address to the system browser.
     Browser,
+    /// `?`: the keys of this card.
+    Help,
     Redraw,
     Ignored,
 }
@@ -1133,21 +1199,13 @@ pub(crate) fn peek_key(key: KeyEvent) -> Peeked {
     match key.code {
         KeyCode::Char('c') if ctrl => Peeked::Interrupt,
         KeyCode::Char('l') if ctrl => Peeked::Redraw,
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace | KeyCode::Left if plain => {
+        KeyCode::Esc | KeyCode::Char('q' | 'h') | KeyCode::Backspace | KeyCode::Left if plain => {
             Peeked::Back
         }
-        KeyCode::Char('o' | 'O') if plain => Peeked::Browser,
+        KeyCode::Char('w' | 'o' | 'O') if plain => Peeked::Browser,
+        KeyCode::Char('?') if plain => Peeked::Help,
         _ => Peeked::Ignored,
     }
-}
-
-/// The profile address `o` hands over: the same public page the list view
-/// opened before this card existed, encoded and never filtered.
-fn profile_address(profile: &Profile) -> String {
-    format!(
-        "https://www.instagram.com/{}/",
-        snob_core::model::in_a_path(&profile.username)
-    )
 }
 
 /// The card of the account under the cursor of a list, on the guard the list
@@ -1199,17 +1257,22 @@ pub(crate) fn peek(
             Peeked::Interrupt => return Ok(Some(ExitCode::Interrupted)),
             Peeked::Redraw => tui.terminal.clear()?,
             Peeked::Browser => {
-                let url = profile_address(profile);
-                note = match opener::open(&url) {
-                    // A note and a receipt, for `tui::saved_note`'s reason.
-                    Ok(()) => {
-                        let line = format!("Opened {url}");
-                        receipts.push(line.clone());
-                        line
-                    }
-                    Err(e) => format!("Could not open it: {e}"),
-                };
+                note = tui::web_note(&tui::page_of(&profile.username), receipts);
             }
+            Peeked::Help => help::show(tui, "Profile", PEEK_KEYS, |frame| {
+                card_frame(
+                    frame,
+                    profile,
+                    &media,
+                    &state,
+                    &rows,
+                    own,
+                    viewer,
+                    &note,
+                    colors,
+                    Some(PEEK_HINT),
+                );
+            })?,
             Peeked::Ignored => {}
         }
     }
@@ -2321,20 +2384,24 @@ mod tests {
         assert_eq!(h, 8, "and wrap to two lines");
     }
 
-    /// Esc, `q`, Backspace and Left go back to the list; `o` is the browser;
-    /// Ctrl+C leaves; the rest does nothing.
+    /// Esc, `q`, Backspace, Left and `h` go back to the list; `w` is the
+    /// browser, and `o` still is; `?` asks for the keys; Ctrl+C leaves; the
+    /// rest does nothing.
     #[test]
     fn the_read_only_card_binds_back_and_the_browser() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         for back in [
             KeyCode::Esc,
             KeyCode::Char('q'),
+            KeyCode::Char('h'),
             KeyCode::Backspace,
             KeyCode::Left,
         ] {
             assert_eq!(peek_key(key(back)), Peeked::Back, "{back:?}");
         }
+        assert_eq!(peek_key(key(KeyCode::Char('w'))), Peeked::Browser);
         assert_eq!(peek_key(key(KeyCode::Char('o'))), Peeked::Browser);
+        assert_eq!(peek_key(key(KeyCode::Char('?'))), Peeked::Help);
         assert_eq!(peek_key(key(KeyCode::Enter)), Peeked::Ignored);
         assert_eq!(peek_key(key(KeyCode::Char('d'))), Peeked::Ignored);
         assert_eq!(
@@ -2347,19 +2414,17 @@ mod tests {
         );
     }
 
-    /// The address `o` opens is the public page, the name encoded.
+    /// Every key the three boxes of this view name is bound to something:
+    /// the card's and the panel's by the shared binding, the read-only
+    /// card's by its own.
     #[test]
-    fn the_browser_gets_the_public_page() {
-        let mut profile = bare_profile();
-        assert_eq!(
-            profile_address(&profile),
-            "https://www.instagram.com/someone/"
-        );
-        profile.username = "a b".to_string();
-        assert_eq!(
-            profile_address(&profile),
-            "https://www.instagram.com/a%20b/"
-        );
+    fn every_key_the_help_names_does_something() {
+        for key in CARD_KEYS.iter().chain(ACTIONS_KEYS) {
+            assert_ne!(action_of(key.press), Action::None, "{}", key.keys);
+        }
+        for key in PEEK_KEYS {
+            assert_ne!(peek_key(key.press), Peeked::Ignored, "{}", key.keys);
+        }
     }
 
     /// The read-only card shows what the profile has (identity, counts,
@@ -2408,7 +2473,8 @@ mod tests {
         assert!(screen.contains("followed by 33 you follow"), "{screen}");
         assert!(screen.contains("1,234"), "{screen}");
         assert!(screen.contains("trip"), "{screen}");
-        assert!(screen.contains("o open in browser"), "{screen}");
+        assert!(screen.contains("w open on the web"), "{screen}");
+        assert!(screen.contains("? keys"), "{screen}");
         assert!(!screen.contains("actions on this account"), "{screen}");
         assert!(!screen.contains('›'), "nothing here opens: {screen}");
         assert!(
