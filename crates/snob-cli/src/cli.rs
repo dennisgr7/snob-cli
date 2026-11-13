@@ -2254,6 +2254,14 @@ pub struct LikersArgs {
 
     #[command(flatten)]
     pub agent: AgentArgs,
+
+    /// Send nothing and ask nothing: say what would refuse this read now
+    /// if an agent made it, or that nothing would
+    // Hidden: what `snob mcp` runs before it asks the person for a yes to a
+    // post's likers, so nobody says yes to a read that is then refused
+    // (`likers::check_ahead`), as `follow --check-ahead` is for a write.
+    #[arg(long, hide = true, conflicts_with = "confirmed_via")]
+    pub check_ahead: bool,
 }
 
 /// How a post's videos are saved.

@@ -416,8 +416,8 @@ impl ServerHandler for Server {
         )
         .with_instructions(format!(
             "Instagram as the signed-in person sees it, through the snob command line: \
-                 the status, the follower and following lists and how they cross, and \
-                 profiles. Call snob_status first: it costs nothing and says how much of \
+                 the status, the follower and following lists and how they cross, \
+                 profiles, and posts with who liked them. Call snob_status first: it costs nothing and says how much of \
                  today's request budget is left and whether the account is cooling down. \
                  Prefer stored answers (mode \"stored\") and dry runs when the budget is low. \
                  Never retry a call that came back rate_limited or in cooldown; say when the \

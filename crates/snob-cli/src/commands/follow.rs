@@ -249,47 +249,8 @@ fn check_ahead(
     secrets: &SessionStore,
     paths: &AccountPaths,
 ) -> Result<ExitCode> {
-    let Some(session) = secrets.load()? else {
-        return Err(common::no_session());
-    };
-    if session.ds_user_id != paths.pk() {
-        anyhow::bail!(
-            "the session stored for account {} is account {}'s; log in again with \
-             \"snob login\"",
-            paths.pk(),
-            session.ds_user_id
-        );
-    }
-    // As the run refuses it at its start (`App::open`).
-    if crate::owner::signed_out(paths, &session) {
-        return Err(common::signed_out_here());
-    }
     let now = snob_core::clock::now_ms();
-    // A job's walk holds the account for as long as it walks, from before
-    // its walk takes `spend.lock` (queued) to its end.
-    if let Some(going) = crate::jobs::all(paths, now.get())?
-        .into_iter()
-        .find(|seen| !seen.status.is_over())
-    {
-        return Err(ExitError::new(
-            ExitCode::Error,
-            format!(
-                "{} of this account is walking a list, and only one run started by an agent \
-                 may use the account on Instagram at a time; nothing was sent",
-                going.id
-            ),
-        )
-        .with_reason("busy")
-        .with_hint(format!(
-            "ask again once it has ended, which \"snob jobs show {id}\" tells, or stop it \
-             with \"snob jobs cancel {id}\"",
-            id = going.id
-        ))
-        .into());
-    }
-    if snob_store::paths::lock_is_held(&paths.spend_lock())?.unwrap_or(false) {
-        return Err(crate::app::held_elsewhere());
-    }
+    let session = common::alone_ahead(secrets, paths, now)?;
     if session.csrftoken.is_none() && !snob_ig::client::page::a_client_would_use_a_page() {
         return Err(cannot_write(verb));
     }

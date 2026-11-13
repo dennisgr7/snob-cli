@@ -130,11 +130,17 @@ pub const PUSHED_BACK: &str = "Instagram pushed back and a cooldown has started 
                                person when the wait ends";
 
 /// Reads a finished child against what its plan counts as an answer.
-pub fn from(plan: &Plan, finished: Finished) -> Answer {
+pub fn from(plan: &Plan, mut finished: Finished) -> Answer {
+    if shows_media(plan) {
+        finished.json = finished.json.take().map(without_media_addresses);
+    }
     let exit = finished.code;
     let offset = plan.page.as_ref().map_or(0, |page| page.offset);
     let limit = plan.page.as_ref().and_then(|page| page.limit);
     let mut whole_items = None;
+    // What a document that holds the list says beside it (`Page::rows`),
+    // which every later page repeats.
+    let mut beside: Vec<String> = Vec::new();
     // Past 0, only with the document it is an answer for: `status` and a dry
     // run print one whatever their exit, and the same exit with nothing on
     // standard output is a refusal, which an empty answer would hide.
@@ -160,9 +166,40 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
                 }
                 body
             }
-            Some(mut document @ Value::Object(_)) => {
-                leave_out_of_accounts(&mut document);
-                document
+            Some(Value::Object(mut document)) => {
+                let rows = plan.page.as_ref().and_then(|page| page.rows);
+                match rows.and_then(|key| document.remove(key).map(|rows| (key, rows))) {
+                    Some((_, Value::Array(items))) => {
+                        let items = compact(&items);
+                        if let Some(refused) = past_the_end(items.len(), offset, limit) {
+                            return refused;
+                        }
+                        let mut body = page(&items, offset, limit, true);
+                        if !body["next_offset"].is_null() {
+                            whole_items = Some(items);
+                        }
+                        if let Some(fields) = body.as_object_mut() {
+                            for (key, value) in document {
+                                if !fields.contains_key(&key) {
+                                    beside.push(key.clone());
+                                    fields.insert(key, value);
+                                }
+                            }
+                        }
+                        body
+                    }
+                    // Not a list where one was expected (`"posts": null` for
+                    // an account with none): the document as it came.
+                    Some((key, other)) => {
+                        document.insert(key.to_string(), other);
+                        Value::Object(document)
+                    }
+                    None => {
+                        let mut document = Value::Object(document);
+                        leave_out_of_accounts(&mut document);
+                        document
+                    }
+                }
             }
             Some(other) => json!({ "value": other }),
             None => json!({ "text": finished.text.trim() }),
@@ -294,7 +331,9 @@ pub fn from(plan: &Plan, finished: Finished) -> Answer {
         items,
         about: ABOUT
             .iter()
-            .filter_map(|key| Some((key.to_string(), body.get(*key)?.clone())))
+            .copied()
+            .chain(beside.iter().map(String::as_str))
+            .filter_map(|key| Some((key.to_string(), body.get(key)?.clone())))
             .collect(),
     });
     Answer {
@@ -658,6 +697,53 @@ fn last_lines(said: &str) -> String {
     lines[lines.len().saturating_sub(6)..].join("\n")
 }
 
+/// Whether `plan` is one of the commands about posts (`snob_posts`,
+/// `snob_post`, `snob_post_likers`), whose answers lose their media
+/// addresses ([`without_media_addresses`]).
+fn shows_media(plan: &Plan) -> bool {
+    matches!(
+        plan.args.first().map(String::as_str),
+        Some("posts" | "post" | "likers")
+    )
+}
+
+/// `value` with every address that is not a page of instagram.com made
+/// null, wherever it is: the pictures and videos a post's answer names, its
+/// best tracks', and the profile pictures of the accounts in it.
+///
+/// **No tool downloads** (AGENTS.md, the MCP server), so an agent has no use
+/// for them, and each is a signed address of a few hundred bytes that
+/// tokenizes at about three bytes a token: a page of posts would be mostly
+/// query strings. Made null rather than removed, so every key the command
+/// prints is still there. Judged by host, so a test's own server counts as a
+/// CDN as Instagram's does, and the post's own link stays.
+pub fn without_media_addresses(value: Value) -> Value {
+    match value {
+        Value::String(text) if is_a_media_address(&text) => Value::Null,
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(without_media_addresses).collect())
+        }
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key, without_media_addresses(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// An `http` or `https` address anywhere but instagram.com.
+fn is_a_media_address(text: &str) -> bool {
+    let Ok(address) = url::Url::parse(text) else {
+        return false;
+    };
+    matches!(address.scheme(), "http" | "https")
+        && !address
+            .host_str()
+            .is_some_and(|host| host == "instagram.com" || host.ends_with(".instagram.com"))
+}
+
 /// `value` with every string, keys included, through `printable`.
 pub fn cleaned(value: Value) -> Value {
     use snob_core::model::printable;
@@ -689,6 +775,94 @@ mod tests {
         }
     }
 
+    /// The grid's plan, whose list is the `posts` of its document.
+    fn grid_at(offset: usize) -> Plan {
+        Plan {
+            args: vec!["posts".into()],
+            page: Some(crate::commands::mcp::tools::Page {
+                offset,
+                of: "the grid".into(),
+                held_only: true,
+                limit: None,
+                rows: Some("posts"),
+            }),
+            ..plan(&[ExitCode::Ok])
+        }
+    }
+
+    /// No answer about posts holds a media address, wherever it was: the
+    /// items', the best tracks', a liker's picture. The post's own link
+    /// stays, and so does every key.
+    #[test]
+    fn no_posts_answer_holds_a_cdn_address() {
+        let printed = json!({
+            "username": "someone",
+            "declared_posts": 30,
+            "more": true,
+            "posts": [{
+                "url": "https://www.instagram.com/p/DTYHCKvDNxy/",
+                "caption": "see https://example.com/shop",
+                "items": [{
+                    "url": "https://scontent-mad1-1.cdninstagram.com/v/t51.jpg?stp=x&oh=y",
+                    "best": {
+                        "video_url": "https://video.fmad1-1.fna.fbcdn.net/o1/v.mp4?efg=z",
+                        "audio_url": "http://127.0.0.1:9/a.mp4"
+                    }
+                }]
+            }]
+        });
+        let told = from(&grid_at(0), finished(ExitCode::Ok, Some(printed), None));
+        let post = &told.body["items"][0];
+        assert_eq!(post["url"], "https://www.instagram.com/p/DTYHCKvDNxy/");
+        assert_eq!(post["items"][0]["url"], Value::Null);
+        assert!(post["items"][0]["best"].get("video_url").is_some());
+        assert_eq!(post["items"][0]["best"]["video_url"], Value::Null);
+        assert_eq!(post["items"][0]["best"]["audio_url"], Value::Null);
+        // A caption is text, not an address, however it ends.
+        assert_eq!(post["caption"], "see https://example.com/shop");
+        let text = told.body.to_string();
+        assert!(
+            !text.contains("cdninstagram") && !text.contains("fbcdn"),
+            "{text}"
+        );
+    }
+
+    /// The grid's posts are paged out of its document, which every page
+    /// repeats beside them, later pages held with it.
+    #[test]
+    fn the_grids_posts_are_paged_with_what_the_document_says() {
+        let caption = "x".repeat(4_000);
+        let posts: Vec<Value> = (0..20)
+            .map(|n| json!({ "number": n, "caption": caption }))
+            .collect();
+        let told = from(
+            &grid_at(0),
+            finished(
+                ExitCode::Ok,
+                Some(json!({ "username": "someone", "more": false, "posts": posts })),
+                None,
+            ),
+        );
+        assert_eq!(told.body["username"], "someone");
+        assert_eq!(told.body["count"], 20);
+        let next = told.body["next_offset"].as_u64().expect("another page");
+        assert!(next < 20);
+        let whole = told.whole.expect("held for the next page");
+        let later = held(&whole, next as usize, None);
+        assert_eq!(later.body["username"], "someone");
+        assert_eq!(later.body["items"][0]["number"], next);
+        // An account with none prints `"posts": null`, answered as it came.
+        let none = from(
+            &grid_at(0),
+            finished(
+                ExitCode::Ok,
+                Some(json!({ "username": "someone", "posts": null })),
+                None,
+            ),
+        );
+        assert_eq!(none.body["posts"], Value::Null);
+    }
+
     /// A list's plan, for the page at `offset`.
     fn list_at(offset: usize) -> Plan {
         limited_at(offset, None)
@@ -702,6 +876,7 @@ mod tests {
                 of: "the call".into(),
                 held_only: false,
                 limit,
+                rows: None,
             }),
             ..plan(&[ExitCode::Ok])
         }

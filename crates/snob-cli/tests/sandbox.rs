@@ -5962,6 +5962,76 @@ async fn confirmed_in_chat(
     client.call(tool, yes).await
 }
 
+/// An agent's read of a post's likers is asked about first, with nothing
+/// sent until the yes, and recorded once it runs; the post and its likers
+/// come back with no media address in them, and a yes for one post's likers
+/// is no yes for another's.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn an_agents_likers_read_is_asked_and_recorded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_post(&instagram).await;
+    with_its_likers(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let about_the_post = |requests: Vec<wiremock::Request>| {
+        requests
+            .iter()
+            .filter(|r| r.url.path().starts_with("/api/v1/media/"))
+            .count()
+    };
+
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let link = format!("https://www.instagram.com/p/{POST_CODE}/?igsh=x");
+    let asking = client
+        .call("snob_post_likers", serde_json::json!({ "link": link }))
+        .await;
+    let told = &asking["structuredContent"];
+    assert_eq!(told["status"], "confirmation_required", "{asking}");
+    assert!(
+        told["question"].as_str().unwrap().contains(POST_CODE),
+        "{asking}"
+    );
+    let sent = instagram.received_requests().await.unwrap_or_default();
+    assert_eq!(about_the_post(sent), 0, "nothing was sent before the yes");
+
+    // A token for this post is no yes for another's.
+    let other = client
+        .call(
+            "snob_post_likers",
+            serde_json::json!({ "link": "AAAAAAAAAAC", "confirmation": told["confirmation"] }),
+        )
+        .await;
+    assert_eq!(
+        other["structuredContent"]["status"], "confirmation_required",
+        "asked again: {other}"
+    );
+
+    let done = confirmed_in_chat(
+        &mut client,
+        "snob_post_likers",
+        serde_json::json!({ "link": link }),
+    )
+    .await;
+    assert_eq!(done["isError"], false, "{done}");
+    let likers = &done["structuredContent"];
+    assert_eq!(likers["likes"], 12, "{done}");
+    assert_eq!(likers["shown"], 3, "{done}");
+    assert_eq!(likers["accounts"][0]["you_follow"], true, "{done}");
+    assert_eq!(acts_recorded(tmp.path()), 1, "the read is recorded");
+
+    let post = client
+        .call("snob_post", serde_json::json!({ "link": POST_CODE }))
+        .await;
+    assert_eq!(post["isError"], false, "{post}");
+    let text = post["structuredContent"].to_string();
+    assert!(text.contains(POST_CODE), "{text}");
+    assert!(
+        !text.contains("/big.jpg") && !text.contains("/clip.mp4"),
+        "{text}"
+    );
+}
+
 /// The acts recorded in the sandbox account's database, of any age.
 #[cfg(feature = "mcp")]
 fn acts_recorded(root: &Path) -> i64 {
@@ -6101,6 +6171,9 @@ async fn a_cooldown_refuses_a_call_before_anybody_is_asked() {
             "snob_list",
             serde_json::json!({ "list": "followers", "account": "someone", "mode": "refresh" }),
         ),
+        // A post's likers, checked ahead as a write is (`likers
+        // --check-ahead`).
+        ("snob_post_likers", serde_json::json!({ "link": POST_CODE })),
     ] {
         let refused = client.call(tool, arguments).await;
         assert_eq!(refused["isError"], true, "{refused}");

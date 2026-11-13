@@ -226,6 +226,61 @@ pub fn write_cap_reached(writes: u32, free_at: snob_core::EpochMs) -> anyhow::Er
     .into()
 }
 
+/// The half of a check made before `snob mcp` asks the person for a yes
+/// (`--check-ahead`: `follow`, `likers`) that every such call shares,
+/// **sending nothing and writing nothing**: the session stored, this
+/// account's own and not one this computer signed out of
+/// (`owner::signed_out`), and nothing else of the account's using it on
+/// Instagram, neither a job walking a list nor a run holding `spend.lock`.
+/// The session, for what the caller checks next.
+pub fn alone_ahead(
+    secrets: &SessionStore,
+    paths: &AccountPaths,
+    now: snob_core::EpochMs,
+) -> Result<snob_core::session::Session> {
+    let Some(session) = secrets.load()? else {
+        return Err(no_session());
+    };
+    if session.ds_user_id != paths.pk() {
+        anyhow::bail!(
+            "the session stored for account {} is account {}'s; log in again with \
+             \"snob login\"",
+            paths.pk(),
+            session.ds_user_id
+        );
+    }
+    // As the run refuses it at its start (`App::open`).
+    if crate::owner::signed_out(paths, &session) {
+        return Err(signed_out_here());
+    }
+    // A job's walk holds the account for as long as it walks, from before
+    // its walk takes `spend.lock` (queued) to its end.
+    if let Some(going) = crate::jobs::all(paths, now.get())?
+        .into_iter()
+        .find(|seen| !seen.status.is_over())
+    {
+        return Err(ExitError::new(
+            ExitCode::Error,
+            format!(
+                "{} of this account is walking a list, and only one run started by an agent \
+                 may use the account on Instagram at a time; nothing was sent",
+                going.id
+            ),
+        )
+        .with_reason("busy")
+        .with_hint(format!(
+            "ask again once it has ended, which \"snob jobs show {id}\" tells, or stop it \
+             with \"snob jobs cancel {id}\"",
+            id = going.id
+        ))
+        .into());
+    }
+    if snob_store::paths::lock_is_held(&paths.spend_lock())?.unwrap_or(false) {
+        return Err(crate::app::held_elsewhere());
+    }
+    Ok(session)
+}
+
 /// The account's database and its request budget as they stand at `now`,
 /// read **writing nothing**: an account that has never sent anything is read
 /// over an empty database rather than having its file made, and a

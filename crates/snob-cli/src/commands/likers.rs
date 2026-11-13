@@ -41,6 +41,15 @@ use crate::ui;
 pub const LIKERS_AT_MOST: u32 = 120;
 
 pub async fn run(args: LikersArgs, store: SecretStore, paths: &AccountPaths) -> Result<ExitCode> {
+    if args.check_ahead {
+        Shortcode::parse(&args.link).map_err(|e| {
+            ExitError::new(
+                ExitCode::Error,
+                format!("{e}: give a post's or a reel's link"),
+            )
+        })?;
+        return check_ahead(&store, paths);
+    }
     // Before anything is opened: a link that names no post costs nothing,
     // and a destination that cannot hold the format must not cost a request.
     let link = Shortcode::parse(&args.link).map_err(|e| {
@@ -54,18 +63,7 @@ pub async fn run(args: LikersArgs, store: SecretStore, paths: &AccountPaths) -> 
     let mut app = common::reader(&store, paths, false, false)?;
 
     // Costs nothing to know, so it is known before the question.
-    let left = app.client().pacer().accounts_left()?;
-    if left < LIKERS_AT_MOST {
-        return Err(ExitError::new(
-            ExitCode::Error,
-            format!(
-                "the accounts this account may read today are nearly spent ({left} left), \
-                 and a post's likers can be {LIKERS_AT_MOST}; nothing was sent"
-            ),
-        )
-        .with_hint("they free up over 24 hours; \"snob status\" says how many are left")
-        .into());
-    }
+    refuse_short_day(u64::from(app.client().pacer().accounts_left()?))?;
 
     ask(&app, args.consent.yes, ui::can_be_asked(), link.code()).await?;
     common::record_agent_act(&mut app, &args.agent, "likers", Some(link.code()), None)?;
@@ -100,6 +98,40 @@ pub async fn run(args: LikersArgs, store: SecretStore, paths: &AccountPaths) -> 
         }
         _ => destination.write(&accounts)?,
     }
+    Ok(ExitCode::Ok)
+}
+
+/// The refusal of a read the day's accounts cannot pay for, with `left` of
+/// them: one home, for the run and for the check `snob mcp` makes first.
+fn refuse_short_day(left: u64) -> Result<()> {
+    if left >= u64::from(LIKERS_AT_MOST) {
+        return Ok(());
+    }
+    Err(ExitError::new(
+        ExitCode::Error,
+        format!(
+            "the accounts this account may read today are nearly spent ({left} left), \
+             and a post's likers can be {LIKERS_AT_MOST}; nothing was sent"
+        ),
+    )
+    .with_hint("they free up over 24 hours; \"snob status\" says how many are left")
+    .into())
+}
+
+/// What `snob mcp` asks before it puts the question to the person
+/// (`--check-ahead`): what would refuse the read now, **sending nothing and
+/// writing nothing**. Another of the account's runs on Instagram, a
+/// cooldown, the day's accounts; or `{"would": "send"}`. The post is not
+/// read, so a link that names nobody's post is only found out by the read.
+fn check_ahead(store: &SecretStore, paths: &AccountPaths) -> Result<ExitCode> {
+    let now = snob_core::clock::now_ms();
+    common::alone_ahead(&store.session_of(paths), paths, now)?;
+    let (_store, budget) = common::standing(paths, now)?;
+    if let Some(held) = common::held_in(&budget, paths, now) {
+        return Err(common::in_cooldown(&held, "nothing can be sent"));
+    }
+    refuse_short_day(budget.accounts_left())?;
+    ui::say!("{}", serde_json::json!({ "would": "send" }));
     Ok(ExitCode::Ok)
 }
 

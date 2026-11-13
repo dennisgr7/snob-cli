@@ -485,9 +485,10 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   Ctrl+C that stops the server would otherwise reach it too, and the input
   closing after it would be a second stop, which exits at once.
   `SNOB_IGNORE_COOLDOWN` is removed from a child's environment.
-- **Reads only, unless `--allow-writes`**: status, lists, profiles. One tool
+- **Reads only, unless `--allow-writes`**: status, lists, profiles, posts
+  (`snob_posts`, `snob_post`, `snob_post_likers`). One tool
   list for every client, from the server's flags alone. Walking another
-  account's lists, and every follow or unfollow, needs a yes for that one
+  account's lists, a post's likers, and every follow or unfollow, needs a yes for that one
   call, asked in this order (`mod.rs`, `Server::consent`): a form the client
   shows (elicitation, either revision); else, for a client that declared no
   form or answers `elicitation/create` with method-not-found, the chat: the
@@ -559,6 +560,18 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   `openWorldHint` is per tool (`tools::Spec::open_world`): false for the
   tools whose every plan spends nothing (`snob_status` and the three job
   tools).
+- **Posts are read inline, and handed back without a media address**
+  (`answer::without_media_addresses`: every `http` address not on
+  instagram.com becomes null, wherever it is), since no tool downloads and
+  a signed address is hundreds of bytes of query string. `snob_posts`
+  reads at most three pages of a grid (`tools::MOST_GRID_PAGES`), its
+  posts paged out of the document (`tools::Page::rows`), and a later page
+  only from what the server holds (`held_only`: nothing of a grid is
+  stored). `snob_post` and `snob_post_likers` take a link and hand the
+  child the post's address alone (`tools::link`), never the share token;
+  the likers ask, as a walk does, with a question of our words and the
+  code, are checked first with `likers --check-ahead` (`busy`, the
+  cooldown, the day's accounts) and recorded as an act.
 - Arguments are checked, not passed through: an `account` must be a possible
   username, so it can never be read as a flag, and an unknown argument is
   refused rather than ignored. A tool that is not listed (the writes without
