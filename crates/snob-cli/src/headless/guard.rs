@@ -25,8 +25,9 @@
 //! the promotions, the message badge's counts and what a profile says of its
 //! account, its posts and the accounts it suggests among them;
 //! `snob_ig::allowlist::refused_app` names the few of them that read and write
-//! nothing, the posts under any number their call vouches for since it
-//! rotates, and everything else the app POSTs is refused as before.
+//! nothing, the posts, the promotions and the two counts under any number
+//! their call vouches for since those rotate, and everything else the app
+//! POSTs is refused as before.
 //! Why each is in or out, and why the beacons (`/ajax/bz`, `/ajax/qm/`) stay
 //! out, is written at `APP_READS`. The numbers of the registry's reads follow
 //! the app when it moves them ([`Rediscovered`]).
@@ -485,25 +486,29 @@ mod tests {
         json!({ "requestId": "interception-1", "resourceType": "Fetch", "request": request })
     }
 
-    fn relay_form(name: &str, doc_id: &str) -> String {
+    fn relay_form(name: &str, doc_id: &str, variables: &str) -> String {
         url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs([
                 ("fb_dtsg", "relay:token"),
                 ("fb_api_req_friendly_name", name),
-                ("variables", r#"{"id":"2345678901"}"#),
+                ("variables", variables),
                 ("doc_id", doc_id),
             ])
             .finish()
     }
 
     fn relay(name: &str, doc_id: &str) -> Value {
+        relay_asking(name, doc_id, r#"{"id":"2345678901"}"#)
+    }
+
+    fn relay_asking(name: &str, doc_id: &str, variables: &str) -> Value {
         paused(
             "POST",
             &format!("{SITE}/api/graphql"),
             json!({
                 "headers": { "X-FB-Friendly-Name": name, "Content-Type": "application/x-www-form-urlencoded" },
                 "hasPostData": true,
-                "postData": relay_form(name, doc_id),
+                "postData": relay_form(name, doc_id, variables),
             }),
         )
     }
@@ -543,22 +548,36 @@ mod tests {
         assert_eq!(judge(&routes), Paused::Continue);
     }
 
-    /// The app's boot reads that write nothing go on, by name and number;
-    /// the beacons, the inbox, the posts and everything else it POSTs do
-    /// not.
+    /// The app's boot reads that write nothing go on, by name and number, or
+    /// by name and the key they ask by; the beacons, the inbox, a grid that
+    /// does not ask for one, and everything else it POSTs do not.
     #[test]
     fn the_apps_boot_reads_go_on_and_its_beacons_do_not() {
-        for (name, doc_id) in [
+        let note = "PolarisProfileNoteBubbleQuery";
+        assert_eq!(judge(&relay(note, "38260824646898178")), Paused::Continue);
+        // Under another number it is anybody's guess.
+        assert!(fails(&judge(&relay(note, "1000000000000001"))));
+        // Held by the key they ask by, under any number, as they moved
+        // between 2026-10-01 and 2026-11-13; not without it.
+        for (name, asks) in [
             (
                 "QuickPromotionSupportIGSchemaBatchFetchQuery",
-                "26673487622279953",
+                r#"{"scale":1,"surface_nux_ids":["1"],"trigger_context":null}"#,
             ),
-            ("IGDBadgeCountOffMsysQuery", "27393860900250970"),
-            ("PolarisProfileNoteBubbleQuery", "38260824646898178"),
+            (
+                "IGDBadgeCountOffMsysQuery",
+                r#"{"device_id_for_iris_subscription":"1"}"#,
+            ),
+            (
+                "PolarisProfilePostsQuery",
+                r#"{"data":{"count":12},"username":"someone"}"#,
+            ),
         ] {
-            assert_eq!(judge(&relay(name, doc_id)), Paused::Continue, "{name}");
-            // Under another number it is anybody's guess.
-            assert!(fails(&judge(&relay(name, "1000000000000001"))), "{name}");
+            for doc_id in ["28774579702164828", "1000000000000001"] {
+                let sent = relay_asking(name, doc_id, asks);
+                assert_eq!(judge(&sent), Paused::Continue, "{name} {doc_id}");
+            }
+            assert!(fails(&judge(&relay(name, "28774579702164828"))), "{name}");
         }
         for name in [
             "IGDThreadDetailQuery",
@@ -642,7 +661,11 @@ mod tests {
                 }),
             )
         };
-        let ours = relay_form(follow.friendly_name(), follow.doc_id());
+        let ours = relay_form(
+            follow.friendly_name(),
+            follow.doc_id(),
+            r#"{"id":"2345678901"}"#,
+        );
         let theirs = ours.replace("2345678901", "2345678902");
         let request = PageRequest {
             method: Method::Post,
@@ -682,7 +705,11 @@ mod tests {
     #[test]
     fn a_write_armed_is_still_held_to_the_allowlist() {
         let url = format!("{SITE}/api/graphql");
-        let form = relay_form("SomeBadgeQuery", "1000000000000001");
+        let form = relay_form(
+            "SomeBadgeQuery",
+            "1000000000000001",
+            r#"{"id":"2345678901"}"#,
+        );
         let request = PageRequest {
             method: Method::Post,
             url: url.clone(),
@@ -824,7 +851,11 @@ mod tests {
     #[test]
     fn a_form_in_pieces_is_judged_whole() {
         let hover = Operation::HoverCard;
-        let form = relay_form(hover.friendly_name(), hover.doc_id());
+        let form = relay_form(
+            hover.friendly_name(),
+            hover.doc_id(),
+            r#"{"id":"2345678901"}"#,
+        );
         let (first, second) = form.split_at(form.len() / 2);
         let encode = |piece: &str| base64::engine::general_purpose::STANDARD.encode(piece);
         let registry = paused(
@@ -838,7 +869,11 @@ mod tests {
         );
         assert_eq!(judge(&registry), Paused::Continue);
 
-        let other = relay_form("SomeBadgeQuery", "1000000000000001");
+        let other = relay_form(
+            "SomeBadgeQuery",
+            "1000000000000001",
+            r#"{"id":"2345678901"}"#,
+        );
         let invented = paused(
             "POST",
             &format!("{SITE}/api/graphql"),

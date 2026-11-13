@@ -112,7 +112,13 @@ pub struct Post {
     pub code: String,
     /// As Instagram spells it.
     pub owner: String,
+    /// What it is, for its address: a reel's is `/reel/<code>/`.
     pub opens: Opens,
+    /// The page it is asked about from, which is not always its address: the
+    /// app opens a post or a reel from a grid over `/p/<code>/` alike (4 reels
+    /// of 4 in the capture of 2026-11-13, their `Referer` `/p/<code>/`), and a
+    /// link from the page the link names.
+    pub asked_from: Opens,
     pub kind: PostKind,
     pub taken_at: Epoch,
     /// One entry per line of the caption.
@@ -182,6 +188,7 @@ impl Post {
         Self {
             pk: media.pk,
             opens: if reel { Opens::Reel } else { Opens::Post },
+            asked_from: Opens::Post,
             code,
             owner: printable(media.owner().unwrap_or(owner)),
             kind,
@@ -215,12 +222,12 @@ impl Post {
 
     /// The page the app opens it on: what it is asked about from.
     pub fn page(&self) -> String {
-        shortcode::page_of(&self.code, self.opens)
+        shortcode::page_of(&self.code, self.asked_from)
     }
 
     /// Its address, for a listing to print.
     pub fn link(&self) -> String {
-        format!("{SITE}{}", self.page())
+        format!("{SITE}{}", shortcode::page_of(&self.code, self.opens))
     }
 
     /// The first line of its caption, for a row.
@@ -444,6 +451,7 @@ pub async fn open(client: &IgClient, post: &Post) -> Result<(Post, Comments)> {
         .map(|media| {
             let mut fresh = Post::from_media(media, &post.owner);
             fresh.opens = post.opens;
+            fresh.asked_from = post.asked_from;
             fresh
         })
         .unwrap_or_else(|| post.clone());
@@ -486,6 +494,7 @@ pub async fn fetch_link(client: &IgClient, link: &Shortcode) -> Result<Post> {
     let mut post = Post::from_media(&media, "");
     // Where it was asked from is where it opens, whatever kind it is.
     post.opens = link.opens();
+    post.asked_from = link.opens();
     post.code = link.code().to_string();
     Ok(post)
 }
@@ -783,7 +792,10 @@ mod tests {
         );
         assert_eq!(post.kind, PostKind::Reel);
         assert_eq!(post.code, "DbGwql4IMei", "made from the pk when absent");
-        assert_eq!(post.page(), "/reel/DbGwql4IMei/");
+        // Asked about from `/p/`, as the app opens a reel from a grid, and
+        // still a reel's address when it is printed.
+        assert_eq!(post.page(), "/p/DbGwql4IMei/");
+        assert_eq!(post.link(), "https://www.instagram.com/reel/DbGwql4IMei/");
         assert_eq!(post.stem(0), "thegrefg-DbGwql4IMei");
         assert_eq!(post.liked_line().as_deref(), Some("2,000 likes"));
         assert_eq!(post.plays, Some(4_017_638));

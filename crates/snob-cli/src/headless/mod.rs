@@ -3349,7 +3349,11 @@ mod tests {
                 moved,
                 r#"{"userID":"1","app_flag":true}"#,
             ),
-            post(promotion, "26673487622279953", r#"{"scale":1}"#),
+            post(
+                promotion,
+                "28774579702164828",
+                r#"{"scale":1,"surface_nux_ids":["1"],"trigger_context":null}"#,
+            ),
             post(
                 "PolarisInventedBadgeQuery",
                 "1000000000000001",

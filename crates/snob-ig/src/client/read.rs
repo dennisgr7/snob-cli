@@ -2382,7 +2382,7 @@ mod tests {
             "fb_api_req_friendly_name".into(),
             "PolarisStoriesV3ReelPageGalleryQuery".into()
         )));
-        assert!(form.contains(&("doc_id".into(), "28262315486766731".into())));
+        assert!(form.contains(&("doc_id".into(), "29088280257466613".into())));
 
         for tray in [Some(&["7", "8"][..]), None] {
             let page = building_gallery(tray);

@@ -1430,6 +1430,56 @@ async fn profile_and_followers_of_someone_through_the_browser() {
     assert!(answers["median_ms"].as_u64().is_some(), "{answers}");
 }
 
+/// Another account's grid through the browser: the posts query on
+/// `/api/graphql`, where the app has sent it since 2026-11-13, with no
+/// root-field header, made from the profile's page; no REST feed is read.
+#[tokio::test]
+async fn a_grid_is_listed_through_the_browser() {
+    let Some(_alone) = a_browser_alone().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let (world, instagram) = fake_instagram().await;
+    logged_in(tmp.path(), &instagram, SESSIONID, "the login failed: ");
+
+    let out = snob(
+        tmp.path(),
+        &instagram,
+        &["posts", "someone", "--format", "json"],
+        None,
+    );
+    assert!(out.status.success(), "{}", told(tmp.path(), &out));
+    let grid: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", told(tmp.path(), &out)));
+    assert_eq!(grid["username"], "someone", "{grid}");
+    assert_eq!(grid["posts"].as_array().map(Vec::len), Some(3), "{grid}");
+
+    let requests = snobs_requests(&instagram).await;
+    let asked: Vec<&Request> = requests
+        .iter()
+        .filter(|r| {
+            url::form_urlencoded::parse(&r.body).any(|(n, v)| {
+                n == "fb_api_req_friendly_name"
+                    && v == snob_ig::allowlist::Operation::ProfilePosts.friendly_name()
+            })
+        })
+        .collect();
+    assert_eq!(asked.len(), 1, "the grid was asked once");
+    assert_eq!(asked[0].url.path(), "/api/graphql");
+    assert_eq!(header(asked[0], "x-root-field-name"), None);
+    assert_eq!(
+        header(asked[0], "referer"),
+        Some(format!("{}/someone/", instagram.uri()).as_str())
+    );
+    let found = world
+        .audit(
+            &instagram,
+            &["/api/v1/users/web_profile_info/", "/api/v1/feed/user/*/"],
+        )
+        .await;
+    assert!(found.is_empty(), "{found:?}");
+}
+
 /// Another account's highlights through the browser: the tray is the web
 /// client's tray query, whose entries know no count and no dates, and an
 /// entry's items are its highlights query, downloaded from the picture's

@@ -161,37 +161,43 @@ impl Operation {
     /// the capture of 2026-10-01; the note and the badge are from both. A
     /// write's is the seed its discovery starts from.
     ///
-    /// The grid's two are from the captures of 2026-10-01, and the first page's
-    /// is known to move: it was 28570182382647478 two days before. A moved one
-    /// is sent under the number the app's own call vouches for ([`vouched`]),
-    /// which every profile document the tab loads sends.
+    /// The profile's header, the stories tray, the gallery and its next page,
+    /// and the grid's two are from the capture of 2026-11-13, in which all six
+    /// had moved since 2026-10-01 (the grid's first page had already moved
+    /// once, from 28570182382647478, between 2026-09-29 and 2026-10-01). A
+    /// moved one is sent under the number the app's own call vouches for
+    /// ([`vouched`]), when the tab has seen the app send it: the header and the
+    /// grid's first page go out with every profile the app opens. **The grid's
+    /// next page never does**: the app sends it as its grid is scrolled, and
+    /// snob's tab never scrolls, so it goes out under this number alone and is
+    /// the one to refresh first when a grid stops answering.
     pub fn doc_id(self) -> &'static str {
         match self {
-            Self::ProfilePage => "28036671149327607",
+            Self::ProfilePage => "40158838120366999",
             Self::HoverCard => "28949219061332276",
             Self::HighlightsTray => "26970053832668570",
             Self::HighlightsPage => "28325328583775973",
-            Self::ReelGallery => "28262315486766731",
-            Self::ReelGalleryPage => "28606543452290985",
-            Self::StoriesTray => "27703822975903310",
+            Self::ReelGallery => "29088280257466613",
+            Self::ReelGalleryPage => "29455599790792632",
+            Self::StoriesTray => "38657722893875056",
             Self::NoteBubble => "38260824646898178",
             Self::SchoolPartnerBadge => "28647748031575520",
-            Self::ProfilePosts => "28991540097136703",
-            Self::ProfilePostsPage => "29240983615539641",
+            Self::ProfilePosts => "29114630661562380",
+            Self::ProfilePostsPage => "29290744380560118",
             Self::Follow => Mutation::Follow.seed_doc_id(),
             Self::Unfollow => Mutation::Unfollow.seed_doc_id(),
         }
     }
 
     /// The endpoint the app sends it to. It never sends one operation to
-    /// both.
+    /// both at once, but it moves one now and then: the grid's two went from
+    /// `/graphql/query` to `/api/graphql` between the captures of 2026-10-01
+    /// and 2026-11-13 (13 calls of 13 in the second, none with a root-field
+    /// header), and a call sent where the app no longer sends it is a call no
+    /// person's browser makes.
     pub fn family(self) -> Family {
         match self {
-            Self::HighlightsPage
-            | Self::ReelGallery
-            | Self::ReelGalleryPage
-            | Self::ProfilePosts
-            | Self::ProfilePostsPage => Family::RelayQuery,
+            Self::HighlightsPage | Self::ReelGallery | Self::ReelGalleryPage => Family::RelayQuery,
             _ => Family::Relay,
         }
     }
@@ -650,11 +656,12 @@ enum Number {
     /// The one number it was captured under.
     Pinned(&'static str),
     /// Any number, when the call vouches for it the way [`vouched`] holds a
-    /// registry read's moved number: the answer's root field named in
-    /// `X-Root-Field-Name`, as the app names it on `/graphql/query`, and the
-    /// key that names what is asked among its variables.
+    /// registry read's moved number: the key that names what is asked among
+    /// its variables, and `X-Root-Field-Name` as the read's endpoint has it,
+    /// naming `root_field` on `/graphql/query` and absent on `/api/graphql`
+    /// (`root_field` is `None` there).
     Vouched {
-        root_field: &'static str,
+        root_field: Option<&'static str>,
         asked_key: &'static str,
     },
 }
@@ -675,14 +682,21 @@ enum Number {
 /// `/api/v1/web/discover/`, stays refused, as every write does.
 ///
 /// **The posts' number is not pinned**: it moved from 28570182382647478 to
-/// 28991540097136703 between the captures of 2026-09-29 and 2026-10-01, and a
-/// pinned one would refuse the app's grid again at the next move. It is held
-/// as the registry's reads are when the app moves them ([`vouched`]): by its
-/// name, on `/graphql/query`, answering under its own root field and asking
-/// by `username`. Not through [`Rediscovered`], which holds the numbers snob
-/// sends the registry's reads under and learns them from the app's calls; for
-/// a read snob never sends, the call being judged is the only one there is to
-/// learn from, so the call vouches for itself here, with the same checks.
+/// 28991540097136703 between the captures of 2026-09-29 and 2026-10-01, and
+/// to 29114630661562380 by 2026-11-13, on another endpoint. It is held as the
+/// registry's reads are when the app moves them ([`vouched`]): by its name,
+/// on `/api/graphql` with no root-field header, and asking by `username`. Not
+/// through [`Rediscovered`], which holds the numbers snob sends the registry's
+/// reads under and learns them from the app's calls; for a read snob never
+/// sends, the call being judged is the only one there is to learn from, so
+/// the call vouches for itself here, with the same checks.
+///
+/// **Nor are the promotions and the two message counts**: pinned at their
+/// numbers of 2026-10-01, all three had moved by 2026-11-13, and a profile
+/// the tab loaded booted without them, which is the state the decision above
+/// set out to end. Each is held by its name and the key its variables were
+/// seen to ask by on every call of that capture (29 of the promotions, 4 of
+/// each count).
 ///
 /// **Left out on purpose**: the message inbox and thread reads, the recipients
 /// of the share sheet, the search boxes, and the sync with Facebook. The
@@ -693,17 +707,26 @@ const APP_READS: [AppRead; 7] = [
     AppRead {
         name: "QuickPromotionSupportIGSchemaBatchFetchQuery",
         path: "/api/graphql",
-        number: Number::Pinned("26673487622279953"),
+        number: Number::Vouched {
+            root_field: None,
+            asked_key: "surface_nux_ids",
+        },
     },
     AppRead {
         name: "IGDBadgeCountOffMsysQuery",
         path: "/api/graphql",
-        number: Number::Pinned("27393860900250970"),
+        number: Number::Vouched {
+            root_field: None,
+            asked_key: "device_id_for_iris_subscription",
+        },
     },
     AppRead {
         name: "IGDChatTabsJewelOffMsysQuery",
         path: "/api/graphql",
-        number: Number::Pinned("27647971824866335"),
+        number: Number::Vouched {
+            root_field: None,
+            asked_key: "device_id_for_iris_subscription",
+        },
     },
     AppRead {
         name: "PolarisProfileDirectOrPartnershipInboxMessageEligibilityQuery",
@@ -723,9 +746,9 @@ const APP_READS: [AppRead; 7] = [
     },
     AppRead {
         name: "PolarisProfilePostsQuery",
-        path: "/graphql/query",
+        path: "/api/graphql",
         number: Number::Vouched {
-            root_field: "xdt_api__v1__feed__user_timeline_graphql_connection",
+            root_field: None,
             asked_key: "username",
         },
     },
@@ -801,7 +824,7 @@ fn app_read(request: &PageRequest) -> bool {
             let asks = field("variables")
                 .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
                 .is_some_and(|v| v.get(asked_key).is_some());
-            is_doc_id(doc_id) && header("x-root-field-name") == Some(root_field) && asks
+            is_doc_id(doc_id) && header("x-root-field-name") == root_field && asks
         }
     };
     url.path() == read.path && header("x-fb-friendly-name") == Some(name) && number
@@ -891,7 +914,7 @@ mod tests {
             [
                 (
                     "PolarisProfilePageContentQuery",
-                    "28036671149327607",
+                    "40158838120366999",
                     "/api/graphql",
                     "user"
                 ),
@@ -915,19 +938,19 @@ mod tests {
                 ),
                 (
                     "PolarisStoriesV3ReelPageGalleryQuery",
-                    "28262315486766731",
+                    "29088280257466613",
                     "/graphql/query",
                     "xdt_api__v1__feed__reels_media__connection"
                 ),
                 (
                     "PolarisStoriesV3ReelPageGalleryPaginationQuery",
-                    "28606543452290985",
+                    "29455599790792632",
                     "/graphql/query",
                     "xdt_api__v1__feed__reels_media__connection"
                 ),
                 (
                     "PolarisStoriesV3TrayContainerQuery",
-                    "27703822975903310",
+                    "38657722893875056",
                     "/api/graphql",
                     "xdt_api__v1__feed__reels_tray"
                 ),
@@ -945,14 +968,14 @@ mod tests {
                 ),
                 (
                     "PolarisProfilePostsQuery",
-                    "28991540097136703",
-                    "/graphql/query",
+                    "29114630661562380",
+                    "/api/graphql",
                     "xdt_api__v1__feed__user_timeline_graphql_connection"
                 ),
                 (
                     "PolarisProfilePostsTabContentQuery_connection",
-                    "29240983615539641",
-                    "/graphql/query",
+                    "29290744380560118",
+                    "/api/graphql",
                     "xdt_api__v1__feed__user_timeline_graphql_connection"
                 ),
                 (
@@ -1621,10 +1644,11 @@ mod tests {
     }
 
     /// The profile's posts go out under whatever number the app sends them,
-    /// both of the two captured among them, when the call vouches for it: on
-    /// `/graphql/query`, under its root field, asking by `username`. Not on
-    /// the other endpoint, not under another root field, not without the
-    /// name it asks by, and not under something that is not a number.
+    /// the three captured among them included, when the call vouches for it:
+    /// on `/api/graphql`, where the app has sent them since 2026-11-13, with
+    /// no root-field header, asking by `username`. Not on `/graphql/query`,
+    /// where they were before, not naming a root field, not without the name
+    /// it asks by, and not under something that is not a number.
     #[test]
     fn the_profile_posts_go_out_under_any_number_the_call_vouches_for() {
         let nobody = Rediscovered::default();
@@ -1632,10 +1656,14 @@ mod tests {
             .iter()
             .find(|read| read.name == "PolarisProfilePostsQuery")
             .unwrap();
-        let root = "xdt_api__v1__feed__user_timeline_graphql_connection";
         let asks = r#"{"data":{"count":12},"username":"someone"}"#;
-        for doc_id in ["28570182382647478", "28991540097136703", "1000000000000777"] {
-            let sent = app_sent(posts, doc_id, asks, Some(root));
+        for doc_id in [
+            "28570182382647478",
+            "28991540097136703",
+            "29114630661562380",
+            "1000000000000777",
+        ] {
+            let sent = app_sent(posts, doc_id, asks, None);
             // Snob's own goes out under the registry's number alone, or one
             // the app was seen to send; the app's under any it vouches for.
             assert_eq!(
@@ -1647,18 +1675,73 @@ mod tests {
         }
         // A number not the registry's: the app's call stands on its own.
         let doc_id = "28570182382647478";
-        let mut elsewhere = app_sent(posts, doc_id, asks, Some(root));
-        elsewhere.url = format!("{BASE}/api/graphql");
+        let root = "xdt_api__v1__feed__user_timeline_graphql_connection";
+        let mut before = app_sent(posts, doc_id, asks, Some(root));
+        before.url = format!("{BASE}/graphql/query");
         let refusals = [
-            elsewhere,
-            app_sent(posts, doc_id, asks, None),
-            app_sent(posts, doc_id, asks, Some("user")),
-            app_sent(posts, doc_id, r#"{"data":{"count":12}}"#, Some(root)),
-            app_sent(posts, doc_id, "not json", Some(root)),
-            app_sent(posts, "12ab", asks, Some(root)),
+            before,
+            app_sent(posts, doc_id, asks, Some(root)),
+            app_sent(posts, doc_id, r#"{"data":{"count":12}}"#, None),
+            app_sent(posts, doc_id, "not json", None),
+            app_sent(posts, "12ab", asks, None),
         ];
         for (i, sent) in refusals.iter().enumerate() {
             assert!(refused_app(sent, &nobody).is_some(), "case {i}");
+        }
+    }
+
+    /// The promotions and the two message counts are held by their name and
+    /// the key they ask by, not by a number: all three moved between
+    /// 2026-10-01 and 2026-11-13, and a pinned number refused the app's own
+    /// call at the next move. Under any number, then, but not without the
+    /// key, not naming a root field `/api/graphql` never names, and not on
+    /// the other endpoint.
+    #[test]
+    fn an_app_read_is_held_by_its_name_and_key_not_a_pinned_number() {
+        let nobody = Rediscovered::default();
+        let held: Vec<_> = APP_READS
+            .iter()
+            .filter(|read| read.name != "PolarisProfilePostsQuery")
+            .filter_map(|read| match read.number {
+                Number::Vouched {
+                    root_field: None,
+                    asked_key,
+                } => Some((read, asked_key)),
+                _ => None,
+            })
+            .collect();
+        let names: Vec<_> = held.iter().map(|(read, _)| read.name).collect();
+        assert_eq!(
+            names,
+            [
+                "QuickPromotionSupportIGSchemaBatchFetchQuery",
+                "IGDBadgeCountOffMsysQuery",
+                "IGDChatTabsJewelOffMsysQuery"
+            ]
+        );
+        for (read, key) in held {
+            let asks = format!(r#"{{"{key}":"1"}}"#);
+            for doc_id in ["26673487622279953", "28774579702164828", "1000000000000999"] {
+                let sent = app_sent(read, doc_id, &asks, None);
+                assert!(refused(&sent).is_some(), "{} is not snob's", read.name);
+                assert_eq!(refused_app(&sent, &nobody), None, "{} {doc_id}", read.name);
+            }
+            let doc_id = "1000000000000999";
+            let mut elsewhere = app_sent(read, doc_id, &asks, None);
+            elsewhere.url = format!("{BASE}/graphql/query");
+            let refusals = [
+                elsewhere,
+                app_sent(read, doc_id, r#"{"other":"1"}"#, None),
+                app_sent(read, doc_id, &asks, Some("data")),
+                app_sent(read, "not-a-number", &asks, None),
+            ];
+            for (i, sent) in refusals.iter().enumerate() {
+                assert!(
+                    refused_app(sent, &nobody).is_some(),
+                    "{} case {i}",
+                    read.name
+                );
+            }
         }
     }
 

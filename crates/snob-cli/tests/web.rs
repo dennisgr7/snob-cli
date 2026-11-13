@@ -570,8 +570,8 @@ async fn watch_check_reads_the_own_account_as_its_profile_opens() {
 
 /// The profile query carries the app's own variables with only the id
 /// replaced once the tab has seen the app send one, and before that the
-/// ones the capture shows it sending: the integrity filter, the id and
-/// five flags of its own.
+/// ones the capture of 2026-11-13 shows it sending: the integrity filter,
+/// the id and seven flags of its own.
 #[tokio::test]
 async fn the_profile_query_copies_the_apps_variables_once_it_has_seen_them() {
     let world = World::new();
@@ -597,9 +597,11 @@ async fn the_profile_query_copies_the_apps_variables_once_it_has_seen_them() {
                 r#"{"enable_integrity_filters":true,"id":"9001","#,
                 r#""__relay_internal__pv__PolarisCannesGuardianExperienceEnabledrelayprovider":true,"#,
                 r#""__relay_internal__pv__PolarisCASB976ProfileEnabledrelayprovider":false,"#,
+                r#""__relay_internal__pv__PolarisProfileInformTreatmentBannerEnabledrelayprovider":false,"#,
                 r#""__relay_internal__pv__PolarisWebSchoolsEnabledrelayprovider":false,"#,
+                r#""__relay_internal__pv__PolarisProfileRingsGradientEnabledrelayprovider":true,"#,
                 r#""__relay_internal__pv__PolarisRepostsConsumptionEnabledrelayprovider":true,"#,
-                r#""__relay_internal__pv__PolarisShortDramaEnabledrelayprovider":false}"#
+                r#""__relay_internal__pv__PolarisShortDramaEnabledrelayprovider":true}"#
             )
             .to_string(),
             r#"{"id":"1000","a_flag_the_app_sends":true}"#.to_string(),
@@ -1565,7 +1567,7 @@ async fn a_grid_is_the_posts_query_and_then_its_next_page() {
     );
     let page = server.received_requests().await.unwrap_or_default()[since..]
         .iter()
-        .find(|r| r.url.path() == "/graphql/query")
+        .find(|r| r.url.path() == "/api/graphql")
         .map(|r| {
             (
                 ig::header(r, "referer").unwrap_or_default().to_string(),

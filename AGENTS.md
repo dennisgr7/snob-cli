@@ -1103,7 +1103,9 @@ recordings to the gitignored `tools/capture/out/`; `summarize.js` reads them)
 before relying on them further: the paths and thresholds the listener counts as
 push-back (`headless/listen.rs`), the prefix of `CLAIM_HANDED_OUT`
 (`headless/guard.rs`), whether Instagram varies on `Sec-Fetch-*`
-(`client/headers.rs`), and `TRUNCATION_THRESHOLD`.
+(`client/headers.rs`), what a Relay or route call without
+`X-FB-Entry-Nonce` draws (the app's own value is copied, and the header is
+left out until one is seen: `web::AppCalls`), and `TRUNCATION_THRESHOLD`.
 
 ## Website (`web/`)
 

@@ -184,7 +184,14 @@ mod tests {
                 "PolarisProfilePostsTabContentQuery_connection"
             ]
         );
-        assert!(sent.iter().all(|r| r.url.ends_with("/graphql/query")));
+        // On `/api/graphql`, where the app has sent the grid since 2026-11-13,
+        // and with no root-field header, which that endpoint never carries.
+        assert!(sent.iter().all(|r| r.url.ends_with("/api/graphql")));
+        assert!(sent.iter().all(|r| {
+            !r.headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("X-Root-Field-Name"))
+        }));
         assert!(sent.iter().all(|r| r.referrer.ends_with("/someone/")));
         let next = field(&sent[1], "variables").unwrap();
         assert!(next.starts_with(r#"{"after":"AQH-next""#), "{next}");

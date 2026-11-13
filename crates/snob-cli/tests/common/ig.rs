@@ -1225,11 +1225,12 @@ fn relay_answered(
             .push(field(&form, "variables").unwrap_or_default().into());
     }
     let answer = state.relay_answer(operation, &variables, viewer);
-    match operation.family() {
-        Family::RelayQuery => {
-            ResponseTemplate::new(200).set_body_raw(answer.to_string(), "text/javascript")
-        }
-        Family::Relay => json_answer(answer),
+    // Every read answered on either endpoint in the capture of 2026-11-13
+    // came as `text/javascript` (176 of 176 on `/api/graphql`); no write was
+    // in it, so a write keeps the type it had.
+    match operation.write() {
+        None => ResponseTemplate::new(200).set_body_raw(answer.to_string(), "text/javascript"),
+        Some(_) => json_answer(answer),
     }
 }
 

@@ -454,7 +454,26 @@ pub struct AppCalls {
     /// `X-IG-App-ID` and `X-ASBD-ID`, as the app's own calls carry them.
     app_id: Option<String>,
     asbd_id: Option<String>,
+    /// `X-FB-Entry-Nonce`, as the app's Relay and Comet calls carry it.
+    ///
+    /// **One value per document, on every Relay and Comet call and on no
+    /// REST one**: in the capture of 2026-11-13 it was on 176 of 176
+    /// `/api/graphql` calls, 9 of 9 on `/graphql/query` and the route calls,
+    /// none under `/api/v1/`, with five values over five documents loaded,
+    /// each the nonce of that document's own `Content-Security-Policy`. It was
+    /// in no capture before, and what Instagram makes of a call without it is
+    /// not known. Copied from the app's own calls, as the identifiers above
+    /// are, rather than read from the document: a call built here goes out
+    /// only after the app has made one ([`Missing::RELAY_CALL`]), and what was
+    /// sent is the value the server expects, which no reading of the page
+    /// can promise. Absent until seen, and then sent: an absent header is
+    /// honest.
+    entry_nonce: Option<String>,
 }
+
+/// The longest `X-FB-Entry-Nonce` taken from the app: eight characters on
+/// every call of the capture of 2026-11-13, and room to spare should it grow.
+const MOST_NONCE: usize = 64;
 
 /// The fields of the app's latest Relay form that describe the page's
 /// state rather than the call: `dpr`, `__ccg`, and the bitmaps of the
@@ -527,6 +546,16 @@ impl AppCalls {
             matches!(path, "/api/graphql" | "/graphql/query") || path.starts_with("/ajax/");
         if carries_the_relay_token && let Some(dtsg) = field("fb_dtsg") {
             self.dtsg = Some(dtsg.clone());
+        }
+        if carries_the_relay_token
+            && let Some(nonce) = header("x-fb-entry-nonce").filter(|nonce| {
+                (1..=MOST_NONCE).contains(&nonce.len())
+                    && nonce
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
+        {
+            self.entry_nonce = Some(nonce.to_string());
         }
         if path.starts_with("/api/v1/")
             && let (Some(dtsg), Some(sent)) = (field("fb_dtsg"), field("jazoest"))
@@ -626,6 +655,12 @@ impl AppCalls {
     /// `X-ASBD-ID`, as the app's calls on this document carry it.
     pub fn asbd_id(&self) -> Option<&str> {
         self.asbd_id.as_deref()
+    }
+
+    /// `X-FB-Entry-Nonce`, as the app's Relay and Comet calls on this
+    /// document carry it.
+    pub fn entry_nonce(&self) -> Option<&str> {
+        self.entry_nonce.as_deref()
     }
 
     /// Whether the app has made a route call on this document, whose
@@ -898,6 +933,9 @@ impl<'a> Context<'a> {
                 ("X-Bloks-Version-Id", bloks),
             ]);
         }
+        if let Some(nonce) = self.app.entry_nonce() {
+            headers.push(("X-FB-Entry-Nonce", nonce));
+        }
 
         Ok(Built {
             method: Method::Post,
@@ -993,6 +1031,9 @@ impl<'a> Context<'a> {
             ("X-IG-Max-Touch-Points", "0"),
             ("Content-Type", FORM),
         ]);
+        if let Some(nonce) = self.app.entry_nonce() {
+            headers.push(("X-FB-Entry-Nonce", nonce));
+        }
 
         Ok(Built {
             method: Method::Post,
@@ -1065,19 +1106,23 @@ pub fn route_of(referrer: &str) -> Option<&'static str> {
 /// The route of the home page.
 pub const FEED_ROUTE: &str = "comet.igweb.PolarisFeedRoute";
 
-/// The variables of the app's profile query for `pk`, as the capture shows it
-/// sending them: the integrity filter, the id, and five flags of its own, in
-/// its order. What a call sends before the app has sent a query to copy
-/// them from; [`Seen::variables`] replaces the flags with the app's own.
+/// The variables of the app's profile query for `pk`, as the capture of
+/// 2026-11-13 shows it sending them: the integrity filter, the id, and seven
+/// flags of its own, in its order (five on 2026-10-01; the banner and the
+/// rings flags are new, and short dramas went on). What a call sends before
+/// the app has sent a query to copy them from; [`Seen::variables`] replaces
+/// the flags with the app's own.
 pub fn profile_variables(pk: Pk) -> String {
     format!(
         concat!(
             r#"{{"enable_integrity_filters":true,"id":"{}","#,
             r#""__relay_internal__pv__PolarisCannesGuardianExperienceEnabledrelayprovider":true,"#,
             r#""__relay_internal__pv__PolarisCASB976ProfileEnabledrelayprovider":false,"#,
+            r#""__relay_internal__pv__PolarisProfileInformTreatmentBannerEnabledrelayprovider":false,"#,
             r#""__relay_internal__pv__PolarisWebSchoolsEnabledrelayprovider":false,"#,
+            r#""__relay_internal__pv__PolarisProfileRingsGradientEnabledrelayprovider":true,"#,
             r#""__relay_internal__pv__PolarisRepostsConsumptionEnabledrelayprovider":true,"#,
-            r#""__relay_internal__pv__PolarisShortDramaEnabledrelayprovider":false}}"#
+            r#""__relay_internal__pv__PolarisShortDramaEnabledrelayprovider":true}}"#
         ),
         pk
     )
@@ -1106,15 +1151,20 @@ const POSTS_DATA: &str = concat!(
     r#""latest_reel_media":true}"#
 );
 
-/// The three flags of the app's own that close both of the grid's queries.
+/// The five flags of the app's own that close both of the grid's queries,
+/// as every grid call of the capture of 2026-11-13 sent them (three on
+/// 2026-10-01; the crawler and comment-style flags are new, and short
+/// dramas went on).
 const POSTS_FLAGS: &str = concat!(
     r#""__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider":true,"#,
-    r#""__relay_internal__pv__PolarisShortDramaEnabledrelayprovider":false,"#,
+    r#""__relay_internal__pv__PolarisShortDramaEnabledrelayprovider":true,"#,
+    r#""__relay_internal__pv__PolarisSEOIsCrawlerrelayprovider":false,"#,
+    r#""__relay_internal__pv__PolarisThreadsStyleCommentsEnabledrelayprovider":false,"#,
     r#""__relay_internal__pv__PolarisReelsRecoDebugOverlayEnabledrelayprovider":false"#
 );
 
 /// The variables of the grid's first page for `username`, as the app sends
-/// them as a profile opens: the page's flags, the name, and its own three.
+/// them as a profile opens: the page's flags, the name, and its own five.
 pub fn posts_variables(username: &str) -> String {
     format!(
         r#"{{"data":{POSTS_DATA},"username":{},{POSTS_FLAGS}}}"#,
@@ -1499,7 +1549,7 @@ mod tests {
             ("fb_api_req_friendly_name", "PolarisProfilePageContentQuery"),
             ("server_timestamps", "true"),
             ("variables", r#"{"id":"2345678901"}"#),
-            ("doc_id", "28036671149327607"),
+            ("doc_id", "40158838120366999"),
         ]);
         assert_eq!(expected.len(), 29);
         assert_eq!(built.form, Some(expected));
@@ -1575,7 +1625,7 @@ mod tests {
             form
         };
         assert_eq!(shared(&query), shared(&graphql));
-        assert_eq!(query.field("doc_id"), Some("28262315486766731"));
+        assert_eq!(query.field("doc_id"), Some("29088280257466613"));
         assert_eq!(
             query.field("fb_api_req_friendly_name"),
             Some("PolarisStoriesV3ReelPageGalleryQuery")
@@ -2178,10 +2228,10 @@ mod tests {
     }
 
     /// Before the app has sent a query to copy, the profile query goes with
-    /// the capture's seven variables, in the app's order; once it has, its
-    /// flags are the app's and only the id is snob's.
+    /// the capture's nine variables (2026-11-13), in the app's order; once it
+    /// has, its flags are the app's and only the id is snob's.
     #[test]
-    fn the_profile_query_goes_with_the_apps_seven_variables() {
+    fn the_profile_query_goes_with_the_apps_nine_variables() {
         let pk = Pk::new(2_345_678_901);
         let ours = profile_variables(pk);
         let keys: Vec<String> =
@@ -2190,16 +2240,18 @@ mod tests {
                 .keys()
                 .cloned()
                 .collect();
-        assert_eq!(keys.len(), 7);
+        assert_eq!(keys.len(), 9);
         assert_eq!(
             ours,
             concat!(
                 r#"{"enable_integrity_filters":true,"id":"2345678901","#,
                 r#""__relay_internal__pv__PolarisCannesGuardianExperienceEnabledrelayprovider":true,"#,
                 r#""__relay_internal__pv__PolarisCASB976ProfileEnabledrelayprovider":false,"#,
+                r#""__relay_internal__pv__PolarisProfileInformTreatmentBannerEnabledrelayprovider":false,"#,
                 r#""__relay_internal__pv__PolarisWebSchoolsEnabledrelayprovider":false,"#,
+                r#""__relay_internal__pv__PolarisProfileRingsGradientEnabledrelayprovider":true,"#,
                 r#""__relay_internal__pv__PolarisRepostsConsumptionEnabledrelayprovider":true,"#,
-                r#""__relay_internal__pv__PolarisShortDramaEnabledrelayprovider":false}"#
+                r#""__relay_internal__pv__PolarisShortDramaEnabledrelayprovider":true}"#
             )
         );
 
@@ -2460,6 +2512,72 @@ mod tests {
             context(&page, &mut app).rest_get(Rest::Following(Pk::new(2_345_678_901)), &[], "/");
         assert_eq!(rest.header("x-ig-app-id"), Some(IG_APP_ID));
         assert_eq!(rest.header("x-asbd-id"), Some(ASBD_ID));
+    }
+
+    /// `X-FB-Entry-Nonce` is the app's own: absent until one of its Relay or
+    /// Comet calls carried it, then on every Relay and route call built on
+    /// that document, and taken only in the shape the app's had.
+    #[test]
+    fn the_entry_nonce_is_the_apps_own_and_absent_when_none_was_seen() {
+        let page = page();
+        let built = |app: &mut AppCalls| {
+            let mut context = context(&page, app);
+            (
+                context.relay(PROFILE, BY_PK, None, "/", None).unwrap(),
+                context.bulk_route_definitions(&["/a/"], "/").unwrap(),
+                context.navigation("/a/").unwrap(),
+            )
+        };
+        let nonce = |value: &str| vec![("x-fb-entry-nonce".to_string(), value.to_string())];
+
+        let mut app = self::app();
+        let (relay, routes, navigation) = built(&mut app);
+        for call in [&relay, &routes, &navigation] {
+            assert_eq!(call.header("x-fb-entry-nonce"), None, "{:?}", call.path);
+        }
+
+        for path in ["/api/graphql", "/graphql/query", "/ajax/navigation/"] {
+            let mut app = self::app();
+            app.saw_with(path, APP_RELAY, &nonce("FIqt3nQG"));
+            let (relay, routes, navigation) = built(&mut app);
+            for call in [&relay, &routes, &navigation] {
+                assert_eq!(
+                    call.header("x-fb-entry-nonce"),
+                    Some("FIqt3nQG"),
+                    "{path} {:?}",
+                    call.path
+                );
+            }
+        }
+
+        // Not the shape the app's had, or not from a call that carries it.
+        let too_long = "a".repeat(MOST_NONCE + 1);
+        for (path, value) in [
+            ("/api/graphql", ""),
+            ("/api/graphql", "abc\"def"),
+            ("/api/graphql", "<script>"),
+            ("/api/graphql", too_long.as_str()),
+            ("/api/v1/friendships/show_many/", "FIqt3nQG"),
+        ] {
+            let mut app = self::app();
+            app.saw_with(path, APP_RELAY, &nonce(value));
+            assert_eq!(app.entry_nonce(), None, "{path} {value}");
+        }
+    }
+
+    /// No REST call carries the nonce, as none of the app's did.
+    #[test]
+    fn no_rest_call_carries_the_entry_nonce() {
+        let page = page();
+        let mut app = self::app();
+        app.saw_with(
+            "/api/graphql",
+            APP_RELAY,
+            &[("X-FB-Entry-Nonce".to_string(), "FIqt3nQG".to_string())],
+        );
+        let rest =
+            context(&page, &mut app).rest_get(Rest::Following(Pk::new(2_345_678_901)), &[], "/");
+        assert_eq!(rest.header("x-fb-entry-nonce"), None);
     }
 
     /// The number the app sends a read under is kept when the call vouches
@@ -2862,7 +2980,7 @@ mod tests {
         }
     }
 
-    /// The grid's variables are the captures' (2026-10-01), key for key and
+    /// The grid's variables are the capture's (2026-11-13), key for key and
     /// in their order, with only the name and the cursor made snob's.
     #[test]
     fn the_grids_variables_are_the_apps() {
@@ -2873,7 +2991,9 @@ mod tests {
                 r#""include_relationship_info":true,"latest_besties_reel_media":true,"#,
                 r#""latest_reel_media":true},"username":"some.one","#,
                 r#""__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider":true,"#,
-                r#""__relay_internal__pv__PolarisShortDramaEnabledrelayprovider":false,"#,
+                r#""__relay_internal__pv__PolarisShortDramaEnabledrelayprovider":true,"#,
+                r#""__relay_internal__pv__PolarisSEOIsCrawlerrelayprovider":false,"#,
+                r#""__relay_internal__pv__PolarisThreadsStyleCommentsEnabledrelayprovider":false,"#,
                 r#""__relay_internal__pv__PolarisReelsRecoDebugOverlayEnabledrelayprovider":false}"#
             )
         );
