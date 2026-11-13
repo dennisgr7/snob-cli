@@ -935,8 +935,11 @@ pub fn comment_json(comment: &CommentLine) -> Value {
 /// download.
 pub type Opened = Vec<Option<PathBuf>>;
 
-/// Hands item `index` of `post` to the system viewer, from `scratch`.
-pub async fn open_item(
+/// Item `index` of `post`, fetched into `scratch` as the view opens one,
+/// the app's own file, and not opened: once per item, so asking twice is
+/// one download. What [`open_item`] hands the system viewer, and what a
+/// preview drawn in the view reads.
+pub async fn fetched_item(
     client: &IgClient,
     post: &Post,
     index: usize,
@@ -946,17 +949,30 @@ pub async fn open_item(
     if let Some(existing) = opened.get(index).cloned().flatten()
         && existing.is_file()
     {
-        opener::open(&existing).map_err(|e| anyhow!("the system viewer would not start: {e}"))?;
         return Ok(existing);
     }
     let path = match save_item(client, post, index, scratch).await? {
         Saved::Now(path) | Saved::Already(path) => path,
     };
-    opener::open(&path).map_err(|e| anyhow!("the system viewer would not start: {e}"))?;
     if opened.len() < post.items.len() {
         opened.resize(post.items.len(), None);
     }
-    opened[index] = Some(path.clone());
+    if let Some(slot) = opened.get_mut(index) {
+        *slot = Some(path.clone());
+    }
+    Ok(path)
+}
+
+/// Hands item `index` of `post` to the system viewer, from `scratch`.
+pub async fn open_item(
+    client: &IgClient,
+    post: &Post,
+    index: usize,
+    scratch: &Path,
+    opened: &mut Opened,
+) -> Result<PathBuf> {
+    let path = fetched_item(client, post, index, scratch, opened).await?;
+    opener::open(&path).map_err(|e| anyhow!("the system viewer would not start: {e}"))?;
     Ok(path)
 }
 
