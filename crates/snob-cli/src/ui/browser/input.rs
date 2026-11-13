@@ -63,7 +63,8 @@ use snob_ig::pace::CancelToken;
 
 /// How long the browser waits before waking up to look at the terminal size.
 ///
-/// An unchanged frame writes nothing, so the cost of a wake-up is one
+/// An unchanged frame writes nothing (`ui::tui::Screen` is what holds the
+/// renderer to that), so the cost of a wake-up is one
 /// `GetConsoleScreenBufferInfo` or `TIOCGWINSZ` and a cell-buffer diff that
 /// finds nothing to send. Short enough that a resize looks immediate, long
 /// enough that an idle browser is not a spin.

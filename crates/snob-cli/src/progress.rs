@@ -716,7 +716,9 @@ fn done_template(has_total: bool, complete: bool) -> &'static str {
 /// which draw braille perfectly well. The terminals that genuinely cannot are
 /// countable: the Linux kernel console, which sets a UTF-8 locale and then
 /// draws from a 512-glyph font, `dumb`, and anything that is not a terminal.
-fn rich_glyphs() -> bool {
+///
+/// Asked by the views too, for the spinner of `ui::browser::busy`.
+pub(crate) fn rich_glyphs() -> bool {
     if !console::Term::stderr().features().is_attended() {
         return false;
     }
@@ -725,7 +727,7 @@ fn rich_glyphs() -> bool {
 
 /// The spinner frames. The last one is the "finished" frame and is not part of
 /// the cycle, which is why both lists end in a space.
-fn tick_chars(rich: bool) -> &'static str {
+pub(crate) fn tick_chars(rich: bool) -> &'static str {
     if rich {
         "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "
     } else {

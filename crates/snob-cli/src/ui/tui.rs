@@ -31,8 +31,10 @@
 //! what is on screen is wrong, and `Terminal::clear` is how it says so.
 
 use std::borrow::Cow;
-use std::io::{Stderr, stderr};
+use std::io::{Stderr, Write, stderr};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
@@ -54,9 +56,100 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::app::Viewer;
 
+/// DEC private mode 2026, "synchronized output": between the two the
+/// terminal holds what it is sent and paints it in one go. A terminal that
+/// does not know the mode ignores both, as it does any private mode it does
+/// not know.
+const BEGIN_UPDATE: &[u8] = b"\x1b[?2026h";
+const END_UPDATE: &[u8] = b"\x1b[?2026l";
+const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
+const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+
+/// What a frame in which no cell changed still asks to have written: the
+/// backend ends every frame by resetting the foreground, the background, the
+/// underline's color and the attributes (`ratatui-crossterm` 0.1.2,
+/// `Backend::draw`, with its `underline-color` feature, which is on), and
+/// the terminal then hides the cursor (`ratatui-core` 0.1.2,
+/// `apply_buffer_with_cursor`). Two tests below hold these bytes: one to
+/// what crossterm writes for those five commands, one to what the renderer
+/// in the tree really sends for a frame it already drew. Were they to drift,
+/// the frame would be written as it always was, and that test would say so.
+const UNCHANGED_FRAME: &[u8] = b"\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[?25l";
+
+/// Where the frames are written: standard error, a whole frame at a time.
+///
+/// Standard error has no buffer, so written to directly a frame is a write
+/// per escape sequence, a few hundred of them, and a terminal that paints
+/// between two of them shows half of the old frame under half of the new
+/// one: the tearing seen while a window is dragged to a new size, or as a
+/// modal goes up over a dimmed view. Here a frame is collected and leaves in
+/// **one write, inside one synchronized update**, so it is painted whole or
+/// not yet.
+///
+/// **An unchanged frame writes nothing.** Every view draws on each tick so
+/// that a resize nobody reported is still noticed (`browser::input::TICK`),
+/// and the renderer finds no cell to send; what it still sends is in
+/// [`UNCHANGED_FRAME`], seven times a second. It is dropped here, and only
+/// when the cursor was left hidden: a frame that says nothing but "hide the
+/// cursor" after one that showed it is not unchanged.
+///
+/// On a console with no escape sequences crossterm draws through the
+/// console's own calls and nothing is ever collected here, so nothing is
+/// written here either, the two markers included.
+pub struct Screen<W: Write = Stderr> {
+    out: W,
+    pending: Vec<u8>,
+    /// Whether the last thing written about the cursor hid it. Shared with
+    /// the guard, which clears it when somebody else has had the terminal
+    /// ([`Tui::resume`]): the backend lends its writer to nobody.
+    cursor_hidden: Arc<AtomicBool>,
+}
+
+impl<W: Write> Screen<W> {
+    fn new(out: W) -> Self {
+        Self {
+            out,
+            pending: Vec::new(),
+            cursor_hidden: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl<W: Write> Write for Screen<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.pending.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        if self.cursor_hidden.load(Ordering::Relaxed) && self.pending == UNCHANGED_FRAME {
+            self.pending.clear();
+            return Ok(());
+        }
+        if self.pending.ends_with(HIDE_CURSOR) {
+            self.cursor_hidden.store(true, Ordering::Relaxed);
+        } else if self.pending.ends_with(SHOW_CURSOR) {
+            self.cursor_hidden.store(false, Ordering::Relaxed);
+        }
+        let mut update =
+            Vec::with_capacity(BEGIN_UPDATE.len() + self.pending.len() + END_UPDATE.len());
+        update.extend_from_slice(BEGIN_UPDATE);
+        update.append(&mut self.pending);
+        update.extend_from_slice(END_UPDATE);
+        self.out.write_all(&update)?;
+        self.out.flush()
+    }
+}
+
 /// The claim on the terminal, and the `ratatui` terminal that draws under it.
 pub struct Tui {
-    pub terminal: Terminal<CrosstermBackend<Stderr>>,
+    pub terminal: Terminal<CrosstermBackend<Screen>>,
+    /// The screen's own note of whether the cursor is hidden, cleared when
+    /// a suspension has shown it behind the screen's back.
+    cursor_hidden: Arc<AtomicBool>,
     /// Whether this guard took the alternate screen, so `suspend` knows
     /// whether there is one to leave.
     fullscreen: bool,
@@ -96,15 +189,15 @@ impl Tui {
         } else {
             crossterm::execute!(stderr(), EnableBracketedPaste, EnableFocusChange, Hide)
         };
+        let screen = Screen::new(stderr());
+        let cursor_hidden = screen.cursor_hidden.clone();
         let terminal = modes.and_then(|()| {
-            Terminal::with_options(
-                CrosstermBackend::new(stderr()),
-                TerminalOptions { viewport },
-            )
+            Terminal::with_options(CrosstermBackend::new(screen), TerminalOptions { viewport })
         });
         match terminal {
             Ok(terminal) => Ok(Self {
                 terminal,
+                cursor_hidden,
                 fullscreen,
                 active: true,
             }),
@@ -178,6 +271,8 @@ impl Tui {
             return Err(e);
         }
         self.active = true;
+        // The suspension showed the cursor behind the screen's back.
+        self.cursor_hidden.store(false, Ordering::Relaxed);
         self.terminal.clear()
     }
 }
@@ -534,6 +629,158 @@ pub(crate) fn me() -> Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A writer that keeps each write apart, as a terminal receives them.
+    #[derive(Default)]
+    struct Writes(Vec<Vec<u8>>);
+
+    impl Write for Writes {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One frame as the backend hands it over: in pieces, then a flush.
+    fn frame(screen: &mut Screen<Writes>, pieces: &[&[u8]]) {
+        for piece in pieces {
+            screen.write_all(piece).unwrap();
+        }
+        screen.flush().unwrap();
+    }
+
+    /// However many pieces a frame arrives in, the terminal gets it in one
+    /// write, between the two ends of a synchronized update.
+    #[test]
+    fn a_frame_is_one_synchronized_update_in_one_write() {
+        let mut screen = Screen::new(Writes::default());
+        frame(&mut screen, &[b"\x1b[1;1H", b"a", b"b", HIDE_CURSOR]);
+        assert_eq!(
+            screen.out.0,
+            [b"\x1b[?2026h\x1b[1;1Hab\x1b[?25l\x1b[?2026l".to_vec()]
+        );
+    }
+
+    /// The frame an idle view draws seven times a second sends no byte, and
+    /// a flush with nothing collected sends no empty update.
+    #[test]
+    fn an_unchanged_frame_writes_nothing() {
+        let mut screen = Screen::new(Writes::default());
+        frame(&mut screen, &[b"x", UNCHANGED_FRAME]);
+        assert_eq!(screen.out.0.len(), 1, "the first frame is written");
+        for _ in 0..3 {
+            frame(&mut screen, &[UNCHANGED_FRAME]);
+            screen.flush().unwrap();
+        }
+        assert_eq!(screen.out.0.len(), 1, "nothing after it");
+    }
+
+    /// After a frame that showed the cursor, or after somebody else had the
+    /// terminal, the same bytes are the ones that hide it: they are written.
+    #[test]
+    fn a_cursor_left_showing_is_hidden_by_the_next_frame() {
+        let mut screen = Screen::new(Writes::default());
+        frame(&mut screen, &[UNCHANGED_FRAME]);
+        assert_eq!(screen.out.0.len(), 1, "nothing says it is hidden yet");
+
+        frame(&mut screen, &[b"x", SHOW_CURSOR]);
+        frame(&mut screen, &[b"\x1b[2;4H"]);
+        frame(&mut screen, &[UNCHANGED_FRAME]);
+        assert_eq!(screen.out.0.len(), 4, "the frame after a shown cursor");
+        frame(&mut screen, &[UNCHANGED_FRAME]);
+        assert_eq!(screen.out.0.len(), 4, "and then it is unchanged");
+
+        screen.cursor_hidden.store(false, Ordering::Relaxed);
+        frame(&mut screen, &[UNCHANGED_FRAME]);
+        assert_eq!(screen.out.0.len(), 5, "the frame after a suspension");
+    }
+
+    /// The bytes dropped are the ones crossterm writes for what a frame with
+    /// no changed cell still sends, and the cursor's two are crossterm's.
+    #[test]
+    fn the_unchanged_frame_is_what_crossterm_writes_for_it() {
+        use crossterm::Command;
+        use crossterm::style::{Attribute, Color, SetAttribute, SetUnderlineColor};
+        use crossterm::style::{SetBackgroundColor, SetForegroundColor};
+
+        let mut written = String::new();
+        SetForegroundColor(Color::Reset)
+            .write_ansi(&mut written)
+            .unwrap();
+        SetBackgroundColor(Color::Reset)
+            .write_ansi(&mut written)
+            .unwrap();
+        SetUnderlineColor(Color::Reset)
+            .write_ansi(&mut written)
+            .unwrap();
+        SetAttribute(Attribute::Reset)
+            .write_ansi(&mut written)
+            .unwrap();
+        Hide.write_ansi(&mut written).unwrap();
+        assert_eq!(written.as_bytes(), UNCHANGED_FRAME);
+
+        let mut hide = String::new();
+        Hide.write_ansi(&mut hide).unwrap();
+        assert_eq!(hide.as_bytes(), HIDE_CURSOR);
+        let mut show = String::new();
+        Show.write_ansi(&mut show).unwrap();
+        assert_eq!(show.as_bytes(), SHOW_CURSOR);
+    }
+
+    /// The renderer itself, through the backend the views use: the second of
+    /// two frames that are the same reaches the terminal as nothing. This is
+    /// what holds [`UNCHANGED_FRAME`] to the ratatui in the tree, where the
+    /// test above holds it only to crossterm.
+    #[test]
+    fn the_renderer_writes_nothing_for_a_frame_it_already_drew() {
+        /// Keeps the writes that get past the screen, each apart.
+        #[derive(Clone, Default)]
+        struct Kept(Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl Write for Kept {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let text = String::from_utf8_lossy(bytes).into_owned();
+                self.0.lock().unwrap().push(text);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let out = Kept::default();
+        let writes = || out.0.lock().unwrap().len();
+        // A fixed viewport, so nothing asks a terminal for its size.
+        let made = Terminal::with_options(
+            CrosstermBackend::new(Screen::new(out.clone())),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 20, 3)),
+            },
+        );
+        let Ok(mut terminal) = made else { return };
+        let mut draw = || {
+            terminal
+                .draw(|frame| frame.render_widget("hello", frame.area()))
+                .is_ok()
+        };
+        // On a Windows console that takes no escape sequences crossterm
+        // draws through the console's own calls, which a test has no console
+        // for: nothing passes through the screen there, and nothing is held.
+        if !draw() || writes() == 0 {
+            return;
+        }
+        assert_eq!(writes(), 1, "the first frame, in one write");
+        assert!(draw() && draw(), "the same frame twice more");
+        // Copied out first: the terminal writes once more as it is dropped,
+        // and must not find the lock held by a failing assertion.
+        let all = out.0.lock().unwrap().clone();
+        assert_eq!(all.len(), 1, "and no write for either: {all:?}");
+    }
 
     /// Walking the selection from end to end keeps two rows of margin
     /// visible wherever the list allows it, and the offset never overshoots.

@@ -336,12 +336,17 @@ pub fn choose_login_method(seat: &crate::seat::Seat) -> Result<Option<LoginMetho
 ///
 /// Focus reporting goes off with them (`?1004l`, a no-op when it is), and a
 /// walk's progress comes off the taskbar where the terminal showed one.
+///
+/// A synchronized update is ended first (`?2026l`, a no-op outside one): a
+/// frame leaves in one write with both ends in it (`tui::Screen`), but a
+/// write cut short would leave the terminal holding everything after it.
 pub fn restore_terminal() {
     use crossterm::cursor::Show;
     use crossterm::event::{DisableBracketedPaste, DisableFocusChange};
-    use crossterm::terminal::LeaveAlternateScreen;
+    use crossterm::terminal::{EndSynchronizedUpdate, LeaveAlternateScreen};
     let _ = crossterm::execute!(
         std::io::stderr(),
+        EndSynchronizedUpdate,
         DisableFocusChange,
         DisableBracketedPaste,
         LeaveAlternateScreen,

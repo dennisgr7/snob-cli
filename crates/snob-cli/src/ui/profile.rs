@@ -55,6 +55,7 @@ use crate::exit::ExitCode;
 use crate::media::Story;
 use crate::report;
 use crate::ui::accounts::{self, Browsed, Picked};
+use crate::ui::browser::busy::Busy;
 use crate::ui::browser::input::{self, Action, Raw, action_of, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::highlights::{Folder, empty_note, folder_title, keep_folder, stem_of, walk_in};
@@ -231,6 +232,30 @@ pub async fn browse(
     let mut list = TableState::default();
     let mut page_rows = 1usize;
     let mut switch_to: Option<Viewer> = None;
+
+    // The level as it is on screen, for a `Busy` to keep and wait over. A
+    // macro and not a closure: a closure made once would hold the media and
+    // the list for as long as it lived, and the fetch the wait is for needs
+    // them back. Each use borrows for the one frame it draws.
+    macro_rules! level_frame {
+        () => {
+            |frame: &mut Frame<'_>| {
+                draw_level(
+                    frame,
+                    profile,
+                    &media,
+                    &state,
+                    &rows,
+                    own,
+                    &viewer,
+                    &note,
+                    colors,
+                    &mut list,
+                    &mut page_rows,
+                );
+            }
+        };
+    }
 
     // Every way out passes the receipts: see `tui::print_receipts`.
     let outcome: Result<ExitCode> = async {
@@ -413,11 +438,23 @@ pub async fn browse(
                             },
                             CardRow::Highlights => {
                                 let index = state.hl_col;
-                                let (result, stopped) = watching_cancel_keys(
-                                    app.client().pacer().cancel_token(),
-                                    walk_in(app.client(), &media.tray, index, &mut media.folders),
-                                )
-                                .await;
+                                let busy = Busy::begin(
+                                    &mut tui,
+                                    format!("Opening highlight {}...", index + 1),
+                                    level_frame!(),
+                                )?;
+                                let (result, stopped) = busy
+                                    .run(
+                                        &mut tui,
+                                        app.client().pacer().cancel_token(),
+                                        walk_in(
+                                            app.client(),
+                                            &media.tray,
+                                            index,
+                                            &mut media.folders,
+                                        ),
+                                    )
+                                    .await;
                                 match result {
                                     Ok(true) => state.level = Level::Inside { index },
                                     Ok(false) => note = empty_note(index),
@@ -471,11 +508,18 @@ pub async fn browse(
                         Action::Down => state.level = Level::Actions { selected: 1 },
                         Action::Open => {
                             if selected == 0 {
-                                let (text, stopped) = watching_cancel_keys(
-                                    app.client().pacer().cancel_token(),
-                                    pfp_open(app, profile, &mut media, &scratch),
-                                )
-                                .await;
+                                let busy = Busy::begin(
+                                    &mut tui,
+                                    "Opening the picture...",
+                                    level_frame!(),
+                                )?;
+                                let (text, stopped) = busy
+                                    .run(
+                                        &mut tui,
+                                        app.client().pacer().cancel_token(),
+                                        pfp_open(app, profile, &mut media, &scratch),
+                                    )
+                                    .await;
                                 note = text;
                                 if let Some(code) = stopped.leave() {
                                     break Ok(code);
@@ -487,11 +531,15 @@ pub async fn browse(
                         }
                         Action::Download => {
                             if selected == 0 {
-                                let (text, stopped) = watching_cancel_keys(
-                                    app.client().pacer().cancel_token(),
-                                    pfp_keep(app, profile, &mut media, &mut receipts),
-                                )
-                                .await;
+                                let busy =
+                                    Busy::begin(&mut tui, "Saving the picture...", level_frame!())?;
+                                let (text, stopped) = busy
+                                    .run(
+                                        &mut tui,
+                                        app.client().pacer().cancel_token(),
+                                        pfp_keep(app, profile, &mut media, &mut receipts),
+                                    )
+                                    .await;
                                 note = text;
                                 if let Some(code) = stopped.leave() {
                                     break Ok(code);
@@ -530,35 +578,49 @@ pub async fn browse(
                         Action::First => state.stories_selected = 0,
                         Action::Last => state.stories_selected = total.saturating_sub(1),
                         Action::Open => {
-                            let (result, stopped) = watching_cancel_keys(
-                                app.client().pacer().cancel_token(),
-                                crate::ui::stories::open(
-                                    app.client(),
-                                    &profile.username,
-                                    &media.stories,
-                                    state.stories_selected,
-                                    &scratch,
-                                    &mut media.stories_opened,
-                                ),
-                            )
-                            .await;
+                            let busy = Busy::begin(
+                                &mut tui,
+                                format!("Opening story {}...", state.stories_selected + 1),
+                                level_frame!(),
+                            )?;
+                            let (result, stopped) = busy
+                                .run(
+                                    &mut tui,
+                                    app.client().pacer().cancel_token(),
+                                    crate::ui::stories::open(
+                                        app.client(),
+                                        &profile.username,
+                                        &media.stories,
+                                        state.stories_selected,
+                                        &scratch,
+                                        &mut media.stories_opened,
+                                    ),
+                                )
+                                .await;
                             note = tui::opened_note(result);
                             if let Some(code) = stopped.leave() {
                                 break Ok(code);
                             }
                         }
                         Action::Download => {
-                            let (result, stopped) = watching_cancel_keys(
-                                app.client().pacer().cancel_token(),
-                                crate::ui::stories::keep(
-                                    app.client(),
-                                    &profile.username,
-                                    &media.stories,
-                                    state.stories_selected,
-                                    &mut media.stories_opened,
-                                ),
-                            )
-                            .await;
+                            let busy = Busy::begin(
+                                &mut tui,
+                                format!("Saving story {}...", state.stories_selected + 1),
+                                level_frame!(),
+                            )?;
+                            let (result, stopped) = busy
+                                .run(
+                                    &mut tui,
+                                    app.client().pacer().cancel_token(),
+                                    crate::ui::stories::keep(
+                                        app.client(),
+                                        &profile.username,
+                                        &media.stories,
+                                        state.stories_selected,
+                                        &mut media.stories_opened,
+                                    ),
+                                )
+                                .await;
                             note = tui::saved_note(result, &mut receipts);
                             if let Some(code) = stopped.leave() {
                                 break Ok(code);
@@ -595,35 +657,55 @@ pub async fn browse(
                         Action::First => folder.selected = 0,
                         Action::Last => folder.selected = total.saturating_sub(1),
                         Action::Open => {
-                            let (result, stopped) = watching_cancel_keys(
-                                app.client().pacer().cancel_token(),
-                                crate::ui::stories::open(
-                                    app.client(),
-                                    &stem,
-                                    items,
-                                    folder.selected,
-                                    &scratch,
-                                    &mut folder.opened,
-                                ),
-                            )
-                            .await;
+                            // The frame under the box reads the folders, so
+                            // the folder is let go of for it and taken again.
+                            let busy = Busy::begin(
+                                &mut tui,
+                                format!("Opening item {}...", folder.selected + 1),
+                                level_frame!(),
+                            )?;
+                            let folder = &mut media.folders[index];
+                            let items = folder.items.as_deref().unwrap_or_default();
+                            let (result, stopped) = busy
+                                .run(
+                                    &mut tui,
+                                    app.client().pacer().cancel_token(),
+                                    crate::ui::stories::open(
+                                        app.client(),
+                                        &stem,
+                                        items,
+                                        folder.selected,
+                                        &scratch,
+                                        &mut folder.opened,
+                                    ),
+                                )
+                                .await;
                             note = tui::opened_note(result);
                             if let Some(code) = stopped.leave() {
                                 break Ok(code);
                             }
                         }
                         Action::Download => {
-                            let (result, stopped) = watching_cancel_keys(
-                                app.client().pacer().cancel_token(),
-                                crate::ui::stories::keep(
-                                    app.client(),
-                                    &stem,
-                                    items,
-                                    folder.selected,
-                                    &mut folder.opened,
-                                ),
-                            )
-                            .await;
+                            let busy = Busy::begin(
+                                &mut tui,
+                                format!("Saving item {}...", folder.selected + 1),
+                                level_frame!(),
+                            )?;
+                            let folder = &mut media.folders[index];
+                            let items = folder.items.as_deref().unwrap_or_default();
+                            let (result, stopped) = busy
+                                .run(
+                                    &mut tui,
+                                    app.client().pacer().cancel_token(),
+                                    crate::ui::stories::keep(
+                                        app.client(),
+                                        &stem,
+                                        items,
+                                        folder.selected,
+                                        &mut folder.opened,
+                                    ),
+                                )
+                                .await;
                             note = tui::saved_note(result, &mut receipts);
                             if let Some(code) = stopped.leave() {
                                 break Ok(code);

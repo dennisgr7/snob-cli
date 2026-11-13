@@ -27,7 +27,8 @@ use crate::exit::ExitCode;
 use crate::media::{Stories, Story, bytes_of, default_name, extension_of, left_of, posted_of};
 use crate::output;
 use crate::ui::accounts::{self, Browsed, Picked};
-use crate::ui::browser::input::{self, Action, next, page, watching_cancel_keys};
+use crate::ui::browser::busy::Busy;
+use crate::ui::browser::input::{self, Action, next, page};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::tui;
 
@@ -97,35 +98,69 @@ pub async fn browse(
                 Action::First => selected = 0,
                 Action::Last => selected = stories.items.len() - 1,
                 Action::Open => {
-                    let (result, stopped) = watching_cancel_keys(
-                        client.pacer().cancel_token(),
-                        open(
-                            client,
-                            &stories.username,
-                            &stories.items,
-                            selected,
-                            &scratch,
-                            &mut opened,
-                        ),
-                    )
-                    .await;
+                    let busy = Busy::begin(
+                        &mut tui,
+                        format!("Opening story {}...", selected + 1),
+                        |frame| {
+                            draw(
+                                frame,
+                                stories,
+                                viewer,
+                                &mut list,
+                                &note,
+                                colors,
+                                &mut page_rows,
+                            );
+                        },
+                    )?;
+                    let (result, stopped) = busy
+                        .run(
+                            &mut tui,
+                            client.pacer().cancel_token(),
+                            open(
+                                client,
+                                &stories.username,
+                                &stories.items,
+                                selected,
+                                &scratch,
+                                &mut opened,
+                            ),
+                        )
+                        .await;
                     note = tui::opened_note(result);
                     if let Some(code) = stopped.leave() {
                         break Ok(code);
                     }
                 }
                 Action::Download => {
-                    let (result, stopped) = watching_cancel_keys(
-                        client.pacer().cancel_token(),
-                        keep(
-                            client,
-                            &stories.username,
-                            &stories.items,
-                            selected,
-                            &mut opened,
-                        ),
-                    )
-                    .await;
+                    let busy = Busy::begin(
+                        &mut tui,
+                        format!("Saving story {}...", selected + 1),
+                        |frame| {
+                            draw(
+                                frame,
+                                stories,
+                                viewer,
+                                &mut list,
+                                &note,
+                                colors,
+                                &mut page_rows,
+                            );
+                        },
+                    )?;
+                    let (result, stopped) = busy
+                        .run(
+                            &mut tui,
+                            client.pacer().cancel_token(),
+                            keep(
+                                client,
+                                &stories.username,
+                                &stories.items,
+                                selected,
+                                &mut opened,
+                            ),
+                        )
+                        .await;
                     note = tui::saved_note(result, &mut receipts);
                     if let Some(code) = stopped.leave() {
                         break Ok(code);

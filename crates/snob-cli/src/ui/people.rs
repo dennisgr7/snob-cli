@@ -58,7 +58,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Position};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, TableState};
+use ratatui::widgets::{Cell, Paragraph, Row, TableState};
 use snob_core::filters::Filter;
 use snob_core::model::User;
 use snob_core::sets;
@@ -70,8 +70,9 @@ use crate::commands::profile::{self as profile_read, MutualPolicy};
 use crate::exit::{ExitCode, ExitError};
 use crate::report;
 use crate::ui::accounts::{self, Browsed, Picked};
+use crate::ui::browser::busy::Busy;
 use crate::ui::browser::input::Action;
-use crate::ui::browser::input::{self, Raw, action_of, page, watching_cancel_keys};
+use crate::ui::browser::input::{self, Raw, action_of, page};
 use crate::ui::profile::{self, Answer, answer, question_modal};
 use crate::ui::tui::{self, Tui};
 
@@ -350,11 +351,10 @@ async fn run(
             Step::Redraw => tui.terminal.clear()?,
             Step::Leave(code) => return Ok((code, None)),
             Step::Profile(person) => {
-                // Said before the read, which may wait on the pacer for a
-                // while: the list stays under a box that names what is going
-                // on and how to stop it.
+                // The read may wait on the pacer for a while: the list stays
+                // under a box that names what is going on and how to stop it.
                 let reading = format!("Reading @{}...", person.safe_username());
-                tui.terminal.draw(|frame| {
+                let busy = Busy::begin(tui, reading, |frame| {
                     draw(
                         frame,
                         shelf,
@@ -365,13 +365,14 @@ async fn run(
                         &mut list,
                         &mut page_rows,
                     );
-                    reading_modal(frame, &reading, colors);
                 })?;
-                let (read, stopped) = watching_cancel_keys(
-                    app.client().pacer().cancel_token(),
-                    read_profile(app, &person),
-                )
-                .await;
+                let (read, stopped) = busy
+                    .run(
+                        tui,
+                        app.client().pacer().cancel_token(),
+                        read_profile(app, &person),
+                    )
+                    .await;
                 if let Some(code) = stopped.leave() {
                     return Ok((code, None));
                 }
@@ -624,26 +625,6 @@ fn could_not_read(person: &User, error: &anyhow::Error) -> String {
     let why = error.to_string();
     let why = why.lines().next().unwrap_or_default();
     format!("Could not open @{}: {why}", person.safe_username())
-}
-
-/// The box over the list while a profile is being read.
-fn reading_modal(frame: &mut Frame<'_>, text: &str, colors: bool) {
-    let dim = tui::paint(colors, tui::DIM);
-    tui::veil(frame, colors);
-    let width = (measure_text_width(text) as u16 + 8)
-        .max(34)
-        .min(frame.area().width);
-    let area = tui::modal_area(frame.area(), width, 5);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(dim)
-        .padding(tui::card_padding())
-        .title_bottom(Line::from(Span::styled(" q or ctrl+c cancels ", dim)).centered());
-    let inner = tui::open_modal(frame, area, block);
-    frame.render_widget(
-        Paragraph::new(tui::styled_line(text, tui::BOLD, colors)),
-        inner,
-    );
 }
 
 /// One key while the query owns the keyboard.
@@ -1571,7 +1552,7 @@ second line"
                     &mut list,
                     &mut page_rows,
                 );
-                reading_modal(frame, "Reading @anna...", false);
+                crate::ui::browser::busy::modal(frame, "Reading @anna...", 0, false);
             })
             .unwrap();
         let screen: String = (0..14).map(|y| tui::row_text(&terminal, y)).collect();

@@ -40,6 +40,7 @@ use crate::exit::ExitCode;
 use crate::media::{Saved, Story, save_story};
 use crate::report;
 use crate::ui::accounts::{self, Browsed, Picked};
+use crate::ui::browser::busy::Busy;
 use crate::ui::browser::input::{self, Action, Raw, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::tui::{self, Tui};
@@ -173,11 +174,29 @@ pub async fn browse(
                 Action::Last => selected = total.saturating_sub(1),
                 Action::Open => match level {
                     Level::Tray => {
-                        let (result, stopped) = watching_cancel_keys(
-                            client.pacer().cancel_token(),
-                            walk_in(client, tray, selected, &mut folders),
-                        )
-                        .await;
+                        let busy = Busy::begin(
+                            &mut tui,
+                            format!("Opening highlight {}...", selected + 1),
+                            |frame| {
+                                draw_tray(
+                                    frame,
+                                    tray,
+                                    &folders,
+                                    viewer,
+                                    &mut list,
+                                    &note,
+                                    colors,
+                                    &mut page_rows,
+                                );
+                            },
+                        )?;
+                        let (result, stopped) = busy
+                            .run(
+                                &mut tui,
+                                client.pacer().cancel_token(),
+                                walk_in(client, tray, selected, &mut folders),
+                            )
+                            .await;
                         match result {
                             Ok(true) => level = Level::Inside(selected),
                             Ok(false) => note = empty_note(selected),
@@ -188,20 +207,39 @@ pub async fn browse(
                         }
                     }
                     Level::Inside(index) => {
+                        let busy = Busy::begin(
+                            &mut tui,
+                            format!("Opening item {}...", selected + 1),
+                            |frame| {
+                                draw_items(
+                                    frame,
+                                    tray,
+                                    index,
+                                    &folders[index],
+                                    viewer,
+                                    &mut list,
+                                    &note,
+                                    colors,
+                                    &mut page_rows,
+                                );
+                            },
+                        )?;
                         let folder = &mut folders[index];
                         let items = folder.items.as_deref().unwrap_or_default();
-                        let (result, stopped) = watching_cancel_keys(
-                            client.pacer().cancel_token(),
-                            crate::ui::stories::open(
-                                client,
-                                &stem_of(tray, index),
-                                items,
-                                selected,
-                                &scratch,
-                                &mut folder.opened,
-                            ),
-                        )
-                        .await;
+                        let (result, stopped) = busy
+                            .run(
+                                &mut tui,
+                                client.pacer().cancel_token(),
+                                crate::ui::stories::open(
+                                    client,
+                                    &stem_of(tray, index),
+                                    items,
+                                    selected,
+                                    &scratch,
+                                    &mut folder.opened,
+                                ),
+                            )
+                            .await;
                         note = tui::opened_note(result);
                         if let Some(code) = stopped.leave() {
                             break Ok(code);
@@ -229,19 +267,38 @@ pub async fn browse(
                         }
                     }
                     Level::Inside(index) => {
+                        let busy = Busy::begin(
+                            &mut tui,
+                            format!("Saving item {}...", selected + 1),
+                            |frame| {
+                                draw_items(
+                                    frame,
+                                    tray,
+                                    index,
+                                    &folders[index],
+                                    viewer,
+                                    &mut list,
+                                    &note,
+                                    colors,
+                                    &mut page_rows,
+                                );
+                            },
+                        )?;
                         let folder = &mut folders[index];
                         let items = folder.items.as_deref().unwrap_or_default();
-                        let (result, stopped) = watching_cancel_keys(
-                            client.pacer().cancel_token(),
-                            crate::ui::stories::keep(
-                                client,
-                                &stem_of(tray, index),
-                                items,
-                                selected,
-                                &mut folder.opened,
-                            ),
-                        )
-                        .await;
+                        let (result, stopped) = busy
+                            .run(
+                                &mut tui,
+                                client.pacer().cancel_token(),
+                                crate::ui::stories::keep(
+                                    client,
+                                    &stem_of(tray, index),
+                                    items,
+                                    selected,
+                                    &mut folder.opened,
+                                ),
+                            )
+                            .await;
                         note = tui::saved_note(result, &mut receipts);
                         if let Some(code) = stopped.leave() {
                             break Ok(code);
