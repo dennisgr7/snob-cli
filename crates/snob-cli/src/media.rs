@@ -80,10 +80,12 @@ pub struct Story {
     pub thumb: Option<String>,
 }
 
-/// The narrowest picture at least this wide is a thumbnail: wide enough for
-/// a cell of a view on a large terminal, and a few tens of kilobytes where
-/// the full picture is hundreds.
-const THUMB_WIDTH: u32 = 320;
+/// The narrowest picture at least this wide is a thumbnail. The views draw
+/// it in real pixels where the terminal can (`ui::graphics`), and the panel
+/// beside a post's text reaches some 600 pixels wide, so a picture of 320
+/// was drawn blown up and looked pixelated (Dennis, 2026-11-13); 640 fills
+/// it and is still a fraction of the full picture's bytes.
+const THUMB_WIDTH: u32 = 640;
 
 /// The picture a view draws small, of the `candidates` Instagram offers for
 /// one item (a video's are its cover): the narrowest at least

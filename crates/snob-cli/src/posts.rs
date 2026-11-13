@@ -1117,7 +1117,7 @@ mod tests {
         );
         assert_eq!(
             picked.as_deref(),
-            Some("https://x.cdninstagram.com/320.jpg")
+            Some("https://x.cdninstagram.com/640.jpg")
         );
     }
 
@@ -1136,8 +1136,8 @@ mod tests {
     #[test]
     fn of_two_thumbnails_alike_the_first_listed_is_taken() {
         let wide = thumb_among(
-            r#"[{"url":"https://x.cdninstagram.com/a.jpg","width":480},
-                {"url":"https://x.cdninstagram.com/b.jpg","width":480}]"#,
+            r#"[{"url":"https://x.cdninstagram.com/a.jpg","width":800},
+                {"url":"https://x.cdninstagram.com/b.jpg","width":800}]"#,
         );
         assert_eq!(wide.as_deref(), Some("https://x.cdninstagram.com/a.jpg"));
         let narrow = thumb_among(

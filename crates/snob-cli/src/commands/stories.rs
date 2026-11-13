@@ -281,6 +281,7 @@ mod tests {
             "pk": "1", "media_type": 2,
             "image_versions2": {"candidates": [
                 {"url": "https://x.cdninstagram.com/1080.jpg", "width": 1080},
+                {"url": "https://x.cdninstagram.com/720.jpg", "width": 720},
                 {"url": "https://x.cdninstagram.com/480.jpg", "width": 480},
                 {"url": "https://x.cdninstagram.com/240.jpg", "width": 240},
             ]},
@@ -294,7 +295,7 @@ mod tests {
         );
         assert_eq!(
             story.thumb.as_deref(),
-            Some("https://x.cdninstagram.com/480.jpg")
+            Some("https://x.cdninstagram.com/720.jpg")
         );
 
         let bare: ReelItem = serde_json::from_value(serde_json::json!({"pk": "2"})).unwrap();
