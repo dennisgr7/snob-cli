@@ -105,7 +105,15 @@ pub fn plan_of(doc: &Value, offset: usize) -> Plan {
         .get("tool")
         .and_then(Value::as_str)
         .zip(doc.get("arguments").and_then(Value::as_object))
-        .and_then(|(tool, arguments)| tools::plan(tool, arguments, tools::Offer::default()).ok());
+        .and_then(|(tool, arguments)| {
+            // The arguments a job recorded may say which account it acted
+            // as, which is planned only where a call may say so.
+            let offer = tools::Offer {
+                accounts: true,
+                ..tools::Offer::default()
+            };
+            tools::plan(tool, arguments, offer).ok()
+        });
     let mut plan = rebuilt.unwrap_or(Plan {
         args: Vec::new(),
         ask: None,
@@ -113,6 +121,8 @@ pub fn plan_of(doc: &Value, offset: usize) -> Plan {
         spends: tools::Spends::Nothing,
         page: None,
         run: tools::Run::Inline,
+        acting_as: None,
+        records: true,
     });
     // Not held under anything: the result is the job's file, read again for
     // every page, so `of` names nothing the server keeps. The limit is the

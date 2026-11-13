@@ -644,6 +644,13 @@ fn started(
     if settings.writes {
         ui::warn(&writes_warning(in_chat));
     }
+    if settings.any_account {
+        ui::warn(
+            "with --any-account, whoever holds the key can read as any account signed in \
+             here, and sign any of them out after a yes; start it with --account to hold it \
+             to one.",
+        );
+    }
     if let Some(directory) = &settings.downloads {
         ui::warn(&format!(
             "with --downloads-dir, whoever holds the key can have posts' photos and videos \
@@ -1305,6 +1312,8 @@ mod tests {
         let settings = Settings {
             writes: false,
             downloads: None,
+            any_account: false,
+            pinned: None,
             in_chat: None,
             writes_a_day: None,
             max_wait: None,

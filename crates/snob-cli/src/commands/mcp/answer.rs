@@ -939,6 +939,8 @@ mod tests {
             spends: crate::commands::mcp::tools::Spends::Nothing,
             page: None,
             run: crate::commands::mcp::tools::Run::Inline,
+            acting_as: None,
+            records: true,
         }
     }
 

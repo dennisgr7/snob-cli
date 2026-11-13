@@ -196,6 +196,14 @@ impl Cli {
         let flag = match &self.command {
             Command::Login(args) if args.add => "--add",
             Command::Logout(args) if args.all => "--all",
+            // A server for one account and one for any are two servers.
+            #[cfg(feature = "mcp")]
+            Command::Mcp(args) if args.any_account => "--any-account",
+            #[cfg(feature = "mcp")]
+            Command::Mcp(McpArgs {
+                command: Some(McpCommand::Config(config)),
+                ..
+            }) if config.any_account => "--any-account",
             _ => return Ok(()),
         };
         if self.account.is_none() {
@@ -367,7 +375,11 @@ macro_rules! mcp_after_help {
                       agent in the chat (--confirm-in-chat narrows what that may cover). \
                       snob cannot tell who gave the yes, so keep the writes on \"ask\" in the \
                       client's permissions. Never login, purge or the monitor, and never \
-                      a file anywhere but in --downloads-dir.\n\n\
+                      a file anywhere but in --downloads-dir. It acts as the active \
+                      account, or the one --account names; --any-account lets the agent see \
+                      the accounts signed in here and say which one a call acts as. It can \
+                      sign an account out of snob, after a yes that names it; signing in \
+                      stays yours.\n\n\
                       A call waits at most --max-wait for the request budget (five minutes \
                       when it is not given) and is refused past it; a list stopped that way \
                       continues next time. Calls that may reach Instagram run one at a time; \
@@ -2533,6 +2545,14 @@ pub struct McpArgs {
     /// what it is called, and nothing already there is written over
     #[arg(long, value_name = "DIR", value_parser = downloads_dir)]
     pub downloads_dir: Option<String>,
+
+    /// Let the agent see which accounts are signed in here and say, call by
+    /// call, which one it acts as. Without it the server acts as the active
+    /// account, or the one --account names, and no other
+    // Not with `--account`, which holds the server to one
+    // (`Cli::refuse_a_named_account`).
+    #[arg(long)]
+    pub any_account: bool,
 }
 
 /// `snob mcp --downloads-dir`: a directory that is there, as its absolute
@@ -2688,6 +2708,10 @@ pub struct McpConfigArgs {
     /// Start it with --downloads-dir
     #[arg(long, value_name = "DIR", value_parser = downloads_dir)]
     pub downloads_dir: Option<String>,
+
+    /// Start it with --any-account
+    #[arg(long, conflicts_with = "remote")]
+    pub any_account: bool,
 
     /// Start it with --max-writes-per-day
     #[arg(

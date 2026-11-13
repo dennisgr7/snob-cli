@@ -4,12 +4,21 @@
 //! turned into the arguments of one `snob` command, run as a child
 //! (`child.rs`), so a tool can do exactly what that command does with those
 //! flags and no more. What is not here cannot be reached: `login` (a password
-//! and a browser window are the person's), `purge`, `logout`, the monitor,
+//! and a browser window are the person's), `purge`, the monitor,
 //! `--same-day`, and every flag that writes a file but one: a post's
 //! download, offered only when the person who started the server named the
 //! directory its files go to (`--downloads-dir`, [`Offer::downloads`]). **No
 //! path is ever an argument of a call**: where a file goes and what it is
 //! called are the server's and the command's to say.
+//!
+//! **Which account a call acts as is the person's to allow** ([`Offer`]): a
+//! server started with `--account` acts as that one and no other; one
+//! started with `--any-account` lists the accounts signed in on the machine
+//! (`snob_accounts`) and takes `as_account` on every call, which reaches the
+//! child as its own `--account` ([`Plan::globals`]) and is part of what a
+//! yes is bound to ([`Plan::binding`]): a yes given for one account is no
+//! yes for another. **Signing an account out** (`snob_logout`) names the
+//! account, always, and runs only after a yes to a question that names it.
 //!
 //! **What reaches someone else needs a yes first.** Walking another account's
 //! lists needs the consent `-y` gives, and a follow or an unfollow reaches
@@ -162,6 +171,40 @@ pub struct Offer<'a> {
     /// as the person who started the server named it. `None`: no download
     /// is offered. **The only place a path comes from.**
     pub downloads: Option<&'a str>,
+    /// `--any-account`: a call may say which of the accounts signed in here
+    /// it acts as (`as_account`), and `snob_accounts` lists them.
+    pub accounts: bool,
+    /// The account the server was started for (`--account`, or
+    /// `SNOB_ACCOUNT`), when it was, as [`acting_name`] reads it: its
+    /// children act as that one, and nothing a call says changes it.
+    pub pinned: Option<&'a str>,
+}
+
+/// The argument that says which account a call acts as.
+pub const AS_ACCOUNT: &str = "as_account";
+
+/// An account signed in here as a call may name it: its username, with or
+/// without the at sign, or its pk in digits. **Checked, not passed
+/// through**: it becomes `--account=<name>` on a command line, and it is
+/// said in a question.
+pub fn acting_name(given: &str) -> Option<String> {
+    let name = given.strip_prefix('@').unwrap_or(given);
+    let digits = !name.is_empty() && name.len() <= 20 && name.bytes().all(|b| b.is_ascii_digit());
+    (digits || (snob_core::model::possible_username(name) && !name.starts_with('@')))
+        .then(|| name.to_string())
+}
+
+/// The `as_account` property, which every tool that acts as an account
+/// gains on a server started with `--any-account`.
+fn as_account_property() -> Value {
+    json!({
+        "type": "string",
+        "description": "Which of the accounts signed in on this machine the call acts as, \
+                        by username or pk, as snob_accounts lists them. Leave it out for the \
+                        active one. Each account has its own request budget, cooldown, \
+                        stored lists and jobs; a confirmation given for one account is no \
+                        confirmation for another."
+    })
 }
 
 /// The `pictures` property of the tools that can show what they list.
@@ -747,6 +790,70 @@ pub fn specs(offer: Offer<'_>) -> Vec<Spec> {
             });
         }
     }
+    specs.push(Spec {
+        name: "snob_logout",
+        title: "Sign an account out of snob",
+        description: "Signs one account out of snob on this machine, only after a yes from \
+                      the person for that one call: the client asks, or the call comes back \
+                      with status confirmation_required and a question to put to them, word \
+                      for word. snob deletes the account's stored session and its browser \
+                      profile and stops its running walks; what it stored of the account's \
+                      lists stays. Nothing is closed on Instagram's side, where the session \
+                      stays active until the person ends it under \"Active sessions\" in the \
+                      app. After it, nothing can act as the account until the person signs \
+                      in again with \"snob login\" in their own terminal, which you cannot \
+                      do for them. Name the account: snob_status says which one is signed \
+                      in.",
+        input: json!({
+            "type": "object",
+            "properties": {
+                "account": {
+                    "type": "string",
+                    "description": "The account to sign out, by username or pk."
+                },
+                "confirmation": confirmation()
+            },
+            "required": ["account"],
+            "additionalProperties": false
+        }),
+        read_only: false,
+        destructive: true,
+        idempotent: true,
+        // It changes what is on this machine, and reaches nobody.
+        open_world: false,
+    });
+    if offer.accounts {
+        specs.push(Spec {
+            name: "snob_accounts",
+            title: "The accounts signed in here",
+            description: "The accounts signed in to snob on this machine: each one's pk and \
+                          username, whether it is the active one (the one a call acts as \
+                          when it names none), whether a session is stored for it (session: \
+                          null means it was signed out and can act as nobody until the \
+                          person signs in again), and when it was last used. Sends nothing. \
+                          Pass a username or a pk from here as as_account on any other \
+                          tool to act as that account for that call; nothing here changes \
+                          which one is active.",
+            input: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+        });
+        // Every tool that acts as an account takes which.
+        for spec in &mut specs {
+            if matches!(spec.name, "snob_accounts" | "snob_logout") {
+                continue;
+            }
+            if let Some(properties) = spec
+                .input
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+            {
+                properties.insert(AS_ACCOUNT.into(), as_account_property());
+            }
+        }
+    }
     specs
 }
 
@@ -780,6 +887,14 @@ pub struct Plan {
     pub page: Option<Page>,
     /// How the command is run, and so how what it said is read.
     pub run: Run,
+    /// The account the call acts as, when it named one (`as_account`, or
+    /// the account `snob_logout` signs out): its child's `--account`
+    /// ([`Plan::globals`]), and part of what a yes is bound to.
+    pub acting_as: Option<String>,
+    /// Whether the command takes how its yes was given (`cli::AgentArgs`)
+    /// and records the act. `logout` does not: it has no such flags, and
+    /// what it removes is the session the record would be read with.
+    pub records: bool,
 }
 
 /// How a call's command is run.
@@ -840,8 +955,41 @@ impl Plan {
     /// What a yes to this call, made as `tool`, is bound to (`seal.rs`): the
     /// tool and the command line, as JSON, which escapes every control
     /// character and so cannot be made to run into the ticket's other fields.
+    ///
+    /// **And the account the call acts as, when it names one**: a yes to an
+    /// unfollow as one account is no yes to the same unfollow as another.
+    /// A call that names none is bound as it always was.
     pub fn binding(&self, tool: &str) -> String {
-        json!([tool, self.args]).to_string()
+        match &self.acting_as {
+            None => json!([tool, self.args]),
+            Some(account) => json!([tool, self.args, { "as": account }]),
+        }
+        .to_string()
+    }
+
+    /// The global flags this call's child gets ahead of its command, beside
+    /// the server's own: the account it acts as, when the call named one.
+    /// `=`, so the name can never be read as a flag of its own.
+    pub fn globals(&self) -> Vec<String> {
+        self.acting_as
+            .iter()
+            .map(|account| format!("--account={account}"))
+            .collect()
+    }
+
+    /// The plan as one that acts as `account`: bound to it, held under it
+    /// (a page of one account's list is never handed back as another's),
+    /// and asked about by name.
+    fn acting(mut self, account: String) -> Self {
+        if let Some(page) = &mut self.page {
+            page.of = json!([page.of, { "as": account }]).to_string();
+        }
+        if let Some(ask) = &mut self.ask {
+            // Of our words and the name as `acting_name` read it.
+            ask.text = format!("{} This is done as the account {account}.", ask.text);
+        }
+        self.acting_as = Some(account);
+        self
     }
 
     /// What the child is run with, after the server's global flags: the
@@ -943,7 +1091,7 @@ impl Plan {
     /// [`Plan::command_line`]).
     fn command(&self, confirmed: Option<&Confirmed<'_>>) -> Vec<String> {
         let mut line = self.args.clone();
-        if let Some(confirmed) = confirmed {
+        if let Some(confirmed) = confirmed.filter(|_| self.records) {
             // `=`, so a value can never be read as a flag of its own.
             line.push(format!("--confirmed-via={}", confirmed.via.as_str()));
             if let Some(client) = confirmed.client {
@@ -1011,6 +1159,10 @@ pub enum About {
     Walk,
     /// A follow or an unfollow.
     Write,
+    /// Signing an account out of snob: it reaches nobody, and it takes
+    /// away what every other call needs, so the chat confirms it only where
+    /// it confirms a write.
+    SignOut,
 }
 
 /// Why a call is not a command.
@@ -1038,8 +1190,59 @@ impl From<String> for Unplannable {
 /// tool it was never listed is told there is no such tool, as for any other
 /// name it made up.
 pub fn plan(name: &str, args: &Map<String, Value>, offer: Offer<'_>) -> Result<Plan, Unplannable> {
+    // Which account the call acts as is no part of any command: taken out
+    // first, and put back as the child's own `--account` ([`Plan::globals`]).
+    let mut args = args.clone();
+    let named = args.remove(AS_ACCOUNT).filter(|named| !named.is_null());
+    let plan = command(name, &args, offer)?;
+    let Some(named) = named else {
+        return Ok(plan);
+    };
+    if matches!(name, "snob_accounts" | "snob_logout") {
+        return Err(Unplannable::Invalid(format!(
+            "this tool takes no argument \"{AS_ACCOUNT}\""
+        )));
+    }
+    if !offer.accounts {
+        let why = match offer.pinned {
+            Some(pinned) => format!(
+                "this server was started for the account {pinned} and acts as no other; \
+                 call again without {AS_ACCOUNT}"
+            ),
+            None => format!(
+                "this server acts as the active account only; the person can start it with \
+                 --any-account to let a call say which. Call again without {AS_ACCOUNT}"
+            ),
+        };
+        return Err(Unplannable::Invalid(why));
+    }
+    let account = named.as_str().and_then(acting_name).ok_or_else(|| {
+        Unplannable::Invalid(format!(
+            "{AS_ACCOUNT} is an account's username or pk, as snob_accounts lists them"
+        ))
+    })?;
+    Ok(plan.acting(account))
+}
+
+/// [`plan`], once which account the call acts as has been taken out of its
+/// arguments.
+fn command(name: &str, args: &Map<String, Value>, offer: Offer<'_>) -> Result<Plan, Unplannable> {
     let writes = offer.writes;
     match name {
+        "snob_accounts" if offer.accounts => {
+            no_more(args, &[])?;
+            Ok(Plan {
+                args: vec!["account".into(), "list".into(), "--json".into()],
+                ask: None,
+                answers: &[ExitCode::Ok],
+                spends: Spends::Nothing,
+                page: None,
+                run: Run::Inline,
+                acting_as: None,
+                records: true,
+            })
+        }
+        "snob_logout" => Ok(logout(args, offer)?),
         "snob_status" => {
             no_more(args, &[])?;
             Ok(Plan {
@@ -1053,6 +1256,8 @@ pub fn plan(name: &str, args: &Map<String, Value>, offer: Offer<'_>) -> Result<P
                 spends: Spends::Nothing,
                 page: None,
                 run: Run::Inline,
+                acting_as: None,
+                records: true,
             })
         }
         "snob_list" => Ok(list(name, args)?),
@@ -1069,6 +1274,8 @@ pub fn plan(name: &str, args: &Map<String, Value>, offer: Offer<'_>) -> Result<P
                 spends: Spends::Reads,
                 page: None,
                 run: Run::Inline,
+                acting_as: None,
+                records: true,
             })
         }
         "snob_posts" => Ok(posts(name, args)?),
@@ -1085,6 +1292,8 @@ pub fn plan(name: &str, args: &Map<String, Value>, offer: Offer<'_>) -> Result<P
                 spends: Spends::Reads,
                 page: None,
                 run: Run::Inline,
+                acting_as: None,
+                records: true,
             })
         }
         "snob_highlights" => {
@@ -1112,6 +1321,8 @@ pub fn plan(name: &str, args: &Map<String, Value>, offer: Offer<'_>) -> Result<P
                 spends: Spends::Reads,
                 page: None,
                 run: Run::Inline,
+                acting_as: None,
+                records: true,
             })
         }
         "snob_post" => {
@@ -1132,6 +1343,8 @@ pub fn plan(name: &str, args: &Map<String, Value>, offer: Offer<'_>) -> Result<P
                 spends: Spends::Reads,
                 page: None,
                 run: Run::Inline,
+                acting_as: None,
+                records: true,
             })
         }
         "snob_post_likers" => {
@@ -1159,6 +1372,8 @@ pub fn plan(name: &str, args: &Map<String, Value>, offer: Offer<'_>) -> Result<P
                 spends: Spends::Reads,
                 page: None,
                 run: Run::Inline,
+                acting_as: None,
+                records: true,
             })
         }
         "snob_post_download" if offer.downloads.is_some() => {
@@ -1191,6 +1406,8 @@ pub fn plan(name: &str, args: &Map<String, Value>, offer: Offer<'_>) -> Result<P
                 spends: Spends::Writes,
                 page: None,
                 run: Run::Inline,
+                acting_as: None,
+                records: true,
             })
         }
         _ => Err(Unplannable::NoSuchTool(name.to_string())),
@@ -1267,6 +1484,8 @@ fn list(tool: &str, args: &Map<String, Value>) -> Result<Plan, String> {
             spends: Spends::Nothing,
             page: None,
             run: Run::Inline,
+            acting_as: None,
+            records: true,
         });
     }
     // A later page with mode "refresh" is the same later page as with mode
@@ -1334,6 +1553,8 @@ fn list(tool: &str, args: &Map<String, Value>) -> Result<Plan, String> {
         } else {
             Run::Job { wait }
         },
+        acting_as: None,
+        records: true,
     };
     // **Held under the call without its mode's `--refresh`**: a refresh
     // and an auto read the same list, and a later page cannot walk, so no
@@ -1377,6 +1598,8 @@ fn list(tool: &str, args: &Map<String, Value>) -> Result<Plan, String> {
         spends: Spends::Nothing,
         page: Some(page),
         run: Run::Inline,
+        acting_as: None,
+        records: true,
     })
 }
 
@@ -1426,6 +1649,8 @@ fn posts(tool: &str, args: &Map<String, Value>) -> Result<Plan, String> {
         spends: Spends::Reads,
         page: None,
         run: Run::Inline,
+        acting_as: None,
+        records: true,
     };
     plan.page = Some(Page {
         offset,
@@ -1493,6 +1718,52 @@ fn flag(args: &Map<String, Value>, key: &str) -> Result<bool, String> {
     }
 }
 
+/// `snob_logout`: `snob logout` as the account named, after a yes to a
+/// question that names it.
+///
+/// **The account is always named, by the call**, and reaches the child as
+/// its own `--account`: `logout` with no account resolved signs every one
+/// out, which no call may come to by leaving a name out. On a server
+/// started for one account it has to be that one, as it was spelled to the
+/// server, and the child is the server's own. `--all` is not offered.
+fn logout(args: &Map<String, Value>, offer: Offer<'_>) -> Result<Plan, String> {
+    no_more(args, &["account"])?;
+    let account = match args.get("account") {
+        None | Some(Value::Null) => return Err("\"account\" is required".into()),
+        Some(Value::String(given)) => acting_name(given).ok_or_else(|| {
+            "account is the username or the pk of the account to sign out".to_string()
+        })?,
+        Some(other) => return Err(format!("account {other} is not a username or a pk")),
+    };
+    let acting_as = match offer.pinned {
+        Some(pinned) if pinned == account => None,
+        Some(pinned) => {
+            return Err(format!(
+                "this server was started for the account {pinned} and signs out no other"
+            ));
+        }
+        None => Some(account.clone()),
+    };
+    Ok(Plan {
+        args: vec!["logout".into()],
+        // Of our words and the name as `acting_name` read it.
+        ask: Some(Question {
+            text: format!(
+                "Sign the account {account} out of snob on this computer? Its stored session \
+                 and browser profile are deleted and its running walks stopped; signing in \
+                 again is done with \"snob login\" in a terminal."
+            ),
+            about: About::SignOut,
+        }),
+        answers: &[ExitCode::Ok],
+        spends: Spends::Nothing,
+        page: None,
+        run: Run::Inline,
+        acting_as,
+        records: false,
+    })
+}
+
 /// `snob_post_download`: `post <link> -d <items> --json` into `directory`,
 /// the server's, with the bounds of one call ([`SAVE_AT_MOST`],
 /// [`SAVE_WITHIN`]). **The directory is the only path on the line, and it is
@@ -1555,6 +1826,8 @@ fn download(args: &Map<String, Value>, directory: &str) -> Result<Plan, String> 
         spends: Spends::Reads,
         page: None,
         run: Run::Inline,
+        acting_as: None,
+        records: true,
     })
 }
 
@@ -1588,6 +1861,8 @@ fn job(name: &str, args: &Map<String, Value>) -> Result<Plan, String> {
         spends: Spends::Nothing,
         page: None,
         run,
+        acting_as: None,
+        records: true,
     };
     let command = crate::jobs::start::COMMAND.to_string();
     match name {
@@ -1728,13 +2003,177 @@ mod tests {
     const EVERYTHING: Offer<'static> = Offer {
         writes: true,
         downloads: Some(DOWNLOADS),
+        accounts: true,
+        pinned: None,
     };
     const DOWNLOADS: &str = "/srv/snob downloads";
     /// One that offers the reads alone.
     const READS: Offer<'static> = Offer {
         writes: false,
         downloads: None,
+        accounts: false,
+        pinned: None,
     };
+
+    /// A call says which account it acts as only where the server lets it,
+    /// and then the account is the child's own flag, part of what a yes is
+    /// bound to and of what a page is held under, and named in the question.
+    #[test]
+    fn a_call_acts_as_the_account_it_names_where_the_server_lets_it() {
+        let follow = |args: Value| call("snob_follow", args).unwrap();
+        let plain = follow(json!({"account": "someone"}));
+        let as_me = follow(json!({"account": "someone", "as_account": "@me"}));
+        let as_other = follow(json!({"account": "someone", "as_account": "43"}));
+        assert_eq!(as_me.args, plain.args, "no part of the command");
+        assert_eq!(plain.globals(), Vec::<String>::new());
+        assert_eq!(as_me.globals(), ["--account=me"]);
+        assert_eq!(as_other.globals(), ["--account=43"]);
+        let bound = |plan: &Plan| plan.binding("snob_follow");
+        assert_ne!(bound(&as_me), bound(&plain));
+        assert_ne!(bound(&as_me), bound(&as_other));
+        assert_eq!(
+            bound(&plain),
+            r#"["snob_follow",["follow","someone","-y","--json"]]"#,
+            "a call that names none is bound as before"
+        );
+        assert!(as_me.ask.unwrap().text.ends_with("as the account me."));
+        // The whole line is one clap takes.
+        let line = as_other
+            .globals()
+            .into_iter()
+            .chain(as_other.command_line(None));
+        let parsed = <crate::cli::Cli as clap::Parser>::try_parse_from(
+            std::iter::once("snob".to_string()).chain(line),
+        );
+        assert!(parsed.is_ok(), "{parsed:?}");
+
+        // A page of one account's list is not another's.
+        let list = |args: Value| call("snob_list", args).unwrap().page.unwrap().of;
+        assert_ne!(
+            list(json!({"list": "followers", "as_account": "me"})),
+            list(json!({"list": "followers", "as_account": "other"}))
+        );
+        assert_ne!(
+            list(json!({"list": "followers", "as_account": "me"})),
+            list(json!({"list": "followers"}))
+        );
+
+        // Not a name, or a flag: refused.
+        for wrong in ["--no-keyring", "a b", "", "x".repeat(40).as_str()] {
+            assert!(
+                call("snob_status", json!({"as_account": wrong})).is_err(),
+                "{wrong}"
+            );
+        }
+        assert!(call("snob_accounts", json!({"as_account": "me"})).is_err());
+
+        // A server that does not let a call choose refuses the argument,
+        // lists no accounts, and says why.
+        let refused = plan(
+            "snob_status",
+            json!({"as_account": "me"}).as_object().unwrap(),
+            READS,
+        );
+        assert!(
+            matches!(refused, Err(Unplannable::Invalid(_))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            plan("snob_accounts", &Map::new(), READS),
+            Err(Unplannable::NoSuchTool("snob_accounts".into()))
+        );
+        let names = |offer| specs(offer).iter().map(|s| s.name).collect::<Vec<_>>();
+        assert!(!names(READS).contains(&"snob_accounts"));
+        let takes = |offer: Offer<'_>, tool: &str| {
+            specs(offer)
+                .into_iter()
+                .find(|spec| spec.name == tool)
+                .is_some_and(|spec| spec.input["properties"].get(AS_ACCOUNT).is_some())
+        };
+        assert!(takes(EVERYTHING, "snob_list"));
+        assert!(takes(EVERYTHING, "snob_job"));
+        assert!(!takes(EVERYTHING, "snob_accounts"));
+        assert!(!takes(EVERYTHING, "snob_logout"));
+        assert!(!takes(READS, "snob_list"));
+    }
+
+    /// Signing out names its account, asks first, and is the plain command
+    /// as that account: never one that signs every account out, and on a
+    /// server started for one account, never another's.
+    #[test]
+    fn signing_out_names_one_account_and_asks() {
+        let plan_of = |offer| {
+            plan(
+                "snob_logout",
+                json!({"account": "@other"}).as_object().unwrap(),
+                offer,
+            )
+        };
+        let signed_out = plan_of(READS).unwrap();
+        assert_eq!(signed_out.args, ["logout"]);
+        assert_eq!(signed_out.globals(), ["--account=other"]);
+        assert_eq!(signed_out.spends, Spends::Nothing);
+        let asked = signed_out.ask.clone().unwrap();
+        assert_eq!(asked.about, About::SignOut);
+        assert!(
+            asked.text.contains("account other out of snob"),
+            "{}",
+            asked.text
+        );
+        // A yes for one account's sign-out is none for another's.
+        let another = plan(
+            "snob_logout",
+            json!({"account": "me"}).as_object().unwrap(),
+            READS,
+        )
+        .unwrap();
+        assert_ne!(
+            signed_out.binding("snob_logout"),
+            another.binding("snob_logout")
+        );
+        // No flag of a recorded act reaches a command that takes none.
+        let confirmed = Confirmed {
+            via: ConfirmedVia::Chat,
+            client: Some("test 0"),
+            writes_a_day: 10,
+        };
+        assert_eq!(signed_out.command_line(Some(&confirmed)), ["logout"]);
+        let line = signed_out
+            .globals()
+            .into_iter()
+            .chain(signed_out.command_line(Some(&confirmed)));
+        let parsed = <crate::cli::Cli as clap::Parser>::try_parse_from(
+            std::iter::once("snob".to_string()).chain(line),
+        );
+        assert!(parsed.is_ok(), "{parsed:?}");
+
+        // Started for one account: that one, with no flag of the call's.
+        let pinned = Offer {
+            pinned: Some("other"),
+            ..READS
+        };
+        let own = plan_of(pinned).unwrap();
+        assert_eq!(own.globals(), Vec::<String>::new());
+        assert!(
+            plan(
+                "snob_logout",
+                json!({"account": "me"}).as_object().unwrap(),
+                pinned
+            )
+            .is_err()
+        );
+        // Never without a name, and never every account.
+        for wrong in [
+            json!({}),
+            json!({"account": "--all"}),
+            json!({"account": "me", "all": true}),
+        ] {
+            assert!(
+                plan("snob_logout", wrong.as_object().unwrap(), READS).is_err(),
+                "{wrong}"
+            );
+        }
+    }
 
     fn call(name: &str, args: Value) -> Result<Plan, Unplannable> {
         plan(name, args.as_object().unwrap(), EVERYTHING)
@@ -2469,7 +2908,8 @@ mod tests {
     fn only_the_tools_that_may_reach_instagram_are_open_world() {
         let id = format!("j{}", "0".repeat(26));
         let reaching = |name: &str| match name {
-            "snob_status" => vec![json!({})],
+            "snob_status" | "snob_accounts" => vec![json!({})],
+            "snob_logout" => vec![json!({"account": "me"})],
             "snob_jobs" => vec![json!({}), json!({"all": true})],
             "snob_job" | "snob_job_cancel" => vec![json!({"job_id": id})],
             "snob_list" => vec![
@@ -2485,7 +2925,7 @@ mod tests {
             _ => vec![json!({"account": "x"})],
         };
         let every = specs(EVERYTHING);
-        assert_eq!(every.len(), 14, "every tool is pinned here");
+        assert_eq!(every.len(), 16, "every tool is pinned here");
         for spec in every {
             let may_reach = reaching(spec.name)
                 .into_iter()

@@ -510,7 +510,8 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   **It limits the chat route only**: a client that declares a form answers
   it as it likes, so over `--listen` whoever holds the key can confirm a
   write whatever it says (recorded as a yes given in a form). Not
-  offered, ever: `login`, `logout`, `purge`, the monitor, `--same-day`,
+  offered, ever: `login` (signing in is the person's, below), `logout
+  --all`, `account use`, `purge`, the monitor, `--same-day`,
   and **a path or a file name as an argument of a call**: the one command
   that writes a file for an agent writes it where the server was told
   (below).
@@ -569,6 +570,46 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   which another day's story takes, and a download that never fetches a
   name twice would then skip the new one; that wants an id in the name
   first.
+- **One account a server, unless the person says any** (`tools::Offer`).
+  Not told otherwise, a server acts as the account its children resolve:
+  the one `--account` or `SNOB_ACCOUNT` names (`Offer::pinned`), else the
+  active one. `snob mcp --any-account` (refused beside `--account`, exit 2,
+  and beside `SNOB_ACCOUNT`, exit 1) offers `snob_accounts` (`account list
+  --json`: no request, no database opened) and gives every other tool
+  `as_account`, a username or a pk, checked (`tools::acting_name`) and
+  handed to the child as its own `--account=<name>` ahead of the command
+  (`Plan::globals`), never as part of `Plan.args`. **What is per account
+  stays so because the child is that account's**: its budget, cooldown and
+  `spend.lock`, its `mcp_acts` and the cap on writes, its jobs (`snob_job`,
+  `snob_jobs` and `snob_job_cancel` take `as_account` too, and another
+  account's id is `no_such_job`). **A yes is bound to the account**
+  (`Plan::binding`: a chat token for a call as one account, brought to the
+  same call as another, is `not_for_this_call`), the question names it, and
+  a page is held under it (`Plan::acting`). The server's limits stay the
+  server's: one call that may reach Instagram at a time whichever account
+  it is for, which is stricter than the accounts need and keeps one server
+  from walking two at once. A walk as a named account is answered with its
+  job, never with an MCP task: `tasks/get` carries an id and nothing else,
+  and is read as the account the server acts as. `account use` is not
+  offered: which account the person's own commands act as is not an
+  agent's to move.
+- **A call that names no account acts as whichever is active when its
+  child starts**, and its yes is bound to the command alone, as before:
+  `snob account use` typed between a question and its yes runs the yes as
+  the other account. Where several accounts are signed in, start the server
+  with `--account`, or have its calls name theirs.
+- **Signing out, after a yes that names the account** (`snob_logout`, on
+  every server). The call names the account, always, and the child is
+  `snob --account=<name> logout`, the command itself, so its order holds
+  (the account's jobs stopped and their lock held until the session is
+  gone, every other process refused its next request, the browser
+  released): never `logout` with no account resolved, which signs every
+  account out, and never `--all`. On a server started for one account it
+  is that account, as it was spelled to the server, or a refusal. Its
+  question (`About::SignOut`) is taken in the chat only where a write's is
+  (`--confirm-in-chat all`), and counts once, for that account. It is not
+  recorded in `mcp_acts`: `logout` takes none of the flags that record an
+  act (`Plan::records`), and nothing is closed on Instagram's side.
 - **The yes comes from the client, not provably from the person.** The
   client declares what it can show, and an agent can type a yes in the chat
   itself (or be steered to by a bio it read). The tickets keep a yes to the

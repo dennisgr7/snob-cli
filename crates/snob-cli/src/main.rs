@@ -450,8 +450,24 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     std::env::current_exe()?,
                     mcp_globals(&cli, None)?,
                 );
+                // The account the server is held to, by a flag or by the
+                // environment its children inherit; a server for any account
+                // is held to none, so the two are refused together.
+                let env = std::env::var("SNOB_ACCOUNT").ok();
+                let pinned = snob_cli::account::given(cli.account.as_deref(), env.as_deref());
+                if args.any_account && pinned.is_some() {
+                    return Err(snob_cli::exit::ExitError::new(
+                        ExitCode::Error,
+                        "--any-account lets a call say which account it acts as, and \
+                         SNOB_ACCOUNT holds this server to one",
+                    )
+                    .with_hint("unset SNOB_ACCOUNT for this server, or leave --any-account out")
+                    .into());
+                }
                 let settings = commands::mcp::Settings {
                     writes: args.allow_writes,
+                    any_account: args.any_account,
+                    pinned: pinned.and_then(commands::mcp::tools::acting_name),
                     downloads: args.downloads_dir.clone(),
                     in_chat: args.confirm_in_chat,
                     writes_a_day: args.max_writes_per_day,

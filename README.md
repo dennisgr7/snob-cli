@@ -164,8 +164,12 @@ can read:
   `--downloads-dir <dir>` saving a post's photos and videos into that
   directory: the agent names the post, never a path, the files get the
   names snob gives every download, and none already there is written over.
-  A follow or an unfollow, walking another account's lists and reading
-  who liked a post run only after a yes
+  It acts as the active account, or the one `--account` names;
+  `--any-account` lets the agent see the accounts signed in here and say,
+  call by call, which one it acts as. It can sign one account out of snob
+  after a yes that names it, and never signs in: that stays yours.
+  A follow or an unfollow, signing out, walking another account's lists
+  and reading who liked a post run only after a yes
   for that one call: asked in the client when it can show a form, or put to
   you by the agent in the chat (`--confirm-in-chat none|lists|all` says what
   that may cover; `all` by default). snob cannot tell whether that yes was

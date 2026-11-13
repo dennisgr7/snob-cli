@@ -67,6 +67,9 @@ pub fn run(
         server_args.push("--max-writes-per-day".into());
         server_args.push(writes.to_string());
     }
+    if args.any_account {
+        server_args.push("--any-account".into());
+    }
     if let Some(directory) = &args.downloads_dir {
         server_args.push("--downloads-dir".into());
         server_args.push(directory.clone());

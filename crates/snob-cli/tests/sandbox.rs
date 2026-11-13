@@ -6386,6 +6386,243 @@ async fn an_agent_saves_a_posts_files_where_the_server_was_told() {
     assert!(!missing.exists());
 }
 
+/// An agent sees the accounts signed in here, and says which one a call
+/// acts as, only on a server started with --any-account; each account is
+/// then answered about as itself, and a yes given for a call as one account
+/// is no yes for the same call as another.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn an_agent_acts_as_the_account_it_names_where_the_server_lets_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = two_accounts(tmp.path()).await;
+
+    // Not asked for, there is no such tool and no such argument.
+    let mut plain = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let listed = plain
+        .ask("tools/list", serde_json::json!({}))
+        .await
+        .to_string();
+    assert!(
+        !listed.contains("snob_accounts") && !listed.contains("as_account"),
+        "{listed}"
+    );
+    let refused = plain
+        .call("snob_status", serde_json::json!({ "as_account": "me" }))
+        .await;
+    assert_eq!(
+        refused["structuredContent"]["error"]["code"], "invalid_arguments",
+        "{refused}"
+    );
+    assert!(
+        refused.to_string().contains("--any-account"),
+        "it says what would let it: {refused}"
+    );
+    drop(plain);
+
+    let mut client = McpClient::start(tmp.path(), &instagram, &["--any-account"]).await;
+    let accounts = client.call("snob_accounts", serde_json::json!({})).await;
+    assert_eq!(accounts["isError"], false, "{accounts}");
+    let told = &accounts["structuredContent"];
+    assert_eq!(told["active"], OTHER.get(), "{accounts}");
+    let named: Vec<(&str, bool)> = told["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|account| {
+            (
+                account["username"].as_str().unwrap(),
+                !account["session"].is_null(),
+            )
+        })
+        .collect();
+    assert_eq!(named, [("me", true), ("other", true)], "{accounts}");
+
+    // Each account answers as itself, by name or by pk; none named, the
+    // active one.
+    for (named, pk) in [
+        (serde_json::json!({ "as_account": "me" }), PK),
+        (serde_json::json!({ "as_account": "43" }), OTHER),
+        (serde_json::json!({}), OTHER),
+    ] {
+        let status = client.call("snob_status", named.clone()).await;
+        assert_eq!(
+            status["structuredContent"]["viewer"]["pk"],
+            pk.get(),
+            "{named}: {status}"
+        );
+    }
+    let nobody = client
+        .call("snob_status", serde_json::json!({ "as_account": "nobody" }))
+        .await;
+    assert_eq!(nobody["isError"], true, "{nobody}");
+
+    // A walk as a named account is that account's job: asked about under
+    // the same name, and no job of the active account's.
+    let walked = client
+        .call(
+            "snob_list",
+            serde_json::json!({ "list": "followers", "as_account": "me" }),
+        )
+        .await;
+    assert_eq!(walked["isError"], false, "{walked}");
+    assert_eq!(walked["structuredContent"]["count"], 3, "{walked}");
+    let id = walked["structuredContent"]["job_id"]
+        .as_str()
+        .expect("the job it ran as")
+        .to_string();
+    let own = client
+        .call(
+            "snob_job",
+            serde_json::json!({ "job_id": id, "as_account": "me" }),
+        )
+        .await;
+    assert_eq!(own["isError"], false, "{own}");
+    assert_eq!(own["structuredContent"]["count"], 3, "{own}");
+    let anothers = client
+        .call("snob_job", serde_json::json!({ "job_id": id }))
+        .await;
+    assert_eq!(
+        anothers["structuredContent"]["error"]["code"], "no_such_job",
+        "{anothers}"
+    );
+
+    // A yes for a walk as one account is none for the walk as another.
+    let walk = |account: &str| serde_json::json!({ "list": "followers", "account": "someone", "as_account": account });
+    let asking = client.call("snob_list", walk("me")).await;
+    let asked = &asking["structuredContent"];
+    assert_eq!(asked["status"], "confirmation_required", "{asking}");
+    assert!(
+        asked["question"]
+            .as_str()
+            .unwrap()
+            .ends_with("as the account me."),
+        "{asking}"
+    );
+    let mut swapped = walk("other");
+    swapped["confirmation"] = asked["confirmation"].clone();
+    let again = client.call("snob_list", swapped).await;
+    assert_eq!(
+        again["structuredContent"]["status"], "confirmation_required",
+        "{again}"
+    );
+    assert_eq!(
+        again["structuredContent"]["previous"], "not_for_this_call",
+        "{again}"
+    );
+
+    // A server started for one account takes no other, and is refused the
+    // flag that would let a call choose.
+    let both = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["--account", "me", "mcp", "--any-account"],
+    );
+    assert_eq!(both.status.code(), Some(2), "{}", stderr(&both));
+}
+
+/// An agent signs an account out of snob only by naming it, and only after
+/// a yes to a question that names it: the session and the browser profile
+/// of that account go, and the other account's stay.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn an_agent_signs_an_account_out_only_after_a_yes_that_names_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = two_accounts(tmp.path()).await;
+    let paths = snob_store::paths::AppPaths::rooted_at(tmp.path());
+    let (me, other) = (paths.account(PK), paths.account(OTHER));
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    // Never without a name, and never every account.
+    for wrong in [
+        serde_json::json!({}),
+        serde_json::json!({ "account": "me", "all": true }),
+        serde_json::json!({ "account": "--all" }),
+    ] {
+        let refused = client.call("snob_logout", wrong).await;
+        assert_eq!(
+            refused["structuredContent"]["error"]["code"], "invalid_arguments",
+            "{refused}"
+        );
+    }
+
+    let asking = client
+        .call("snob_logout", serde_json::json!({ "account": "me" }))
+        .await;
+    let asked = &asking["structuredContent"];
+    assert_eq!(asked["status"], "confirmation_required", "{asking}");
+    assert!(
+        asked["question"]
+            .as_str()
+            .unwrap()
+            .starts_with("Sign the account me out of snob"),
+        "{asking}"
+    );
+    assert!(me.session_file().exists() && other.session_file().exists());
+
+    // The yes is for that account: brought to another's sign-out it is
+    // none, and nothing is signed out.
+    let another = client
+        .call(
+            "snob_logout",
+            serde_json::json!({ "account": "other", "confirmation": asked["confirmation"] }),
+        )
+        .await;
+    assert_eq!(
+        another["structuredContent"]["status"], "confirmation_required",
+        "{another}"
+    );
+    assert!(me.session_file().exists() && other.session_file().exists());
+
+    let done = client
+        .call(
+            "snob_logout",
+            serde_json::json!({ "account": "me", "confirmation": asked["confirmation"] }),
+        )
+        .await;
+    assert_eq!(done["isError"], false, "{done}");
+    assert!(
+        done["structuredContent"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Session deleted"),
+        "{done}"
+    );
+    assert!(!me.session_file().exists() && !me.browser_profile().exists());
+    assert!(me.db_file().exists(), "what it stored stays");
+    assert!(other.session_file().exists() && other.browser_profile().exists());
+
+    // The same yes again signs nothing out.
+    let twice = client
+        .call(
+            "snob_logout",
+            serde_json::json!({ "account": "me", "confirmation": asked["confirmation"] }),
+        )
+        .await;
+    assert_eq!(
+        twice["structuredContent"]["error"]["code"], "confirmation_used",
+        "{twice}"
+    );
+
+    // A server started for one account signs out no other.
+    drop(client);
+    let mut pinned = McpClient::start(tmp.path(), &instagram, &["--account", "other"]).await;
+    let refused = pinned
+        .call("snob_logout", serde_json::json!({ "account": "me" }))
+        .await;
+    assert_eq!(
+        refused["structuredContent"]["error"]["code"], "invalid_arguments",
+        "{refused}"
+    );
+    let own = pinned
+        .call("snob_logout", serde_json::json!({ "account": "other" }))
+        .await;
+    assert_eq!(
+        own["structuredContent"]["status"], "confirmation_required",
+        "{own}"
+    );
+    assert!(other.session_file().exists());
+}
+
 /// The image blocks of a tool result, each as its kind and its bytes.
 #[cfg(feature = "mcp")]
 fn images(result: &serde_json::Value) -> Vec<(String, Vec<u8>)> {
