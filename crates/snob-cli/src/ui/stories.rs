@@ -602,6 +602,7 @@ mod tests {
             expiring_at: None,
             url: None,
             mentions: mentions.iter().map(|m| (*m).to_string()).collect(),
+            thumb: None,
         }
     }
 

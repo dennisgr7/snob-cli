@@ -817,6 +817,7 @@ mod tests {
             declared_items: declared,
             created_at: None,
             updated_at: None,
+            cover: None,
         }
     }
 
@@ -830,6 +831,7 @@ mod tests {
                         expiring_at: None,
                         url: None,
                         mentions: Vec::new(),
+                        thumb: None,
                     })
                     .collect()
             }),

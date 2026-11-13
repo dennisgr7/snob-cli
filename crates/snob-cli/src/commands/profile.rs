@@ -151,6 +151,9 @@ pub struct Highlight {
     pub items: Option<u64>,
     /// When something was last added to it.
     pub updated_at: Option<Epoch>,
+    /// Its cover's address, for a view to draw
+    /// (`commands::highlights::cover_of`). Not in the JSON contract.
+    pub cover: Option<String>,
 }
 
 impl Profile {
@@ -403,6 +406,7 @@ pub async fn fetch(
         Visibility::Shown(
             tray.into_iter()
                 .map(|h| Highlight {
+                    cover: crate::commands::highlights::cover_of(&h),
                     id: h.id,
                     title: printable(h.title.as_deref().unwrap_or("")),
                     items: h.media_count,
@@ -1011,6 +1015,7 @@ mod tests {
             expiring_at: None,
             url: None,
             mentions: Vec::new(),
+            thumb: None,
         }
     }
 
@@ -1047,6 +1052,7 @@ mod tests {
                 title: "trip".to_string(),
                 items: Some(5),
                 updated_at: None,
+                cover: None,
             }]),
             pfp_url: None,
             pfp_full_size: None,
@@ -1182,6 +1188,7 @@ mod tests {
             title: html.to_string(),
             items: Some(1),
             updated_at: None,
+            cover: None,
         }]);
         profile.external_url = Some("https://example.test/".to_string());
 

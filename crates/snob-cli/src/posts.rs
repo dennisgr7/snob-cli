@@ -33,8 +33,8 @@ use snob_core::Epoch;
 use snob_core::model::post::{self as document, AccountRef, Place};
 use snob_core::model::printable;
 use snob_ig::client::IgClient;
+use snob_ig::model::dash;
 use snob_ig::model::post::{Comment, CommentsPage, LikedBy, Media, Named as NamedAccount};
-use snob_ig::model::{PictureVersion, dash};
 use snob_ig::pace::{PAGES_PER_SITTING, Pace};
 use snob_ig::shortcode::{self, MediaPk, Opens, Shortcode};
 
@@ -378,23 +378,10 @@ impl Post {
     }
 }
 
-/// The narrowest picture at least this wide is a thumbnail: wide enough for
-/// a cell of the view's grid on a large terminal, and a few tens of
-/// kilobytes where the full picture is hundreds.
-const THUMB_WIDTH: u32 = 320;
-
 /// The picture of `item` a view draws small: of its candidates (a video's
-/// are its cover), the narrowest at least [`THUMB_WIDTH`] wide, and when none
-/// is, the widest; on a tie, the one listed first.
+/// are its cover), the one [`media::thumb_among`] picks.
 fn thumb_of(item: &Media) -> Option<String> {
-    let candidates = &item.image_versions2.as_ref()?.candidates;
-    let width = |v: &&PictureVersion| v.width.unwrap_or(0);
-    candidates
-        .iter()
-        .filter(|v| width(v) >= THUMB_WIDTH)
-        .min_by_key(width)
-        .or_else(|| candidates.iter().rev().max_by_key(width))
-        .map(|v| v.url.clone())
+    crate::media::thumb_among(&item.image_versions2.as_ref()?.candidates)
 }
 
 /// `item`'s best tracks, read from its DASH manifest, when its widest video

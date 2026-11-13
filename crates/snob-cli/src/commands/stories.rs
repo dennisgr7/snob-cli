@@ -195,6 +195,10 @@ pub(crate) fn story_from(item: &ReelItem) -> Story {
             _ => image.or(video),
         },
         mentions: item.mentioned().map(printable).collect(),
+        thumb: item
+            .image_versions2
+            .as_ref()
+            .and_then(|c| media::thumb_among(&c.candidates)),
     }
 }
 
@@ -268,6 +272,34 @@ mod tests {
     use crate::report;
     use snob_core::Epoch;
     use snob_ig::model::{Candidates, PictureVersion};
+
+    /// A story's thumbnail is the narrowest of its pictures wide enough
+    /// for a view, a video's cover included, and never the video's file.
+    #[test]
+    fn a_storys_thumbnail_is_its_narrowest_picture_wide_enough() {
+        let item: ReelItem = serde_json::from_value(serde_json::json!({
+            "pk": "1", "media_type": 2,
+            "image_versions2": {"candidates": [
+                {"url": "https://x.cdninstagram.com/1080.jpg", "width": 1080},
+                {"url": "https://x.cdninstagram.com/480.jpg", "width": 480},
+                {"url": "https://x.cdninstagram.com/240.jpg", "width": 240},
+            ]},
+            "video_versions": [{"url": "https://x.cdninstagram.com/v.mp4", "width": 720}],
+        }))
+        .unwrap();
+        let story = story_from(&item);
+        assert_eq!(
+            story.url.as_deref(),
+            Some("https://x.cdninstagram.com/v.mp4")
+        );
+        assert_eq!(
+            story.thumb.as_deref(),
+            Some("https://x.cdninstagram.com/480.jpg")
+        );
+
+        let bare: ReelItem = serde_json::from_value(serde_json::json!({"pk": "2"})).unwrap();
+        assert_eq!(story_from(&bare).thumb, None);
+    }
 
     fn version(url: &str, w: u32, h: u32) -> PictureVersion {
         PictureVersion {
@@ -351,6 +383,7 @@ mod tests {
             expiring_at: None,
             url: Some(format!("https://cdn.example/{}", mentions.len())),
             mentions: mentions.iter().map(ToString::to_string).collect(),
+            thumb: None,
         };
         Stories {
             username: "someone".into(),

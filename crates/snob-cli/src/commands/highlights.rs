@@ -75,6 +75,23 @@ pub struct Entry {
     pub created_at: Option<Epoch>,
     /// When something was last added to it.
     pub updated_at: Option<Epoch>,
+    /// Its cover's address, for a view to draw ([`cover_of`]). Not in the
+    /// JSON contract.
+    pub cover: Option<String>,
+}
+
+/// The address of `highlight`'s cover, the square picture the profile
+/// shows above its title, as the tray hands it out
+/// (`cover_media.cropped_image_version`, on the REST and GraphQL trays
+/// alike).
+pub(crate) fn cover_of(highlight: &snob_ig::model::Highlight) -> Option<String> {
+    highlight
+        .cover_media
+        .as_ref()?
+        .cropped_image_version
+        .as_ref()
+        .map(|v| v.url.clone())
+        .filter(|url| !url.is_empty())
 }
 
 /// The tray, gathered before anything is printed.
@@ -336,6 +353,7 @@ pub async fn fetch_tray(
         entries: tray
             .into_iter()
             .map(|h| Entry {
+                cover: cover_of(&h),
                 id: h.id,
                 title: printable(h.title.as_deref().unwrap_or("")),
                 declared_items: h.media_count,
@@ -690,6 +708,30 @@ mod tests {
     use super::*;
     use snob_ig::error::IgError;
 
+    /// A highlight's cover is the tray's cropped picture, and nothing when
+    /// the tray gives none or an empty address.
+    #[test]
+    fn a_highlights_cover_is_its_cropped_picture() {
+        let tray: snob_ig::model::HighlightsTray = serde_json::from_value(serde_json::json!({
+            "tray": [
+                {"id": "highlight:1", "cover_media": {"cropped_image_version":
+                    {"url": "https://x.cdninstagram.com/cover.jpg", "width": 150, "height": 150}}},
+                {"id": "highlight:2", "cover_media": null},
+                {"id": "highlight:3", "cover_media": {"cropped_image_version": {"url": ""}}},
+            ]
+        }))
+        .unwrap();
+        let covers: Vec<Option<String>> = tray.tray.iter().map(cover_of).collect();
+        assert_eq!(
+            covers,
+            [
+                Some("https://x.cdninstagram.com/cover.jpg".to_string()),
+                None,
+                None
+            ]
+        );
+    }
+
     /// Every entry not saved is counted, the ones never tried included.
     #[test]
     fn what_was_not_saved_counts_the_entries_not_tried() {
@@ -733,6 +775,7 @@ mod tests {
                     declared_items: Some(2),
                     created_at: Some(Epoch::new(1_700_000_000)),
                     updated_at: Some(Epoch::new(1_773_576_000)),
+                    cover: None,
                 },
                 Entry {
                     id: "highlight:2".into(),
@@ -740,6 +783,7 @@ mod tests {
                     declared_items: None,
                     created_at: None,
                     updated_at: None,
+                    cover: None,
                 },
             ],
         }
@@ -752,6 +796,7 @@ mod tests {
             expiring_at: None,
             url: Some(format!("https://cdn.example/{}", mentions.len())),
             mentions: mentions.iter().map(ToString::to_string).collect(),
+            thumb: None,
         };
         vec![
             story(crate::media::Kind::Photo, &["a", "b"]),

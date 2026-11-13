@@ -10,6 +10,7 @@ use snob_core::Epoch;
 use snob_core::model::printable;
 use snob_ig::client::IgClient;
 use snob_ig::error::IgError;
+use snob_ig::model::PictureVersion;
 use snob_ig::model::dash::Track;
 
 use crate::cli::{DownloadSelection, Format};
@@ -74,6 +75,28 @@ pub struct Story {
     pub url: Option<String>,
     /// Accounts tagged in it, already filtered for a terminal.
     pub mentions: Vec<String>,
+    /// A small picture of it for a view to draw: a photo's own, a video's
+    /// cover ([`thumb_among`]). Not in the JSON contract.
+    pub thumb: Option<String>,
+}
+
+/// The narrowest picture at least this wide is a thumbnail: wide enough for
+/// a cell of a view on a large terminal, and a few tens of kilobytes where
+/// the full picture is hundreds.
+const THUMB_WIDTH: u32 = 320;
+
+/// The picture a view draws small, of the `candidates` Instagram offers for
+/// one item (a video's are its cover): the narrowest at least
+/// [`THUMB_WIDTH`] wide, and when none is, the widest; on a tie, the one
+/// listed first. The one rule for posts, stories and highlights.
+pub(crate) fn thumb_among(candidates: &[PictureVersion]) -> Option<String> {
+    let width = |v: &&PictureVersion| v.width.unwrap_or(0);
+    candidates
+        .iter()
+        .filter(|v| width(v) >= THUMB_WIDTH)
+        .min_by_key(width)
+        .or_else(|| candidates.iter().rev().max_by_key(width))
+        .map(|v| v.url.clone())
 }
 
 /// Everything the story listing needs, gathered before anything is printed.

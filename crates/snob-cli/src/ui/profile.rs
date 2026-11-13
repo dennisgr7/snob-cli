@@ -1103,6 +1103,7 @@ fn entry_of(h: &Highlight) -> Entry {
         declared_items: h.items,
         created_at: None,
         updated_at: h.updated_at,
+        cover: h.cover.clone(),
     }
 }
 
@@ -3098,6 +3099,7 @@ mod tests {
                 title: "trip".to_string(),
                 items: Some(5),
                 updated_at: None,
+                cover: None,
             }]),
             pfp_url: None,
             pfp_full_size: None,
@@ -3149,6 +3151,7 @@ mod tests {
             expiring_at: None,
             url: None,
             mentions: Vec::new(),
+            thumb: None,
         }
     }
 
@@ -3263,7 +3266,12 @@ mod tests {
             title: String::new(),
             items: Some(3),
             updated_at: Some(Epoch::new(5)),
+            cover: Some("https://x.cdninstagram.com/cover.jpg".to_string()),
         });
+        assert_eq!(
+            entry.cover.as_deref(),
+            Some("https://x.cdninstagram.com/cover.jpg")
+        );
         assert_eq!(entry.id, "highlight:9");
         assert_eq!(entry.declared_items, Some(3));
         assert_eq!(entry.created_at, None);
