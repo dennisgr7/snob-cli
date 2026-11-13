@@ -29,3 +29,14 @@ savePrefix: ''
 
 # Enforce the Node and pnpm versions declared in `engines`.
 engineStrict: true
+
+# Pinned peers
+
+# `@napi-rs/wasm-runtime` takes `@emnapi/runtime` as a peer, `^1.7.1 ||
+# ^2.0.0-alpha.4`, and pnpm resolves it to the newest match, a 2.0 beta,
+# while `@emnapi/core` stays on 1.x. The two then disagree on their bridge,
+# and `astro check` dies in `@astrojs/astro2tsx` with "this.bridge.setLastError
+# is not a function" (@astrojs/check 0.9.12, November 2026). Remove this once
+# `@emnapi/core` 2.0 is released and the peer resolves to a matching pair.
+overrides:
+  '@emnapi/runtime': 1.11.3

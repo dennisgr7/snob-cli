@@ -1114,7 +1114,7 @@ videos alone (`run_worker_first`) and answers byte ranges, which static assets
 do not and Safari needs to play a video; it sets its own headers, since
 `_headers` does not reach a Worker's answers.
 Workers Builds deploys `main` and uploads a preview for every other branch.
-Node `24.21.0` (`web/.node-version`), pnpm `12.9.1` via Corepack; exact
+Node `24.22.3` (`web/.node-version`), pnpm `12.18.0` via Corepack; exact
 versions only, a 24 h release quarantine and an install-script allowlist in
 `web/pnpm-workspace.yaml`. CI (`.github/workflows/web.yml`, only on changes
 under `web/`):
