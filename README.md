@@ -92,6 +92,7 @@ snob stories someone -d all      # save every story an account has up
 snob highlights someone 2 -d all # save everything in its second highlight
 snob posts someone               # the posts on its grid
 snob post <link> -d all          # one post by its link, every photo and video in it
+snob post <link> --comments 5    # the post and five pages of its comments
 snob reel <link> -d all          # the same for a reel
 snob likers <link>               # who liked a post, as many as Instagram shows
 snob fetch <cdn-address>         # one file by its address, no account needed

@@ -107,6 +107,16 @@ pub const ACCOUNTS_PER_PAGE_FEWEST: u32 = 8;
 /// person scrolls to.
 pub const STEP_MS: (u64, u64) = (1_000, 3_000);
 
+/// The wait between two pages of a post's comments, in milliseconds, drawn
+/// anew each time: two to five seconds, in place of [`STEP_MS`].
+///
+/// The app reads the next comments when "load more" is clicked, and the
+/// clicks of the capture of 2026-11-13 came 2.3, 4.5 and 7.5 seconds apart.
+/// Three samples of one hand is thin, so this is an estimate: it starts no
+/// sooner than the quickest of them and ends past their median, so a run of
+/// pages is never quicker than a person reading them.
+pub const COMMENT_STEP_MS: (u64, u64) = (2_000, 5_000);
+
 /// The wait before the first page of a list, in milliseconds, drawn anew for
 /// each list: one and a half to four seconds.
 ///
@@ -246,6 +256,17 @@ impl Default for Pace {
             },
             network_retries: 3,
             backoff_base_ms: 2_000,
+        }
+    }
+}
+
+impl Pace {
+    /// The pace of a post's comments read a page after another: the default
+    /// one, with [`COMMENT_STEP_MS`] between the pages.
+    pub fn for_comments() -> Self {
+        Self {
+            step_ms: COMMENT_STEP_MS,
+            ..Self::default()
         }
     }
 }
@@ -1163,6 +1184,11 @@ mod tests {
     #[test]
     fn the_default_pace_is_the_documented_one() {
         assert_eq!(STEP_MS, (1_000, 3_000), "one to three seconds a page");
+        assert_eq!(
+            COMMENT_STEP_MS,
+            (2_000, 5_000),
+            "two to five seconds a page of comments"
+        );
         assert_eq!(
             DWELL_MS,
             (1_500, 4_000),

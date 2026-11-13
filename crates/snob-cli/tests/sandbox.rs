@@ -1856,6 +1856,146 @@ async fn a_reel_is_listed_with_what_it_says_and_its_comments() {
     assert!(text.contains("Liked by close and 11 others"), "{text}");
 }
 
+/// The cursors [`with_comment_pages`] hands out, in the shape Instagram's
+/// have (`comments_cursor_has_its_shape`).
+const SECOND_PAGE: &str = r#"{"cached_comments_cursor":"15","bifilter_token":"QVFB"}"#;
+const THIRD_PAGE: &str = r#"{"cached_comments_cursor":"30","bifilter_token":"QVFC"}"#;
+
+/// The post of [`with_a_post`] with three pages of one comment each: the
+/// first as the post opens, the next two by the cursor the page before
+/// handed out, in the order the app asks for them.
+async fn with_comment_pages(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(url_path(format!("/api/v1/media/{POST_PK}/info/")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"items":[{{"pk":"{POST_PK}","code":"{POST_CODE}","media_type":1,
+                "user":{{"username":"me"}},"comment_count":3}}],"status":"ok"}}"#
+        )))
+        .mount(server)
+        .await;
+    let page = |n: u32, next: Option<&str>| {
+        let mut body = serde_json::json!({
+            "comments": [{"pk": n.to_string(), "text": format!("comment {n}"),
+                          "created_at": 1_790_000_100, "user": {"username": "friend"}}],
+            "comment_count": 3,
+            "has_more_comments": false,
+            "has_more_headload_comments": next.is_some(),
+            "status": "ok",
+        });
+        if let Some(next) = next {
+            body["next_min_id"] = serde_json::json!(next);
+        }
+        ResponseTemplate::new(200).set_body_json(body)
+    };
+    let comments = format!("/api/v1/media/{POST_PK}/comments/");
+    Mock::given(method("GET"))
+        .and(url_path(comments.clone()))
+        .and(query_param("permalink_enabled", "false"))
+        .respond_with(page(1, Some(SECOND_PAGE)))
+        .mount(server)
+        .await;
+    for (n, cursor, next) in [(2, SECOND_PAGE, Some(THIRD_PAGE)), (3, THIRD_PAGE, None)] {
+        Mock::given(method("GET"))
+            .and(url_path(comments.clone()))
+            .and(query_param("can_support_threading", "true"))
+            .and(query_param("min_id", cursor))
+            .and(query_param("sort_order", "popular"))
+            .respond_with(page(n, next))
+            .mount(server)
+            .await;
+    }
+}
+
+/// `--comments` reads that many pages of comments, each after the first by
+/// the cursor the page before handed out, and says whether more are left;
+/// asked for more pages than there are, it stops at the last.
+#[tokio::test]
+async fn comments_are_read_a_page_after_another_as_far_as_asked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_comment_pages(&instagram).await;
+    log_in(tmp.path(), &instagram);
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["post", POST_CODE, "--comments", "2", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let listed = json(&out);
+    let texts: Vec<&str> = listed["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["text"].as_str())
+        .collect();
+    assert_eq!(texts, ["comment 1", "comment 2"]);
+    assert_eq!(listed["more_comments"], true);
+    let asked = asked_about_the_post(&instagram).await;
+    assert_eq!(asked.len(), 3, "the info and two pages: {asked:?}");
+    assert!(asked[2].1.contains("min_id="), "{asked:?}");
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["post", POST_CODE, "--comments", "20", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let listed = json(&out);
+    assert_eq!(listed["comments"].as_array().map(Vec::len), Some(3));
+    assert_eq!(listed["more_comments"], false);
+    assert_eq!(
+        asked_about_the_post(&instagram).await.len(),
+        3 + 4,
+        "no fourth page"
+    );
+
+    for refused in [&["--comments", "21"][..], &["--comments", "2", "-d", "1"]] {
+        let mut args = vec!["post", POST_CODE];
+        args.extend_from_slice(refused);
+        let out = snob(tmp.path(), Some(&instagram), &args);
+        assert_eq!(out.status.code(), Some(2), "{refused:?}: {}", stderr(&out));
+    }
+}
+
+/// Pages of comments are pages of the account's sitting: the one that
+/// fills it owes the rest, which the next page pays first, saying so, and
+/// the pages after it begin a new sitting. The sitting is one earlier
+/// commands left thirty-nine pages in.
+#[tokio::test]
+async fn pages_of_comments_count_in_the_sitting_and_pay_its_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_comment_pages(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let store = || snob_store::store::Store::open_at(&database(tmp.path())).unwrap();
+    let sitting = || snob_store::store::rate_budget::sitting(store().conn()).unwrap();
+    store()
+        .conn()
+        .execute(
+            "INSERT INTO sitting (id, pages, last_page_at, rest_until) VALUES (1, 39, ?1, NULL)",
+            [snob_core::clock::now_ms().get()],
+        )
+        .expect("the sitting can be written");
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["post", POST_CODE, "--comments", "3", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(
+        stderr(&out).contains("between sittings before the next page of the comments"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        sitting().map(|s| (s.pages, s.rest_until)),
+        Some((2, None)),
+        "the first page filled the sitting, and the two after the rest began the next"
+    );
+}
+
 /// An address that names no post is refused before anything is asked.
 #[tokio::test]
 async fn a_link_that_names_no_post_costs_nothing() {

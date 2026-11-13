@@ -8,7 +8,9 @@
 //! the app asks for one it opens, its info from the page it opens on, which
 //! is never loaded, and its first page of comments with it, as the app
 //! always asks the two together when a post opens: two reads, printed,
-//! saved or browsed alike.
+//! saved or browsed alike. `--comments N` reads on to N pages of comments
+//! in the printed form, each a comment step after the page before
+//! ([`posts::comment_pages`]).
 //!
 //! What it prints and saves is `snob posts someone 3`'s, for the same
 //! post: the same lines, the same numbers, the same file names.
@@ -57,12 +59,17 @@ pub async fn run(args: PostArgs, store: SecretStore, paths: &AccountPaths) -> Re
         return crate::ui::posts::browse_post(app.client(), post, app.viewer(), paths).await;
     }
     // The app never opens a post without its comments, so neither does the
-    // printed form nor a download.
-    let comments = posts::first_comments(app.client(), &post).await?;
+    // printed form nor a download; the printed form reads on when asked to.
     let destination = args.action.output.as_deref();
     if let Some(selection) = args.action.selection() {
+        posts::first_comments(app.client(), &post).await?;
         return download_items(&app, &post, selection, destination, &videos).await;
     }
+    let Some(comments) =
+        posts::comment_pages(app.client(), &post, args.comments.unwrap_or(1)).await?
+    else {
+        return Ok(ExitCode::Interrupted);
+    };
     list_post(&post, Some(&comments), args.list.format, destination)
 }
 
@@ -124,7 +131,7 @@ fn comments_text(comments: &Comments) -> String {
         }
     }
     if comments.next.is_some() {
-        text.push_str("  … more in the view (-i)\n");
+        text.push_str("  … more with --comments <pages>, or in the view (-i)\n");
     }
     text.pop();
     text
@@ -199,6 +206,9 @@ mod tests {
         assert_eq!(lines[0], "Comments (1,200):");
         assert!(lines[1].starts_with("  @a: nice"), "{text}");
         assert!(lines[2].starts_with("      ↳ @b: yes"), "{text}");
-        assert_eq!(lines[3], "  … more in the view (-i)");
+        assert_eq!(
+            lines[3],
+            "  … more with --comments <pages>, or in the view (-i)"
+        );
     }
 }

@@ -541,9 +541,21 @@ impl CommentsPage {
     pub fn next(&self) -> Option<&str> {
         let more =
             self.has_more_headload_comments != Some(false) || self.has_more_comments == Some(true);
-        self.next_min_id
+        let next = self
+            .next_min_id
             .as_deref()
-            .filter(|next| more && !next.is_empty())
+            .filter(|next| more && !next.is_empty())?;
+        if !comments_cursor_has_its_shape(next) {
+            // Ended rather than sent: a cursor is handed back as `min_id`
+            // whole, so one of another shape would be text nobody vouched
+            // for in a request. Said, since it ends the comments early.
+            tracing::warn!(
+                bytes = next.len(),
+                "a page of comments handed out a cursor of a shape never seen; reading no further"
+            );
+            return None;
+        }
+        Some(next)
     }
 
     /// How many accounts the page names: each comment's author and the
@@ -555,6 +567,44 @@ impl CommentsPage {
             .map(|c| 1 + c.preview_child_comments.len())
             .sum()
     }
+}
+
+/// The longest comments cursor taken: the longest of the capture of
+/// 2026-11-13 was 346 bytes (a 280-character token), and four times that
+/// leaves room for a longer token without taking text of any length.
+const MOST_CURSOR_BYTES: usize = 1_400;
+
+/// Whether `cursor` has the shape of every `next_min_id` Instagram handed
+/// out in the capture of 2026-11-13 (9 of 9 pages): a JSON object holding
+/// `cached_comments_cursor`, a comment's pk in digits, and maybe
+/// `bifilter_token`, base64 of either alphabet, and nothing else. What
+/// [`CommentsPage::next`] hands on, and what
+/// `IgClient::media_comments` sends.
+pub fn comments_cursor_has_its_shape(cursor: &str) -> bool {
+    if cursor.len() > MOST_CURSOR_BYTES {
+        return false;
+    }
+    let Ok(serde_json::Value::Object(keys)) = serde_json::from_str(cursor) else {
+        return false;
+    };
+    let digits = |v: &serde_json::Value| {
+        v.as_str()
+            .is_some_and(|s| (1..=32).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let base64 = |v: &serde_json::Value| {
+        v.as_str().is_some_and(|s| {
+            !s.is_empty()
+                && s.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'-' | b'_' | b'=')
+                })
+        })
+    };
+    keys.get("cached_comments_cursor").is_some_and(digits)
+        && keys.iter().all(|(key, value)| match key.as_str() {
+            "cached_comments_cursor" => true,
+            "bifilter_token" => base64(value),
+            _ => false,
+        })
 }
 
 /// `media/<pk>/likers/`: the accounts that liked a post, as many as the app
@@ -641,6 +691,49 @@ pub struct Comment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_comments_cursor_is_taken_only_in_the_shape_instagram_hands_out() {
+        let token = "QVFBd0RfZm9v-_=";
+        for good in [
+            format!(
+                r#"{{"cached_comments_cursor":"18012345678901234","bifilter_token":"{token}"}}"#
+            ),
+            r#"{"cached_comments_cursor":"18012345678901234"}"#.to_string(),
+        ] {
+            assert!(comments_cursor_has_its_shape(&good), "{good}");
+        }
+        for bad in [
+            String::new(),
+            "18012345678901234".to_string(),
+            r#"{"c":"1"}"#.to_string(),
+            r#"{"bifilter_token":"QVFB"}"#.to_string(),
+            r#"{"cached_comments_cursor":18012345678901234}"#.to_string(),
+            r#"{"cached_comments_cursor":"12a"}"#.to_string(),
+            r#"{"cached_comments_cursor":"1","bifilter_token":"a&b=c"}"#.to_string(),
+            r#"{"cached_comments_cursor":"1","bifilter_token":""}"#.to_string(),
+            r#"{"cached_comments_cursor":"1","sort_order":"newest"}"#.to_string(),
+            format!(
+                r#"{{"cached_comments_cursor":"1","bifilter_token":"{}"}}"#,
+                "A".repeat(2_000)
+            ),
+        ] {
+            assert!(!comments_cursor_has_its_shape(&bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_page_whose_cursor_has_another_shape_is_the_last() {
+        let page = |next: &str| -> CommentsPage {
+            serde_json::from_value(serde_json::json!({
+                "comments": [], "has_more_headload_comments": true, "next_min_id": next,
+            }))
+            .unwrap()
+        };
+        let good = r#"{"cached_comments_cursor":"1","bifilter_token":"QVFB"}"#;
+        assert_eq!(page(good).next(), Some(good));
+        assert_eq!(page(r#"{"c":"1"}"#).next(), None);
+    }
 
     /// The likers are read with their standing, a pk as text or as a
     /// number; one with no name or no pk is skipped, not the whole answer.

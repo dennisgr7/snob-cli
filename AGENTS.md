@@ -218,6 +218,9 @@ with a documented reason in the same place.
   exactly spends it, and every other one, the app's under any `doc_id`,
   fails (`allowlist::refused_app`).
   `doc_id`s are discovered from the page's JavaScript, never hard-coded.
+  A comments cursor goes back as `min_id` only in the shape Instagram
+  hands one out (`comments_cursor_has_its_shape`); a page with another
+  is the last.
 - **Headers.** Every value is the page's, or computed from the User-Agent of
   the browser actually installed; what cannot be computed is left out. An
   absent header is honest, an invented one is not, and no header is a
@@ -226,7 +229,12 @@ with a documented reason in the same place.
 - **Pace** (`snob_ig::pace`): web app's page size (12), 1 to 3 s between pages
   of an action (`STEP_MS`), 1.5 to 4 s dwell before a list (`DWELL_MS`), a
   5 to 15 min rest after 40 pages (`PAGES_PER_SITTING`, `SITTING_PAUSE_MS`),
-  `HARD_PAGE_CAP = 2000`. Under it, the persistent GCRA buckets of
+  `HARD_PAGE_CAP = 2000`. A post's comments read a page after another
+  (`post --comments`, at most `posts::MOST_COMMENT_PAGES`, 20) are 2 to 5 s
+  apart (`COMMENT_STEP_MS`), as "load more" is clicked; pages of a grid and
+  of comments count in the sitting as a list's do
+  (`IgClient::count_in_the_sitting`), and a command that reads on by itself
+  pays a rest owed before its next page. Under it, the persistent GCRA buckets of
   `snob-store/src/store/rate_budget.rs`: pace (3.83 s emission, burst 20),
   daily (about 2,000 requests), and writes (burst of 3, then one every 15 min).
   Lists read at most 2,000 accounts in any 24 h, 1,000 for a week after a

@@ -654,7 +654,7 @@ pub async fn fetch_grid(
     grid.take(first);
     let mut read = 1;
     while (read < pages || grid.posts.len() < at_least) && read < MOST_PAGES {
-        if !more(client, &mut grid).await? {
+        if rest_before_a_page(client, "the grid").await? || !more(client, &mut grid).await? {
             break;
         }
         read += 1;
@@ -750,6 +750,47 @@ pub async fn first_comments(client: &IgClient, post: &Post) -> Result<Comments> 
     let mut comments = Comments::default();
     comments.take(&client.media_comments(post.pk, None, &post.page()).await?);
     Ok(comments)
+}
+
+/// The most pages of a post's comments one run reads: twenty, some 300
+/// comments at the fifteen a page the app reads (capture of 2026-11-13),
+/// and half a sitting ([`PAGES_PER_SITTING`]), so that one post cannot be a
+/// list's worth of reading.
+pub const MOST_COMMENT_PAGES: u32 = 20;
+
+/// `post`'s comments, `pages` pages of them, or fewer when they end: the
+/// first, then each next one a comment step after the page before
+/// ([`Pace::for_comments`]), as "load more" is clicked, past any rest the
+/// account's sitting owes. At most [`MOST_COMMENT_PAGES`]. `None` when
+/// Ctrl+C stopped a wait.
+pub async fn comment_pages(client: &IgClient, post: &Post, pages: u32) -> Result<Option<Comments>> {
+    let mut comments = first_comments(client, post).await?;
+    let pace = Pace::for_comments();
+    for _ in 1..pages.min(MOST_COMMENT_PAGES) {
+        if comments.next.is_none() {
+            break;
+        }
+        if rest_before_a_page(client, "the comments").await? || client.step_between(&pace).await {
+            return Ok(None);
+        }
+        more_comments(client, post, &mut comments).await?;
+    }
+    Ok(Some(comments))
+}
+
+/// Pays a rest the account's sitting owes before a page of `of` that a
+/// command reads on its own, saying so on standard error, since nothing
+/// else would say why it went quiet for minutes. `true` when it was
+/// canceled.
+async fn rest_before_a_page(client: &IgClient, of: &str) -> Result<bool> {
+    Ok(client
+        .rest_before_a_page(&Pace::default(), |left| {
+            ui::info(&format!(
+                "Resting {} between sittings before the next page of {of}.",
+                crate::report::rest_left(left)
+            ));
+        })
+        .await?)
 }
 
 /// Saves item `index` (zero-based) of `post` into `dir` under its own name,

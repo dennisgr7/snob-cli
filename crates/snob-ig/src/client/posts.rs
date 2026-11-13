@@ -32,7 +32,9 @@
 
 use crate::allowlist::{Operation, Rest};
 use crate::error::IgError;
-use crate::model::post::{CommentsPage, LikersPage, Media, MediaInfo, TimelinePage};
+use crate::model::post::{
+    CommentsPage, LikersPage, Media, MediaInfo, TimelinePage, comments_cursor_has_its_shape,
+};
 use crate::shortcode::MediaPk;
 use crate::web::{Ask, Told};
 
@@ -86,7 +88,22 @@ impl IgClient {
         let page: TimelinePage =
             self.decode_query(&answered(&endpoint, answer), operation.root_field())?;
         let (posts, next) = page.posts();
+        self.count_in_the_sitting().await?;
         Ok(PostsPage { posts, next })
+    }
+
+    /// Counts a page of a grid or of a post's comments in the account's
+    /// sitting, as a page of a list is (`Pacer::page_walked`): pages read one
+    /// after another are a person's reading whatever they list, and a run of
+    /// them is a run of requests all the same. Not paid here: the rest a
+    /// full sitting owes is paid before the next page by whatever reads it
+    /// on its own (`IgClient::rest_before_a_page`), and stays owed, and so
+    /// paid by the next walk, when a person in a view turns the page.
+    async fn count_in_the_sitting(&self) -> Result<(), IgError> {
+        self.pacer
+            .page_walked(&crate::pace::Pace::default(), snob_core::clock::now_ms())
+            .await
+            .map(|_| ())
     }
 
     /// The post `pk`, asked from `page`, the page it opens on
@@ -113,6 +130,13 @@ impl IgClient {
         page: &str,
     ) -> Result<CommentsPage, IgError> {
         let read = Rest::Comments(pk);
+        // Only a cursor of the shape Instagram hands out goes back to it:
+        // anything else would be text nobody vouched for in a request.
+        if after.is_some_and(|after| !comments_cursor_has_its_shape(after)) {
+            return Err(IgError::NotAllowed(
+                "a page of comments after a cursor Instagram never handed out".into(),
+            ));
+        }
         // In the app's order: the first page as the post opens, the next
         // ones as the comments scroll (capture of 2026-10-01).
         let query: Vec<(&str, &str)> = match after {
@@ -135,6 +159,7 @@ impl IgClient {
         if let Err(e) = self.pacer.spend_accounts(accounts).await {
             tracing::warn!(error = %e, "could not record the accounts a page of comments carried");
         }
+        self.count_in_the_sitting().await?;
         Ok(comments)
     }
 }
@@ -240,7 +265,7 @@ mod tests {
             } else if request.url.contains("min_id=") {
                 r#"{"comments":[],"has_more_headload_comments":false,"status":"ok"}"#
             } else {
-                r#"{"comments":[{"pk":"1","text":"hi","user":{"username":"a"}}],"has_more_headload_comments":true,"next_min_id":"{\"c\":\"1\"}","status":"ok"}"#
+                r#"{"comments":[{"pk":"1","text":"hi","user":{"username":"a"}}],"has_more_headload_comments":true,"next_min_id":"{\"cached_comments_cursor\":\"1\"}","status":"ok"}"#
             };
             Ok(page_said(200, body))
         });
@@ -251,7 +276,7 @@ mod tests {
         assert_eq!(post.unwrap().code.as_deref(), Some("DbGwql4IMei"));
         let first = client.media_comments(pk, None, page).await.unwrap();
         let next = first.next().map(str::to_string);
-        assert_eq!(next.as_deref(), Some(r#"{"c":"1"}"#));
+        assert_eq!(next.as_deref(), Some(r#"{"cached_comments_cursor":"1"}"#));
         let last = client
             .media_comments(pk, next.as_deref(), page)
             .await
@@ -274,12 +299,32 @@ mod tests {
                 "/api/v1/media/3947056156557494178/comments/?can_support_threading=true&permalink_enabled=false".to_string(),
                 format!(
                     "/api/v1/media/3947056156557494178/comments/?can_support_threading=true&min_id={}&sort_order=popular",
-                    "%7B%22c%22%3A%221%22%7D"
+                    "%7B%22cached_comments_cursor%22%3A%221%22%7D"
                 ),
             ]
         );
         assert!(sent.iter().all(|r| r.referrer.ends_with(page)));
         assert_eq!(budget.reserved(), (3, 0));
+    }
+
+    /// A cursor of a shape Instagram never handed out is refused before it
+    /// leaves: nothing is sent and nothing paid.
+    #[tokio::test]
+    async fn a_comments_cursor_of_another_shape_is_never_sent() {
+        let tab = Scripted::building(|_| Ok(page_said(200, r#"{"comments":[],"status":"ok"}"#)));
+        let (client, budget) = spending_client(Arc::clone(&tab) as Arc<dyn Page>);
+        let pk = MediaPk::new(3_947_056_156_557_494_178);
+        for after in [r#"{"c":"1"}"#, "1&sort_order=newest", ""] {
+            let refused = client
+                .media_comments(pk, Some(after), "/p/DbGwql4IMei/")
+                .await;
+            assert!(
+                matches!(refused, Err(IgError::NotAllowed(_))),
+                "{after}: {refused:?}"
+            );
+        }
+        assert!(tab.asked().is_empty());
+        assert_eq!(budget.reserved(), (0, 0));
     }
 
     /// The likers are one GET with no query, from the post's own page, paid

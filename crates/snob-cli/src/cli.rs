@@ -2232,6 +2232,22 @@ pub struct PostArgs {
     #[arg(value_name = "LINK")]
     pub link: String,
 
+    /// How many pages of comments the listing reads, up to 20, about
+    /// fifteen comments each, the first page included. The view reads the
+    /// next page as you reach it instead
+    // A count of pages, as `posts --pages`: a page is what is asked for, one
+    // request each. Twenty is `posts::MOST_COMMENT_PAGES`, and each page after
+    // the first waits as the app's "load more" is clicked
+    // (`pace::COMMENT_STEP_MS`). A download reads the first page alone, as the
+    // app opens a post with it.
+    #[arg(
+        long,
+        value_name = "PAGES",
+        value_parser = clap::value_parser!(u32).range(1..=20),
+        conflicts_with_all = ["interactive", "download"]
+    )]
+    pub comments: Option<u32>,
+
     #[command(flatten)]
     pub action: MediaActionArgs,
 
