@@ -133,6 +133,9 @@ pub enum Action {
     /// browser the system opens addresses with. `w` and not `o`: in the posts
     /// browser `o` already opens the item in the viewer.
     Web,
+    /// The picture under the cursor, drawn in the terminal (`ui::preview`),
+    /// in a build that draws them; nothing in one that does not.
+    Preview,
     /// The keys of the view on screen, in a box over it (`ui::help`).
     Help,
     Redraw,
@@ -268,6 +271,7 @@ pub fn action_of(key: KeyEvent) -> Action {
         KeyCode::Char('d') | KeyCode::Char('D') if plain => Action::Download,
         KeyCode::Char('a') if plain => Action::Accounts,
         KeyCode::Char('w') if plain => Action::Web,
+        KeyCode::Char('p') if plain => Action::Preview,
         KeyCode::Char('?') if plain => Action::Help,
         KeyCode::Esc | KeyCode::Char('q') if plain => Action::Quit,
         _ => Action::None,

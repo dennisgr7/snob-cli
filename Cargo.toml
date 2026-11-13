@@ -120,6 +120,16 @@ indicatif = "0.18"
 supports-hyperlinks = "3"
 csv = "1"
 rust_xlsxwriter = "0.102"
+# Only behind `snob-cli`'s `preview` feature (`ui/preview.rs`): decodes the
+# JPEG a view draws in the terminal on `p`. One decoder, where the `image`
+# crate is a dozen, and its terminal front ends bring sixel, kitty's protocol
+# and a question put to the terminal, whose answer arrives among the keys.
+#
+# No default features: `x86` and `neon` are its SIMD and the whole of its
+# `unsafe` (0.5.15 forbids `unsafe_code` with neither on), and what it reads
+# are bytes somebody else uploaded, one picture a key press. `std` is its
+# error type's `Error`. With `zune-core`, two crates nothing else here uses.
+zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 # The Model Context Protocol SDK behind `snob mcp`. Pinned to the exact
 # version: it moves fast (eight releases in the two months before this one),
 # the protocol revision it speaks is part of what `snob mcp` promises a

@@ -640,7 +640,7 @@ fn moving(shelf: &Shelf<'_>, state: &mut State, flat: bool, page_rows: usize, ev
             }
         }
         Action::Help => return Step::Help,
-        Action::Download | Action::None => {}
+        Action::Download | Action::Preview | Action::None => {}
     }
     Step::Go
 }

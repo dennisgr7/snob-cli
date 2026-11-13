@@ -31,6 +31,7 @@ use crate::ui::browser::busy::Busy;
 use crate::ui::browser::input::{self, Action, next, page};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::help;
+use crate::ui::preview;
 use crate::ui::theme::Role;
 use crate::ui::tui;
 
@@ -205,17 +206,68 @@ pub async fn browse(
                 Action::Web => {
                     note = tui::web_note(&tui::page_of(&stories.username), &mut receipts);
                 }
-                Action::Help => help::show(&mut tui, "Stories", KEYS, |frame| {
-                    draw(
-                        frame,
-                        stories,
-                        viewer,
-                        &mut list,
-                        &note,
-                        colors,
-                        &mut page_rows,
-                    );
-                })?,
+                Action::Help => {
+                    help::show(&mut tui, "Stories", &preview::with_key(KEYS), |frame| {
+                        draw(
+                            frame,
+                            stories,
+                            viewer,
+                            &mut list,
+                            &note,
+                            colors,
+                            &mut page_rows,
+                        );
+                    })?;
+                }
+                Action::Preview => {
+                    if let Some(why) = preview::refused(Some(stories.items[selected].kind)) {
+                        note = why;
+                        continue;
+                    }
+                    let busy = Busy::begin(
+                        &mut tui,
+                        format!("Fetching story {}...", selected + 1),
+                        |frame| {
+                            draw(
+                                frame,
+                                stories,
+                                viewer,
+                                &mut list,
+                                &note,
+                                colors,
+                                &mut page_rows,
+                            );
+                        },
+                    )?;
+                    let (file, stopped) = busy
+                        .run(
+                            &mut tui,
+                            client.pacer().cancel_token(),
+                            fetched(
+                                client,
+                                &stories.username,
+                                &stories.items,
+                                selected,
+                                &scratch,
+                                &mut opened,
+                            ),
+                        )
+                        .await;
+                    if let Some(code) = stopped.leave() {
+                        break Ok(code);
+                    }
+                    note = preview::show_file(&mut tui, file, |frame| {
+                        draw(
+                            frame,
+                            stories,
+                            viewer,
+                            &mut list,
+                            &note,
+                            colors,
+                            &mut page_rows,
+                        );
+                    })?;
+                }
                 Action::None => {}
             }
         }
@@ -467,11 +519,27 @@ pub(crate) async fn open(
     scratch: &Scratch,
     cache: &mut [Option<PathBuf>],
 ) -> Result<PathBuf> {
+    let path = fetched(client, stem_base, items, index, scratch, cache).await?;
+    opener::open(&path).context("the system viewer would not start")?;
+    Ok(path)
+}
+
+/// The story as a file in the scratch directory: the one already there when
+/// this session fetched it before, or fetched now and kept for the next
+/// time. What Enter opens and what `p` draws are this same file, so looking
+/// at a story both ways is one download.
+pub(crate) async fn fetched(
+    client: &IgClient,
+    stem_base: &str,
+    items: &[Story],
+    index: usize,
+    scratch: &Scratch,
+    cache: &mut [Option<PathBuf>],
+) -> Result<PathBuf> {
     if let Some(existing) = cache[index].clone() {
         // Still there: a viewer may have been closed, but nothing deletes
         // these until the session ends.
         if existing.is_file() {
-            opener::open(&existing).context("the system viewer would not start")?;
             return Ok(existing);
         }
     }
@@ -488,7 +556,6 @@ pub(crate) async fn open(
     output::create_new(&path)?
         .write_all(&bytes)
         .with_context(|| format!("could not write {}", path.display()))?;
-    opener::open(&path).context("the system viewer would not start")?;
     cache[index] = Some(path.clone());
     Ok(path)
 }

@@ -1024,10 +1024,15 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   browser `o` opens the item in the viewer; in the account list's filter
   every key is a letter of the query but Ctrl+U, Ctrl+W, the arrows and
   Enter, which opens the match under the selection.
-- **Stories are handed to the system viewer.** Media is never rendered in the
-  terminal: a view writes the file into the session's scratch directory
-  (`ui/browser/scratch.rs`, swept when abandoned) and opens it with `opener`
-  in whatever the user already uses for pictures and videos.
+- **Stories are handed to the system viewer.** A view writes the file into
+  the session's scratch directory (`ui/browser/scratch.rs`, swept when
+  abandoned) and opens it with `opener` in whatever the user already uses
+  for pictures and videos. **The one thing drawn in the terminal is a still
+  picture, on `p`** (`ui/preview.rs`, feature `preview`, not a default): a
+  JPEG, in half blocks, in a box over the view, fetched as Enter fetches it
+  and into the same file. Never as the selection moves, never a video, and
+  nothing a terminal has to be asked about first (no sixel, no kitty
+  protocol). A build without the feature binds `p` to nothing.
 - `stories` and `highlights` are separate commands because a highlight has a
   tray level and an items level (`snob highlights someone 2`); `posts` has the
   same two levels. Shared flags live in `cli::MediaActionArgs`.

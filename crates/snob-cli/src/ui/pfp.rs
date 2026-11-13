@@ -31,6 +31,7 @@ use crate::ui::accounts::{self, Browsed, Picked};
 use crate::ui::browser::input::{self, Action, next};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::help;
+use crate::ui::preview;
 use crate::ui::tui;
 
 /// Drives the row until the user leaves it, or picks another account to see
@@ -91,9 +92,24 @@ pub(crate) async fn browse(
                 Action::Web => {
                     note = tui::web_note(&tui::page_of(&picture.username), &mut receipts);
                 }
-                Action::Help => help::show(&mut tui, "Profile picture", KEYS, |frame| {
-                    draw(frame, picture, viewer, &note, colors);
-                })?,
+                Action::Help => {
+                    let keys = preview::with_key(KEYS);
+                    help::show(&mut tui, "Profile picture", &keys, |frame| {
+                        draw(frame, picture, viewer, &note, colors);
+                    })?;
+                }
+                // The picture is already in memory: nothing to wait on.
+                Action::Preview => {
+                    note = match preview::refused(None) {
+                        Some(why) => why,
+                        None => {
+                            let name = format!("@{}", printable(&picture.username));
+                            preview::show(&mut tui, &name, &picture.bytes, |frame| {
+                                draw(frame, picture, viewer, &note, colors);
+                            })?
+                        }
+                    };
+                }
                 // One row: there is nowhere for the selection to move, and
                 // Back is not a way out — leaving a view and leaving the
                 // program are different intentions, the way `input::Action`'s

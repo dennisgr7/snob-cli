@@ -44,6 +44,7 @@ use crate::ui::browser::busy::Busy;
 use crate::ui::browser::input::{self, Action, Raw, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::help;
+use crate::ui::preview;
 use crate::ui::tui::{self, Tui};
 
 /// Where the browser is, and what the arrow keys therefore move.
@@ -356,10 +357,13 @@ pub async fn browse(
                 }
                 Action::Help => {
                     let (title, keys) = match level {
-                        Level::Tray => ("Highlights", TRAY_KEYS),
-                        Level::Inside(_) => ("A highlight", crate::ui::stories::FOLDER_KEYS),
+                        Level::Tray => ("Highlights", TRAY_KEYS.to_vec()),
+                        Level::Inside(_) => (
+                            "A highlight",
+                            preview::with_key(crate::ui::stories::FOLDER_KEYS),
+                        ),
                     };
-                    help::show(&mut tui, title, keys, |frame| match level {
+                    help::show(&mut tui, title, &keys, |frame| match level {
                         Level::Tray => draw_tray(
                             frame,
                             tray,
@@ -382,6 +386,70 @@ pub async fn browse(
                             &mut page_rows,
                         ),
                     })?;
+                }
+                // An item of a highlight: the tray's rows are folders, and a
+                // folder has no picture to draw.
+                Action::Preview => {
+                    if let Level::Inside(index) = level {
+                        let kind = folders[index]
+                            .items
+                            .as_deref()
+                            .and_then(|items| items.get(selected))
+                            .map(|item| item.kind);
+                        if let Some(why) = preview::refused(kind) {
+                            note = why;
+                        } else if kind.is_some() {
+                            let busy = Busy::begin(
+                                &mut tui,
+                                format!("Fetching item {}...", selected + 1),
+                                |frame| {
+                                    draw_items(
+                                        frame,
+                                        tray,
+                                        index,
+                                        &folders[index],
+                                        viewer,
+                                        &mut list,
+                                        &note,
+                                        colors,
+                                        &mut page_rows,
+                                    );
+                                },
+                            )?;
+                            let folder = &mut folders[index];
+                            let items = folder.items.as_deref().unwrap_or_default();
+                            let (file, stopped) = busy
+                                .run(
+                                    &mut tui,
+                                    client.pacer().cancel_token(),
+                                    crate::ui::stories::fetched(
+                                        client,
+                                        &stem_of(tray, index),
+                                        items,
+                                        selected,
+                                        &scratch,
+                                        &mut folder.opened,
+                                    ),
+                                )
+                                .await;
+                            if let Some(code) = stopped.leave() {
+                                break Ok(code);
+                            }
+                            note = preview::show_file(&mut tui, file, |frame| {
+                                draw_items(
+                                    frame,
+                                    tray,
+                                    index,
+                                    &folders[index],
+                                    viewer,
+                                    &mut list,
+                                    &note,
+                                    colors,
+                                    &mut page_rows,
+                                );
+                            })?;
+                        }
+                    }
                 }
                 Action::None => {}
             }

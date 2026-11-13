@@ -46,7 +46,17 @@ mcp-http = [
     "dep:http-body-util",
     "dep:bytes",
 ]
-testing = ["snob-ig/testing"]
+# `p` in the media views: the picture under the cursor drawn in the terminal,
+# in half blocks (`ui::preview`, and the exception it is to "Stories are
+# handed to the system viewer" in AGENTS.md). **Not a default**, so the
+# released binary has none of it and `p` is bound to nothing there: it is
+# the one feature that draws another person's bytes, behind a decoder
+# nothing else needs. `cargo build --features preview` turns it on.
+preview = ["dep:zune-jpeg"]
+# `preview` rides along so that the decoder's own tests run where CI runs
+# the rest: no CI line names a feature that is not a default, and
+# `--features testing` is the one that already builds a second binary.
+testing = ["snob-ig/testing", "preview"]
 
 [dependencies]
 snob-core.workspace = true
@@ -85,6 +95,7 @@ comfy-table = { workspace = true, features = ["custom_styling"] }
 csv.workspace = true
 rust_xlsxwriter = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
+zune-jpeg = { workspace = true, optional = true }
 # `server` is the protocol's server half; `transport-io` serves it over this
 # process's standard input and output, the transport every client can start;
 # `elicitation` is the question a write is confirmed with. Not

@@ -144,7 +144,7 @@ impl Picker {
             // The picker is itself a box over a view, with its own keys on
             // its bottom edge: it takes neither a second box nor the page
             // of an account, which is the view's to open.
-            Action::Download | Action::Web | Action::Help | Action::None => {}
+            Action::Download | Action::Web | Action::Preview | Action::Help | Action::None => {}
         }
         Step::Stay
     }

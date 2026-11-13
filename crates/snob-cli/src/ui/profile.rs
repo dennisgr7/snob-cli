@@ -71,6 +71,7 @@ use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::help;
 use crate::ui::highlights::{Folder, empty_note, folder_title, keep_folder, stem_of, walk_in};
 use crate::ui::people::Shelf;
+use crate::ui::preview;
 use crate::ui::theme::Role;
 use crate::ui::tui::{self, Tui};
 
@@ -407,12 +408,18 @@ pub async fn browse(
                 }
                 Action::Help => {
                     let (title, keys) = match state.level {
-                        Level::Card => ("Profile", CARD_KEYS),
-                        Level::Actions { .. } => ("Actions", ACTIONS_KEYS),
-                        Level::Stories => ("Stories", crate::ui::stories::FOLDER_KEYS),
-                        Level::Inside { .. } => ("A highlight", crate::ui::stories::FOLDER_KEYS),
+                        Level::Card => ("Profile", CARD_KEYS.to_vec()),
+                        Level::Actions { .. } => ("Actions", preview::with_key(ACTIONS_KEYS)),
+                        Level::Stories => (
+                            "Stories",
+                            preview::with_key(crate::ui::stories::FOLDER_KEYS),
+                        ),
+                        Level::Inside { .. } => (
+                            "A highlight",
+                            preview::with_key(crate::ui::stories::FOLDER_KEYS),
+                        ),
                     };
-                    help::show(&mut tui, title, keys, level_frame!())?;
+                    help::show(&mut tui, title, &keys, level_frame!())?;
                     continue;
                 }
                 _ => {}
@@ -572,6 +579,7 @@ pub async fn browse(
                         | Action::Accounts
                         | Action::Web
                         | Action::Help
+                        | Action::Preview
                         | Action::None => {}
                     }
                 }
@@ -623,6 +631,39 @@ pub async fn browse(
                                 if let Some(code) = stopped.leave() {
                                     break Ok(code);
                                 }
+                            }
+                        }
+                        Action::Preview => {
+                            if selected == 0 {
+                                if let Some(why) = preview::refused(None) {
+                                    note = why;
+                                    continue;
+                                }
+                                let busy = Busy::begin(
+                                    &mut tui,
+                                    "Fetching the picture...",
+                                    level_frame!(),
+                                )?;
+                                let (fetched, stopped) = busy
+                                    .run(
+                                        &mut tui,
+                                        app.client().pacer().cancel_token(),
+                                        ensure_pfp(app, profile, &mut media),
+                                    )
+                                    .await;
+                                if let Some(code) = stopped.leave() {
+                                    break Ok(code);
+                                }
+                                note = match (fetched, media.pfp.as_ref()) {
+                                    (Err(e), _) => could_not_fetch_the_picture(&e),
+                                    (Ok(()), Some(picture)) => preview::show(
+                                        &mut tui,
+                                        &picture_name(profile),
+                                        &picture.bytes,
+                                        level_frame!(),
+                                    )?,
+                                    (Ok(()), None) => String::new(),
+                                };
                             }
                         }
                         Action::Back => state.level = Level::Card,
@@ -702,6 +743,27 @@ pub async fn browse(
                         Action::Redraw => tui.terminal.clear()?,
                         Action::Quit => break Ok(ExitCode::Ok),
                         Action::Interrupt => break Ok(ExitCode::Interrupted),
+                        Action::Preview => {
+                            let at = state.stories_selected;
+                            let kind = media.stories.get(at).map(|story| story.kind);
+                            if let Some(why) = preview::refused(kind) {
+                                note = why;
+                                continue;
+                            }
+                            let busy = Busy::begin(
+                                &mut tui,
+                                format!("Fetching story {}...", at + 1),
+                                level_frame!(),
+                            )?;
+                            let (file, stopped) = story_fetched(
+                                busy, &mut tui, app, profile, &mut media, at, &scratch,
+                            )
+                            .await;
+                            if let Some(code) = stopped.leave() {
+                                break Ok(code);
+                            }
+                            note = preview::show_file(&mut tui, file, level_frame!())?;
+                        }
                         Action::Accounts | Action::Web | Action::Help | Action::None => {}
                     }
                 }
@@ -787,6 +849,39 @@ pub async fn browse(
                         Action::Redraw => tui.terminal.clear()?,
                         Action::Quit => break Ok(ExitCode::Ok),
                         Action::Interrupt => break Ok(ExitCode::Interrupted),
+                        Action::Preview => {
+                            let at = folder.selected;
+                            let kind = items.get(at).map(|item| item.kind);
+                            if let Some(why) = preview::refused(kind) {
+                                note = why;
+                                continue;
+                            }
+                            let busy = Busy::begin(
+                                &mut tui,
+                                format!("Fetching item {}...", at + 1),
+                                level_frame!(),
+                            )?;
+                            let folder = &mut media.folders[index];
+                            let items = folder.items.as_deref().unwrap_or_default();
+                            let (file, stopped) = busy
+                                .run(
+                                    &mut tui,
+                                    app.client().pacer().cancel_token(),
+                                    crate::ui::stories::fetched(
+                                        app.client(),
+                                        &stem,
+                                        items,
+                                        at,
+                                        &scratch,
+                                        &mut folder.opened,
+                                    ),
+                                )
+                                .await;
+                            if let Some(code) = stopped.leave() {
+                                break Ok(code);
+                            }
+                            note = preview::show_file(&mut tui, file, level_frame!())?;
+                        }
                         Action::Accounts | Action::Web | Action::Help | Action::None => {}
                     }
                 }
@@ -1131,7 +1226,7 @@ fn stay_or_leave(app: &App, tui: &mut Tui, error: anyhow::Error) -> Result<After
 /// Enter on the picture row: fetched once, then the story browser's open.
 async fn pfp_open(app: &App, profile: &Profile, media: &mut Media, scratch: &Scratch) -> String {
     if let Err(e) = ensure_pfp(app, profile, media).await {
-        return format!("Could not fetch the picture: {e}");
+        return could_not_fetch_the_picture(&e);
     }
     let Some(picture) = media.pfp.as_ref() else {
         return String::new();
@@ -1151,7 +1246,7 @@ async fn pfp_keep(
     receipts: &mut Vec<String>,
 ) -> String {
     if let Err(e) = ensure_pfp(app, profile, media).await {
-        return format!("Could not fetch the picture: {e}");
+        return could_not_fetch_the_picture(&e);
     }
     let Some(picture) = media.pfp.as_ref() else {
         return String::new();
@@ -1234,6 +1329,43 @@ async fn story_keep(
         )
         .await;
     (tui::saved_note(result, receipts), stopped)
+}
+
+/// `p` on a story: the file Enter would open, fetched under the box `busy`
+/// drew, for `preview::show_file` to draw once the wait is over and the view
+/// can be drawn under it again.
+async fn story_fetched(
+    busy: Busy,
+    tui: &mut Tui,
+    app: &App,
+    profile: &Profile,
+    media: &mut Media,
+    index: usize,
+    scratch: &Scratch,
+) -> (Result<PathBuf>, Stopped) {
+    busy.run(
+        tui,
+        app.client().pacer().cancel_token(),
+        crate::ui::stories::fetched(
+            app.client(),
+            &profile.username,
+            &media.stories,
+            index,
+            scratch,
+            &mut media.stories_opened,
+        ),
+    )
+    .await
+}
+
+/// The note a picture that could not be fetched leaves.
+fn could_not_fetch_the_picture(error: &anyhow::Error) -> String {
+    format!("Could not fetch the picture: {error}")
+}
+
+/// What the box of a drawn profile picture is called.
+fn picture_name(profile: &Profile) -> String {
+    format!("@{}", printable(&profile.username))
 }
 
 /// The title over the stories of the account, from either card.
@@ -1369,6 +1501,8 @@ pub(crate) enum Peeked {
     Open,
     /// `d`: save what the row under the cursor is.
     Save,
+    /// `p`: draw the picture here, in a build that draws them.
+    Preview,
     Redraw,
     Ignored,
 }
@@ -1388,6 +1522,7 @@ pub(crate) fn peek_key(key: KeyEvent) -> Peeked {
         KeyCode::Char('w' | 'o' | 'O') if plain => Peeked::Browser,
         KeyCode::Char('?') if plain => Peeked::Help,
         KeyCode::Char('i') if plain => Peeked::About,
+        KeyCode::Char('p') if plain => Peeked::Preview,
         KeyCode::Up | KeyCode::Char('k') if plain => Peeked::Up,
         KeyCode::Down | KeyCode::Char('j') if plain => Peeked::Down,
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if plain => Peeked::Open,
@@ -1569,7 +1704,28 @@ pub(crate) async fn peek(
                     note = tui::web_note(&tui::page_of(&profile.username), receipts);
                 }
                 Action::Help => {
-                    help::show(tui, "Stories", PEEK_STORIES_KEYS, peek_frame!())?;
+                    help::show(
+                        tui,
+                        "Stories",
+                        &preview::with_key(PEEK_STORIES_KEYS),
+                        peek_frame!(),
+                    )?;
+                }
+                Action::Preview => {
+                    let at = state.stories_selected;
+                    let kind = media.stories.get(at).map(|story| story.kind);
+                    if let Some(why) = preview::refused(kind) {
+                        note = why;
+                        continue;
+                    }
+                    let busy =
+                        Busy::begin(tui, format!("Fetching story {}...", at + 1), peek_frame!())?;
+                    let (file, stopped) =
+                        story_fetched(busy, tui, app, profile, &mut media, at, scratch).await;
+                    if let Some(code) = stopped.leave() {
+                        return Ok(Some(code));
+                    }
+                    note = preview::show_file(tui, file, peek_frame!())?;
                 }
                 // The moves were taken above; an account changes from the
                 // list this card was opened from.
@@ -1596,7 +1752,9 @@ pub(crate) async fn peek(
             Peeked::Browser => {
                 note = tui::web_note(&tui::page_of(&profile.username), receipts);
             }
-            Peeked::Help => help::show(tui, "Profile", PEEK_KEYS, peek_frame!())?,
+            Peeked::Help => {
+                help::show(tui, "Profile", &preview::with_key(PEEK_KEYS), peek_frame!())?
+            }
             Peeked::About => {
                 if says_something(profile) {
                     show_about(tui, profile, peek_frame!())?;
@@ -1649,6 +1807,35 @@ pub(crate) async fn peek(
                     if let Some(code) = stopped.leave() {
                         return Ok(Some(code));
                     }
+                }
+            }
+            Peeked::Preview => {
+                if let Some((_, CardRow::Picture)) = here {
+                    if let Some(why) = preview::refused(None) {
+                        note = why;
+                        continue;
+                    }
+                    let busy = Busy::begin(tui, "Fetching the picture...", peek_frame!())?;
+                    let (fetched, stopped) = busy
+                        .run(
+                            tui,
+                            app.client().pacer().cancel_token(),
+                            ensure_pfp(app, profile, &mut media),
+                        )
+                        .await;
+                    if let Some(code) = stopped.leave() {
+                        return Ok(Some(code));
+                    }
+                    note = match (fetched, media.pfp.as_ref()) {
+                        (Err(e), _) => could_not_fetch_the_picture(&e),
+                        (Ok(()), Some(picture)) => preview::show(
+                            tui,
+                            &picture_name(profile),
+                            &picture.bytes,
+                            peek_frame!(),
+                        )?,
+                        (Ok(()), None) => String::new(),
+                    };
                 }
             }
             Peeked::Ignored => {}
@@ -3079,6 +3266,7 @@ mod tests {
             assert_eq!(peek_key(key(open)), Peeked::Open, "{open:?}");
         }
         assert_eq!(peek_key(key(KeyCode::Char('d'))), Peeked::Save);
+        assert_eq!(peek_key(preview::KEY.press), Peeked::Preview);
         assert_eq!(peek_key(key(KeyCode::Char('a'))), Peeked::Ignored);
         assert_eq!(
             peek_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
