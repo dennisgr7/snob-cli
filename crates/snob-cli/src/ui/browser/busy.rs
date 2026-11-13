@@ -22,6 +22,7 @@
 //! this wraps: `q` and Ctrl+C cancel the token the fetch races.
 
 use std::future::Future;
+use std::pin::Pin;
 
 use console::measure_text_width;
 use ratatui::Frame;
@@ -72,32 +73,47 @@ impl Busy {
     /// A frame that fails to draw is ignored on purpose: the fetch is the
     /// job and the box is the report, and the view's next ordinary frame
     /// repaints whatever this left behind.
-    pub async fn run<T>(
+    ///
+    /// **The wait lives on the heap, and that is not a nicety.** Every
+    /// command's future is held inside the one `main` awaits, a view's with
+    /// the rest, and a debug build copies that future from frame to frame on
+    /// its way into the runtime. With this an `async fn`, each wait a view
+    /// makes stood in the view's future by value, the work with the loop
+    /// around it and the watcher around that, and took the whole from 13,736
+    /// bytes to 22,728 (`size_of_val` of what `main` awaits, a debug build
+    /// with `testing`, November 2026). On Windows, where the main thread has
+    /// 1 MiB, that was enough for a command that draws nothing to overflow
+    /// its stack: the sandbox test `a_job_polled_to_its_end_gives_the_walks_answer`
+    /// failed on it every time. Boxed, a wait is a pointer in the view's
+    /// future whatever the work is, and the whole is 13,736 bytes again.
+    pub fn run<'a, T: 'a>(
         self,
-        tui: &mut Tui,
-        cancel: &CancelToken,
-        work: impl Future<Output = T>,
-    ) -> (T, Stopped) {
-        let waited = async {
-            tokio::pin!(work);
-            let mut turn = 0usize;
-            // The first wait is a focused tick whoever is looking: a window
-            // without the focus is often still on screen, and two seconds of
-            // nothing is what this box exists to prevent.
-            let mut wait = input::TICK;
-            loop {
-                tokio::select! {
-                    biased;
-                    out = &mut work => break out,
-                    () = tokio::time::sleep(wait) => {
-                        let _ = tui.terminal.draw(|frame| self.draw(frame, turn));
-                        turn = turn.wrapping_add(1);
-                        wait = input::tick();
+        tui: &'a mut Tui,
+        cancel: &'a CancelToken,
+        work: impl Future<Output = T> + 'a,
+    ) -> Pin<Box<dyn Future<Output = (T, Stopped)> + 'a>> {
+        Box::pin(async move {
+            let waited = async {
+                tokio::pin!(work);
+                let mut turn = 0usize;
+                // The first wait is a focused tick whoever is looking: a
+                // window without the focus is often still on screen, and two
+                // seconds of nothing is what this box exists to prevent.
+                let mut wait = input::TICK;
+                loop {
+                    tokio::select! {
+                        biased;
+                        out = &mut work => break out,
+                        () = tokio::time::sleep(wait) => {
+                            let _ = tui.terminal.draw(|frame| self.draw(frame, turn));
+                            turn = turn.wrapping_add(1);
+                            wait = input::tick();
+                        }
                     }
                 }
-            }
-        };
-        watching_cancel_keys(cancel, waited).await
+            };
+            watching_cancel_keys(cancel, waited).await
+        })
     }
 
     /// One frame of the wait: the kept view, dimmed, and the box over it.
