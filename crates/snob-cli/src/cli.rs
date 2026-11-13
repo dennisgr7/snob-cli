@@ -356,14 +356,16 @@ macro_rules! mcp_after_help {
         "Started by the agent's client, not typed: \"snob mcp config <client>\" \
                       prints what to add to its configuration. Each tool call runs one snob \
                       command, so the budget, the cooldown and consent hold exactly as they do \
-                      in a terminal. It offers the status, the lists and profiles; with \
-                      --allow-writes, follow and unfollow too. Each of those, and walking \
+                      in a terminal. It offers the status, the lists, profiles and posts; \
+                      with --allow-writes, follow and unfollow too; with --downloads-dir, \
+                      saving a post's photos and videos into that directory, under names \
+                      snob gives them. Each write, and walking \
                       another account's lists, runs only after a yes for that one call, \
                       asked in the client when it can show a form, or else put to you by the \
                       agent in the chat (--confirm-in-chat narrows what that may cover). \
                       snob cannot tell who gave the yes, so keep the writes on \"ask\" in the \
-                      client's permissions. Never login, purge, the monitor or a \
-                      download.\n\n\
+                      client's permissions. Never login, purge or the monitor, and never \
+                      a file anywhere but in --downloads-dir.\n\n\
                       A call waits at most --max-wait for the request budget (five minutes \
                       when it is not given) and is refused past it; a list stopped that way \
                       continues next time. Calls that may reach Instagram run one at a time; \
@@ -2277,6 +2279,34 @@ pub struct PostArgs {
     )]
     pub comments: Option<u32>,
 
+    /// With -d, print what was saved as one JSON document on standard
+    /// output: each file's name and size, what failed, and where they are.
+    /// -o is then a directory, made when it is not there
+    // For a caller that reads the answer rather than the directory: a
+    // script, and `snob mcp`, which runs a download for an agent this way
+    // (`posts::save_telling`). The files go in one after another.
+    #[arg(long, requires = "download")]
+    pub json: bool,
+
+    /// Start no further file once this many bytes were fetched
+    // Hidden: plumbing for `snob mcp`, which bounds what one call of an
+    // agent's may fetch (`commands::mcp::tools::SAVE_AT_MOST`). The files
+    // not started are said in the document, under `left`.
+    #[arg(long, hide = true, requires = "json", value_name = "BYTES")]
+    pub save_at_most: Option<u64>,
+
+    /// Start no further file once the downloads have taken this long
+    // Hidden: plumbing for `snob mcp`, as `--save-at-most`
+    // (`commands::mcp::tools::SAVE_WITHIN`).
+    #[arg(
+        long,
+        hide = true,
+        requires = "json",
+        value_name = "DURATION",
+        value_parser = duration
+    )]
+    pub save_within: Option<std::time::Duration>,
+
     #[command(flatten)]
     pub action: MediaActionArgs,
 
@@ -2487,6 +2517,31 @@ pub struct McpArgs {
             .range(1..=i64::from(snob_store::store::mcp_acts::MOST_WRITES_A_DAY))
     )]
     pub max_writes_per_day: Option<u32>,
+
+    /// Let the agent save posts' photos and videos into this directory,
+    /// which has to exist. The agent never chooses where a file goes or
+    /// what it is called, and nothing already there is written over
+    #[arg(long, value_name = "DIR", value_parser = downloads_dir)]
+    pub downloads_dir: Option<String>,
+}
+
+/// `snob mcp --downloads-dir`: a directory that is there, as its absolute
+/// path, refused by clap (exit 2) otherwise. **It has to exist**: one made
+/// from a mistyped path would be files nobody finds, and making directories
+/// is not something a server started in the background should do. In UTF-8,
+/// since it becomes an argument of every download's command line
+/// (`commands::mcp::tools::download`).
+#[cfg(feature = "mcp")]
+fn downloads_dir(value: &str) -> Result<String, String> {
+    let path = std::path::Path::new(value);
+    if !path.is_dir() {
+        return Err("that is not a directory that exists; make it first".into());
+    }
+    let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
+    absolute
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| "its path is not valid UTF-8".to_string())
 }
 
 /// What `snob mcp` takes a yes in the chat for (`commands::mcp`, `consent`).
@@ -2611,9 +2666,18 @@ pub struct McpConfigArgs {
         long,
         value_name = "URL",
         value_parser = crate::commands::mcp::config::RemoteUrl,
-        conflicts_with_all = ["allow_writes", "confirm_in_chat", "max_writes_per_day"]
+        conflicts_with_all = [
+            "allow_writes",
+            "confirm_in_chat",
+            "max_writes_per_day",
+            "downloads_dir"
+        ]
     )]
     pub remote: Option<url::Url>,
+
+    /// Start it with --downloads-dir
+    #[arg(long, value_name = "DIR", value_parser = downloads_dir)]
+    pub downloads_dir: Option<String>,
 
     /// Start it with --max-writes-per-day
     #[arg(

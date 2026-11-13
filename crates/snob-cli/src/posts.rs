@@ -933,6 +933,115 @@ pub(crate) async fn download(
     download_named(client, files, destination, "files").await
 }
 
+/// What a download told as a document stops at ([`save_telling`]): the
+/// bytes it may fetch and the time it may take before it starts no further
+/// file. `None` is no bound.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Bounds {
+    pub bytes: Option<u64>,
+    pub within: Option<std::time::Duration>,
+}
+
+/// Saves `files`, items of `post`, into the directory `dir`, one after
+/// another, and answers with what became of each as one JSON document, and
+/// with how many failed:
+///
+/// - `post`: what tells the post from every other (`pk`, `code`, `url`,
+///   `owner`, `kind`, `taken_at`);
+/// - `directory`: where the files are, absolute;
+/// - `saved`: each file there, by its item's number: its `file` name, its
+///   `bytes`, its `kind` and the item's `pk`, `already` when an earlier run
+///   had saved it and nothing was fetched, and a `note` when a video was
+///   saved as the app's smaller file;
+/// - `failed`: the items that could not be fetched, each with `why`;
+/// - `left`: the items not started because a bound of `bounds` was reached,
+///   each with `why` (`bytes` or `time`): asking again saves them, since
+///   those already there are not fetched twice;
+/// - `bytes`: what this run fetched.
+///
+/// **For a caller that reads the answer rather than a directory** (`post -d
+/// --json`, which `snob mcp` runs for an agent): `dir` is always a
+/// directory, made when it is not there, so one file is never written over
+/// a name, and nothing is, since every file goes in under a name of its own
+/// (`media::save_named`). One after another, not three at a time, so the
+/// bounds are judged between two files. Ctrl+C stops it as it stops any
+/// download.
+pub(crate) async fn save_telling(
+    client: &IgClient,
+    post: &Post,
+    files: Vec<Named>,
+    dir: &Path,
+    bounds: Bounds,
+) -> Result<(Value, usize)> {
+    use anyhow::Context as _;
+
+    std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    let directory = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let started = std::time::Instant::now();
+    let (mut saved, mut failed, mut left) = (Vec::new(), Vec::new(), Vec::new());
+    let mut fetched: u64 = 0;
+    for file in files {
+        if client.pacer().cancel_token().is_canceled() {
+            return Err(ExitError::new(ExitCode::Interrupted, "stopped").into());
+        }
+        let past = if bounds.bytes.is_some_and(|most| fetched >= most) {
+            Some("bytes")
+        } else if bounds.within.is_some_and(|most| started.elapsed() >= most) {
+            Some("time")
+        } else {
+            None
+        };
+        if let Some(why) = past {
+            left.push(serde_json::json!({ "item": file.number, "why": why }));
+            continue;
+        }
+        let item = post.items.get(file.number.wrapping_sub(1));
+        match crate::media::save_file_saying(client, &file, &directory).await {
+            Ok((kept, note)) => {
+                let (path, already) = match kept {
+                    Saved::Now(path) => (path, false),
+                    Saved::Already(path) => (path, true),
+                };
+                let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                if !already {
+                    fetched = fetched.saturating_add(bytes);
+                }
+                saved.push(serde_json::json!({
+                    "item": file.number,
+                    "pk": item.and_then(|item| item.pk.clone()),
+                    "kind": item.map(|item| item.kind.label()),
+                    "file": path.file_name().map(|name| name.to_string_lossy().into_owned()),
+                    "bytes": bytes,
+                    "already": already,
+                    "note": note,
+                }));
+            }
+            Err(e) if crate::media::was_canceled(&e) => {
+                return Err(ExitError::new(ExitCode::Interrupted, "stopped").into());
+            }
+            Err(e) => failed.push(serde_json::json!({ "item": file.number, "why": e.to_string() })),
+        }
+    }
+    let about = post_document(post, None);
+    let document = serde_json::json!({
+        "post": {
+            "pk": about.pk,
+            "code": about.code,
+            "url": about.url,
+            "owner": about.owner,
+            "kind": about.kind,
+            "taken_at": about.taken_at,
+        },
+        "directory": directory.to_string_lossy(),
+        "saved": saved,
+        "failed": failed,
+        "left": left,
+        "bytes": fetched,
+    });
+    let failures = document["failed"].as_array().map_or(0, Vec::len);
+    Ok((document, failures))
+}
+
 /// The files of every item of `posts`, in order.
 pub(crate) fn files_of(posts: &[&Post]) -> Vec<Named> {
     let mut number = 0;

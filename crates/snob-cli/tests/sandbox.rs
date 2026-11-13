@@ -6172,6 +6172,220 @@ async fn an_agents_likers_read_is_asked_and_recorded() {
     );
 }
 
+/// How many times the fake Instagram was asked for the file at `path`.
+async fn fetched(instagram: &MockServer, path: &str) -> usize {
+    instagram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == path)
+        .count()
+}
+
+/// `post -d --json` says what it saved, where, and what it left when a
+/// bound was reached; the files left are saved by asking again, and the one
+/// already there is not fetched twice.
+#[tokio::test]
+async fn a_download_told_as_json_says_what_it_saved_and_what_it_left() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_post(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let into = tmp.path().join("kept");
+    let run = |extra: &[&str]| {
+        let mut args = vec!["post", POST_CODE, "-d", "all", "--json", "-o"];
+        args.push(into.to_str().unwrap());
+        args.extend(extra);
+        snob(tmp.path(), Some(&instagram), &args)
+    };
+
+    // One byte is all it may fetch: the first file, and the second is left.
+    let bounded = run(&["--save-at-most", "1"]);
+    assert!(
+        bounded.status.success(),
+        "{}{}",
+        stdout(&bounded),
+        stderr(&bounded)
+    );
+    let told = json(&bounded);
+    assert_eq!(told["post"]["code"], POST_CODE, "{told}");
+    assert_eq!(told["post"]["pk"], POST_PK, "{told}");
+    assert_eq!(
+        told["directory"],
+        std::path::absolute(&into).unwrap().to_str().unwrap(),
+        "{told}"
+    );
+    let photo = format!("me-{POST_CODE}-1.jpg");
+    assert_eq!(told["saved"].as_array().map(Vec::len), Some(1), "{told}");
+    assert_eq!(told["saved"][0]["file"], photo.as_str(), "{told}");
+    assert_eq!(told["saved"][0]["item"], 1, "{told}");
+    assert_eq!(told["saved"][0]["kind"], "photo", "{told}");
+    assert_eq!(told["saved"][0]["already"], false, "{told}");
+    assert_eq!(told["saved"][0]["bytes"], 14, "{told}");
+    assert_eq!(
+        told["left"],
+        serde_json::json!([{ "item": 2, "why": "bytes" }]),
+        "{told}"
+    );
+    assert_eq!(told["failed"], serde_json::json!([]), "{told}");
+    assert!(into.join(&photo).is_file());
+    assert_eq!(fetched(&instagram, "/clip.mp4").await, 0);
+
+    // Asked again with no bound: the clip is fetched, the photo is not.
+    let rest = run(&[]);
+    assert!(rest.status.success(), "{}{}", stdout(&rest), stderr(&rest));
+    let told = json(&rest);
+    assert_eq!(told["saved"][0]["already"], true, "{told}");
+    assert_eq!(told["saved"][1]["already"], false, "{told}");
+    assert_eq!(
+        told["saved"][1]["file"],
+        format!("me-{POST_CODE}-2.mp4").as_str(),
+        "{told}"
+    );
+    assert_eq!(told["saved"][1]["kind"], "video", "{told}");
+    assert_eq!(told["left"], serde_json::json!([]), "{told}");
+    assert_eq!(fetched(&instagram, "/big.jpg").await, 1);
+    assert_eq!(fetched(&instagram, "/clip.mp4").await, 1);
+
+    // The document goes to standard output, so the files cannot.
+    let both = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["post", POST_CODE, "-d", "1", "--json", "-o", "-"],
+    );
+    assert_eq!(both.status.code(), Some(1), "{}", stderr(&both));
+    assert!(stdout(&both).is_empty(), "{}", stdout(&both));
+}
+
+/// An agent saves a post's files only on a server that was given a
+/// directory for them, into that directory and under the names snob gives
+/// them, and is told where they are; asking again fetches nothing twice,
+/// and no argument of a call is a path.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn an_agent_saves_a_posts_files_where_the_server_was_told() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_post(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let link = format!("https://www.instagram.com/p/{POST_CODE}/?igsh=x");
+
+    // Without the directory there is no such tool, listed or called.
+    let mut without = McpClient::start(tmp.path(), &instagram, &[]).await;
+    let listed = without.ask("tools/list", serde_json::json!({})).await;
+    assert!(
+        !listed.to_string().contains("snob_post_download"),
+        "{listed}"
+    );
+    let refused = without
+        .ask(
+            "tools/call",
+            serde_json::json!({ "name": "snob_post_download", "arguments": { "link": link } }),
+        )
+        .await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    drop(without);
+
+    let into = tmp.path().join("for the agent");
+    std::fs::create_dir(&into).unwrap();
+    let mut client = McpClient::start(
+        tmp.path(),
+        &instagram,
+        &["--downloads-dir", into.to_str().unwrap()],
+    )
+    .await;
+    let listed = client.ask("tools/list", serde_json::json!({})).await;
+    let tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "snob_post_download")
+        .expect("offered")
+        .clone();
+    assert_eq!(tool["annotations"]["readOnlyHint"], false, "{tool}");
+
+    // No argument names a place: refused before anything is run.
+    for wrong in [
+        serde_json::json!({ "link": link, "output": tmp.path().to_str().unwrap() }),
+        serde_json::json!({ "link": link, "directory": ".." }),
+        serde_json::json!({ "link": link, "items": ["../x"] }),
+    ] {
+        let told = client.call("snob_post_download", wrong).await;
+        assert_eq!(told["isError"], true, "{told}");
+        assert_eq!(
+            told["structuredContent"]["error"]["code"], "invalid_arguments",
+            "{told}"
+        );
+    }
+    assert_eq!(std::fs::read_dir(&into).unwrap().count(), 0);
+
+    let done = client
+        .call("snob_post_download", serde_json::json!({ "link": link }))
+        .await;
+    assert_eq!(done["isError"], false, "{done}");
+    let told = &done["structuredContent"];
+    assert_eq!(told["post"]["code"], POST_CODE, "{done}");
+    assert_eq!(told["post"]["pk"], POST_PK, "{done}");
+    assert_eq!(
+        told["directory"],
+        std::path::absolute(&into).unwrap().to_str().unwrap(),
+        "{done}"
+    );
+    let names: Vec<&str> = told["saved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|saved| saved["file"].as_str().unwrap())
+        .collect();
+    let (photo, clip) = (
+        format!("me-{POST_CODE}-1.jpg"),
+        format!("me-{POST_CODE}-2.mp4"),
+    );
+    assert_eq!(names, [photo.as_str(), clip.as_str()], "{done}");
+    assert_eq!(
+        std::fs::read(into.join(&photo)).unwrap(),
+        b"\xff\xd8\xff\xe0 a picture"
+    );
+    assert_eq!(
+        std::fs::read(into.join(&clip)).unwrap(),
+        b"\x00\x00\x00\x18ftypisom a clip"
+    );
+    // Nothing of a file's address is handed back, and nothing landed
+    // anywhere else: the two files are all the directory holds.
+    let text = done.to_string();
+    assert!(
+        !text.contains("/big.jpg") && !text.contains("/clip.mp4"),
+        "{text}"
+    );
+    assert_eq!(std::fs::read_dir(&into).unwrap().count(), 2);
+
+    // Asked again, for one item: it is there, and nothing is fetched.
+    let again = client
+        .call(
+            "snob_post_download",
+            serde_json::json!({ "link": POST_CODE, "items": [2] }),
+        )
+        .await;
+    assert_eq!(again["isError"], false, "{again}");
+    let saved = &again["structuredContent"]["saved"];
+    assert_eq!(saved.as_array().map(Vec::len), Some(1), "{again}");
+    assert_eq!(saved[0]["already"], true, "{again}");
+    assert_eq!(saved[0]["file"], clip.as_str(), "{again}");
+    assert_eq!(fetched(&instagram, "/big.jpg").await, 1);
+    assert_eq!(fetched(&instagram, "/clip.mp4").await, 1);
+
+    // A directory that is not there is refused when the server starts.
+    let missing = tmp.path().join("nowhere");
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["mcp", "--downloads-dir", missing.to_str().unwrap()],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(!missing.exists());
+}
+
 /// The acts recorded in the sandbox account's database, of any age.
 #[cfg(feature = "mcp")]
 fn acts_recorded(root: &Path) -> i64 {

@@ -105,7 +105,7 @@ pub fn plan_of(doc: &Value, offset: usize) -> Plan {
         .get("tool")
         .and_then(Value::as_str)
         .zip(doc.get("arguments").and_then(Value::as_object))
-        .and_then(|(tool, arguments)| tools::plan(tool, arguments, false).ok());
+        .and_then(|(tool, arguments)| tools::plan(tool, arguments, tools::Offer::default()).ok());
     let mut plan = rebuilt.unwrap_or(Plan {
         args: Vec::new(),
         ask: None,

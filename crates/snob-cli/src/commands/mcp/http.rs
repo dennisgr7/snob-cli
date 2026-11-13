@@ -644,6 +644,13 @@ fn started(
     if settings.writes {
         ui::warn(&writes_warning(in_chat));
     }
+    if let Some(directory) = &settings.downloads {
+        ui::warn(&format!(
+            "with --downloads-dir, whoever holds the key can have posts' photos and videos \
+             saved into {directory}, on this machine, and is told the names of the files \
+             there that it saved: nothing of them travels in an answer."
+        ));
+    }
     ui::info("Ctrl+C stops it, giving the calls still running their grace.");
 }
 
@@ -1297,6 +1304,7 @@ mod tests {
         let key = key::Key::generate().unwrap();
         let settings = Settings {
             writes: false,
+            downloads: None,
             in_chat: None,
             writes_a_day: None,
             max_wait: None,

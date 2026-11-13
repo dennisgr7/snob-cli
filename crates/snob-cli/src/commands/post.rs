@@ -12,6 +12,10 @@
 //! in the printed form, each a comment step after the page before
 //! ([`posts::comment_pages`]).
 //!
+//! `-d --json` saves and then says what it saved, as one JSON document on
+//! standard output ([`posts::save_telling`]), for a caller that reads an
+//! answer rather than a directory.
+//!
 //! What it prints and saves is `snob posts someone 3`'s, for the same
 //! post: the same lines, the same numbers, the same file names.
 
@@ -27,7 +31,7 @@ use crate::commands::common;
 use crate::commands::posts::{download_items, post_text, videos_of};
 use crate::exit::{ExitCode, ExitError};
 use crate::media;
-use crate::output::Presentation;
+use crate::output::{self, Presentation};
 use crate::posts::{self, CommentLine, Comments, Post, comment_json, post_json};
 use crate::report;
 use crate::ui;
@@ -43,6 +47,14 @@ pub async fn run(args: PostArgs, store: SecretStore, paths: &AccountPaths) -> Re
         )
     })?;
     args.action.refuse_stdout_download_early()?;
+    if args.json && args.action.output.as_deref().is_some_and(output::is_stdout) {
+        return Err(ExitError::new(
+            ExitCode::Error,
+            "--json prints what was saved on standard output, so the files cannot go there \
+             too: give -o a directory",
+        )
+        .into());
+    }
     let videos = videos_of(&args.video, &args.action)?;
     let app = common::reader(&store, paths, args.action.interactive, false)?;
     let browses = args.action.browses(
@@ -63,6 +75,13 @@ pub async fn run(args: PostArgs, store: SecretStore, paths: &AccountPaths) -> Re
     let destination = args.action.output.as_deref();
     if let Some(selection) = args.action.selection() {
         posts::first_comments(app.client(), &post).await?;
+        if args.json {
+            let bounds = posts::Bounds {
+                bytes: args.save_at_most,
+                within: args.save_within,
+            };
+            return save_telling(&app, &post, selection, destination, &videos, bounds).await;
+        }
         return download_items(&app, &post, selection, destination, &videos).await;
     }
     let Some(comments) =
@@ -71,6 +90,36 @@ pub async fn run(args: PostArgs, store: SecretStore, paths: &AccountPaths) -> Re
         return Ok(ExitCode::Interrupted);
     };
     list_post(&post, Some(&comments), args.list.format, destination)
+}
+
+/// `-d --json`: the items `selection` names saved into `destination`, a
+/// directory (the working one when none is given), and what became of each
+/// printed as one document. Exit 1 when one could not be fetched, after the
+/// document, so what was saved is still told.
+async fn save_telling(
+    app: &crate::app::App,
+    post: &Post,
+    selection: crate::cli::DownloadSelection,
+    destination: Option<&Path>,
+    videos: &crate::posts::Videos,
+    bounds: posts::Bounds,
+) -> Result<ExitCode> {
+    let numbers = media::numbers_of(selection, post.items.len(), |n| {
+        crate::commands::posts::no_such_item(post, n)
+    })?;
+    let files = videos.prepare(numbers.iter().map(|n| post.file(n - 1)).collect());
+    let total = files.len();
+    let dir = destination.unwrap_or(Path::new("."));
+    let (document, failed) = posts::save_telling(app.client(), post, files, dir, bounds).await?;
+    ui::say!("{}", serde_json::to_string_pretty(&document)?);
+    if failed > 0 {
+        return Err(ExitError::new(
+            ExitCode::Error,
+            format!("{failed} of {total} files could not be downloaded"),
+        )
+        .into());
+    }
+    Ok(ExitCode::Ok)
 }
 
 /// Prints the post, its items numbered, and its comments when they were

@@ -179,7 +179,7 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
             document(args.list.format.map(Format::from), args.action.listing_to())
         }
         Command::Post(args) => {
-            document(args.list.format.map(Format::from), args.action.listing_to())
+            args.json || document(args.list.format.map(Format::from), args.action.listing_to())
         }
         Command::Likers(args) => document(args.output.format, args.output.path.as_deref()),
         Command::Profile(args) => matches!(
@@ -452,6 +452,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 );
                 let settings = commands::mcp::Settings {
                     writes: args.allow_writes,
+                    downloads: args.downloads_dir.clone(),
                     in_chat: args.confirm_in_chat,
                     writes_a_day: args.max_writes_per_day,
                     max_wait: cli.max_wait,

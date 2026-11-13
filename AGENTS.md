@@ -510,7 +510,35 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   it as it likes, so over `--listen` whoever holds the key can confirm a
   write whatever it says (recorded as a yes given in a form). Not
   offered, ever: `login`, `logout`, `purge`, the monitor, `--same-day`,
-  downloads (outside the request budget), any flag that writes a file.
+  and **a path or a file name as an argument of a call**: the one command
+  that writes a file for an agent writes it where the server was told
+  (below).
+- **A post's files, only into a directory the person named** (`snob mcp
+  --downloads-dir <DIR>`, `tools::Offer::downloads`; not given,
+  `snob_post_download` is not listed, and calling it is -32602, as a write
+  is without `--allow-writes`). The directory has to exist when the server
+  starts (clap, exit 2) and is the only path on a download's command line;
+  the call names a post by its link, read for its code, and its items by
+  their numbers. The child is `snob post <link> --download=<items>
+  --output=<DIR> --quality=compat|best --json` (`posts::save_telling`):
+  the files go in one after another under the names every download has,
+  `<owner>-<code>[-<n>].<ext>`, **never over one that is there** (an
+  earlier copy is answered as `already`; the write is `create_new` on a
+  `.part`, renamed once whole, `media::save_named`), and what comes back is
+  a document (`post`, `directory`, `saved`, `failed`, `left`, `bytes`),
+  never the bytes: a child's standard output is the JSON the server reads,
+  so `-o -` beside `--json` is refused. The read that finds the files is
+  paid as any read (two requests, the post and its first page of comments,
+  under `--spend-alone`, one call at a time); the files come from the CDN,
+  which the request budget does not count, so a call is bounded on its
+  own: it starts no further file once it has fetched `tools::SAVE_AT_MOST`
+  (1 GiB) or downloaded for `tools::SAVE_WITHIN` (2 min), says the rest
+  under `left`, and the same call again saves them. **It asks no yes**: a
+  post's read reaches nobody and tells its owner nothing, the person's part
+  is the flag, and the client's own prompt stands before the tool
+  (`readOnlyHint: false`). Over `--listen` the files are saved on snob's
+  machine all the same and nothing of them travels in an answer; startup
+  warns that whoever holds the key can have them saved.
 - **The yes comes from the client, not provably from the person.** The
   client declares what it can show, and an agent can type a yes in the chat
   itself (or be steered to by a bio it read). The tickets keep a yes to the

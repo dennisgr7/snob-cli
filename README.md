@@ -158,9 +158,12 @@ can read:
   nothing.
 - `snob mcp` is an MCP server for AI agents, on standard input and output:
   the status, the lists, profiles and posts (without their picture and
-  video addresses: nothing there downloads), and with `--allow-writes`
-  follow and unfollow. Those, walking another account's lists and reading
-  who liked a post, run only after a yes
+  video addresses), with `--allow-writes` follow and unfollow, and with
+  `--downloads-dir <dir>` saving a post's photos and videos into that
+  directory: the agent names the post, never a path, the files get the
+  names snob gives every download, and none already there is written over.
+  A follow or an unfollow, walking another account's lists and reading
+  who liked a post run only after a yes
   for that one call: asked in the client when it can show a form, or put to
   you by the agent in the chat (`--confirm-in-chat none|lists|all` says what
   that may cover; `all` by default). snob cannot tell whether that yes was
