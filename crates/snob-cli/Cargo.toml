@@ -17,7 +17,7 @@ path = "src/main.rs"
 # flags nor the code behind them. `cargo test --features testing` is what turns
 # them on, and `crates/snob-cli/tests/sandbox.rs` is what they are for.
 [features]
-default = ["xlsx", "mcp", "mcp-http"]
+default = ["xlsx", "mcp", "mcp-http", "preview"]
 # The `.xlsx` export and the `zip` crate behind it. On by default, and the
 # released binary carries it; what the feature buys is that somebody building
 # from source can leave it out -- `rust_xlsxwriter` and `zopfli` are the
@@ -46,17 +46,16 @@ mcp-http = [
     "dep:http-body-util",
     "dep:bytes",
 ]
-# `p` in the media views: the picture under the cursor drawn in the terminal,
-# in half blocks (`ui::preview`, and the exception it is to "Stories are
-# handed to the system viewer" in AGENTS.md). **Not a default**, so the
-# released binary has none of it and `p` is bound to nothing there: it is
-# the one feature that draws another person's bytes, behind a decoder
-# nothing else needs. `cargo build --features preview` turns it on.
+# Pictures drawn in the terminal, in half blocks (`ui::preview`, and the
+# exception it is to "Stories are handed to the system viewer" in
+# AGENTS.md): the one under the cursor on `p`, and a small one beside the
+# text of the posts browser and on the profile card. On by default, so the
+# released binary has it; a feature of its own because it is the one that
+# decodes another person's bytes, behind a decoder nothing else needs, and
+# a build that wants neither leaves both out with `--no-default-features`.
+# Its cost is measured in AGENTS.md, under "Costs worth knowing".
 preview = ["dep:zune-jpeg"]
-# `preview` rides along so that the decoder's own tests run where CI runs
-# the rest: no CI line names a feature that is not a default, and
-# `--features testing` is the one that already builds a second binary.
-testing = ["snob-ig/testing", "preview"]
+testing = ["snob-ig/testing"]
 
 [dependencies]
 snob-core.workspace = true

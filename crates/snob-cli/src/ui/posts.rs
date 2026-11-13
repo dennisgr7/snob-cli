@@ -42,7 +42,7 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row, TableState};
 use snob_core::model::printable;
@@ -53,6 +53,7 @@ use crate::app::Viewer;
 use crate::commands::post::comment_line;
 use crate::commands::posts::{about, clipped, size_of};
 use crate::exit::ExitCode;
+use crate::media::Kind;
 use crate::posts::{self, Comments, Grid, Opened, Post};
 use crate::report;
 use crate::ui::browser::busy::Busy;
@@ -214,6 +215,20 @@ enum Ended {
 struct Seen {
     page_rows: usize,
     text_width: usize,
+    /// Whether the frame had room for a small picture beside its text: one
+    /// is fetched only where it would be drawn.
+    beside: bool,
+}
+
+/// The small picture a frame draws beside its text (`preview::Gallery`).
+#[derive(Clone, Copy, Default)]
+struct Beside<'a> {
+    /// Whether this run draws small pictures at all.
+    on: bool,
+    /// The one for what the cursor is on, once it has arrived.
+    picture: Option<&'a preview::Pixels>,
+    /// Whether what it shows is a video, whose picture is its cover.
+    cover: bool,
 }
 
 /// Browses `grid`, opening post `start` (zero-based) on the first frame when
@@ -249,6 +264,8 @@ pub async fn browse_post(
         receipts: Vec::new(),
         lent: false,
         first: Some(First::Comments),
+        gallery: preview::Gallery::new(),
+        pictures: preview::Gallery::draws(),
     };
     session.run(viewer, paths).await
 }
@@ -292,6 +309,9 @@ struct Session<'a> {
     /// Whether the terminal is another view's, to go back to.
     lent: bool,
     first: Option<First>,
+    /// The small pictures drawn beside the text, where this run draws any.
+    gallery: preview::Gallery<'a>,
+    pictures: bool,
 }
 
 impl<'a> Session<'a> {
@@ -307,6 +327,36 @@ impl<'a> Session<'a> {
             receipts: Vec::new(),
             lent,
             first: None,
+            gallery: preview::Gallery::new(),
+            pictures: preview::Gallery::draws(),
+        }
+    }
+
+    /// The address of the small picture of what the cursor is on: at the
+    /// grid the selected post's first item, inside a post the item on
+    /// screen, a video's being its cover (`posts::Item::thumb`).
+    fn thumb(&self) -> Option<&str> {
+        self.item_under_the_cursor()?.thumb.as_deref()
+    }
+
+    fn item_under_the_cursor(&self) -> Option<&posts::Item> {
+        match self.level {
+            Level::Grid => self.grid.as_ref()?.posts.get(self.selected)?.items.first(),
+            Level::Post(index) => {
+                let detail = self.detail(index)?;
+                detail.post.items.get(detail.item)
+            }
+        }
+    }
+
+    /// What this frame draws beside its text.
+    fn beside(&self) -> Beside<'_> {
+        Beside {
+            on: self.pictures,
+            picture: self.thumb().and_then(|address| self.gallery.get(address)),
+            cover: self
+                .item_under_the_cursor()
+                .is_some_and(|item| item.kind == Kind::Video),
         }
     }
 
@@ -351,9 +401,22 @@ impl<'a> Session<'a> {
             }
         }
 
+        let client = self.client;
         loop {
             self.draw(tui, &mut list, viewer, colors, &mut seen)?;
-            let raw = input::read(input::tick()).map_err(input::unreadable)?;
+            // The small picture of what the cursor is on, where the frame
+            // just drawn had room for one: fetched once the cursor has
+            // rested, while the keys are read (`preview::Gallery`).
+            let wanted = self
+                .thumb()
+                .filter(|_| self.pictures && seen.beside)
+                .map(str::to_string);
+            self.gallery.want(wanted.as_deref());
+            let raw = self
+                .gallery
+                .read(|address| Box::pin(async move { client.download(&address).await.ok() }))
+                .await
+                .map_err(input::unreadable)?;
             let key = match raw {
                 Raw::Key(key) => key_of(key),
                 Raw::Resized | Raw::Paste(_) | Raw::Tick => continue,
@@ -862,7 +925,15 @@ impl<'a> Session<'a> {
                 if let Some(grid) = &self.grid {
                     list.select(Some(self.selected));
                     draw_grid(
-                        frame, grid, self.lent, viewer, list, &self.note, colors, seen,
+                        frame,
+                        grid,
+                        self.lent,
+                        viewer,
+                        list,
+                        &self.note,
+                        colors,
+                        self.beside(),
+                        seen,
                     );
                 }
             }
@@ -872,7 +943,16 @@ impl<'a> Session<'a> {
                         (Some(_), _) => "esc back",
                         (None, _) => "esc leave",
                     };
-                    draw_post(frame, detail, out, viewer, &self.note, colors, seen);
+                    draw_post(
+                        frame,
+                        detail,
+                        out,
+                        viewer,
+                        &self.note,
+                        colors,
+                        self.beside(),
+                        seen,
+                    );
                 }
             }
         }
@@ -927,6 +1007,7 @@ fn draw_grid(
     list: &mut TableState,
     note: &str,
     colors: bool,
+    beside: Beside<'_>,
     seen: &mut Seen,
 ) {
     let total = grid.posts.len();
@@ -1034,17 +1115,51 @@ fn draw_grid(
             .padding(Padding::horizontal(1));
         let within = block.inner(panel);
         frame.render_widget(block, panel);
+        // The picture has a place of its own at the top of the panel, kept
+        // whether or not it has arrived, so that the text under it does not
+        // jump as the cursor moves: as tall as a square picture the panel's
+        // width, and never more than half the panel.
+        let slot = (within.width / 2).min(within.height / 2);
+        seen.beside = beside.on && slot >= PICTURE_MIN_ROWS;
+        let text = if seen.beside {
+            let [picture, _, text] = Layout::vertical([
+                Constraint::Length(slot),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+            ])
+            .areas(within);
+            if let Some(pixels) = beside.picture {
+                pixels.draw_in(frame, picture);
+            }
+            text
+        } else {
+            within
+        };
         frame.render_widget(
             Paragraph::new(about_lines(
                 post,
-                within.width as usize,
-                within.height as usize,
+                text.width as usize,
+                text.height as usize,
                 colors,
             )),
-            within,
+            text,
         );
+    } else {
+        seen.beside = false;
     }
 }
+
+/// The fewest rows a small picture is drawn in: under it, at two pixels a
+/// row, there is nothing left to recognize.
+const PICTURE_MIN_ROWS: u16 = 6;
+
+/// The fewest columns a picture beside a post is drawn in: a column is a
+/// pixel, and under two dozen across nothing is recognized.
+const PICTURE_MIN_W: u16 = 24;
+
+/// The fewest columns a post's text keeps when a picture is drawn beside
+/// it: a line of a caption is still read as a line.
+const TEXT_MIN_W: u16 = 60;
 
 /// What a post says, a line each, styled as the post's own view styles it:
 /// whose it is in bold, when and where it is on the web dim.
@@ -1167,6 +1282,7 @@ fn furthest(detail: &Detail, seen: &Seen) -> usize {
 /// between the items: the item on screen is kept in view, even under a
 /// caption taller than the terminal, which would otherwise push the items
 /// under the bottom edge with no key to reach them.
+#[expect(clippy::too_many_arguments, reason = "one frame's worth of state")]
 fn draw_post(
     frame: &mut Frame<'_>,
     detail: &Detail,
@@ -1174,6 +1290,7 @@ fn draw_post(
     viewer: &Viewer,
     note: &str,
     colors: bool,
+    beside: Beside<'_>,
     seen: &mut Seen,
 ) {
     let post = &detail.post;
@@ -1183,7 +1300,26 @@ fn draw_post(
         colors,
         tui::card_padding(),
     );
-    let inner = block.inner(area);
+    let whole = block.inner(area);
+    // The item on screen is drawn to the right of the text where there is
+    // room for both: as wide as a square picture the view's height, half
+    // the view at most, and never so wide that the text has under
+    // `TEXT_MIN_W` columns left.
+    let picture_w = (whole.height * 2)
+        .min(whole.width / 2)
+        .min(whole.width.saturating_sub(TEXT_MIN_W + 2));
+    seen.beside = beside.on && picture_w >= PICTURE_MIN_W;
+    let (inner, picture) = if seen.beside {
+        let [text, _, picture] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(2),
+            Constraint::Length(picture_w),
+        ])
+        .areas(whole);
+        (text, Some(picture))
+    } else {
+        (whole, None)
+    };
     seen.page_rows = inner.height as usize;
     seen.text_width = inner.width as usize;
 
@@ -1230,6 +1366,22 @@ fn draw_post(
     if scrolls {
         // The bar's travel is the offsets there are, the first to the last.
         tui::scrollbar(frame, area, overflow + 1, scroll, inner.height);
+    }
+    if let (Some(area), Some(pixels)) = (picture, beside.picture) {
+        // A row is kept under a video's picture to say that it is its cover.
+        let rows = area.height.saturating_sub(u16::from(beside.cover));
+        let taken = pixels.draw_in(frame, Rect::new(area.x, area.y, area.width, rows));
+        if beside.cover {
+            let under = Rect::new(area.x, taken.y + taken.height, area.width, 1);
+            frame.render_widget(
+                Paragraph::new(
+                    Line::from("the video's cover")
+                        .style(tui::paint(colors, tui::DIM))
+                        .centered(),
+                ),
+                under,
+            );
+        }
     }
 }
 
@@ -1363,6 +1515,7 @@ mod tests {
                     &mut list,
                     "",
                     false,
+                    Beside::default(),
                     &mut seen,
                 );
             })
@@ -1414,6 +1567,7 @@ mod tests {
                     &mut list,
                     "",
                     false,
+                    Beside::default(),
                     &mut seen,
                 );
             })
@@ -1534,7 +1688,16 @@ mod tests {
         let mut seen = Seen::default();
         terminal
             .draw(|frame| {
-                draw_post(frame, &detail, "esc back", &tui::me(), "", false, &mut seen);
+                draw_post(
+                    frame,
+                    &detail,
+                    "esc back",
+                    &tui::me(),
+                    "",
+                    false,
+                    Beside::default(),
+                    &mut seen,
+                );
             })
             .unwrap();
         assert!(tui::row_text(&terminal, 0).contains("@someone · DdzEShhEWCR"));
@@ -1552,7 +1715,16 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
             terminal
                 .draw(|frame| {
-                    draw_post(frame, detail, "esc back", &tui::me(), "", false, seen);
+                    draw_post(
+                        frame,
+                        detail,
+                        "esc back",
+                        &tui::me(),
+                        "",
+                        false,
+                        Beside::default(),
+                        seen,
+                    );
                 })
                 .unwrap();
             screen_of(&terminal)
@@ -1628,7 +1800,16 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
             terminal
                 .draw(|frame| {
-                    draw_post(frame, detail, "esc back", &tui::me(), "", false, seen);
+                    draw_post(
+                        frame,
+                        detail,
+                        "esc back",
+                        &tui::me(),
+                        "",
+                        false,
+                        Beside::default(),
+                        seen,
+                    );
                 })
                 .unwrap();
             screen_of(&terminal)
@@ -1707,5 +1888,144 @@ mod tests {
                 named.keys
             );
         }
+    }
+
+    fn blocks(terminal: &Terminal<TestBackend>) -> usize {
+        screen_of(terminal).matches('▀').count()
+    }
+
+    /// A wide grid keeps a place for the selected post's small picture over
+    /// what the post says, drawn once it has arrived; the text is where it
+    /// was either way. A run that draws no pictures has the text alone, as
+    /// before, and so has a grid with no panel.
+    #[test]
+    fn a_wide_grid_draws_the_selected_posts_picture_over_what_it_says() {
+        let picture = preview::Pixels::plain(320, 400, (200, 10, 10));
+        let draw = |width: u16, beside: Beside<'_>| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+            let mut list = TableState::default();
+            list.select(Some(0));
+            let mut seen = Seen::default();
+            terminal
+                .draw(|frame| {
+                    draw_grid(
+                        frame,
+                        &grid(),
+                        false,
+                        &tui::me(),
+                        &mut list,
+                        "",
+                        true,
+                        beside,
+                        &mut seen,
+                    );
+                })
+                .unwrap();
+            (terminal, seen.beside)
+        };
+        let row_of = |terminal: &Terminal<TestBackend>, text: &str| {
+            screen_of(terminal)
+                .lines()
+                .position(|line| line.contains(text))
+                .unwrap_or_else(|| panic!("{}", screen_of(terminal)))
+        };
+
+        let on = Beside {
+            on: true,
+            picture: None,
+            cover: false,
+        };
+        let (waiting, room) = draw(120, on);
+        assert!(room, "the frame has room for a picture");
+        assert_eq!(blocks(&waiting), 0, "and none has arrived");
+        let (arrived, _) = draw(
+            120,
+            Beside {
+                picture: Some(&picture),
+                ..on
+            },
+        );
+        assert!(blocks(&arrived) > 0, "{}", screen_of(&arrived));
+        assert_eq!(
+            row_of(&waiting, "@someone · 2 items"),
+            row_of(&arrived, "@someone · 2 items"),
+            "the text does not move when the picture arrives"
+        );
+
+        let (plain, room) = draw(120, Beside::default());
+        assert!(!room);
+        assert_eq!(blocks(&plain), 0);
+        assert!(
+            row_of(&plain, "@someone · 2 items") < row_of(&waiting, "@someone · 2 items"),
+            "with no pictures the text starts at the top"
+        );
+        let (narrow, room) = draw(100, on);
+        assert!(!room, "no panel, no picture to fetch");
+        assert_eq!(blocks(&narrow), 0);
+    }
+
+    /// Inside a post the item on screen is drawn to the right of the text
+    /// where there is room for both, and the text is wrapped to what is
+    /// left; a video's picture says it is its cover. A narrow terminal, or
+    /// a run with no pictures, has the text alone at its whole width.
+    #[test]
+    fn a_post_draws_the_item_on_screen_beside_its_text() {
+        let picture = preview::Pixels::plain(320, 400, (10, 200, 10));
+        let mut detail = Detail::new(post(), None);
+        let draw = |detail: &Detail, width: u16, beside: Beside<'_>| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            let mut seen = Seen::default();
+            terminal
+                .draw(|frame| {
+                    draw_post(
+                        frame,
+                        detail,
+                        "esc back",
+                        &tui::me(),
+                        "",
+                        true,
+                        beside,
+                        &mut seen,
+                    );
+                })
+                .unwrap();
+            (terminal, seen)
+        };
+        let shown = Beside {
+            on: true,
+            picture: Some(&picture),
+            cover: false,
+        };
+
+        let (wide, seen) = draw(&detail, 160, shown);
+        assert!(seen.beside);
+        assert!(blocks(&wide) > 0, "{}", screen_of(&wide));
+        // 26 rows of text: a picture of 52 columns, and two between them.
+        assert_eq!((seen.page_rows, seen.text_width), (26, 154 - 2 - 52));
+        assert!(!screen_of(&wide).contains("the video's cover"));
+
+        detail.item = 1;
+        let (video, _) = draw(
+            &detail,
+            160,
+            Beside {
+                cover: true,
+                ..shown
+            },
+        );
+        assert!(
+            screen_of(&video).contains("the video's cover"),
+            "{}",
+            screen_of(&video)
+        );
+
+        let (narrow, seen) = draw(&detail, 80, shown);
+        assert!(!seen.beside, "the text keeps its columns first");
+        assert_eq!(blocks(&narrow), 0);
+        assert_eq!(seen.text_width, 74);
+        let (plain, seen) = draw(&detail, 160, Beside::default());
+        assert!(!seen.beside);
+        assert_eq!(blocks(&plain), 0);
+        assert_eq!(seen.text_width, 154);
     }
 }

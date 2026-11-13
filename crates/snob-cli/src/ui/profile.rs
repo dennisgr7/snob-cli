@@ -45,6 +45,7 @@
 //! screen after the alternate screen has taken the frame away.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use console::measure_text_width;
@@ -54,6 +55,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Cell, Padding, Paragraph, Row, Table, TableState, Wrap};
 use snob_core::model::{ListKind, User, printable};
+use snob_ig::client::IgClient;
 use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
 
@@ -115,7 +117,18 @@ enum CardRow {
 /// Which rows this profile has to move over. Absent parts are simply not
 /// focusable: a hidden tray is not a row that says "nothing".
 fn card_rows(profile: &Profile) -> Vec<CardRow> {
-    let mut rows = vec![CardRow::Actions];
+    card_rows_of(profile, false)
+}
+
+/// [`card_rows`], with the picture first where the card draws it
+/// (`pictured`): then it is on the card to be seen and opened, and no longer
+/// only under the actions.
+fn card_rows_of(profile: &Profile, pictured: bool) -> Vec<CardRow> {
+    let mut rows = Vec::new();
+    if pictured {
+        rows.push(CardRow::Picture);
+    }
+    rows.push(CardRow::Actions);
     if matches!(&profile.stories, Visibility::Shown(items) if !items.is_empty()) {
         rows.push(CardRow::Stories);
     }
@@ -186,6 +199,42 @@ struct Media {
     /// CDN alone ([`picture_is_a_request`]). The read-only card says so on
     /// the row, before the key.
     pfp_is_a_request: bool,
+    /// Whether the card draws the account's picture ([`pictured`]), and the
+    /// small one it draws once that has arrived.
+    pictured: bool,
+    avatar: Option<preview::Pixels>,
+}
+
+/// Takes the account's small picture from the gallery once it has arrived,
+/// for the frames to draw, and hands back its address while it is still to
+/// be fetched: what a card's loop tells the gallery it wants, every turn.
+fn adopt_avatar<'p>(
+    profile: &'p Profile,
+    media: &mut Media,
+    gallery: &preview::Gallery<'_>,
+) -> Option<&'p str> {
+    let address = profile.pfp_url.as_deref().filter(|_| media.pictured)?;
+    if media.avatar.is_none() {
+        media.avatar = gallery.get(address).cloned();
+    }
+    media.avatar.is_none().then_some(address)
+}
+
+/// How a card's gallery fetches an address: a download, which is the tab's
+/// or the CDN client's and no request to Instagram, on a client the task
+/// holds for itself.
+fn fetching(client: &Arc<IgClient>) -> impl FnOnce(String) -> preview::Fetching<'static> + '_ {
+    move |address| {
+        let client = Arc::clone(client);
+        Box::pin(async move { client.download(&address).await.ok() })
+    }
+}
+
+/// Whether a card draws the account's picture: a run that draws pictures
+/// at all (`preview::Gallery::draws`), and an account that has one and says
+/// where a small copy of it is.
+fn pictured(profile: &Profile) -> bool {
+    preview::Gallery::draws() && !profile.pfp_anonymous && profile.pfp_url.is_some()
 }
 
 impl Media {
@@ -212,6 +261,8 @@ impl Media {
             pfp: None,
             pfp_opened: None,
             pfp_is_a_request: false,
+            pictured: false,
+            avatar: None,
         }
     }
 }
@@ -249,7 +300,8 @@ pub async fn browse(
 
     let viewer = app.viewer().clone();
     let own = viewer.pk == profile.pk;
-    let rows = card_rows(profile);
+    let pictured = pictured(profile);
+    let rows = card_rows_of(profile, pictured);
     let mut state = State {
         level: Level::Card,
         row: 0,
@@ -259,6 +311,13 @@ pub async fn browse(
         ask: Ask::None,
     };
     let mut media = Media::of(profile);
+    media.pictured = pictured;
+    // The account's small picture, fetched once the card has been up for a
+    // moment and while the keys are read (`preview::Gallery`). Through a
+    // client of its own to hold: the walks this card starts take the `App`
+    // whole.
+    let mut gallery = preview::Gallery::new();
+    let shared = app.client_shared();
 
     let colors = tui::colors_enabled();
     let mut receipts: Vec<String> = Vec::new();
@@ -293,6 +352,8 @@ pub async fn browse(
     // Every way out passes the receipts: see `tui::print_receipts`.
     let outcome: Result<ExitCode> = async {
         loop {
+            let wanted = adopt_avatar(profile, &mut media, &gallery);
+            gallery.want(wanted);
             match state.level {
                 Level::Stories => list.select(Some(state.stories_selected)),
                 Level::Inside { index } => list.select(Some(media.folders[index].selected)),
@@ -314,7 +375,10 @@ pub async fn browse(
                 );
             })?;
 
-            let event = input::read(input::tick()).map_err(input::unreadable)?;
+            let event = gallery
+                .read(fetching(&shared))
+                .await
+                .map_err(input::unreadable)?;
             let key = match event {
                 Raw::Tick | Raw::Resized | Raw::Paste(_) => continue,
                 Raw::Key(key) => key,
@@ -413,6 +477,7 @@ pub async fn browse(
                 }
                 Action::Help => {
                     let (title, keys) = match state.level {
+                        Level::Card if pictured => ("Profile", preview::with_key(CARD_KEYS)),
                         Level::Card => ("Profile", CARD_KEYS.to_vec()),
                         Level::Actions { .. } => ("Actions", preview::with_key(ACTIONS_KEYS)),
                         Level::Stories => (
@@ -440,7 +505,21 @@ pub async fn browse(
             }
 
             let level_before = state.level;
-            match state.level {
+            // The picture on the card is the first entry of the actions
+            // panel put where it can be seen: Enter, `d` and `p` on it do
+            // what they do there, through the same code.
+            let on_the_picture = state.level == Level::Card
+                && rows[state.row.min(rows.len() - 1)] == CardRow::Picture
+                && matches!(
+                    action_of(key),
+                    Action::Open | Action::Download | Action::Preview
+                );
+            let level_of_the_key = if on_the_picture {
+                Level::Actions { selected: 0 }
+            } else {
+                state.level
+            };
+            match level_of_the_key {
                 Level::Card => {
                     let here = rows[state.row.min(rows.len() - 1)];
                     // Left and Right, and `h` and `l` with them, move the
@@ -1507,7 +1586,11 @@ const CARD_KEYS: &[help::Key] = &[
     help::key("← → h l", "pick within a row", KeyCode::Right),
     help::key("g G home end", "the first row, the last", KeyCode::Home),
     help::key("enter", "open what is under the cursor", KeyCode::Enter),
-    help::key("d", "save all of a highlight here", KeyCode::Char('d')),
+    help::key(
+        "d",
+        "save the picture, or all of a highlight",
+        KeyCode::Char('d'),
+    ),
     ABOUT_KEY,
     help::ACCOUNT,
     help::WEB,
@@ -1649,6 +1732,9 @@ pub(crate) async fn peek(
         .collect();
     let mut media = Media::of(profile);
     media.pfp_is_a_request = picture_is_a_request(app, profile);
+    media.pictured = pictured(profile);
+    let mut gallery = preview::Gallery::new();
+    let shared = app.client_shared();
     let mut state = State {
         level: Level::Card,
         row: opening.first().copied().unwrap_or(0),
@@ -1683,11 +1769,17 @@ pub(crate) async fn peek(
     }
 
     loop {
+        let wanted = adopt_avatar(profile, &mut media, &gallery);
+        gallery.want(wanted);
         if state.level == Level::Stories {
             list.select(Some(state.stories_selected));
         }
         tui.terminal.draw(peek_frame!())?;
-        let key = match input::read(input::tick()).map_err(input::unreadable)? {
+        let read = gallery
+            .read(fetching(&shared))
+            .await
+            .map_err(input::unreadable)?;
+        let key = match read {
             Raw::Tick | Raw::Resized | Raw::Paste(_) => continue,
             Raw::Key(key) => key,
         };
@@ -1968,7 +2060,21 @@ struct Fit {
     gaps: bool,
     /// The blank row inside the top border and inside the bottom one.
     padded: bool,
+    /// The picture drawn at the left of the about block, the text beside
+    /// it. Then the picture's row is that drawing and has no band of its
+    /// own ([`banded`]).
+    avatar: bool,
 }
+
+/// The picture on the card: this many columns, which at a pixel a column
+/// and two a row is a square of 16 by 16, and a row under it that says what
+/// it is and carries the cursor. Small on purpose: it says who the card is
+/// about at a glance, and Enter is one key away from the real thing.
+const AVATAR_W: u16 = 16;
+const AVATAR_ROWS: u16 = AVATAR_W / 2 + 1;
+
+/// The columns between the picture and the text beside it.
+const AVATAR_GAP: u16 = 3;
 
 impl Fit {
     /// The card where there is room for all of it.
@@ -1976,7 +2082,17 @@ impl Fit {
         bio: BIO_ROWS,
         gaps: true,
         padded: true,
+        avatar: false,
     };
+
+    /// The columns the about block's text has, of the card's `text_w`.
+    fn about_width(self, text_w: usize) -> usize {
+        if self.avatar {
+            text_w.saturating_sub(usize::from(AVATAR_W + AVATAR_GAP))
+        } else {
+            text_w
+        }
+    }
 
     fn padding(self) -> Padding {
         if self.padded {
@@ -2001,10 +2117,30 @@ fn text_width(area: Rect) -> usize {
 /// The card's height under `fit`: the borders, the padding, the about
 /// block, the rows, and the blank rows between them all.
 fn card_height(profile: &Profile, rows: &[CardRow], text_w: usize, fit: Fit) -> u16 {
-    let about = about_lines(profile, text_w, fit.bio, false).len() as u16;
-    let body: u16 = rows.iter().map(row_height).sum();
-    let air = if fit.gaps { rows.len() as u16 } else { 0 };
-    2 + if fit.padded { 2 } else { 0 } + about + body + air
+    2 + if fit.padded { 2 } else { 0 } + about_rows(profile, text_w, fit) + {
+        let banded = banded(rows, fit);
+        let body: u16 = banded.clone().map(row_height).sum();
+        let air = if fit.gaps { banded.count() as u16 } else { 0 };
+        body + air
+    }
+}
+
+/// The rows the about block takes: its text's, and no fewer than the
+/// picture's where one is drawn beside it.
+fn about_rows(profile: &Profile, text_w: usize, fit: Fit) -> u16 {
+    let text = about_lines(profile, fit.about_width(text_w), fit.bio, false).len() as u16;
+    if fit.avatar {
+        text.max(AVATAR_ROWS)
+    } else {
+        text
+    }
+}
+
+/// The rows that get a band of their own under the about block: all of
+/// them, less the picture's where it is drawn in the about block.
+fn banded(rows: &[CardRow], fit: Fit) -> impl Iterator<Item = &CardRow> + Clone {
+    rows.iter()
+        .filter(move |row| !(fit.avatar && **row == CardRow::Picture))
 }
 
 /// Fits the card to the rows of `area`, giving up first what costs least:
@@ -2014,9 +2150,21 @@ fn card_height(profile: &Profile, rows: &[CardRow], text_w: usize, fit: Fit) -> 
 /// something to open, and one that fell off the bottom of a short terminal
 /// was there to move onto and not to see, which is what this replaced. A
 /// terminal too short for even that cuts the card at its bottom edge.
-fn fitted(profile: &Profile, rows: &[CardRow], area: Rect) -> Fit {
+///
+/// `pictured` is whether the card draws its picture (`Media::pictured`).
+/// The picture is the first thing given up: it is drawn only where the
+/// whole card fits with it, since under that it would be taking rows from
+/// the bio to show sixteen pixels of a face.
+fn fitted(profile: &Profile, rows: &[CardRow], area: Rect, pictured: bool) -> Fit {
     let text_w = text_width(area);
     let fits = |fit: Fit| card_height(profile, rows, text_w, fit) <= area.height;
+    let with_the_picture = Fit {
+        avatar: true,
+        ..Fit::WHOLE
+    };
+    if pictured && rows.contains(&CardRow::Picture) && fits(with_the_picture) {
+        return with_the_picture;
+    }
     let mut fit = Fit::WHOLE;
     while fit.bio > BIO_ROWS_KEPT && !fits(fit) {
         fit.bio -= 1;
@@ -2301,11 +2449,11 @@ fn card_frame(
     // in the rows under it, so the two never overlap.
     let [label, below] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
     frame.render_widget(Paragraph::new(tui::viewer_line(viewer, colors)), label);
-    let fit = fitted(profile, rows, below);
+    let fit = fitted(profile, rows, below, media.pictured);
     let text_w = text_width(below);
     let h = card_height(profile, rows, text_w, fit).min(below.height);
     let card = below.centered(Constraint::Length(card_width(below)), Constraint::Length(h));
-    let cut = bio_is_cut(profile, text_w, fit.bio);
+    let cut = bio_is_cut(profile, fit.about_width(text_w), fit.bio);
 
     // The identity on the border: the handle bold on the left, what the
     // account is and how you stand to it dim on the right.
@@ -2337,10 +2485,10 @@ fn card_frame(
     // part is not a band that says "nothing". Band 0 is the about block;
     // `at` is where each row landed, which depends on whether this terminal
     // has the rows for a blank one between them.
-    let about = about_lines(profile, width, fit.bio, colors);
-    let mut constraints = vec![Constraint::Length(about.len() as u16)];
+    let about = about_lines(profile, fit.about_width(width), fit.bio, colors);
+    let mut constraints = vec![Constraint::Length(about_rows(profile, width, fit))];
     let mut at = Vec::with_capacity(rows.len());
-    for row in rows {
+    for row in banded(rows, fit) {
         if fit.gaps {
             constraints.push(Constraint::Length(1));
         }
@@ -2349,9 +2497,27 @@ fn card_frame(
     }
     constraints.push(Constraint::Fill(1));
     let bands = Layout::vertical(constraints).split(inner);
-    frame.render_widget(Paragraph::new(about).wrap(Wrap { trim: false }), bands[0]);
+    let about_at = if fit.avatar {
+        let [picture, _, text] = Layout::horizontal([
+            Constraint::Length(AVATAR_W),
+            Constraint::Length(AVATAR_GAP),
+            Constraint::Fill(1),
+        ])
+        .areas(bands[0]);
+        draw_avatar(
+            frame,
+            picture,
+            media.avatar.as_ref(),
+            focus == Some(CardRow::Picture),
+            colors,
+        );
+        text
+    } else {
+        bands[0]
+    };
+    frame.render_widget(Paragraph::new(about).wrap(Wrap { trim: false }), about_at);
 
-    for (row, at) in rows.iter().zip(at) {
+    for (row, at) in banded(rows, fit).zip(at) {
         let band = bands[at];
         match row {
             CardRow::Actions => draw_row_button(
@@ -2562,16 +2728,46 @@ fn card_footer_line(here: CardRow, cut: bool, note: &str, colors: bool) -> Line<
     tui::footer(note, &card_hint(here, cut), colors)
 }
 
+/// The account's picture at the left of the about block: the picture, once
+/// it has arrived, and under it the row that says what it is and carries
+/// the cursor, since a picture cannot be drawn in reverse video and still be
+/// the picture. Until it arrives its place is kept, empty, so that nothing
+/// on the card moves when it does.
+fn draw_avatar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    picture: Option<&preview::Pixels>,
+    focused: bool,
+    colors: bool,
+) {
+    let [place, label] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(
+        Rect::new(area.x, area.y, area.width, area.height.min(AVATAR_ROWS)),
+    );
+    if let Some(picture) = picture {
+        picture.draw_in(frame, place);
+    }
+    let style = if focused {
+        tui::paint(colors, tui::selection())
+    } else {
+        tui::paint(colors, tui::DIM)
+    };
+    let text = if focused { "picture ›" } else { "picture" };
+    frame.render_widget(
+        Paragraph::new(Line::from(text).centered()).style(style),
+        label,
+    );
+}
+
 /// The card's hints. `cut` is whether the bio is shown short of whole, which
 /// is when `i` is worth naming here. The account key gives its place to the
 /// save on the highlights row, so that the line still fits a card 80 columns
 /// wide; `?` names every key.
 fn card_hint(here: CardRow, cut: bool) -> String {
     let mut hint = String::from("↑↓ move · ←→ pick · enter open");
-    hint.push_str(if here == CardRow::Highlights {
-        " · d save all"
-    } else {
-        " · a account"
+    hint.push_str(match here {
+        CardRow::Highlights => " · d save all",
+        CardRow::Picture => " · d save",
+        _ => " · a account",
     });
     if cut {
         hint.push_str(" · i bio");
@@ -3695,7 +3891,7 @@ mod tests {
 
         // With room: the whole bio, and air between the bands.
         let area = Rect::new(0, 0, 80, 29);
-        assert_eq!(fitted(&profile, &rows, area), Fit::WHOLE);
+        assert_eq!(fitted(&profile, &rows, area, false), Fit::WHOLE);
         let screen = draw(30, 0);
         every_row(&screen);
         assert!(screen.contains("four"), "{screen}");
@@ -3704,15 +3900,18 @@ mod tests {
         // four lines of bio 5, the rows 6, the blank rows 5. A row short,
         // the bio gives up one of its own, and the air stays; two short,
         // another, down to the second.
-        assert_eq!(fitted(&profile, &rows, Rect::new(0, 0, 80, 20)), Fit::WHOLE);
-        let fit = fitted(&profile, &rows, Rect::new(0, 0, 80, 19));
+        assert_eq!(
+            fitted(&profile, &rows, Rect::new(0, 0, 80, 20), false),
+            Fit::WHOLE
+        );
+        let fit = fitted(&profile, &rows, Rect::new(0, 0, 80, 19), false);
         assert_eq!((fit.bio, fit.gaps, fit.padded), (3, true, true));
-        let fit = fitted(&profile, &rows, Rect::new(0, 0, 80, 18));
+        let fit = fitted(&profile, &rows, Rect::new(0, 0, 80, 18), false);
         assert_eq!((fit.bio, fit.gaps, fit.padded), (2, true, true));
 
         // 14 rows, where the highlights used to fall off the bottom: the
         // blank rows go, and every row is there.
-        let fit = fitted(&profile, &rows, Rect::new(0, 0, 80, 13));
+        let fit = fitted(&profile, &rows, Rect::new(0, 0, 80, 13), false);
         assert_eq!((fit.bio, fit.gaps), (2, false));
         let screen = draw(14, rows.len() - 1);
         every_row(&screen);
@@ -3720,7 +3919,7 @@ mod tests {
         assert!(screen.contains(">trip"), "the cursor shows: {screen}");
 
         // Shorter still: the padding, then the bio's second row.
-        let fit = fitted(&profile, &rows, Rect::new(0, 0, 80, 10));
+        let fit = fitted(&profile, &rows, Rect::new(0, 0, 80, 10), false);
         assert_eq!((fit.bio, fit.gaps, fit.padded), (1, false, false));
         let screen = draw(11, rows.len() - 1);
         every_row(&screen);
@@ -3750,5 +3949,144 @@ mod tests {
         let other = cell_of("posts");
         assert!(other.modifier.contains(Modifier::DIM), "{other:?}");
         assert!(!other.modifier.contains(Modifier::REVERSED), "{other:?}");
+    }
+
+    /// A card as `viewing` says, at this size, with its picture arrived or
+    /// not, and the cursor on `row`.
+    fn pictured_card(
+        profile: &Profile,
+        rows: &[CardRow],
+        row: usize,
+        arrived: bool,
+        viewing: bool,
+        height: u16,
+    ) -> Terminal<TestBackend> {
+        let mut media = Media::of(profile);
+        media.pictured = true;
+        if arrived {
+            media.avatar = Some(preview::Pixels::plain(150, 150, (9, 9, 200)));
+        }
+        let mut state = at_the_card();
+        state.row = row;
+        let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                card_frame(
+                    frame,
+                    profile,
+                    &media,
+                    &state,
+                    rows,
+                    false,
+                    &tui::me(),
+                    "",
+                    true,
+                    viewing,
+                );
+            })
+            .unwrap();
+        terminal
+    }
+
+    /// Where the card draws pictures, the account's is at the left of what
+    /// the account says, which moves to its right; it is the card's first
+    /// row, with the cursor on the label under it, and no row of text
+    /// stands for it. The place is kept before the picture arrives.
+    #[test]
+    fn the_card_draws_the_picture_beside_what_the_account_says() {
+        let mut profile = with_a_bio("climber\nbased in Oslo");
+        profile.pfp_url = Some("https://x.cdninstagram.com/small.jpg".to_string());
+        let rows = card_rows_of(&profile, true);
+        assert_eq!(&rows[..2], [CardRow::Picture, CardRow::Actions]);
+        assert!(!card_rows(&profile).contains(&CardRow::Picture));
+
+        let terminal = pictured_card(&profile, &rows, 0, true, false, 30);
+        let screen = screen_of(&terminal);
+        let lines: Vec<&str> = screen.lines().collect();
+        let named = lines
+            .iter()
+            .position(|line| line.contains("Some One"))
+            .unwrap_or_else(|| panic!("{screen}"));
+        // Sixteen columns of picture, eight rows of it, from the row the
+        // name is on; the name and the bio start past it.
+        assert_eq!(lines[named].matches('▀').count(), 16, "{screen}");
+        assert_eq!(screen.matches('▀').count(), 16 * 8, "{screen}");
+        let column = |text: &str| {
+            let line = lines.iter().find(|line| line.contains(text)).unwrap();
+            line.chars().position(|c| c == text.chars().next().unwrap())
+        };
+        assert_eq!(column("Some One"), column("climber"), "{screen}");
+        assert!(
+            lines[named].find('▀') < lines[named].find("Some One"),
+            "{screen}"
+        );
+        assert!(lines[named + 8].contains("picture ›"), "{screen}");
+        assert!(!screen.contains("profile picture"), "{screen}");
+        assert!(screen.contains("actions on this account"), "{screen}");
+        assert!(screen.contains("enter open · d save"), "{screen}");
+        // The label under the picture carries the cursor, in reverse video.
+        let buffer = terminal.backend().buffer();
+        let at = lines[named + 8].find("picture").unwrap();
+        let x = lines[named + 8][..at].chars().count() as u16;
+        assert!(
+            buffer[(x, named as u16 + 8)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "{screen}"
+        );
+
+        // Not arrived yet: the place is kept, and nothing moves when it is.
+        let waiting = screen_of(&pictured_card(&profile, &rows, 1, false, false, 30));
+        assert_eq!(waiting.matches('▀').count(), 0, "{waiting}");
+        assert_eq!(
+            waiting.lines().position(|line| line.contains("Some One")),
+            Some(named)
+        );
+        assert!(waiting.contains("picture") && !waiting.contains("picture ›"));
+    }
+
+    /// A terminal too short for the card with its picture draws the card
+    /// without it, and the picture is a row of text again: still there to
+    /// open. The card a list opens draws its picture the same way.
+    #[test]
+    fn a_short_terminal_gives_up_the_picture_and_keeps_its_row() {
+        let mut profile = bare_profile();
+        profile.pfp_url = Some("https://x.cdninstagram.com/small.jpg".to_string());
+        let rows = card_rows_of(&profile, true);
+        let fit = fitted(&profile, &rows, Rect::new(0, 0, 80, 22), true);
+        assert!(fit.avatar, "22 rows hold it: {fit:?}");
+        let fit = fitted(&profile, &rows, Rect::new(0, 0, 80, 21), true);
+        assert!(!fit.avatar, "21 do not: {fit:?}");
+        assert!(!fitted(&profile, &rows, Rect::new(0, 0, 80, 40), false).avatar);
+
+        let short = screen_of(&pictured_card(&profile, &rows, 0, true, false, 20));
+        assert_eq!(short.matches('▀').count(), 0, "{short}");
+        assert!(short.contains("> profile picture") || short.contains("profile picture"));
+        assert!(short.contains("actions on this account"), "{short}");
+
+        let viewing = viewing_rows(&profile);
+        let peeked = screen_of(&pictured_card(&profile, &viewing, 0, true, true, 30));
+        assert_eq!(peeked.matches('▀').count(), 16 * 8, "{peeked}");
+        assert!(peeked.contains("picture ›"), "{peeked}");
+        assert!(!peeked.contains("profile picture"), "{peeked}");
+        assert!(peeked.contains("enter open · d save"), "{peeked}");
+    }
+
+    /// The picture is fetched while the card has none, and no longer once
+    /// it has arrived; a card that draws no pictures never asks.
+    #[test]
+    fn the_cards_picture_is_wanted_until_it_arrives() {
+        let mut profile = bare_profile();
+        profile.pfp_url = Some("https://x.cdninstagram.com/small.jpg".to_string());
+        let gallery = preview::Gallery::new();
+        let mut media = Media::of(&profile);
+        assert_eq!(adopt_avatar(&profile, &mut media, &gallery), None);
+        media.pictured = true;
+        assert_eq!(
+            adopt_avatar(&profile, &mut media, &gallery),
+            profile.pfp_url.as_deref()
+        );
+        media.avatar = Some(preview::Pixels::plain(2, 2, (1, 1, 1)));
+        assert_eq!(adopt_avatar(&profile, &mut media, &gallery), None);
     }
 }

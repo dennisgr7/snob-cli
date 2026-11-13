@@ -1029,11 +1029,19 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   the session's scratch directory (`ui/browser/scratch.rs`, swept when
   abandoned) and opens it with `opener` in whatever the user already uses
   for pictures and videos. **The one thing drawn in the terminal is a still
-  picture, on `p`** (`ui/preview.rs`, feature `preview`, not a default): a
-  JPEG, in half blocks, in a box over the view, fetched as Enter fetches it
-  and into the same file. Never as the selection moves, never a video, and
-  nothing a terminal has to be asked about first (no sixel, no kitty
-  protocol). A build without the feature binds `p` to nothing.
+  picture** (`ui/preview.rs`, feature `preview`): a JPEG, in half blocks.
+  On `p`, the one under the cursor, in a box over the view, fetched as
+  Enter fetches it and into the same file. Without a key, a small one
+  beside the text (`preview::Gallery`): the thumbnail of the post or item
+  the cursor is on, a video's cover, the avatar on a profile card, where
+  it is also what Enter and `d` act on. A small one is fetched only after
+  the cursor has rested, one at a time, once a session, from the address
+  the answer already carried (`posts::Item::thumb`, `Profile::pfp_url`),
+  and a failed one is not asked for again. Never a video, never anything
+  marked as seen, and nothing a terminal has to be asked about first (no
+  sixel, no kitty protocol). A build without the feature, a run with no
+  colors and a terminal that does not say 24-bit color draw none, and lay
+  the views out as if there were none.
 - `stories` and `highlights` are separate commands because a highlight has a
   tray level and an items level (`snob highlights someone 2`); `posts` has the
   same two levels. Shared flags live in `cli::MediaActionArgs`.
@@ -1147,6 +1155,11 @@ sent and binary size, not speed. Measured, and recorded beside the setting:
   crates, the rest was in the tree through reqwest): 486,912 bytes, 4.8%
   of the Windows x86-64 release binary (10,180,608 against 9,693,696
   with `--no-default-features --features xlsx,mcp`); on by default.
+- The `preview` feature (pictures drawn in the terminal: `zune-jpeg`
+  built without its SIMD, and `zune-core`, two crates nothing else
+  uses): 102,400 bytes, 0.9% of the Windows x86-64 release binary
+  (11,245,056 against 11,142,656 with `--no-default-features --features
+  xlsx,mcp,mcp-http`); on by default.
 
 ## Open questions
 

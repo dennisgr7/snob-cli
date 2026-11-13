@@ -1,17 +1,25 @@
-//! A picture drawn in the terminal, on `p`.
+//! Pictures drawn in the terminal: the one under the cursor at its full
+//! size on `p`, and a small one beside the text of the views that have one.
 //!
 //! **The one exception to "Stories are handed to the system viewer"**
-//! (`AGENTS.md`), and a narrow one: a still picture, in a box over the view,
-//! when its key is pressed. Enter still hands the file to the viewer the
-//! person already uses; this is for knowing which picture a row is before
-//! opening it.
+//! (`AGENTS.md`), and a narrow one: still pictures, for knowing which
+//! picture a row is before opening it. Enter still hands the file to the
+//! viewer the person already uses.
 //!
-//! **Never as the selection moves.** A preview is the very read Enter makes:
-//! the file is fetched from the CDN into the session's scratch directory,
-//! where Enter and `d` find it afterwards, and is fetched once. Drawn for
-//! every row the cursor passes it would be a download per keystroke of
-//! pictures nobody asked to see. Nothing marks anything as seen, here or
-//! there: looking is a download, not the call that says "seen".
+//! **On `p`, the picture itself**, in a box over the view. It is the very
+//! read Enter makes: the file is fetched from the CDN into the session's
+//! scratch directory, where Enter and `d` find it afterwards, and is
+//! fetched once. Only when its key is pressed: it is the full file, some
+//! megabytes of it for a post.
+//!
+//! **Beside the text, a small one, without a key** ([`Gallery`]): the
+//! thumbnail of the post or the item the cursor is on, the avatar on a
+//! profile card. These are the small copies an answer already names next to
+//! the large one, the ones the app loads for every tile of a grid. What
+//! keeps them from being a download per keystroke is that the cursor has to
+//! rest first ([`REST`]), that one is fetched at a time, and that each is
+//! fetched once a session. Nothing marks anything as seen, here or there:
+//! looking is a download, not the call that says "seen".
 //!
 //! **Two pixels to a cell.** Each cell is an upper half block, its
 //! foreground the pixel above and its background the pixel below; a cell is
@@ -22,10 +30,11 @@
 //! has to be asked, and the answer comes back on the terminal's input in the
 //! middle of the keys.
 //!
-//! **Behind the `preview` feature, which is not a default**, until what it
-//! costs the binary is measured. A build without it binds `p` to nothing and
-//! names it in no help ([`AVAILABLE`]); everything here still compiles, less
-//! the decoder, so the drawing is tested in every build.
+//! **Behind the `preview` feature**, a default one whose cost is in
+//! `AGENTS.md` ("Costs worth knowing"). A build without it binds `p` to
+//! nothing, names it in no help and lays its views out with no place for a
+//! picture ([`AVAILABLE`], [`Gallery::draws`]); everything here still
+//! compiles, less the decoder, so the drawing is tested in every build.
 //!
 //! **What is said instead of drawn**, in the note line and before anything
 //! is fetched: a run that draws no colors, a terminal that does not say it
@@ -38,10 +47,14 @@
 //! refused from the header before a pixel is decoded, and a picture that
 //! will not decode is a note. The decoder is built without its SIMD, which
 //! is the whole of its `unsafe` (`zune-jpeg` 0.5.15 forbids `unsafe_code`
-//! with neither `x86` nor `neon` on): one picture is decoded per key press,
-//! and nobody waits on it.
+//! with neither `x86` nor `neon` on): one picture is decoded at a time, a
+//! small one in a few milliseconds, and nobody waits on it.
 
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::KeyCode;
@@ -118,7 +131,7 @@ fn refusal(
 
 /// A decoded picture: `width * height` pixels of red, green and blue.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Pixels {
+pub struct Pixels {
     width: usize,
     height: usize,
     rgb: Vec<u8>,
@@ -382,6 +395,221 @@ fn decode(bytes: &[u8]) -> std::result::Result<Pixels, String> {
     Err(String::new())
 }
 
+/// How long the cursor rests on something before its small picture is
+/// fetched. Long enough that holding an arrow down fetches nothing on the
+/// way, two of a view's ticks; short enough that stopping on a row feels
+/// answered.
+const REST: Duration = Duration::from_millis(300);
+
+/// How often the keyboard is looked at while a small picture is on its way:
+/// the longest a key waits behind one. The fetch watcher of a wait under a
+/// box looks every 50 ms (`input::WATCH`); here nothing says "wait", so a
+/// key should not feel one.
+const POLL: Duration = Duration::from_millis(20);
+
+/// How many small pictures a session keeps decoded. One is at most
+/// [`MAX_SIDE`] a side but in practice some 320 by 400, about 400 KiB of
+/// RGB, so this is some 12 MiB however long somebody scrolls a grid.
+const KEPT: usize = 32;
+
+/// A small picture on its way: its bytes, or nothing when they could not be
+/// had.
+pub type Fetching<'a> = Pin<Box<dyn Future<Output = Option<Vec<u8>>> + 'a>>;
+
+/// The small pictures a view draws beside its text: the one for what the
+/// cursor rests on, fetched while the keys stay alive, and the ones before
+/// it, kept for the session.
+///
+/// **A view draws these without being asked**, which the picture on `p` is
+/// not: a thumbnail beside the selected post, the avatar on a profile card.
+/// What keeps that from being a download per keystroke is the rest: nothing
+/// is fetched for a row the cursor only passes ([`REST`]), one picture is
+/// fetched at a time, and moving on drops the one in flight. They are the
+/// small files the app itself loads for every tile of a grid as it opens
+/// one, from the CDN and no request to Instagram, and nothing is marked as
+/// seen. An address that fails is not asked for again: these are signed
+/// links that expire, and a view is no place for a retry.
+pub struct Gallery<'a> {
+    /// What the view wants on screen, and since when.
+    wanted: Option<(String, Instant)>,
+    fetching: Option<(String, Fetching<'a>)>,
+    /// By address. `None` is one that could not be fetched or drawn.
+    kept: HashMap<String, Option<Pixels>>,
+    /// The addresses of `kept`, oldest first.
+    order: VecDeque<String>,
+}
+
+impl Default for Gallery<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> Gallery<'a> {
+    pub fn new() -> Self {
+        Self {
+            wanted: None,
+            fetching: None,
+            kept: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Whether a view should make room for small pictures at all: a build
+    /// that draws them, on a terminal that says it can. Read once a session;
+    /// a view that gets `false` is laid out as it was before there were any.
+    pub fn draws() -> bool {
+        refusal(AVAILABLE, tui::colors_enabled(), theme::truecolor(), None).is_none()
+    }
+
+    /// Says what the view wants beside the cursor now: the address of a
+    /// small picture, or nothing. Called on every turn of a view's loop; a
+    /// change restarts the rest and drops the fetch of the one before.
+    pub fn want(&mut self, address: Option<&str>) {
+        self.want_at(address, Instant::now());
+    }
+
+    fn want_at(&mut self, address: Option<&str>, now: Instant) {
+        if self.wanted.as_ref().map(|(wanted, _)| wanted.as_str()) == address {
+            return;
+        }
+        self.wanted = address.map(|address| (address.to_string(), now));
+        if self
+            .fetching
+            .as_ref()
+            .is_some_and(|(fetching, _)| Some(fetching.as_str()) != address)
+        {
+            self.fetching = None;
+        }
+    }
+
+    /// The picture at `address`, once it has been fetched.
+    pub fn get(&self, address: &str) -> Option<&Pixels> {
+        self.kept.get(address).and_then(Option::as_ref)
+    }
+
+    /// How long until the wanted picture may be fetched; `None` when there
+    /// is nothing to fetch: nothing wanted, or it is kept, or on its way.
+    fn rest_left(&self, now: Instant) -> Option<Duration> {
+        let (address, since) = self.wanted.as_ref()?;
+        if self.kept.contains_key(address) || self.fetching.is_some() {
+            return None;
+        }
+        Some(REST.saturating_sub(now.saturating_duration_since(*since)))
+    }
+
+    fn keep(&mut self, address: String, bytes: Option<Vec<u8>>) {
+        let pixels = bytes.and_then(|bytes| decode(&bytes).ok());
+        if self.kept.insert(address.clone(), pixels).is_none() {
+            self.order.push_back(address);
+        }
+        while self.order.len() > KEPT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.kept.remove(&oldest);
+            }
+        }
+    }
+
+    /// Waits for the next key as `input::read(input::tick())` does, and
+    /// meanwhile fetches the wanted picture once the cursor has rested.
+    /// `fetch` makes the download of an address; it is called at most once
+    /// a turn. A picture that arrives ends the wait as a tick does, so the
+    /// view draws again and it is on screen.
+    ///
+    /// With nothing to fetch this is exactly the read it replaces: one
+    /// blocking wait, no timer.
+    pub async fn read(
+        &mut self,
+        fetch: impl FnOnce(String) -> Fetching<'a>,
+    ) -> std::io::Result<Raw> {
+        let until = Instant::now() + input::tick();
+        let mut fetch = Some(fetch);
+        loop {
+            let now = Instant::now();
+            let left = until.saturating_duration_since(now);
+            if let Some((_, fetching)) = self.fetching.as_mut() {
+                let raw = input::read(Duration::ZERO)?;
+                if !matches!(raw, Raw::Tick) {
+                    return Ok(raw);
+                }
+                if left.is_zero() {
+                    return Ok(Raw::Tick);
+                }
+                let arrived = tokio::select! {
+                    bytes = fetching.as_mut() => Some(bytes),
+                    () = tokio::time::sleep(left.min(POLL)) => None,
+                };
+                if let Some(bytes) = arrived {
+                    if let Some((address, _)) = self.fetching.take() {
+                        self.keep(address, bytes);
+                    }
+                    return Ok(Raw::Tick);
+                }
+                continue;
+            }
+            match self.rest_left(now) {
+                // Rested: the fetch starts, unless this turn started one.
+                Some(rest) if rest.is_zero() => {
+                    let (Some(fetch), Some((address, _))) = (fetch.take(), self.wanted.as_ref())
+                    else {
+                        return input::read(left);
+                    };
+                    self.fetching = Some((address.clone(), fetch(address.clone())));
+                }
+                // Still resting: wait for a key no longer than the rest.
+                Some(rest) if rest < left => {
+                    let raw = input::read(rest)?;
+                    if !matches!(raw, Raw::Tick) {
+                        return Ok(raw);
+                    }
+                }
+                _ => return input::read(left),
+            }
+        }
+    }
+}
+
+impl Pixels {
+    /// Draws the picture as large as fits in `area`, in its own shape, from
+    /// the area's top and in the middle of its width. Hands back the cells
+    /// it took, which are no more than `area`.
+    pub fn draw_in(&self, frame: &mut Frame<'_>, area: Rect) -> Rect {
+        let (width, height) = fitted(
+            self.width,
+            self.height,
+            usize::from(area.width),
+            usize::from(area.height),
+        );
+        if width == 0 || height == 0 {
+            return Rect::new(area.x, area.y, 0, 0);
+        }
+        let rows = height.div_ceil(2) as u16;
+        let taken = Rect::new(area.x, area.y, area.width, rows.min(area.height))
+            .centered_horizontally(Constraint::Length(width as u16));
+        paint(frame.buffer_mut(), taken, &self.scaled(width, height));
+        taken
+    }
+
+    /// A picture of one color, for a view's tests to draw.
+    #[cfg(test)]
+    pub(crate) fn plain(width: usize, height: usize, (red, green, blue): (u8, u8, u8)) -> Self {
+        let rgb = [red, green, blue].repeat(width * height);
+        Self { width, height, rgb }
+    }
+
+    /// The rows of cells the picture takes when it is drawn `cols` wide at
+    /// most and `rows` tall at most: what a view lays its text out around.
+    pub fn rows_in(&self, cols: u16, rows: u16) -> u16 {
+        let (_, height) = fitted(
+            self.width,
+            self.height,
+            usize::from(cols),
+            usize::from(rows),
+        );
+        height.div_ceil(2) as u16
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ratatui::Terminal;
@@ -615,5 +843,98 @@ mod tests {
         let said = decode(&wide).unwrap_err();
         assert!(said.starts_with("Could not decode"), "{said}");
         assert!(said.contains("5000"), "{said}");
+    }
+
+    /// Nothing is fetched for a row the cursor only passes: a picture may
+    /// be fetched once what is wanted has stayed wanted for the rest, and
+    /// wanting something else starts the rest over.
+    #[test]
+    fn moving_the_selection_fetches_nothing_until_it_rests() {
+        let mut gallery = Gallery::new();
+        let start = Instant::now();
+        assert_eq!(gallery.rest_left(start), None, "nothing is wanted");
+
+        gallery.want_at(Some("a"), start);
+        assert_eq!(gallery.rest_left(start), Some(REST));
+        let later = start + REST / 2;
+        assert_eq!(gallery.rest_left(later), Some(REST / 2));
+        // Asked again for the same thing, as a view's loop does every turn:
+        // the rest goes on from where it was.
+        gallery.want_at(Some("a"), later);
+        assert_eq!(gallery.rest_left(later), Some(REST / 2));
+
+        gallery.want_at(Some("b"), later);
+        assert_eq!(gallery.rest_left(later), Some(REST), "it starts over");
+        assert_eq!(gallery.rest_left(later + REST), Some(Duration::ZERO));
+        assert_eq!(gallery.rest_left(later + REST * 3), Some(Duration::ZERO));
+
+        gallery.want_at(None, later);
+        assert_eq!(gallery.rest_left(later + REST), None);
+    }
+
+    /// A picture on its way is dropped when the cursor moves on, and kept
+    /// when the view asks for the same one again.
+    #[test]
+    fn moving_on_drops_the_picture_in_flight() {
+        let mut gallery = Gallery::new();
+        let now = Instant::now();
+        gallery.want_at(Some("a"), now);
+        gallery.fetching = Some(("a".to_string(), Box::pin(async { None })));
+        assert_eq!(gallery.rest_left(now + REST), None, "it is on its way");
+        gallery.want_at(Some("a"), now);
+        assert!(gallery.fetching.is_some());
+        gallery.want_at(Some("b"), now);
+        assert!(gallery.fetching.is_none());
+    }
+
+    /// What was fetched is kept and not fetched again, a failure included;
+    /// the oldest go once there are more than the session keeps.
+    #[test]
+    fn a_picture_is_fetched_once_and_the_oldest_are_let_go() {
+        let mut gallery = Gallery::new();
+        let now = Instant::now();
+        gallery.keep("gone".to_string(), None);
+        assert!(gallery.get("gone").is_none());
+        gallery.want_at(Some("gone"), now);
+        assert_eq!(
+            gallery.rest_left(now + REST),
+            None,
+            "an address that failed is not asked for again"
+        );
+
+        for n in 0..KEPT {
+            gallery.keep(format!("picture {n}"), None);
+        }
+        assert_eq!(gallery.kept.len(), KEPT);
+        assert!(!gallery.kept.contains_key("gone"), "the oldest went");
+        assert!(gallery.kept.contains_key("picture 0"));
+        // Kept twice, it is still one.
+        gallery.keep("picture 0".to_string(), None);
+        assert_eq!(gallery.order.len(), KEPT);
+    }
+
+    /// A picture is drawn as large as its place allows, in its own shape,
+    /// in the middle of the place's width and from its top.
+    #[test]
+    fn a_small_picture_takes_the_middle_of_its_place() {
+        let picture = Pixels::plain(320, 400, (1, 2, 3));
+        // 40 columns by 10 rows are 40 by 20 pixels: the height decides.
+        assert_eq!(picture.rows_in(40, 10), 10);
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let mut taken = Rect::default();
+        terminal
+            .draw(|frame| taken = picture.draw_in(frame, Rect::new(0, 1, 40, 10)))
+            .unwrap();
+        assert_eq!(taken, Rect::new(12, 1, 16, 10));
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(12, 1)].symbol(), "▀");
+        assert_eq!(buffer[(12, 1)].fg, Color::Rgb(1, 2, 3));
+        assert_eq!(buffer[(11, 1)].symbol(), " ");
+        assert_eq!(buffer[(12, 0)].symbol(), " ");
+        // A place with no room draws nothing and says so.
+        terminal
+            .draw(|frame| taken = picture.draw_in(frame, Rect::new(0, 0, 0, 5)))
+            .unwrap();
+        assert_eq!((taken.width, taken.height), (0, 0));
     }
 }
