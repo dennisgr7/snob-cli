@@ -20,11 +20,11 @@
 use anyhow::{Context, Result};
 use console::Term;
 use ratatui::Frame;
-use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::browser::input::{self, Action};
+use super::theme::Role;
 use super::tui::{self, Tui};
 
 /// Draws the list of `labels` under `prompt` and waits for a choice.
@@ -74,11 +74,13 @@ pub fn choose(prompt: &str, labels: &[&str]) -> Result<Option<usize>> {
         Some(index) => labels[index],
         None => "(none)",
     };
+    // Answered, so the mark is the green of something done, and the answer
+    // is the data on the line.
     Term::stderr().write_line(&format!(
         "{} {} {}",
-        console::style("?").green().for_stderr(),
+        console::style("?").fg(Role::Ok.console()).for_stderr(),
         prompt,
-        console::style(answer).cyan().for_stderr()
+        console::style(answer).fg(Role::Info.console()).for_stderr()
     ))?;
     Ok(outcome)
 }
@@ -89,8 +91,10 @@ pub fn choose(prompt: &str, labels: &[&str]) -> Result<Option<usize>> {
 /// cell buffer has nowhere to wrap to.
 fn draw(frame: &mut Frame<'_>, prompt: &str, labels: &[&str], selected: usize, colors: bool) {
     let mut lines = Vec::with_capacity(labels.len() + 1);
+    // While it is being asked the mark is the prompt, and the prompt is the
+    // accent's, as the pointer under it is.
     lines.push(Line::from(vec![
-        Span::styled("?", tui::paint(colors, Style::new().fg(Color::Green))),
+        Span::styled("?", tui::paint(colors, Role::Accent.style())),
         Span::raw(format!(" {prompt}")),
     ]));
     for (index, label) in labels.iter().enumerate() {
@@ -99,7 +103,7 @@ fn draw(frame: &mut Frame<'_>, prompt: &str, labels: &[&str], selected: usize, c
             // colored — `tui::selection` documents why a selection never
             // names a color, and this menu is no exception.
             lines.push(Line::from(vec![
-                Span::styled("› ", tui::paint(colors, Style::new().fg(Color::Cyan))),
+                Span::styled("› ", tui::paint(colors, Role::Accent.style())),
                 Span::styled((*label).to_string(), tui::paint(colors, tui::BOLD)),
             ]));
         } else {

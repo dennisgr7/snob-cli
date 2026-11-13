@@ -46,7 +46,7 @@ use crossterm::terminal::{
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Cell, Clear, HighlightSpacing, Padding, Row, Scrollbar,
@@ -55,6 +55,7 @@ use ratatui::widgets::{
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::app::Viewer;
+use crate::ui::theme::Role;
 
 /// DEC private mode 2026, "synchronized output": between the two the
 /// terminal holds what it is sent and paints it in one go. A terminal that
@@ -376,8 +377,8 @@ pub fn print_receipts(lines: &[String]) {
 ///
 /// No color is ever named for selection or for the border -- the selected row
 /// is reverse video and the chrome is dim/bold, so the user's own palette
-/// decides what everything looks like. Accents elsewhere stay within the 16
-/// ANSI colors for the same reason. And no italics anywhere: several
+/// decides what everything looks like. Every color that is named is a role
+/// of `ui::theme`, for the same reason. And no italics anywhere: several
 /// terminals -- conhost among them -- render italic as reverse video, which
 /// would collide with the one meaning reverse video has here.
 pub fn view_block(title: String, colors: bool, padding: Padding) -> Block<'static> {
@@ -385,12 +386,32 @@ pub fn view_block(title: String, colors: bool, padding: Padding) -> Block<'stati
         .border_type(BorderType::Rounded)
         .padding(padding);
     if colors {
-        block
-            .border_style(DIM)
-            .title_top(Line::from(Span::styled(format!(" {title} "), BOLD)))
+        block.border_style(DIM).title_top(title_line(&title))
     } else {
         block.title_top(Line::from(format!(" {title} ")))
     }
+}
+
+/// A view's title as it is styled: bold, and what it is about in the accent.
+/// That is whatever comes before the first ` · ` or ` — `, the view's name
+/// or the list's, since every title is written name first: `Stories ·
+/// @someone · 3 up`, `followers of @someone — 120 accounts`.
+fn title_line(title: &str) -> Line<'static> {
+    let cut = [" · ", " — "]
+        .iter()
+        .filter_map(|separator| title.find(separator))
+        .min()
+        .unwrap_or(title.len());
+    let (about, rest) = title.split_at(cut);
+    Line::from(vec![
+        Span::styled(format!(" {about}"), accent_bold()),
+        Span::styled(format!("{rest} "), BOLD),
+    ])
+}
+
+/// The accent, bold: a title's word, the handle on a card, a key in the help.
+pub fn accent_bold() -> Style {
+    Role::Accent.style().add_modifier(Modifier::BOLD)
 }
 
 /// The breathing room a list gets: one blank row under the border, one cell
@@ -439,26 +460,36 @@ pub fn hint_line(text: String, colors: bool) -> Line<'static> {
     styled_line(format!(" {text} "), DIM, colors)
 }
 
-/// What just happened -- `Saved ./x.jpg`, `Could not open it` -- in the
-/// hints' place. Yellow because it must win against a row of dim text, and
-/// yellow is an ANSI color every theme has already decided how to show.
+/// Something worth a look -- `Nothing walked`, `No more comments` -- in the
+/// hints' place. The warning's yellow, because it must win against a row of
+/// dim text, and it is a color every theme has already decided how to show.
 pub fn note_line(text: String, colors: bool) -> Line<'static> {
-    styled_line(format!(" {text} "), Style::new().fg(Color::Yellow), colors)
+    styled_line(format!(" {text} "), Role::Warn.style(), colors)
+}
+
+/// What was done as asked -- `Saved ./x.jpg`, `Opened ...` -- in the hints'
+/// place, in the green the site's terminals say "ok" in: a receipt is not a
+/// warning, and yellow was saying both.
+pub fn done_line(text: String, colors: bool) -> Line<'static> {
+    styled_line(format!(" {text} "), Role::Ok.style(), colors)
 }
 
 /// What went wrong -- `Could not open it: ...` -- in the hints' place. Red,
-/// because a failure and a receipt are two different sentences and yellow
-/// was saying both.
+/// because a failure and a receipt are two different sentences.
 pub fn problem_line(text: String, colors: bool) -> Line<'static> {
-    styled_line(format!(" {text} "), Style::new().fg(Color::Red), colors)
+    styled_line(format!(" {text} "), Role::Error.style(), colors)
 }
 
-/// The right note for what a verb reported: failures are problems, the rest
-/// are notes. The views build their messages with `Could not` in front, so
-/// the prefix is the seam.
+/// The right line for what a verb reported: a failure is a problem, a
+/// receipt is done, the rest are notes. The views build their messages with
+/// `Could not` in front of a failure and `Saved` or `Opened` in front of a
+/// receipt ([`saved_note`], [`opened_note`], [`web_note`]), so the first
+/// word is the seam.
 pub fn outcome_line(text: String, colors: bool) -> Line<'static> {
     if text.starts_with("Could not") {
         problem_line(text, colors)
+    } else if text.starts_with("Saved ") || text.starts_with("Opened ") {
+        done_line(text, colors)
     } else {
         note_line(text, colors)
     }
@@ -907,13 +938,53 @@ mod tests {
         }
     }
 
-    /// Without styling a style is dropped whole; with it, kept as given.
+    /// Without styling a style is dropped whole, a role's with the rest;
+    /// with it, kept as given.
     #[test]
     fn paint_keeps_a_style_only_where_the_views_may_style() {
-        let accent = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+        let accent = accent_bold();
         assert_eq!(paint(true, accent), accent);
         assert_eq!(paint(false, accent), Style::new());
         assert_eq!(paint(false, DIM), Style::new());
+        for role in [Role::Accent, Role::Ok, Role::Warn, Role::Error, Role::Info] {
+            assert_eq!(paint(false, role.style()), Style::new(), "{role:?}");
+        }
+    }
+
+    /// A receipt is green, a failure red and anything else the warning's
+    /// yellow, by the first word the views write.
+    #[test]
+    fn a_receipt_a_failure_and_a_note_are_three_colors() {
+        let color = |text: &str| outcome_line(text.to_string(), true).spans[0].style;
+        assert_eq!(color("Saved ./someone-1.jpg"), Role::Ok.style());
+        assert_eq!(color("Opened ./someone-1.jpg"), Role::Ok.style());
+        assert_eq!(color("Could not save it: disk full"), Role::Error.style());
+        assert_eq!(color("Nothing walked"), Role::Warn.style());
+        assert_eq!(color("Saved"), Role::Warn.style(), "a word, not a receipt");
+        assert!(
+            outcome_line("Saved ./x.jpg".to_string(), false)
+                .spans
+                .iter()
+                .all(|span| span.style == Style::new())
+        );
+    }
+
+    /// A title's name is in the accent and the rest of it only bold; the
+    /// text is the title's, a space each side, whatever the styling.
+    #[test]
+    fn a_title_says_what_it_is_about_in_the_accent() {
+        let line = title_line("Stories · @someone · 3 up");
+        assert_eq!(line.to_string(), " Stories · @someone · 3 up ");
+        assert_eq!(line.spans[0].content, " Stories");
+        assert_eq!(line.spans[0].style, accent_bold());
+        assert_eq!(line.spans[1].style, BOLD);
+
+        let line = title_line("followers of @someone — 120 accounts");
+        assert_eq!(line.spans[0].content, " followers of @someone");
+
+        let line = title_line("People");
+        assert_eq!(line.to_string(), " People ");
+        assert_eq!(line.spans[0].style, accent_bold());
     }
 
     /// The notes the verbs leave: what was opened or saved, or why not, with

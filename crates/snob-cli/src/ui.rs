@@ -634,4 +634,5 @@ pub mod pfp;
 pub mod posts;
 pub mod profile;
 pub mod stories;
+pub mod theme;
 pub mod tui;

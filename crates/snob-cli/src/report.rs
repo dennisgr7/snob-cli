@@ -12,6 +12,7 @@ use crate::app::{ConsentInAdvance, Held, Viewer};
 use crate::engine::Provenance;
 
 use crate::exit::{ExitCode, ExitError};
+use crate::ui::theme::Role;
 
 /// What a machine with no `watch.toml` is told, by both things that look:
 /// `snob watch check`, through `commands::watch::say::problem_line`, and
@@ -185,6 +186,14 @@ fn error_json_for(error: &anyhow::Error, viewer: Option<&Viewer>) -> serde_json:
     })
 }
 
+/// `hint:` as every hint is labeled: bold, in the color of an aside.
+fn hint_label() -> console::StyledObject<&'static str> {
+    console::style("hint:")
+        .fg(Role::Info.console())
+        .bold()
+        .for_stderr()
+}
+
 /// The block `print_error` writes, built rather than printed, so a test can
 /// assert on every branch of it, the filter included, from inside the process.
 fn rendered(error: &anyhow::Error) -> String {
@@ -197,7 +206,12 @@ fn rendered(error: &anyhow::Error) -> String {
         return format!("{}\n", filtered(&error.to_string(), "\n"));
     }
 
-    let label = console::style("error:").red().bold().for_stderr();
+    // The same roles the views draw in (`ui::theme`), so an error is one red
+    // and a hint one cyan wherever this program says them.
+    let label = console::style("error:")
+        .fg(Role::Error.console())
+        .bold()
+        .for_stderr();
     let mut out = format!("{label} {}\n", indented(&error.to_string()));
 
     for cause in error.chain().skip(1) {
@@ -206,7 +220,7 @@ fn rendered(error: &anyhow::Error) -> String {
     }
 
     if let Some(hint) = advice_in(error) {
-        let label = console::style("hint:").cyan().bold().for_stderr();
+        let label = hint_label();
         out.push_str(&format!("{label}  {}\n", indented(hint)));
     }
 
@@ -217,7 +231,7 @@ fn rendered(error: &anyhow::Error) -> String {
     // reaches names the date itself, so this fires only when one of them was
     // forgotten — which is exactly when the person reading needs it most.
     if let Some(snob_ig::error::IgError::InCooldown { until_ms }) = instagram_in(error) {
-        let label = console::style("hint:").cyan().bold().for_stderr();
+        let label = hint_label();
         out.push_str(&format!(
             "{label}  {}\n",
             indented(&format!("it lifts {}", cooldown_ends_at(*until_ms)))

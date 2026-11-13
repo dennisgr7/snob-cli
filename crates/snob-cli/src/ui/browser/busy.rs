@@ -138,13 +138,14 @@ fn spinner(turn: usize) -> char {
     frames.chars().nth(turn % turning).unwrap_or(' ')
 }
 
-/// The box itself, over whatever the frame holds: the spinner and what is
-/// going on in bold, and on the bottom edge the two keys that stop it.
+/// The box itself, over whatever the frame holds: the spinner in the accent,
+/// what is going on in bold, and on the bottom edge the two keys that stop
+/// it.
 pub fn modal(frame: &mut Frame<'_>, text: &str, turn: usize, colors: bool) {
     let dim = tui::paint(colors, tui::DIM);
     tui::veil(frame, colors);
-    let text = format!("{} {text}", spinner(turn));
-    let width = (measure_text_width(&text) as u16 + 8)
+    let turning = format!("{} ", spinner(turn));
+    let width = (measure_text_width(&turning) as u16 + measure_text_width(text) as u16 + 8)
         .max(34)
         .min(frame.area().width);
     let area = tui::modal_area(frame.area(), width, 5);
@@ -155,7 +156,10 @@ pub fn modal(frame: &mut Frame<'_>, text: &str, turn: usize, colors: bool) {
         .title_bottom(Line::from(Span::styled(" q or ctrl+c cancels ", dim)).centered());
     let inner = tui::open_modal(frame, area, block);
     frame.render_widget(
-        Paragraph::new(tui::styled_line(text, tui::BOLD, colors)),
+        Paragraph::new(Line::from(vec![
+            Span::styled(turning, tui::paint(colors, tui::accent_bold())),
+            Span::styled(text.to_string(), tui::paint(colors, tui::BOLD)),
+        ])),
         inner,
     );
 }

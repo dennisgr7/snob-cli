@@ -997,8 +997,13 @@ reaches a server already listening: no command, no key, see "Over HTTP").
 - Terminal UI: `ratatui` for drawing, keys read through
   `ui/browser/input.rs` (crossterm, bracketed paste) and never
   `console::Term::read_key`; `ui::tui::Tui` is the one claim on the terminal
-  and restores it on drop; the 16 ANSI colors only, so the user's theme
-  decides. Full-screen views use the alternate screen and print receipts
+  and restores it on drop. **A color is named by what it is for**, one of
+  the five roles of `ui/theme.rs` (accent, ok, warn, error, info; the five of
+  the site's terminal blocks), never as a color: each is one of the 16 ANSI
+  colors, so the user's theme decides the shade, and the one exception is
+  asked for, `SNOB_THEME=brand`, which draws the accent alone in the site's
+  pink where `COLORTERM` says truecolor. The selection is reverse video and
+  no role. Full-screen views use the alternate screen and print receipts
   after leaving it; the menu draws inline. From the profile card, never call
   `ui::stories::browse` or `ui::highlights::browse` (a second `Tui` and a
   second scratch directory on the same path). A frame leaves in one write,

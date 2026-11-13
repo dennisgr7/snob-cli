@@ -87,13 +87,14 @@ pub fn show(
     }
 }
 
-/// The box: one row a key, the keys bold on the left and what they do
-/// beside them. On a terminal too short for all of it the last rows are
-/// cut, which is the first rows' good luck: they are the ones every view
-/// puts first.
+/// The box: one row a key, the keys on the left in the accent, bold, and
+/// what they do beside them. On a terminal too short for all of it the last
+/// rows are cut, which is the first rows' good luck: they are the ones every
+/// view puts first.
 pub fn modal(frame: &mut Frame<'_>, title: &str, keys: &[Key], colors: bool) {
     let dim = tui::paint(colors, tui::DIM);
     let bold = tui::paint(colors, tui::BOLD);
+    let key = tui::paint(colors, tui::accent_bold());
     tui::veil(frame, colors);
 
     let keys_w = keys
@@ -119,7 +120,7 @@ pub fn modal(frame: &mut Frame<'_>, title: &str, keys: &[Key], colors: bool) {
     let inner = tui::open_modal(frame, area, block);
     let rows = keys.iter().map(|k| {
         Row::new(vec![
-            Cell::from(Span::styled(k.keys, bold)),
+            Cell::from(Span::styled(k.keys, key)),
             Cell::from(k.does),
         ])
     });

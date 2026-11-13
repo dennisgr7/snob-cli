@@ -15,7 +15,6 @@ use anyhow::{Context, Result};
 use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::Constraint;
-use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Cell, Row, TableState};
 use snob_core::model::printable;
@@ -32,6 +31,7 @@ use crate::ui::browser::busy::Busy;
 use crate::ui::browser::input::{self, Action, next, page};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::help;
+use crate::ui::theme::Role;
 use crate::ui::tui;
 
 /// Drives the list until the user leaves it, or picks another account to see
@@ -444,7 +444,7 @@ fn item_row(
             .map(|m| format!("@{m}"))
             .collect::<Vec<_>>()
             .join(" ");
-        cells.push(Cell::from(joined).style(tui::paint(colors, Style::new().fg(Color::Cyan))));
+        cells.push(Cell::from(joined).style(tui::paint(colors, Role::Info.style())));
     }
     Row::new(cells)
 }

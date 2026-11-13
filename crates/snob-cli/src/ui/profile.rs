@@ -61,6 +61,7 @@ use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::help;
 use crate::ui::highlights::{Folder, empty_note, folder_title, keep_folder, stem_of, walk_in};
 use crate::ui::people::Shelf;
+use crate::ui::theme::Role;
 use crate::ui::tui::{self, Tui};
 
 /// How long a stored list may serve a click without a question: the default
@@ -1309,7 +1310,8 @@ fn row_height(row: &CardRow) -> u16 {
 
 /// The about block's lines: the full name in bold, the category dim, the
 /// bio's first line plain — it is the one thing here the person wrote, and
-/// the least aside-like fact on the card — and the link dim.
+/// the least aside-like fact on the card — and the link in the accent, as
+/// a link is on the site.
 fn about_lines(profile: &Profile, width: usize, colors: bool) -> Vec<Line<'static>> {
     let dim = tui::paint(colors, tui::DIM);
     let mut lines = Vec::new();
@@ -1331,7 +1333,10 @@ fn about_lines(profile: &Profile, width: usize, colors: bool) -> Vec<Line<'stati
         }
     }
     if let Some(url) = &profile.external_url {
-        lines.push(Line::from(Span::styled(url.clone(), dim)));
+        lines.push(Line::from(Span::styled(
+            url.clone(),
+            tui::paint(colors, Role::Accent.style()),
+        )));
     }
     if lines.is_empty() {
         lines.push(Line::default());
@@ -1438,7 +1443,7 @@ fn card_frame(
         .padding(tui::card_padding())
         .title_top(Line::from(Span::styled(
             format!(" @{} ", printable(&profile.username)),
-            tui::paint(colors, tui::BOLD),
+            tui::paint(colors, tui::accent_bold()),
         )));
     if !attrs.is_empty() {
         let text = format!(" {} ", attrs.join(" · "));
