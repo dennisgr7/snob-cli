@@ -56,6 +56,7 @@ use ratatui::widgets::{
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::app::Viewer;
+use crate::ui::graphics;
 use crate::ui::theme::Role;
 
 /// DEC private mode 2026, "synchronized output": between the two the
@@ -119,6 +120,9 @@ pub struct Screen<W: Write = Stderr> {
     /// the guard, which clears it when somebody else has had the terminal
     /// ([`Tui::resume`]): the backend lends its writer to nobody.
     cursor_hidden: Arc<AtomicBool>,
+    /// The pictures a frame placed over its cells, which go out after the
+    /// frame's own bytes, in the same update (`ui::graphics`).
+    painter: graphics::Painter,
 }
 
 impl<W: Write> Screen<W> {
@@ -127,8 +131,21 @@ impl<W: Write> Screen<W> {
             out,
             pending: Vec::new(),
             cursor_hidden: Arc::new(AtomicBool::new(false)),
+            painter: graphics::Painter::new(),
         }
     }
+}
+
+/// What every frame carries and nothing else a view writes does: the reset
+/// of the attributes the backend ends a frame's cells with. It is how the
+/// screen tells a frame, whose pictures are to be drawn, from a clear or
+/// the way out, after which there are none.
+const FRAME_END: &[u8] = b"\x1b[0m";
+
+fn is_a_frame(bytes: &[u8]) -> bool {
+    bytes
+        .windows(FRAME_END.len())
+        .any(|window| window == FRAME_END)
 }
 
 impl<W: Write> Write for Screen<W> {
@@ -141,7 +158,16 @@ impl<W: Write> Write for Screen<W> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        if self.cursor_hidden.load(Ordering::Relaxed) && says_nothing(&self.pending) {
+        let unchanged = self.cursor_hidden.load(Ordering::Relaxed) && says_nothing(&self.pending);
+        // The frame's pictures, after its cells: a frame that wrote no cell
+        // may still have a picture to show, one that arrived meanwhile.
+        let mut pictures = Vec::new();
+        if is_a_frame(&self.pending) {
+            self.painter.after_frame(!unchanged, &mut pictures);
+        } else {
+            self.painter.after_anything_else(&mut pictures);
+        }
+        if unchanged && pictures.is_empty() {
             self.pending.clear();
             return Ok(());
         }
@@ -150,10 +176,12 @@ impl<W: Write> Write for Screen<W> {
         } else if self.pending.ends_with(SHOW_CURSOR) {
             self.cursor_hidden.store(false, Ordering::Relaxed);
         }
-        let mut update =
-            Vec::with_capacity(BEGIN_UPDATE.len() + self.pending.len() + END_UPDATE.len());
+        let mut update = Vec::with_capacity(
+            BEGIN_UPDATE.len() + self.pending.len() + pictures.len() + END_UPDATE.len(),
+        );
         update.extend_from_slice(BEGIN_UPDATE);
         update.append(&mut self.pending);
+        update.append(&mut pictures);
         update.extend_from_slice(END_UPDATE);
         self.out.write_all(&update)?;
         self.out.flush()
@@ -640,6 +668,10 @@ pub fn modal_area(area: Rect, width: u16, height: u16) -> Rect {
 /// modal itself is rendered over a `Clear`, which resets its cells, so the
 /// veil never reaches it.
 pub fn veil(frame: &mut Frame<'_>, colors: bool) {
+    // A picture the terminal draws itself is not a cell to dim, and would
+    // stand bright over the box: it is taken back, and returns with the
+    // first frame that has no box.
+    graphics::hide();
     if colors {
         let area = frame.area();
         frame.buffer_mut().set_style(area, DIM);

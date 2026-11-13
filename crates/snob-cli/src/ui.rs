@@ -344,6 +344,12 @@ pub fn restore_terminal() {
     use crossterm::cursor::Show;
     use crossterm::event::{DisableBracketedPaste, DisableFocusChange};
     use crossterm::terminal::{EndSynchronizedUpdate, LeaveAlternateScreen};
+    // The pictures kitty holds are not on a screen, and leaving one does
+    // not free them.
+    if let Some(forget) = graphics::on_the_way_out() {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(forget);
+    }
     let _ = crossterm::execute!(
         std::io::stderr(),
         EndSynchronizedUpdate,
@@ -625,6 +631,7 @@ mod tests {
 
 pub mod accounts;
 pub mod browser;
+pub mod graphics;
 pub mod help;
 pub mod highlights;
 pub mod menu;

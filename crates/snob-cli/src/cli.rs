@@ -340,6 +340,8 @@ Environment:
                     absolute path, in place of the one on PATH
   SNOB_THEME        \"brand\" draws the accent in snob's own pink rather than
                     your terminal's magenta, where it shows 24-bit color
+  SNOB_IMAGES       how a picture is drawn, when the guess from your terminal
+                    is wrong: kitty, iterm, sixel, or blocks
   SNOB_CSRFTOKEN, SNOB_SIGNING_KEY
                     the two secrets a command line would otherwise carry;
                     see \"snob login --help\" and \"snob watch --help\"",

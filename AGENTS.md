@@ -1046,10 +1046,19 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   the cursor has rested, one at a time, once a session, from the address
   the answer already carried (`posts::Item::thumb`, `Profile::pfp_url`),
   and a failed one is not asked for again. Never a video, never anything
-  marked as seen, and nothing a terminal has to be asked about first (no
-  sixel, no kitty protocol). A build without the feature, a run with no
-  colors and a terminal that does not say 24-bit color draw none, and lay
-  the views out as if there were none.
+  marked as seen. **A picture goes out in the terminal's own pixels where
+  the terminal is known to draw them** (`ui/graphics.rs`): kitty's
+  protocol in kitty and Ghostty, iTerm2's inline images in iTerm2 and
+  WezTerm, sixel in Windows Terminal and foot, half blocks anywhere else
+  and inside tmux or screen. Which one is read from the environment and
+  the terminal is never asked, since its answer would arrive among the
+  keys; `SNOB_IMAGES=kitty|iterm|sixel|blocks` says otherwise. The
+  picture's bytes leave after the frame's, in the same update, over cells
+  the frame left blank with the picture's number on them, and a box over
+  a view takes the pictures under it away (`tui::veil`). A build without
+  the feature, a run with no colors and a terminal that neither draws
+  pictures nor says 24-bit color draw none, and lay the views out as if
+  there were none.
 - `stories` and `highlights` are separate commands because a highlight has a
   tray level and an items level (`snob highlights someone 2`); `posts` has the
   same two levels. Shared flags live in `cli::MediaActionArgs`.

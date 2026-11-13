@@ -21,14 +21,15 @@
 //! fetched once a session. Nothing marks anything as seen, here or there:
 //! looking is a download, not the call that says "seen".
 //!
-//! **Two pixels to a cell.** Each cell is an upper half block, its
-//! foreground the pixel above and its background the pixel below; a cell is
-//! about twice as tall as it is wide, so the halves come out square. It is
-//! 24-bit color, the one place a view names a color that is not a role of
-//! `ui/theme.rs`: the colors are the picture's. Not sixel and not kitty's
-//! protocol, which draw far better: to know that a terminal takes either it
-//! has to be asked, and the answer comes back on the terminal's input in the
-//! middle of the keys.
+//! **In the terminal's own pixels where it has any, and two to a cell where
+//! it has not.** A terminal known to draw pictures is sent the picture
+//! through its protocol, kitty's, iTerm2's or sixel (`ui::graphics`, which
+//! says which terminal gets which, and that none of them is ever asked).
+//! Anywhere else each cell is an upper half block, its foreground the pixel
+//! above and its background the pixel below; a cell is about twice as tall
+//! as it is wide, so the halves come out square. That is 24-bit color, the
+//! one place a view names a color that is not a role of `ui/theme.rs`: the
+//! colors are the picture's.
 //!
 //! **Behind the `preview` feature**, a default one whose cost is in
 //! `AGENTS.md` ("Costs worth knowing"). A build without it binds `p` to
@@ -54,6 +55,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -67,6 +69,7 @@ use ratatui::widgets::{Block, BorderType};
 
 use crate::media::Kind;
 use crate::ui::browser::input::{self, Raw};
+use crate::ui::graphics;
 use crate::ui::help;
 use crate::ui::theme;
 use crate::ui::tui::{self, Tui};
@@ -107,7 +110,14 @@ pub fn with_key(keys: &[help::Key]) -> Vec<help::Key> {
 /// rows that say. In a build without previews the reason is empty: a note
 /// with nothing in it, which is `p` doing nothing.
 pub fn refused(kind: Option<Kind>) -> Option<String> {
-    refusal(AVAILABLE, tui::colors_enabled(), theme::truecolor(), kind).map(str::to_string)
+    refusal(AVAILABLE, tui::colors_enabled(), shows_pictures(), kind).map(str::to_string)
+}
+
+/// Whether the terminal can be handed a picture in color: it says it shows
+/// 24-bit color, which the half blocks need, or it is one that draws
+/// pictures itself (`graphics::protocol`).
+fn shows_pictures() -> bool {
+    theme::truecolor() || graphics::protocol() != graphics::Protocol::Blocks
 }
 
 fn refusal(
@@ -130,14 +140,95 @@ fn refusal(
 }
 
 /// A decoded picture: `width * height` pixels of red, green and blue.
+///
+/// Cheap to clone, the pixels being shared: a frame hands the pictures it
+/// places to the screen (`graphics::place`), every frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pixels {
     width: usize,
     height: usize,
-    rgb: Vec<u8>,
+    rgb: Arc<[u8]>,
+    /// A number for these very pixels, for telling two pictures apart
+    /// without comparing them: which one the screen already shows.
+    id: u64,
 }
 
 impl Pixels {
+    fn made(width: usize, height: usize, rgb: Vec<u8>) -> Self {
+        // FNV-1a over the size and the samples: not a secret, a name.
+        let mut id = 0xcbf2_9ce4_8422_2325u64;
+        for byte in (width as u64)
+            .to_le_bytes()
+            .iter()
+            .chain(&(height as u64).to_le_bytes())
+            .chain(&rgb)
+        {
+            id = (id ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Self {
+            width,
+            height,
+            rgb: rgb.into(),
+            id,
+        }
+    }
+
+    pub(crate) fn width(&self) -> usize {
+        self.width
+    }
+
+    pub(crate) fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Three bytes a pixel, row after row.
+    pub(crate) fn rgb(&self) -> &[u8] {
+        &self.rgb
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The picture at exactly `width` by `height`: taken down as
+    /// [`Self::scaled`] takes one down, and taken up, where a terminal that
+    /// draws real pixels has more of them than the picture, by weighing the
+    /// four pixels around each point.
+    pub(crate) fn sized(&self, width: usize, height: usize) -> Pixels {
+        let (width, height) = (width.max(1), height.max(1));
+        if width <= self.width && height <= self.height {
+            return self.scaled(width, height);
+        }
+        let mut rgb = Vec::with_capacity(width * height * 3);
+        // Fixed point, eight bits of fraction: the place in the source of
+        // each pixel's center.
+        let place = |at: usize, of: usize, from: usize| -> (usize, usize, u32) {
+            let scaled = ((2 * at + 1) * from * 128 / of).saturating_sub(128);
+            let low = (scaled / 256).min(from - 1);
+            (low, (low + 1).min(from - 1), (scaled % 256) as u32)
+        };
+        for y in 0..height {
+            let (top, bottom, down) = place(y, height, self.height);
+            for x in 0..width {
+                let (left, right, across) = place(x, width, self.width);
+                let corners = [
+                    (self.at(left, top), (256 - across) * (256 - down)),
+                    (self.at(right, top), across * (256 - down)),
+                    (self.at(left, bottom), (256 - across) * down),
+                    (self.at(right, bottom), across * down),
+                ];
+                let mut sum = [0u32; 3];
+                for ((red, green, blue), weight) in corners {
+                    sum[0] += u32::from(red) * weight;
+                    sum[1] += u32::from(green) * weight;
+                    sum[2] += u32::from(blue) * weight;
+                }
+                rgb.extend(sum.map(|channel| (channel >> 16) as u8));
+            }
+        }
+        Pixels::made(width, height, rgb)
+    }
+
     /// From what a decoder handed over: one, three or four samples a pixel,
     /// gray, RGB, or RGB and something after it. Anything else is not a
     /// picture this draws.
@@ -155,7 +246,7 @@ impl Pixels {
                 .collect(),
             _ => return None,
         };
-        Some(Self { width, height, rgb })
+        Some(Self::made(width, height, rgb))
     }
 
     fn at(&self, x: usize, y: usize) -> (u8, u8, u8) {
@@ -192,7 +283,7 @@ impl Pixels {
                 rgb.extend(sum.map(|channel| (channel / count) as u8));
             }
         }
-        Pixels { width, height, rgb }
+        Pixels::made(width, height, rgb)
     }
 }
 
@@ -235,15 +326,8 @@ fn paint(buffer: &mut Buffer, area: Rect, pixels: &Pixels) {
 }
 
 /// The box: the picture as large as the screen allows inside a border, its
-/// name and its size in pixels on the top edge. `drawn` keeps the picture at
-/// the size it was last drawn, so that an idle tick does not scale it again.
-fn modal(
-    frame: &mut Frame<'_>,
-    title: &str,
-    pixels: &Pixels,
-    drawn: &mut Option<Pixels>,
-    colors: bool,
-) {
+/// name and its size in pixels on the top edge.
+fn modal(frame: &mut Frame<'_>, title: &str, pixels: &Pixels, colors: bool) {
     let dim = tui::paint(colors, tui::DIM);
     let bold = tui::paint(colors, tui::BOLD);
     tui::veil(frame, colors);
@@ -256,15 +340,6 @@ fn modal(
     if width == 0 || height == 0 {
         return;
     }
-    if drawn
-        .as_ref()
-        .is_none_or(|was| (was.width, was.height) != (width, height))
-    {
-        *drawn = Some(pixels.scaled(width, height));
-    }
-    let Some(scaled) = drawn.as_ref() else {
-        return;
-    };
 
     // Wide enough for its two edges to be read, however thin the picture.
     let closes = " any key closes ";
@@ -283,8 +358,7 @@ fn modal(
         .title_top(Line::from(Span::styled(named, bold)))
         .title_bottom(Line::from(Span::styled(closes, dim)).centered());
     let inner = tui::open_modal(frame, area, block);
-    let picture = inner.centered_horizontally(Constraint::Length(width as u16));
-    paint(frame.buffer_mut(), picture, scaled);
+    pixels.draw_in(frame, inner);
 }
 
 /// Draws the picture in `bytes` over the view `under` draws, until a key is
@@ -302,11 +376,11 @@ pub fn show(
         Err(why) => return Ok(why),
     };
     let colors = tui::colors_enabled();
-    let mut drawn = None;
+
     loop {
         tui.terminal.draw(|frame| {
             under(frame);
-            modal(frame, title, &pixels, &mut drawn, colors);
+            modal(frame, title, &pixels, colors);
         })?;
         if let Raw::Key(_) = input::read(input::tick()).map_err(input::unreadable)? {
             return Ok(String::new());
@@ -459,7 +533,7 @@ impl<'a> Gallery<'a> {
     /// that draws them, on a terminal that says it can. Read once a session;
     /// a view that gets `false` is laid out as it was before there were any.
     pub fn draws() -> bool {
-        refusal(AVAILABLE, tui::colors_enabled(), theme::truecolor(), None).is_none()
+        refusal(AVAILABLE, tui::colors_enabled(), shows_pictures(), None).is_none()
     }
 
     /// Says what the view wants beside the cursor now: the address of a
@@ -586,7 +660,24 @@ impl Pixels {
         let rows = height.div_ceil(2) as u16;
         let taken = Rect::new(area.x, area.y, area.width, rows.min(area.height))
             .centered_horizontally(Constraint::Length(width as u16));
-        paint(frame.buffer_mut(), taken, &self.scaled(width, height));
+        if graphics::protocol() == graphics::Protocol::Blocks {
+            paint(frame.buffer_mut(), taken, &self.scaled(width, height));
+        } else {
+            // The terminal draws the picture itself, in its own pixels,
+            // over these cells: they are left blank, with the picture's
+            // number on them (`graphics::under` says what that is for).
+            let number = graphics::under(self);
+            let buffer = frame.buffer_mut();
+            for y in taken.top()..taken.bottom() {
+                for x in taken.left()..taken.right() {
+                    if let Some(cell) = buffer.cell_mut((x, y)) {
+                        cell.reset();
+                        cell.set_fg(number);
+                    }
+                }
+            }
+            graphics::place(taken, self);
+        }
         taken
     }
 
@@ -594,7 +685,13 @@ impl Pixels {
     #[cfg(test)]
     pub(crate) fn plain(width: usize, height: usize, (red, green, blue): (u8, u8, u8)) -> Self {
         let rgb = [red, green, blue].repeat(width * height);
-        Self { width, height, rgb }
+        Self::made(width, height, rgb)
+    }
+
+    /// The same size with other pixels, for a test that needs a pattern.
+    #[cfg(test)]
+    pub(crate) fn with(&self, rgb: Vec<u8>) -> Self {
+        Self::made(self.width, self.height, rgb)
     }
 
     /// The rows of cells the picture takes when it is drawn `cols` wide at
@@ -717,9 +814,9 @@ mod tests {
     fn the_box_names_the_picture_and_its_size() {
         let pixels = picture(2, &[&[RED, GREEN], &[BLUE, WHITE]]);
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        let mut drawn = None;
+
         terminal
-            .draw(|frame| modal(frame, "someone-3.jpg", &pixels, &mut drawn, true))
+            .draw(|frame| modal(frame, "someone-3.jpg", &pixels, true))
             .unwrap();
         let screen: String = (0..12)
             .map(|y| tui::row_text(&terminal, y) + "\n")
@@ -727,7 +824,6 @@ mod tests {
         assert!(screen.contains("someone-3.jpg · 2x2"), "{screen}");
         assert!(screen.contains("any key closes"), "{screen}");
         assert_eq!(screen.matches('▀').count(), 2, "{screen}");
-        assert_eq!(drawn, Some(pixels));
     }
 
     /// What `p` says instead of drawing, before anything is fetched: a
