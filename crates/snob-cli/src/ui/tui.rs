@@ -36,6 +36,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use console::measure_text_width;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
@@ -655,6 +656,53 @@ pub fn open_modal(frame: &mut Frame<'_>, area: Rect, block: Block<'_>) -> Rect {
     inner
 }
 
+/// The lines `text` takes at `width` display columns: its own line breaks
+/// kept, an empty one included, and each line wrapped greedily at the
+/// blanks. A word wider than the line is cut at the edge rather than left to
+/// run past it, since what is wrapped here is what people wrote: an address,
+/// a row of emoji with no blank in it.
+///
+/// Pure, and that is the point of it: a view counts the rows a text needs
+/// before it draws, to size a card or to bound a scroll, which `Paragraph`'s
+/// own wrap never says.
+pub fn wrapped(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for paragraph in text.lines() {
+        let mut line = String::new();
+        let mut used = 0usize;
+        for word in paragraph.split_whitespace() {
+            let wide = measure_text_width(word);
+            if used > 0 && used + 1 + wide <= width {
+                line.push(' ');
+                line.push_str(word);
+                used += 1 + wide;
+                continue;
+            }
+            if used > 0 {
+                lines.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            if wide <= width {
+                line.push_str(word);
+                used = wide;
+                continue;
+            }
+            for letter in word.chars() {
+                let cells = measure_text_width(letter.encode_utf8(&mut [0; 4]));
+                if used > 0 && used + cells > width {
+                    lines.push(std::mem::take(&mut line));
+                    used = 0;
+                }
+                line.push(letter);
+                used += cells;
+            }
+        }
+        lines.push(line);
+    }
+    lines
+}
+
 /// What `List::scroll_padding` does and `Table` does not: keep `padding`
 /// rows visible on each side of the selection. `Table` only ever scrolls
 /// just enough, so the selection rides the edge; this recomputes the offset
@@ -1073,6 +1121,42 @@ mod tests {
         );
         let row = top_row(block, 12);
         assert!(row.ends_with(" as @me ┐"), "got {row:?}");
+    }
+
+    /// A text is wrapped at the blanks, within the width, and keeps the line
+    /// breaks its writer put in it, the empty ones too.
+    #[test]
+    fn a_text_wraps_at_the_blanks_and_keeps_its_own_line_breaks() {
+        assert_eq!(
+            wrapped("one two three four", 9),
+            ["one two", "three", "four"]
+        );
+        assert_eq!(
+            wrapped("first\n\nsecond line", 20),
+            ["first", "", "second line"]
+        );
+        assert_eq!(wrapped("  spaced   out  ", 20), ["spaced out"]); // layout-allow: the blanks are what is being collapsed
+        assert!(wrapped("", 20).is_empty());
+        for line in wrapped("a bio of some words and a few more of them", 7) {
+            assert!(measure_text_width(&line) <= 7, "{line:?}");
+        }
+    }
+
+    /// A word wider than the line is cut at the edge, in display columns:
+    /// a wide character is never split and never pushed past the width.
+    #[test]
+    fn a_word_wider_than_the_line_is_cut_at_the_edge() {
+        assert_eq!(
+            wrapped("see example.com/a/long/path now", 10),
+            ["see", "example.co", "m/a/long/p", "ath now"]
+        );
+        // Each of these is two columns wide: two fit in five, not three.
+        assert_eq!(
+            wrapped("日本語のテキスト", 5),
+            ["日本", "語の", "テキ", "スト"]
+        );
+        // A width of nothing is taken as one, and still ends.
+        assert_eq!(wrapped("ab", 0), ["a", "b"]);
     }
 
     /// The modal band sits above the geometric middle, centered across.

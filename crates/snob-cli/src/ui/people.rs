@@ -33,9 +33,13 @@
 //! Enter on the same account. While it runs the list stays on screen under a
 //! "reading" box and `q` or Ctrl+C cancels, as in the card. A failure (not
 //! found, private, cooldown, rate limit) is a red note on the list's bottom
-//! edge, and the list is where it was. The profile itself is the read-only
-//! card of `ui::profile::peek`: Esc, `q`, Backspace or Left come back to the
-//! list with its selection and its filter untouched, and `w`, there and on
+//! edge, and the list is where it was. The profile itself is the card of
+//! `ui::profile::peek`, which opens what that read already holds a file
+//! away, the picture and the stories, and nothing that is a walk; they are
+//! written into the scratch directory of whoever made this view (`browse`
+//! makes one, `browse_in` is lent the card's). Esc, `q`, Backspace or Left
+//! come back to the list with its selection and its filter untouched, and
+//! `w`, there and on
 //! the list itself for the account under the selection, hands the address
 //! to the system browser, which is `User::profile_url` the way the
 //! printed table already puts it behind every username: encoded, never
@@ -76,6 +80,7 @@ use crate::ui::accounts::{self, Browsed, Picked};
 use crate::ui::browser::busy::Busy;
 use crate::ui::browser::input::Action;
 use crate::ui::browser::input::{self, Raw, action_of, page};
+use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::help;
 use crate::ui::profile::{self, Answer, answer, question_modal};
 use crate::ui::tui::{self, Tui};
@@ -240,11 +245,25 @@ pub async fn browse(
     rewalk: &Rewalk<'_>,
     note: String,
 ) -> Result<Browsed> {
+    // Where the card of an account opens its picture and its stories from.
+    // Made before the terminal is claimed, as the media views make theirs.
+    snob_store::paths::sweep_old_scratch(&rewalk.paths.stories_root(), ABANDONED_AFTER);
+    let scratch = Scratch::new(rewalk.paths.story_scratch())?;
+
     let mut tui =
         tui::claim_fullscreen("--no-interactive prints the listing; --format and -o shape it")?;
 
     let mut receipts: Vec<String> = Vec::new();
-    let outcome = run(&mut tui, app, shelf, Some(rewalk), &mut receipts, note).await;
+    let outcome = run(
+        &mut tui,
+        app,
+        shelf,
+        Some(rewalk),
+        &scratch,
+        &mut receipts,
+        note,
+    )
+    .await;
     drop(tui);
     tui::print_receipts(&receipts);
     outcome.map(|(code, switch_to)| Browsed::of(code, switch_to))
@@ -254,14 +273,19 @@ pub async fn browse(
 ///
 /// The profile card enters here: it already owns the terminal, and two `Tui`s
 /// would be two claims on it. Receipts belong to the guard's owner too — they
-/// are printed after *that* guard drops, not here.
+/// are printed after *that* guard drops, not here. So does the scratch
+/// directory: a second one would be made on the first one's path, and take
+/// the files the card has open with it when it went.
 pub(crate) async fn browse_in(
     tui: &mut Tui,
     app: &mut App,
     shelf: &Shelf<'_>,
+    scratch: &Scratch,
     receipts: &mut Vec<String>,
 ) -> Result<ExitCode> {
-    Ok(run(tui, app, shelf, None, receipts, String::new()).await?.0)
+    Ok(run(tui, app, shelf, None, scratch, receipts, String::new())
+        .await?
+        .0)
 }
 
 /// The loop, and the account the user agreed to walk the list as, if any.
@@ -271,6 +295,7 @@ async fn run(
     app: &mut App,
     shelf: &Shelf<'_>,
     rewalk: Option<&Rewalk<'_>>,
+    scratch: &Scratch,
     receipts: &mut Vec<String>,
     mut note: String,
 ) -> Result<(ExitCode, Option<Viewer>)> {
@@ -382,8 +407,12 @@ async fn run(
                 }
                 match read {
                     Ok(profile) => {
-                        let viewer = app.viewer().clone();
-                        if let Some(code) = profile::peek(tui, &profile, &viewer, receipts)? {
+                        // On the heap, like every wait a view makes: the
+                        // card's loop is a future of its own size, and this
+                        // one is already inside a command's (`Busy::run`).
+                        let peeked =
+                            Box::pin(profile::peek(tui, app, &profile, scratch, receipts)).await?;
+                        if let Some(code) = peeked {
                             return Ok((code, None));
                         }
                         // Back on the list as it was left; the card's frame

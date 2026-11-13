@@ -21,7 +21,15 @@
 //! same `story_scratch()` path, which deletes the live session's files. The
 //! shared internals (`walk_in`, `keep_folder`, `open`, `keep`) are the
 //! supported way in. `ui::people` is entered only through its `browse_in`,
-//! which borrows this card's guard instead of building one.
+//! which borrows this card's guard and its scratch directory instead of
+//! building either: the card a list opens for one of its accounts ([`peek`])
+//! opens that account's picture and stories into the same directory.
+//!
+//! **The card is fitted to the terminal, and never loses a row to it**
+//! ([`fitted`]). The bio takes up to six rows and ends in `…` when it has
+//! more; `i` shows all the account says about itself, from what was already
+//! read. On a short terminal the bio's extra rows go first, then the blank
+//! rows, so that everything there is to open is still on screen.
 //!
 //! Walks are the other thing that cannot run under the browser's terminal
 //! state: the progress bars belong on the real screen, where their finished
@@ -40,7 +48,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, BorderType, Cell, Padding, Paragraph, Row, Table, TableState, Wrap};
 use snob_core::model::{ListKind, User, printable};
 use snob_store::paths::AppPaths;
 use snob_store::secrets::SecretStore;
@@ -56,7 +64,9 @@ use crate::media::Story;
 use crate::report;
 use crate::ui::accounts::{self, Browsed, Picked};
 use crate::ui::browser::busy::Busy;
-use crate::ui::browser::input::{self, Action, Raw, action_of, page, watching_cancel_keys};
+use crate::ui::browser::input::{
+    self, Action, Raw, Stopped, action_of, page, watching_cancel_keys,
+};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::help;
 use crate::ui::highlights::{Folder, empty_note, folder_title, keep_folder, stem_of, walk_in};
@@ -87,6 +97,9 @@ enum Level {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardRow {
     Actions,
+    /// The picture, a row of the card a list opens alone ([`viewing_rows`]): on
+    /// the card it is under the actions.
+    Picture,
     Stories,
     FollowedBy,
     Counts,
@@ -163,6 +176,10 @@ struct Media {
     mutual: Option<Vec<User>>,
     pfp: Option<Picture>,
     pfp_opened: Option<PathBuf>,
+    /// Whether fetching the picture is a request to Instagram and not the
+    /// CDN alone ([`picture_is_a_request`]). The read-only card says so on
+    /// the row, before the key.
+    pfp_is_a_request: bool,
 }
 
 impl Media {
@@ -188,8 +205,16 @@ impl Media {
             mutual: None,
             pfp: None,
             pfp_opened: None,
+            pfp_is_a_request: false,
         }
     }
+}
+
+/// Whether the picture costs a request beyond the CDN's: only where the
+/// profile named no full-size picture and there is no page to have named it,
+/// which is when `commands::pfp::picture` asks the by-id endpoint.
+fn picture_is_a_request(app: &App, profile: &Profile) -> bool {
+    profile.pfp_full_size.is_none() && !app.client().has_page()
 }
 
 /// What a suspended piece of work left the loop to do.
@@ -306,12 +331,28 @@ pub async fn browse(
                         let after = match pending {
                             Ask::List(kind) => {
                                 consent_was_given(app, typed, own);
-                                walk_and_open(app, &mut tui, &mut receipts, typed, profile, kind)
-                                    .await?
+                                walk_and_open(
+                                    app,
+                                    &mut tui,
+                                    &mut receipts,
+                                    &scratch,
+                                    typed,
+                                    profile,
+                                    kind,
+                                )
+                                .await?
                             }
                             Ask::Scan => {
                                 consent_was_given(app, typed, own);
-                                scan_and_open(app, &mut tui, &mut receipts, typed, profile).await?
+                                scan_and_open(
+                                    app,
+                                    &mut tui,
+                                    &mut receipts,
+                                    &scratch,
+                                    typed,
+                                    profile,
+                                )
+                                .await?
                             }
                             Ask::None => After::Stay(String::new()),
                         };
@@ -376,6 +417,15 @@ pub async fn browse(
                 }
                 _ => {}
             }
+            // And, from the card, all the account says about itself.
+            if state.level == Level::Card && asks_about(key) {
+                if says_something(profile) {
+                    show_about(&mut tui, profile, level_frame!())?;
+                } else {
+                    note = nothing_said(profile);
+                }
+                continue;
+            }
 
             let level_before = state.level;
             match state.level {
@@ -409,12 +459,15 @@ pub async fn browse(
                         Action::Last => state.row = rows.len() - 1,
                         Action::Open => match here {
                             CardRow::Actions => state.level = Level::Actions { selected: 0 },
+                            // Never a row of this card: see `viewing_rows`.
+                            CardRow::Picture => {}
                             CardRow::Stories => state.level = Level::Stories,
                             CardRow::FollowedBy => {
                                 match followed_by_open(
                                     app,
                                     &mut tui,
                                     &mut receipts,
+                                    &scratch,
                                     profile,
                                     &mut media,
                                 )
@@ -446,6 +499,7 @@ pub async fn browse(
                                         app,
                                         &mut tui,
                                         &mut receipts,
+                                        &scratch,
                                         profile,
                                         kind,
                                         &mut state,
@@ -608,21 +662,17 @@ pub async fn browse(
                                 format!("Opening story {}...", state.stories_selected + 1),
                                 level_frame!(),
                             )?;
-                            let (result, stopped) = busy
-                                .run(
-                                    &mut tui,
-                                    app.client().pacer().cancel_token(),
-                                    crate::ui::stories::open(
-                                        app.client(),
-                                        &profile.username,
-                                        &media.stories,
-                                        state.stories_selected,
-                                        &scratch,
-                                        &mut media.stories_opened,
-                                    ),
-                                )
-                                .await;
-                            note = tui::opened_note(result);
+                            let (text, stopped) = story_open(
+                                busy,
+                                &mut tui,
+                                app,
+                                profile,
+                                &mut media,
+                                state.stories_selected,
+                                &scratch,
+                            )
+                            .await;
+                            note = text;
                             if let Some(code) = stopped.leave() {
                                 break Ok(code);
                             }
@@ -633,20 +683,17 @@ pub async fn browse(
                                 format!("Saving story {}...", state.stories_selected + 1),
                                 level_frame!(),
                             )?;
-                            let (result, stopped) = busy
-                                .run(
-                                    &mut tui,
-                                    app.client().pacer().cancel_token(),
-                                    crate::ui::stories::keep(
-                                        app.client(),
-                                        &profile.username,
-                                        &media.stories,
-                                        state.stories_selected,
-                                        &mut media.stories_opened,
-                                    ),
-                                )
-                                .await;
-                            note = tui::saved_note(result, &mut receipts);
+                            let (text, stopped) = story_keep(
+                                busy,
+                                &mut tui,
+                                app,
+                                profile,
+                                &mut media,
+                                state.stories_selected,
+                                &mut receipts,
+                            )
+                            .await;
+                            note = text;
                             if let Some(code) = stopped.leave() {
                                 break Ok(code);
                             }
@@ -786,11 +833,7 @@ fn draw_level(
         }
         Level::Stories => crate::ui::stories::draw_items_view(
             frame,
-            format!(
-                "Stories · @{} · {} up",
-                printable(&profile.username),
-                media.stories.len()
-            ),
+            stories_title(profile, media),
             crate::ui::stories::FOLDER_HINT,
             &media.stories,
             true,
@@ -882,6 +925,7 @@ async fn list_open(
     app: &mut App,
     tui: &mut Tui,
     receipts: &mut Vec<String>,
+    scratch: &Scratch,
     profile: &Profile,
     kind: ListKind,
     state: &mut State,
@@ -902,7 +946,7 @@ async fn list_open(
             &people,
             app.viewer().clone(),
         );
-        let code = crate::ui::people::browse_in(tui, app, &shelf, receipts).await?;
+        let code = crate::ui::people::browse_in(tui, app, &shelf, scratch, receipts).await?;
         if code == ExitCode::Interrupted {
             return Ok(After::Leave(code));
         }
@@ -920,6 +964,7 @@ async fn walk_and_open(
     app: &mut App,
     tui: &mut Tui,
     receipts: &mut Vec<String>,
+    scratch: &Scratch,
     typed: Option<&str>,
     profile: &Profile,
     kind: ListKind,
@@ -945,7 +990,7 @@ async fn walk_and_open(
         &people,
         app.viewer().clone(),
     );
-    let code = crate::ui::people::browse_in(tui, app, &shelf, receipts).await?;
+    let code = crate::ui::people::browse_in(tui, app, &shelf, scratch, receipts).await?;
     if code == ExitCode::Interrupted {
         return Ok(After::Leave(code));
     }
@@ -962,6 +1007,7 @@ async fn scan_and_open(
     app: &mut App,
     tui: &mut Tui,
     receipts: &mut Vec<String>,
+    scratch: &Scratch,
     typed: Option<&str>,
     profile: &Profile,
 ) -> Result<After> {
@@ -1003,7 +1049,7 @@ async fn scan_and_open(
         &snob_core::filters::Filter::default(),
     );
     let shelf = Shelf::tray(format!("scan of {subject}"), &sets, app.viewer().clone());
-    let code = crate::ui::people::browse_in(tui, app, &shelf, receipts).await?;
+    let code = crate::ui::people::browse_in(tui, app, &shelf, scratch, receipts).await?;
     if code == ExitCode::Interrupted {
         return Ok(After::Leave(code));
     }
@@ -1019,6 +1065,7 @@ async fn followed_by_open(
     app: &mut App,
     tui: &mut Tui,
     receipts: &mut Vec<String>,
+    scratch: &Scratch,
     profile: &Profile,
     media: &mut Media,
 ) -> Result<After> {
@@ -1060,7 +1107,7 @@ async fn followed_by_open(
         people,
         app.viewer().clone(),
     );
-    let code = crate::ui::people::browse_in(tui, app, &shelf, receipts).await?;
+    let code = crate::ui::people::browse_in(tui, app, &shelf, scratch, receipts).await?;
     if code == ExitCode::Interrupted {
         return Ok(After::Leave(code));
     }
@@ -1132,15 +1179,138 @@ async fn ensure_pfp(app: &App, profile: &Profile, media: &mut Media) -> Result<(
 }
 
 // ---------------------------------------------------------------------------
-// The read-only card an account list opens.
+// What the card and the card a list opens both do.
 
-/// The bottom edge of the read-only card.
+/// Enter on a story: fetched and handed to the system viewer, under the box
+/// `busy` already drew the view for. The note it leaves, and whether a key
+/// stopped it.
+async fn story_open(
+    busy: Busy,
+    tui: &mut Tui,
+    app: &App,
+    profile: &Profile,
+    media: &mut Media,
+    index: usize,
+    scratch: &Scratch,
+) -> (String, Stopped) {
+    let (result, stopped) = busy
+        .run(
+            tui,
+            app.client().pacer().cancel_token(),
+            crate::ui::stories::open(
+                app.client(),
+                &profile.username,
+                &media.stories,
+                index,
+                scratch,
+                &mut media.stories_opened,
+            ),
+        )
+        .await;
+    (tui::opened_note(result), stopped)
+}
+
+/// D on a story: saved where the user is, under the box `busy` drew.
+async fn story_keep(
+    busy: Busy,
+    tui: &mut Tui,
+    app: &App,
+    profile: &Profile,
+    media: &mut Media,
+    index: usize,
+    receipts: &mut Vec<String>,
+) -> (String, Stopped) {
+    let (result, stopped) = busy
+        .run(
+            tui,
+            app.client().pacer().cancel_token(),
+            crate::ui::stories::keep(
+                app.client(),
+                &profile.username,
+                &media.stories,
+                index,
+                &mut media.stories_opened,
+            ),
+        )
+        .await;
+    (tui::saved_note(result, receipts), stopped)
+}
+
+/// The title over the stories of the account, from either card.
+fn stories_title(profile: &Profile, media: &Media) -> String {
+    format!(
+        "Stories · @{} · {} up",
+        printable(&profile.username),
+        media.stories.len()
+    )
+}
+
+/// The note `i` leaves on an account with no name, category, bio or link.
+fn nothing_said(profile: &Profile) -> String {
+    format!(
+        "@{} says nothing about itself",
+        printable(&profile.username)
+    )
+}
+
+/// Where a key that moves takes the selection of a list of `total`, and
+/// `None` for a key that does not move.
+fn moved(selected: usize, total: usize, page_rows: usize, action: Action) -> Option<usize> {
+    let last = total.saturating_sub(1);
+    Some(match action {
+        Action::Up => selected.saturating_sub(1),
+        Action::Down => (selected + 1).min(last),
+        Action::PageUp => selected.saturating_sub(page(page_rows)),
+        Action::PageDown => (selected + page(page_rows)).min(last),
+        Action::First => 0,
+        Action::Last => last,
+        _ => return None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The card an account list opens.
+
+/// The bottom edge of the card a list opens, when nothing on it opens.
 pub(crate) const PEEK_HINT: &str = "w open on the web · ? keys · esc back";
 
-/// What `?` shows over the read-only card.
+/// The same, said shorter, after the keys of a row that opens: the line has
+/// to fit a card 80 columns wide.
+const PEEK_HINT_SHORT: &str = "w web · ? keys · esc back";
+
+/// The bottom edge of the stories that card opens.
+const PEEK_STORIES_HINT: &str = "↑↓ move · enter open · d save · ← back · ? keys";
+
+/// `i`, on both cards.
+const ABOUT_KEY: help::Key =
+    help::key("i", "all the account says about itself", KeyCode::Char('i'));
+
+/// What `?` shows over the card a list opens.
 const PEEK_KEYS: &[help::Key] = &[
+    help::key("↑ ↓ j k", "move between what opens", KeyCode::Down),
+    help::key(
+        "enter → l",
+        "open the picture, or the stories",
+        KeyCode::Enter,
+    ),
+    help::key("d", "save the picture here", KeyCode::Char('d')),
+    ABOUT_KEY,
     help::WEB,
     help::key("esc q ← h backspace", "back to the list", KeyCode::Esc),
+    help::REDRAW,
+    help::STOP,
+];
+
+/// What `?` shows over the stories that card opens. `q` is back here, as it
+/// is on the card they were opened from, and there is no account to change.
+const PEEK_STORIES_KEYS: &[help::Key] = &[
+    help::MOVE,
+    help::PAGE,
+    help::ENDS,
+    crate::ui::stories::OPEN_KEY,
+    crate::ui::stories::SAVE_KEY,
+    help::key("esc q ← h backspace", "back to the card", KeyCode::Left),
+    help::WEB,
     help::REDRAW,
     help::STOP,
 ];
@@ -1152,6 +1322,7 @@ const CARD_KEYS: &[help::Key] = &[
     help::key("g G home end", "the first row, the last", KeyCode::Home),
     help::key("enter", "open what is under the cursor", KeyCode::Enter),
     help::key("d", "save all of a highlight here", KeyCode::Char('d')),
+    ABOUT_KEY,
     help::ACCOUNT,
     help::WEB,
     help::REDRAW,
@@ -1176,7 +1347,7 @@ const ACTIONS_KEYS: &[help::Key] = &[
     help::STOP,
 ];
 
-/// What a key did to the read-only card.
+/// What a key did to the card a list opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Peeked {
     /// Esc, `q`, Backspace, Left or `h`: back to the list it came from.
@@ -1188,12 +1359,23 @@ pub(crate) enum Peeked {
     Browser,
     /// `?`: the keys of this card.
     Help,
+    /// `i`: all the account says about itself.
+    About,
+    /// Up or `k`, among the rows that open.
+    Up,
+    /// Down or `j`.
+    Down,
+    /// Enter, Right or `l`: open the row under the cursor.
+    Open,
+    /// `d`: save what the row under the cursor is.
+    Save,
     Redraw,
     Ignored,
 }
 
-/// Binds one key of the read-only card. Deliberately not `action_of`: here
-/// `q` and Esc both mean "back to the list", where in the card they leave.
+/// Binds one key of the card a list opens. Deliberately not `action_of`:
+/// here `q` and Esc both mean "back to the list", where in the card they
+/// leave.
 pub(crate) fn peek_key(key: KeyEvent) -> Peeked {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let plain = !ctrl && !key.modifiers.contains(KeyModifiers::ALT);
@@ -1205,54 +1387,208 @@ pub(crate) fn peek_key(key: KeyEvent) -> Peeked {
         }
         KeyCode::Char('w' | 'o' | 'O') if plain => Peeked::Browser,
         KeyCode::Char('?') if plain => Peeked::Help,
+        KeyCode::Char('i') if plain => Peeked::About,
+        KeyCode::Up | KeyCode::Char('k') if plain => Peeked::Up,
+        KeyCode::Down | KeyCode::Char('j') if plain => Peeked::Down,
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if plain => Peeked::Open,
+        KeyCode::Char('d' | 'D') if plain => Peeked::Save,
         _ => Peeked::Ignored,
     }
 }
 
+/// Whether the card a list opens can open this row: only what is a file
+/// away. The stories came with the profile, and looking at one is a download
+/// from the CDN, which is no request to Instagram; the picture is the same,
+/// or says on its row that it is one request ([`picture_is_a_request`]). A
+/// highlight is a walk, a list is a walk and a question, and the mutual
+/// followers are pages of a sitting: those stay with `snob profile`, which
+/// asks before it spends.
+fn opens_in_a_list(row: CardRow) -> bool {
+    matches!(row, CardRow::Picture | CardRow::Stories)
+}
+
+/// The hints under the card a list opens: the keys of the row under the
+/// cursor, when one opens, then the ones that are always there. `several`
+/// is whether there is more than one row to move between, and `cut` whether
+/// the bio is shown short of whole.
+fn peek_hint(focus: Option<CardRow>, several: bool, cut: bool) -> String {
+    let mut hint = String::new();
+    if several {
+        hint.push_str("↑↓ move · ");
+    }
+    match focus {
+        Some(CardRow::Picture) => hint.push_str("enter open · d save · "),
+        Some(_) => hint.push_str("enter open · "),
+        None => {}
+    }
+    if cut {
+        hint.push_str("i bio · ");
+    }
+    hint.push_str(if focus.is_some() {
+        PEEK_HINT_SHORT
+    } else {
+        PEEK_HINT
+    });
+    hint
+}
+
 /// The card of the account under the cursor of a list, on the guard the list
-/// holds, with nothing on it to click: what `snob profile` shows, without the
-/// rows that start more work. Nothing here sends a request; the profile was
-/// read before this is called. `None` is back to the list; `Some` leaves the
-/// view with that code.
-pub(crate) fn peek(
+/// holds: what `snob profile` shows, without the rows that start a walk.
+///
+/// **It opens what is a file away and nothing else** ([`opens_in_a_list`]):
+/// the picture and the stories the profile came with, each fetched when its
+/// key is pressed, under a [`Busy`], into `scratch`, which is the caller's:
+/// the list's own, or the card's when the list was opened from the card,
+/// since two scratch directories on one path is the second deleting the
+/// first's files. `i` shows the whole bio, and sends nothing.
+///
+/// `None` is back to the list; `Some` leaves the view with that code.
+pub(crate) async fn peek(
     tui: &mut Tui,
+    app: &App,
     profile: &Profile,
-    viewer: &Viewer,
+    scratch: &Scratch,
     receipts: &mut Vec<String>,
 ) -> Result<Option<ExitCode>> {
     let colors = tui::colors_enabled();
+    let viewer = app.viewer().clone();
     let own = viewer.pk == profile.pk;
     let rows = viewing_rows(profile);
-    let media = Media::of(profile);
-    let state = State {
+    // The rows the cursor moves between, as places in `rows`.
+    let opening: Vec<usize> = (0..rows.len())
+        .filter(|at| opens_in_a_list(rows[*at]))
+        .collect();
+    let mut media = Media::of(profile);
+    media.pfp_is_a_request = picture_is_a_request(app, profile);
+    let mut state = State {
         level: Level::Card,
-        row: 0,
+        row: opening.first().copied().unwrap_or(0),
         counts_col: 0,
         hl_col: 0,
         stories_selected: 0,
         ask: Ask::None,
     };
     let mut note = String::new();
+    let mut list = TableState::default();
+    let mut page_rows = 1usize;
+
+    // The view as it is on screen: a macro for the reason `browse` has one.
+    macro_rules! peek_frame {
+        () => {
+            |frame: &mut Frame<'_>| {
+                draw_peek(
+                    frame,
+                    profile,
+                    &media,
+                    &state,
+                    &rows,
+                    own,
+                    &viewer,
+                    &note,
+                    colors,
+                    &mut list,
+                    &mut page_rows,
+                );
+            }
+        };
+    }
+
     loop {
-        tui.terminal.draw(|frame| {
-            card_frame(
-                frame,
-                profile,
-                &media,
-                &state,
-                &rows,
-                own,
-                viewer,
-                &note,
-                colors,
-                Some(PEEK_HINT),
-            );
-        })?;
+        if state.level == Level::Stories {
+            list.select(Some(state.stories_selected));
+        }
+        tui.terminal.draw(peek_frame!())?;
         let key = match input::read(input::tick()).map_err(input::unreadable)? {
             Raw::Tick | Raw::Resized | Raw::Paste(_) => continue,
             Raw::Key(key) => key,
         };
         note.clear();
+
+        if state.level == Level::Stories {
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            if plain && key.code == KeyCode::Esc {
+                state.level = Level::Card;
+                continue;
+            }
+            let action = action_of(key);
+            let total = media.stories.len();
+            if let Some(to) = moved(state.stories_selected, total, page_rows, action) {
+                state.stories_selected = to;
+                continue;
+            }
+            match action {
+                Action::Open => {
+                    let busy = Busy::begin(
+                        tui,
+                        format!("Opening story {}...", state.stories_selected + 1),
+                        peek_frame!(),
+                    )?;
+                    let (text, stopped) = story_open(
+                        busy,
+                        tui,
+                        app,
+                        profile,
+                        &mut media,
+                        state.stories_selected,
+                        scratch,
+                    )
+                    .await;
+                    note = text;
+                    if let Some(code) = stopped.leave() {
+                        return Ok(Some(code));
+                    }
+                }
+                Action::Download => {
+                    let busy = Busy::begin(
+                        tui,
+                        format!("Saving story {}...", state.stories_selected + 1),
+                        peek_frame!(),
+                    )?;
+                    let (text, stopped) = story_keep(
+                        busy,
+                        tui,
+                        app,
+                        profile,
+                        &mut media,
+                        state.stories_selected,
+                        receipts,
+                    )
+                    .await;
+                    note = text;
+                    if let Some(code) = stopped.leave() {
+                        return Ok(Some(code));
+                    }
+                }
+                // `q` is back here, as it is on the card under this list.
+                Action::Back | Action::Quit => state.level = Level::Card,
+                Action::Redraw => tui.terminal.clear()?,
+                Action::Interrupt => return Ok(Some(ExitCode::Interrupted)),
+                Action::Web => {
+                    note = tui::web_note(&tui::page_of(&profile.username), receipts);
+                }
+                Action::Help => {
+                    help::show(tui, "Stories", PEEK_STORIES_KEYS, peek_frame!())?;
+                }
+                // The moves were taken above; an account changes from the
+                // list this card was opened from.
+                Action::Up
+                | Action::Down
+                | Action::PageUp
+                | Action::PageDown
+                | Action::First
+                | Action::Last
+                | Action::Accounts
+                | Action::None => {}
+            }
+            continue;
+        }
+
+        let here = opening
+            .iter()
+            .position(|at| *at == state.row)
+            .map(|place| (place, rows[state.row]));
         match peek_key(key) {
             Peeked::Back => return Ok(None),
             Peeked::Interrupt => return Ok(Some(ExitCode::Interrupted)),
@@ -1260,29 +1596,109 @@ pub(crate) fn peek(
             Peeked::Browser => {
                 note = tui::web_note(&tui::page_of(&profile.username), receipts);
             }
-            Peeked::Help => help::show(tui, "Profile", PEEK_KEYS, |frame| {
-                card_frame(
-                    frame,
-                    profile,
-                    &media,
-                    &state,
-                    &rows,
-                    own,
-                    viewer,
-                    &note,
-                    colors,
-                    Some(PEEK_HINT),
-                );
-            })?,
+            Peeked::Help => help::show(tui, "Profile", PEEK_KEYS, peek_frame!())?,
+            Peeked::About => {
+                if says_something(profile) {
+                    show_about(tui, profile, peek_frame!())?;
+                } else {
+                    note = nothing_said(profile);
+                }
+            }
+            Peeked::Up => {
+                if let Some((place, _)) = here {
+                    state.row = opening[place.saturating_sub(1)];
+                }
+            }
+            Peeked::Down => {
+                if let Some((place, _)) = here {
+                    state.row = opening[(place + 1).min(opening.len() - 1)];
+                }
+            }
+            Peeked::Open => match here {
+                Some((_, CardRow::Stories)) => {
+                    state.level = Level::Stories;
+                    list = TableState::default();
+                }
+                Some((_, CardRow::Picture)) => {
+                    let busy = Busy::begin(tui, "Opening the picture...", peek_frame!())?;
+                    let (text, stopped) = busy
+                        .run(
+                            tui,
+                            app.client().pacer().cancel_token(),
+                            pfp_open(app, profile, &mut media, scratch),
+                        )
+                        .await;
+                    note = text;
+                    if let Some(code) = stopped.leave() {
+                        return Ok(Some(code));
+                    }
+                }
+                _ => {}
+            },
+            Peeked::Save => {
+                if let Some((_, CardRow::Picture)) = here {
+                    let busy = Busy::begin(tui, "Saving the picture...", peek_frame!())?;
+                    let (text, stopped) = busy
+                        .run(
+                            tui,
+                            app.client().pacer().cancel_token(),
+                            pfp_keep(app, profile, &mut media, receipts),
+                        )
+                        .await;
+                    note = text;
+                    if let Some(code) = stopped.leave() {
+                        return Ok(Some(code));
+                    }
+                }
+            }
             Peeked::Ignored => {}
         }
     }
 }
 
-/// The rows the read-only card draws: the card's, less the actions button.
+/// One frame of [`peek`]: the card, or the stories it opened.
+#[expect(clippy::too_many_arguments, reason = "one frame's worth of state")]
+fn draw_peek(
+    frame: &mut Frame<'_>,
+    profile: &Profile,
+    media: &Media,
+    state: &State,
+    rows: &[CardRow],
+    own: bool,
+    viewer: &Viewer,
+    note: &str,
+    colors: bool,
+    list: &mut TableState,
+    page_rows: &mut usize,
+) {
+    if state.level == Level::Stories {
+        crate::ui::stories::draw_items_view(
+            frame,
+            stories_title(profile, media),
+            PEEK_STORIES_HINT,
+            &media.stories,
+            true,
+            viewer,
+            list,
+            note,
+            colors,
+            page_rows,
+        );
+    } else {
+        card_frame(
+            frame, profile, media, state, rows, own, viewer, note, colors, true,
+        );
+    }
+}
+
+/// The rows the card a list opens draws: the card's, with the picture in
+/// the place of the actions button, unless the account never set one.
 fn viewing_rows(profile: &Profile) -> Vec<CardRow> {
     let mut rows = card_rows(profile);
     rows.retain(|row| *row != CardRow::Actions);
+    if !profile.pfp_anonymous {
+        rows.insert(0, CardRow::Picture);
+    }
     rows
 }
 
@@ -1293,26 +1709,136 @@ fn viewing_rows(profile: &Profile) -> Vec<CardRow> {
 /// and starts being a banner; on a wide terminal the card centers instead.
 const CARD_MAX_W: u16 = 96;
 
-/// The card's size: at most [`CARD_MAX_W`] wide, as tall as its content —
-/// borders, padding, the about block, a blank line, and the focusable rows
-/// with a blank line between each pair.
-fn card_size(profile: &Profile, rows: &[CardRow], area: Rect) -> (u16, u16) {
-    let width = area.width.min(CARD_MAX_W);
-    let text_w = width.saturating_sub(2 + 4) as usize;
-    let body: u16 = rows.iter().map(row_height).sum::<u16>() + rows.len().saturating_sub(1) as u16;
-    let height = (2 + 2 + about_height(profile, text_w) + 1 + body).min(area.height);
-    (width, height)
+/// The most rows of the card a bio takes. Instagram's own form ends a bio
+/// at 150 characters, under two lines of a card this wide, so what takes
+/// more is the line breaks a bio is laid out with; six shows most of those
+/// whole, and `i` shows any bio whole.
+const BIO_ROWS: usize = 6;
+
+/// The rows of bio the card holds on to while there is air left to give up.
+const BIO_ROWS_KEPT: usize = 2;
+
+/// How the card is fitted to the rows the terminal has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fit {
+    /// The rows the bio may take.
+    bio: usize,
+    /// A blank row under the about block and between each pair of rows.
+    gaps: bool,
+    /// The blank row inside the top border and inside the bottom one.
+    padded: bool,
+}
+
+impl Fit {
+    /// The card where there is room for all of it.
+    const WHOLE: Fit = Fit {
+        bio: BIO_ROWS,
+        gaps: true,
+        padded: true,
+    };
+
+    fn padding(self) -> Padding {
+        if self.padded {
+            tui::card_padding()
+        } else {
+            Padding::horizontal(2)
+        }
+    }
+}
+
+/// The card's width: at most [`CARD_MAX_W`].
+fn card_width(area: Rect) -> u16 {
+    area.width.min(CARD_MAX_W)
+}
+
+/// The columns of text inside the card: its width less the borders and the
+/// two columns of padding each side.
+fn text_width(area: Rect) -> usize {
+    card_width(area).saturating_sub(2 + 4) as usize
+}
+
+/// The card's height under `fit`: the borders, the padding, the about
+/// block, the rows, and the blank rows between them all.
+fn card_height(profile: &Profile, rows: &[CardRow], text_w: usize, fit: Fit) -> u16 {
+    let about = about_lines(profile, text_w, fit.bio, false).len() as u16;
+    let body: u16 = rows.iter().map(row_height).sum();
+    let air = if fit.gaps { rows.len() as u16 } else { 0 };
+    2 + if fit.padded { 2 } else { 0 } + about + body + air
+}
+
+/// Fits the card to the rows of `area`, giving up first what costs least:
+/// the bio's rows past the second, since the whole of it is one `i` away;
+/// then the blank rows between the bands; then the ones inside the border;
+/// and the bio's second row last. **Never a row of the card**: a row is
+/// something to open, and one that fell off the bottom of a short terminal
+/// was there to move onto and not to see, which is what this replaced. A
+/// terminal too short for even that cuts the card at its bottom edge.
+fn fitted(profile: &Profile, rows: &[CardRow], area: Rect) -> Fit {
+    let text_w = text_width(area);
+    let fits = |fit: Fit| card_height(profile, rows, text_w, fit) <= area.height;
+    let mut fit = Fit::WHOLE;
+    while fit.bio > BIO_ROWS_KEPT && !fits(fit) {
+        fit.bio -= 1;
+    }
+    if !fits(fit) {
+        fit.gaps = false;
+    }
+    if !fits(fit) {
+        fit.padded = false;
+    }
+    if !fits(fit) {
+        fit.bio = 1;
+    }
+    fit
 }
 
 fn row_height(row: &CardRow) -> u16 {
     if *row == CardRow::Counts { 2 } else { 1 }
 }
 
+/// The bio as the card shows it, and whether that left any of it out:
+/// wrapped, its blank lines dropped, since a row of the card is worth more
+/// than a pause, and at most `rows` rows, the last ending in `…` where there
+/// was more. `i` shows all of it, as it was written ([`about_text`]).
+fn bio_on_the_card(bio: &str, width: usize, rows: usize) -> (Vec<String>, bool) {
+    let width = width.max(8);
+    let mut lines: Vec<String> = tui::wrapped(bio, width)
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect();
+    let cut = lines.len() > rows;
+    if cut {
+        lines.truncate(rows);
+        if let Some(last) = lines.last_mut() {
+            while measure_text_width(last) + 1 > width {
+                last.pop();
+            }
+            last.truncate(last.trim_end().len());
+            last.push('…');
+        }
+    }
+    (lines, cut)
+}
+
+/// Whether the card shows less than the whole bio at this width and fit:
+/// what the bottom edge offers `i` for.
+fn bio_is_cut(profile: &Profile, width: usize, rows: usize) -> bool {
+    profile
+        .biography
+        .as_deref()
+        .is_some_and(|bio| bio_on_the_card(bio, width, rows).1)
+}
+
 /// The about block's lines: the full name in bold, the category dim, the
-/// bio's first line plain — it is the one thing here the person wrote, and
-/// the least aside-like fact on the card — and the link in the accent, as
-/// a link is on the site.
-fn about_lines(profile: &Profile, width: usize, colors: bool) -> Vec<Line<'static>> {
+/// bio plain, on at most `bio_rows` rows — it is the one thing here the
+/// person wrote, and the least aside-like fact on the card — and the link
+/// in the accent, as a link is on the site.
+fn about_lines(
+    profile: &Profile,
+    width: usize,
+    bio_rows: usize,
+    colors: bool,
+) -> Vec<Line<'static>> {
     let dim = tui::paint(colors, tui::DIM);
     let mut lines = Vec::new();
     if let Some(name) = &profile.full_name {
@@ -1324,11 +1850,8 @@ fn about_lines(profile: &Profile, width: usize, colors: bool) -> Vec<Line<'stati
     if let Some(category) = &profile.category {
         lines.push(Line::from(Span::styled(category.clone(), dim)));
     }
-    if let Some(bio) = &profile.biography
-        && let Some(first) = bio.lines().next()
-        && !first.is_empty()
-    {
-        for line in wrapped(first, width, 2) {
+    if let Some(bio) = &profile.biography {
+        for line in bio_on_the_card(bio, width, bio_rows).0 {
             lines.push(Line::from(line));
         }
     }
@@ -1344,43 +1867,148 @@ fn about_lines(profile: &Profile, width: usize, colors: bool) -> Vec<Line<'stati
     lines
 }
 
-fn about_height(profile: &Profile, width: usize) -> u16 {
-    about_lines(profile, width, false).len() as u16
-}
-
-/// Greedy word wrap to at most `max_lines`, in display columns. Pure, so the
-/// card's height can be computed without drawing.
-fn wrapped(text: &str, width: usize, max_lines: usize) -> Vec<String> {
-    let width = width.max(8);
-    let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        let candidate = if current.is_empty() {
-            word.to_string()
-        } else {
-            format!("{current} {word}")
-        };
-        if measure_text_width(&candidate) <= width {
-            current = candidate;
-        } else {
-            if !current.is_empty() {
-                lines.push(std::mem::take(&mut current));
-            }
-            if lines.len() == max_lines {
-                current.clear();
-                break;
-            }
-            current = word.to_string();
+/// Everything the account says about itself, for the box `i` opens: the
+/// name, the category, the bio as it was written, blank lines and all, and
+/// the link. Wrapped here, so the box knows how far it can scroll.
+fn about_text(profile: &Profile, width: usize, colors: bool) -> Vec<Line<'static>> {
+    let mut blocks: Vec<Vec<Line<'static>>> = Vec::new();
+    let mut heading = Vec::new();
+    if let Some(name) = &profile.full_name {
+        for line in tui::wrapped(name, width) {
+            heading.push(Line::from(Span::styled(
+                line,
+                tui::paint(colors, tui::BOLD),
+            )));
         }
     }
-    if !current.is_empty() && lines.len() < max_lines {
-        lines.push(current);
+    if let Some(category) = &profile.category {
+        for line in tui::wrapped(category, width) {
+            heading.push(Line::from(Span::styled(line, tui::paint(colors, tui::DIM))));
+        }
     }
-    if lines.is_empty() {
-        lines.push(String::new());
+    blocks.push(heading);
+    if let Some(bio) = &profile.biography {
+        blocks.push(
+            tui::wrapped(bio, width)
+                .into_iter()
+                .map(Line::from)
+                .collect(),
+        );
     }
-    lines.truncate(max_lines);
+    if let Some(url) = &profile.external_url {
+        blocks.push(
+            tui::wrapped(url, width)
+                .into_iter()
+                .map(|line| {
+                    Line::from(Span::styled(line, tui::paint(colors, Role::Accent.style())))
+                })
+                .collect(),
+        );
+    }
+    // A blank line between the blocks that are there, and none around them.
+    let mut lines = Vec::new();
+    for block in blocks.into_iter().filter(|block| !block.is_empty()) {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.extend(block);
+    }
     lines
+}
+
+/// The widest the box `i` opens grows: a line of prose is read, not scanned.
+const ABOUT_MAX_W: u16 = 72;
+
+/// The box `i` opens over the card: [`about_text`], from line `scroll` on.
+/// Hands back the furthest it can scroll, which is 0 when all of it fits.
+fn about_modal(frame: &mut Frame<'_>, profile: &Profile, scroll: usize, colors: bool) -> usize {
+    let dim = tui::paint(colors, tui::DIM);
+    let bold = tui::paint(colors, tui::BOLD);
+    tui::veil(frame, colors);
+
+    let screen = frame.area();
+    let width = screen.width.min(ABOUT_MAX_W);
+    let text = about_text(profile, width.saturating_sub(2 + 4).max(8) as usize, colors);
+    let height = (2 + 2 + text.len() as u16).min(screen.height);
+    let area = tui::modal_area(screen, width, height);
+    let rows = height.saturating_sub(2 + 2) as usize;
+    let furthest = text.len().saturating_sub(rows);
+    let scroll = scroll.min(furthest);
+    let closes = if furthest > 0 {
+        " ↑↓ scroll · any other key closes "
+    } else {
+        " any key closes "
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(dim)
+        .padding(tui::card_padding())
+        .title_top(Line::from(Span::styled(
+            format!(" About @{} ", printable(&profile.username)),
+            bold,
+        )))
+        .title_bottom(Line::from(Span::styled(closes, dim)).centered());
+    let inner = tui::open_modal(frame, area, block);
+    let shown: Vec<Line<'static>> = text.into_iter().skip(scroll).take(rows).collect();
+    frame.render_widget(Paragraph::new(shown), inner);
+    if furthest > 0 {
+        // The bar's travel is the offsets there are, the first to the last.
+        tui::scrollbar(frame, area, furthest + 1, scroll, rows as u16);
+    }
+    furthest
+}
+
+/// Whether the account says anything about itself that `i` could show.
+fn says_something(profile: &Profile) -> bool {
+    profile.full_name.is_some()
+        || profile.category.is_some()
+        || profile.biography.is_some()
+        || profile.external_url.is_some()
+}
+
+/// `i`: all the account says about itself, over the view `under` draws,
+/// until a key that does not scroll it is pressed. Nothing is fetched: it is
+/// what the card was opened with. The key that closes it is spent doing so,
+/// as in [`help::show`].
+fn show_about(
+    tui: &mut Tui,
+    profile: &Profile,
+    mut under: impl FnMut(&mut Frame<'_>),
+) -> Result<()> {
+    let colors = tui::colors_enabled();
+    let mut scroll = 0usize;
+    let mut furthest = 0usize;
+    let mut rows = 1usize;
+    loop {
+        tui.terminal.draw(|frame| {
+            under(frame);
+            furthest = about_modal(frame, profile, scroll, colors);
+            rows = frame.area().height.saturating_sub(2 + 2).max(1) as usize;
+        })?;
+        scroll = scroll.min(furthest);
+        let key = match input::read(input::tick()).map_err(input::unreadable)? {
+            Raw::Tick | Raw::Resized | Raw::Paste(_) => continue,
+            Raw::Key(key) => key,
+        };
+        match action_of(key) {
+            Action::Up => scroll = scroll.saturating_sub(1),
+            Action::Down => scroll = (scroll + 1).min(furthest),
+            Action::PageUp => scroll = scroll.saturating_sub(page(rows)),
+            Action::PageDown => scroll = (scroll + page(rows)).min(furthest),
+            Action::First => scroll = 0,
+            Action::Last => scroll = furthest,
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// Whether a key asks for the box of [`show_about`]: `i`, with nothing held.
+/// Bound here and not in `action_of`, since only the two cards have one.
+fn asks_about(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('i')
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 /// Draws the card: identity on the border, an about block, the focusable
@@ -1400,13 +2028,14 @@ fn draw_card(
     colors: bool,
 ) {
     card_frame(
-        frame, profile, media, state, rows, own, viewer, note, colors, None,
+        frame, profile, media, state, rows, own, viewer, note, colors, false,
     );
 }
 
-/// The card, with `viewing` saying it is the read-only one the account list
-/// opens ([`peek`]): then nothing has the cursor, no row says it opens
-/// something, and the bottom edge carries these hints instead of the card's.
+/// The card, with `viewing` saying it is the one the account list opens
+/// ([`peek`]): then only the rows that card can open take the cursor and say
+/// they open ([`opens_in_a_list`]), and the bottom edge carries these hints
+/// instead of the card's.
 #[expect(clippy::too_many_arguments, reason = "one frame's worth of state")]
 fn card_frame(
     frame: &mut Frame<'_>,
@@ -1418,11 +2047,12 @@ fn card_frame(
     viewer: &Viewer,
     note: &str,
     colors: bool,
-    viewing: Option<&str>,
+    viewing: bool,
 ) {
     let area = frame.area();
     let here = rows[state.row.min(rows.len() - 1)];
-    let focus = viewing.is_none().then_some(here);
+    let opens = |row: CardRow| !viewing || opens_in_a_list(row);
+    let focus = opens(here).then_some(here);
     let dim = tui::paint(colors, tui::DIM);
 
     // The account acted as goes on the frame's top row rather than on the
@@ -1430,8 +2060,11 @@ fn card_frame(
     // in the rows under it, so the two never overlap.
     let [label, below] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
     frame.render_widget(Paragraph::new(tui::viewer_line(viewer, colors)), label);
-    let (w, h) = card_size(profile, rows, below);
-    let card = below.centered(Constraint::Length(w), Constraint::Length(h));
+    let fit = fitted(profile, rows, below);
+    let text_w = text_width(below);
+    let h = card_height(profile, rows, text_w, fit).min(below.height);
+    let card = below.centered(Constraint::Length(card_width(below)), Constraint::Length(h));
+    let cut = bio_is_cut(profile, text_w, fit.bio);
 
     // The identity on the border: the handle bold on the left, what the
     // account is and how you stand to it dim on the right.
@@ -1440,7 +2073,7 @@ fn card_frame(
     let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(dim)
-        .padding(tui::card_padding())
+        .padding(fit.padding())
         .title_top(Line::from(Span::styled(
             format!(" @{} ", printable(&profile.username)),
             tui::paint(colors, tui::accent_bold()),
@@ -1449,35 +2082,36 @@ fn card_frame(
         let text = format!(" {} ", attrs.join(" · "));
         block = block.title_top(Line::from(Span::styled(text, dim)).right_aligned());
     }
-    block = block.title_bottom(match viewing {
-        Some(hint) => tui::footer(note, hint, colors),
-        None => card_footer_line(here, note, colors),
+    block = block.title_bottom(if viewing {
+        let several = rows.iter().filter(|row| opens_in_a_list(**row)).count() > 1;
+        tui::footer(note, &peek_hint(focus, several, cut), colors)
+    } else {
+        card_footer_line(here, cut, note, colors)
     });
     let inner = block.inner(card);
     frame.render_widget(block, card);
     let width = inner.width as usize;
 
     // The vertical bands, built from the rows this profile has: an absent
-    // part is not a band that says "nothing".
-    let about = about_lines(profile, width, colors);
-    let mut constraints = vec![
-        Constraint::Length(about.len() as u16),
-        Constraint::Length(1),
-    ];
-    for (i, row) in rows.iter().enumerate() {
-        if i > 0 {
+    // part is not a band that says "nothing". Band 0 is the about block;
+    // `at` is where each row landed, which depends on whether this terminal
+    // has the rows for a blank one between them.
+    let about = about_lines(profile, width, fit.bio, colors);
+    let mut constraints = vec![Constraint::Length(about.len() as u16)];
+    let mut at = Vec::with_capacity(rows.len());
+    for row in rows {
+        if fit.gaps {
             constraints.push(Constraint::Length(1));
         }
+        at.push(constraints.len());
         constraints.push(Constraint::Length(row_height(row)));
     }
     constraints.push(Constraint::Fill(1));
     let bands = Layout::vertical(constraints).split(inner);
     frame.render_widget(Paragraph::new(about).wrap(Wrap { trim: false }), bands[0]);
 
-    // Band 0 is the about block, band 1 the blank under it; each row lands
-    // on every second band after that.
-    for (i, row) in rows.iter().enumerate() {
-        let band = bands[2 + i * 2];
+    for (row, at) in rows.iter().zip(at) {
+        let band = bands[at];
         match row {
             CardRow::Actions => draw_row_button(
                 frame,
@@ -1485,7 +2119,16 @@ fn card_frame(
                 "actions on this account",
                 None,
                 focus == Some(CardRow::Actions),
-                viewing.is_none(),
+                opens(CardRow::Actions),
+                colors,
+            ),
+            CardRow::Picture => draw_row_button(
+                frame,
+                band,
+                "profile picture",
+                media.pfp_is_a_request.then_some("one request"),
+                focus == Some(CardRow::Picture),
+                opens(CardRow::Picture),
                 colors,
             ),
             CardRow::Stories => {
@@ -1501,7 +2144,7 @@ fn card_frame(
                     &label,
                     None,
                     focus == Some(CardRow::Stories),
-                    viewing.is_none(),
+                    opens(CardRow::Stories),
                     colors,
                 );
             }
@@ -1520,7 +2163,7 @@ fn card_frame(
                     &format!("followed by {} you follow", grouped(mutual.count)),
                     aside.as_deref(),
                     focus == Some(CardRow::FollowedBy),
-                    viewing.is_none(),
+                    opens(CardRow::FollowedBy),
                     colors,
                 );
             }
@@ -1613,7 +2256,9 @@ fn draw_row_button(
 
 /// The counters as three tiles: the label dim on top, the number bold under
 /// it, and the focused tile inverted whole — `column_highlight_style` covers
-/// the full height of the rows area, which is exactly the two lines.
+/// the full height of the rows area, which is exactly the two lines. The
+/// focused tile's label is not dim: dim and reverse video together is a
+/// faint background with the label lost in it on more than one theme.
 fn draw_counts(
     frame: &mut Frame<'_>,
     band: Rect,
@@ -1638,7 +2283,9 @@ fn draw_counts(
         + 2;
 
     let row = Row::new(tiles.iter().enumerate().map(|(i, (label, n))| {
-        let label_line = if colors {
+        let label_line = if colors && focused && i == col {
+            Line::from((*label).to_string()).centered()
+        } else if colors {
             Line::from(Span::styled((*label).to_string(), dim)).centered()
         } else {
             let marker = if focused && i == col { ">" } else { " " };
@@ -1670,13 +2317,26 @@ fn counted(n: Option<u64>) -> String {
 /// The card's bottom edge: the note when there is one, otherwise the hints
 /// for the row under the cursor. A pending question is a modal, not a line
 /// here.
-fn card_footer_line(here: CardRow, note: &str, colors: bool) -> Line<'static> {
+fn card_footer_line(here: CardRow, cut: bool, note: &str, colors: bool) -> Line<'static> {
+    tui::footer(note, &card_hint(here, cut), colors)
+}
+
+/// The card's hints. `cut` is whether the bio is shown short of whole, which
+/// is when `i` is worth naming here. The account key gives its place to the
+/// save on the highlights row, so that the line still fits a card 80 columns
+/// wide; `?` names every key.
+fn card_hint(here: CardRow, cut: bool) -> String {
     let mut hint = String::from("↑↓ move · ←→ pick · enter open");
-    if here == CardRow::Highlights {
-        hint.push_str(" · d save all");
+    hint.push_str(if here == CardRow::Highlights {
+        " · d save all"
+    } else {
+        " · a account"
+    });
+    if cut {
+        hint.push_str(" · i bio");
     }
-    hint.push_str(" · a account · q quit");
-    tui::footer(note, &hint, colors)
+    hint.push_str(" · ? keys · q quit");
+    hint
 }
 
 /// What the modal needs to say no twice and yes once, for measuring.
@@ -1693,7 +2353,7 @@ fn question_size(question: &str, area: Rect) -> (u16, u16) {
         .clamp(MODAL_MIN_W, MODAL_MAX_W)
         .min(area.width);
     let text_w = width.saturating_sub(6) as usize;
-    let lines = wrapped(question, text_w, 3).len() as u16;
+    let lines = tui::wrapped(question, text_w.max(8)).len().clamp(1, 3) as u16;
     let height = (2 + 2 + lines + 1 + 1).min(area.height);
     (width, height)
 }
@@ -2390,10 +3050,11 @@ mod tests {
     }
 
     /// Esc, `q`, Backspace, Left and `h` go back to the list; `w` is the
-    /// browser, and `o` still is; `?` asks for the keys; Ctrl+C leaves; the
-    /// rest does nothing.
+    /// browser, and `o` still is; `?` asks for the keys and `i` for the bio;
+    /// the arrows and `j` `k` move, Enter, Right and `l` open, `d` saves;
+    /// Ctrl+C leaves; the rest does nothing.
     #[test]
-    fn the_read_only_card_binds_back_and_the_browser() {
+    fn the_card_a_list_opens_binds_its_own_keys() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         for back in [
             KeyCode::Esc,
@@ -2407,11 +3068,25 @@ mod tests {
         assert_eq!(peek_key(key(KeyCode::Char('w'))), Peeked::Browser);
         assert_eq!(peek_key(key(KeyCode::Char('o'))), Peeked::Browser);
         assert_eq!(peek_key(key(KeyCode::Char('?'))), Peeked::Help);
-        assert_eq!(peek_key(key(KeyCode::Enter)), Peeked::Ignored);
-        assert_eq!(peek_key(key(KeyCode::Char('d'))), Peeked::Ignored);
+        assert_eq!(peek_key(key(KeyCode::Char('i'))), Peeked::About);
+        for up in [KeyCode::Up, KeyCode::Char('k')] {
+            assert_eq!(peek_key(key(up)), Peeked::Up, "{up:?}");
+        }
+        for down in [KeyCode::Down, KeyCode::Char('j')] {
+            assert_eq!(peek_key(key(down)), Peeked::Down, "{down:?}");
+        }
+        for open in [KeyCode::Enter, KeyCode::Right, KeyCode::Char('l')] {
+            assert_eq!(peek_key(key(open)), Peeked::Open, "{open:?}");
+        }
+        assert_eq!(peek_key(key(KeyCode::Char('d'))), Peeked::Save);
+        assert_eq!(peek_key(key(KeyCode::Char('a'))), Peeked::Ignored);
         assert_eq!(
             peek_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Peeked::Interrupt
+        );
+        assert_eq!(
+            peek_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            Peeked::Redraw
         );
         assert_eq!(
             peek_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT)),
@@ -2419,36 +3094,158 @@ mod tests {
         );
     }
 
-    /// Every key the three boxes of this view name is bound to something:
-    /// the card's and the panel's by the shared binding, the read-only
-    /// card's by its own.
+    /// Every key the boxes of this view name is bound to something: the
+    /// card's and the panel's by the shared binding, with `i` by the card's
+    /// own; the card a list opens by its own; its stories by the shared one.
     #[test]
     fn every_key_the_help_names_does_something() {
         for key in CARD_KEYS.iter().chain(ACTIONS_KEYS) {
-            assert_ne!(action_of(key.press), Action::None, "{}", key.keys);
+            assert!(
+                action_of(key.press) != Action::None || asks_about(key.press),
+                "{}",
+                key.keys
+            );
         }
         for key in PEEK_KEYS {
             assert_ne!(peek_key(key.press), Peeked::Ignored, "{}", key.keys);
         }
+        for key in PEEK_STORIES_KEYS {
+            assert_ne!(action_of(key.press), Action::None, "{}", key.keys);
+        }
+        // `i` is the card's, and is no letter of anything else there.
+        assert!(asks_about(ABOUT_KEY.press));
+        assert_eq!(action_of(ABOUT_KEY.press), Action::None);
+        assert!(!asks_about(KeyEvent::new(
+            KeyCode::Char('i'),
+            KeyModifiers::CONTROL
+        )));
     }
 
-    /// The read-only card shows what the profile has (identity, counts,
-    /// who you both know, highlights), nothing on it claims to open, there is
-    /// no actions row, and the bottom edge carries the key hints.
-    #[test]
-    fn the_read_only_card_shows_the_page_and_the_hints() {
-        let profile = bare_profile();
-        let rows = viewing_rows(&profile);
-        assert!(!rows.contains(&CardRow::Actions));
-        let media = Media::of(&profile);
-        let state = State {
+    fn at_the_card() -> State {
+        State {
             level: Level::Card,
             row: 0,
             counts_col: 0,
             hl_col: 0,
             stories_selected: 0,
             ask: Ask::None,
-        };
+        }
+    }
+
+    fn screen_of(terminal: &Terminal<TestBackend>) -> String {
+        let height = terminal.backend().buffer().area.height;
+        (0..height)
+            .map(|y| tui::row_text(terminal, y) + "\n")
+            .collect()
+    }
+
+    /// A frame of the card a list opens, at this size, without styling.
+    fn peeked(profile: &Profile, state: &State, width: u16, height: u16) -> String {
+        let rows = viewing_rows(profile);
+        let media = Media::of(profile);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut list = TableState::default();
+        let mut page_rows = 1usize;
+        terminal
+            .draw(|frame| {
+                draw_peek(
+                    frame,
+                    profile,
+                    &media,
+                    state,
+                    &rows,
+                    false,
+                    &tui::me(),
+                    "",
+                    false,
+                    &mut list,
+                    &mut page_rows,
+                );
+            })
+            .unwrap();
+        screen_of(&terminal)
+    }
+
+    /// The card a list opens shows what the profile has (identity, counts,
+    /// who you both know, highlights), has no actions row, and only the
+    /// picture says it opens: the lists and the highlights are walks, and
+    /// stay with `snob profile`.
+    #[test]
+    fn the_card_a_list_opens_shows_the_page_and_opens_only_what_is_a_file_away() {
+        let profile = bare_profile();
+        let rows = viewing_rows(&profile);
+        assert_eq!(rows[0], CardRow::Picture);
+        assert!(!rows.contains(&CardRow::Actions));
+        assert!(!rows.contains(&CardRow::Stories), "it has none up");
+        for row in [
+            CardRow::Actions,
+            CardRow::FollowedBy,
+            CardRow::Counts,
+            CardRow::Highlights,
+        ] {
+            assert!(!opens_in_a_list(row), "{row:?}");
+        }
+
+        let screen = peeked(&profile, &at_the_card(), 80, 24);
+        assert!(screen.contains("@someone"), "{screen}");
+        assert!(screen.contains("Some One"), "{screen}");
+        assert!(screen.contains("followed by 33 you follow"), "{screen}");
+        assert!(screen.contains("1,234"), "{screen}");
+        assert!(screen.contains("trip"), "{screen}");
+        assert!(!screen.contains("actions on this account"), "{screen}");
+        assert!(screen.contains("> profile picture"), "{screen}");
+        assert_eq!(
+            screen.matches('›').count(),
+            1,
+            "the picture alone opens: {screen}"
+        );
+        assert!(screen.contains("enter open · d save"), "{screen}");
+        assert!(screen.contains("? keys · esc back"), "{screen}");
+        assert!(!screen.contains("↑↓ move"), "one row, nowhere to move");
+
+        // An account that never set a picture, with nothing up: nothing on
+        // the card opens, nothing has the cursor, and the edge says so.
+        let mut plain = bare_profile();
+        plain.pfp_anonymous = true;
+        assert!(!viewing_rows(&plain).contains(&CardRow::Picture));
+        let screen = peeked(&plain, &at_the_card(), 80, 24);
+        assert!(!screen.contains('›'), "nothing here opens: {screen}");
+        assert!(
+            !screen.contains('>'),
+            "and nothing has the cursor: {screen}"
+        );
+        assert!(screen.contains(PEEK_HINT), "{screen}");
+    }
+
+    /// With stories up, the card a list opens has a row for them that opens,
+    /// under the picture's, and what it opens is the list of them with its
+    /// own keys on the bottom edge. A picture that costs a request says so
+    /// on its row.
+    #[test]
+    fn the_card_a_list_opens_can_open_its_stories() {
+        let mut profile = bare_profile();
+        profile.stories = Visibility::Shown(vec![story(), story()]);
+        let rows = viewing_rows(&profile);
+        assert_eq!(&rows[..2], [CardRow::Picture, CardRow::Stories]);
+        assert!(opens_in_a_list(CardRow::Picture) && opens_in_a_list(CardRow::Stories));
+
+        let mut state = at_the_card();
+        state.row = 1;
+        let screen = peeked(&profile, &state, 80, 24);
+        assert!(screen.contains("> 2 stories up"), "{screen}");
+        assert_eq!(screen.matches('›').count(), 2, "{screen}");
+        assert!(screen.contains("↑↓ move · enter open · w web"), "{screen}");
+        assert!(!screen.contains("d save"), "a row of stories is opened");
+
+        state.level = Level::Stories;
+        let screen = peeked(&profile, &state, 80, 24);
+        assert!(screen.contains("Stories · @someone · 2 up"), "{screen}");
+        assert!(screen.contains("enter open · d save"), "{screen}");
+        assert!(!screen.contains("q quit"), "q is back here: {screen}");
+
+        // The picture's row names its price when it has one.
+        let mut media = Media::of(&profile);
+        media.pfp_is_a_request = true;
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|frame| {
@@ -2456,35 +3253,260 @@ mod tests {
                     frame,
                     &profile,
                     &media,
-                    &state,
+                    &at_the_card(),
                     &rows,
                     false,
                     &tui::me(),
                     "",
                     false,
-                    Some(PEEK_HINT),
+                    true,
                 );
             })
             .unwrap();
-        let screen: String = (0..24)
-            .map(|y| {
-                tui::row_text(&terminal, y)
-                    + "
-"
-            })
-            .collect();
-        assert!(screen.contains("@someone"), "{screen}");
-        assert!(screen.contains("Some One"), "{screen}");
-        assert!(screen.contains("followed by 33 you follow"), "{screen}");
-        assert!(screen.contains("1,234"), "{screen}");
-        assert!(screen.contains("trip"), "{screen}");
-        assert!(screen.contains("w open on the web"), "{screen}");
-        assert!(screen.contains("? keys"), "{screen}");
-        assert!(!screen.contains("actions on this account"), "{screen}");
-        assert!(!screen.contains('›'), "nothing here opens: {screen}");
+        let screen = screen_of(&terminal);
+        assert!(screen.contains("profile picture   one request"), "{screen}"); // layout-allow: the gap is the one the row draws
+    }
+
+    /// The hints of the card a list opens name the keys of the row under
+    /// the cursor and fit the narrowest card with every part there.
+    #[test]
+    fn the_hints_of_the_card_a_list_opens_fit_eighty_columns() {
+        assert_eq!(peek_hint(None, false, false), PEEK_HINT);
+        let longest = peek_hint(Some(CardRow::Picture), true, true);
+        assert!(longest.contains("i bio"), "{longest}");
+        // 80 columns less the two corners and the blank each side of a hint.
+        assert!(measure_text_width(&longest) <= 76, "{longest}");
+        for here in [
+            CardRow::Actions,
+            CardRow::Stories,
+            CardRow::Counts,
+            CardRow::Highlights,
+        ] {
+            let hint = card_hint(here, true);
+            assert!(measure_text_width(&hint) <= 76, "{hint}");
+            assert!(hint.contains("? keys"), "{hint}");
+        }
+        assert!(!card_hint(CardRow::Counts, false).contains("i bio"));
+    }
+
+    /// The movement keys take a list's selection where they say, within it.
+    #[test]
+    fn a_selection_moves_within_its_list() {
+        assert_eq!(moved(0, 5, 3, Action::Up), Some(0));
+        assert_eq!(moved(3, 5, 3, Action::Down), Some(4));
+        assert_eq!(moved(4, 5, 3, Action::Down), Some(4));
+        assert_eq!(moved(0, 5, 3, Action::PageDown), Some(2));
+        assert_eq!(moved(4, 5, 3, Action::PageUp), Some(2));
+        assert_eq!(moved(2, 5, 3, Action::First), Some(0));
+        assert_eq!(moved(2, 5, 3, Action::Last), Some(4));
+        assert_eq!(moved(0, 0, 3, Action::Last), Some(0));
+        assert_eq!(moved(2, 5, 3, Action::Open), None);
+    }
+
+    fn with_a_bio(bio: &str) -> Profile {
+        let mut profile = bare_profile();
+        profile.biography = Some(bio.to_string());
+        profile
+    }
+
+    /// A bio laid out on several lines is on the card as it was written,
+    /// line under line, with only its blank lines left out.
+    #[test]
+    fn a_bio_of_several_lines_is_shown_whole_when_it_fits() {
+        let profile = with_a_bio("climber\n\nbased in Oslo\nprints at the shop");
+        let rows = card_rows(&profile);
+        let media = Media::of(&profile);
+        let terminal = card_rendered(&profile, &media, &at_the_card(), &rows, "");
+        let screen = screen_of(&terminal);
+        let lines: Vec<&str> = screen.lines().collect();
+        let first = lines
+            .iter()
+            .position(|line| line.contains("climber"))
+            .unwrap_or_else(|| panic!("{screen}"));
+        assert!(lines[first + 1].contains("based in Oslo"), "{screen}");
+        assert!(lines[first + 2].contains("prints at the shop"), "{screen}");
+        assert!(!screen.contains('…'), "nothing was left out: {screen}");
+        assert!(!screen.contains("i bio"), "so `i` is not offered: {screen}");
+        // And the row under it is still a blank one: the card kept its air.
         assert!(
-            !screen.contains('>'),
-            "no cursor on a read-only card: {screen}"
+            lines[first + 3].replace('│', "").trim().is_empty(),
+            "{screen}"
         );
+    }
+
+    /// A bio of more rows than the card gives it ends in an ellipsis, the
+    /// bottom edge names `i`, and the box `i` opens has all of it, blank
+    /// lines included, scrolling where the terminal is too short for it.
+    #[test]
+    fn a_long_bio_ends_in_an_ellipsis_and_i_shows_the_rest() {
+        let bio = (1..=9)
+            .map(|n| format!("line number {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let profile = with_a_bio(&format!("{bio}\n\nthe last one"));
+        let (shown, cut) = bio_on_the_card(profile.biography.as_deref().unwrap(), 70, BIO_ROWS);
+        assert!(cut);
+        assert_eq!(shown.len(), BIO_ROWS);
+        assert_eq!(shown[BIO_ROWS - 1], "line number 6…");
+        // The ellipsis takes a column of the line, never one past it.
+        let (narrow, _) = bio_on_the_card("abcdefgh abcdefgh abcdefgh", 8, 2);
+        assert_eq!(narrow, ["abcdefgh", "abcdefg…"]);
+
+        let rows = card_rows(&profile);
+        let media = Media::of(&profile);
+        let terminal = card_rendered(&profile, &media, &at_the_card(), &rows, "");
+        let screen = screen_of(&terminal);
+        assert!(screen.contains("line number 1"), "{screen}");
+        assert!(!screen.contains("the last one"), "{screen}");
+        assert!(screen.contains('…'), "{screen}");
+        assert!(screen.contains("i bio"), "{screen}");
+
+        // The box, on a terminal with room for all of it.
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let mut furthest = usize::MAX;
+        terminal
+            .draw(|frame| furthest = about_modal(frame, &profile, 0, false))
+            .unwrap();
+        let screen = screen_of(&terminal);
+        assert_eq!(furthest, 0, "{screen}");
+        assert!(screen.contains("About @someone"), "{screen}");
+        assert!(screen.contains("Some One"), "{screen}");
+        assert!(screen.contains("line number 9"), "{screen}");
+        assert!(screen.contains("the last one"), "{screen}");
+        assert!(screen.contains("any key closes"), "{screen}");
+
+        // And on one too short: it scrolls, to the last line and no further.
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal
+            .draw(|frame| furthest = about_modal(frame, &profile, 0, false))
+            .unwrap();
+        let screen = screen_of(&terminal);
+        assert!(furthest > 0, "{screen}");
+        assert!(screen.contains("↑↓ scroll"), "{screen}");
+        assert!(!screen.contains("the last one"), "{screen}");
+        terminal
+            .draw(|frame| {
+                about_modal(frame, &profile, usize::MAX, false);
+            })
+            .unwrap();
+        let screen = screen_of(&terminal);
+        assert!(screen.contains("the last one"), "{screen}");
+        assert!(!screen.contains("Some One"), "{screen}");
+    }
+
+    /// An account that says nothing about itself has nothing for `i`.
+    #[test]
+    fn i_has_something_to_show_only_where_the_account_said_something() {
+        let mut profile = bare_profile();
+        assert!(says_something(&profile), "it has a name");
+        profile.full_name = None;
+        assert!(!says_something(&profile));
+        assert!(about_text(&profile, 40, false).is_empty());
+        assert_eq!(nothing_said(&profile), "@someone says nothing about itself");
+        profile.external_url = Some("https://example.com".to_string());
+        assert!(says_something(&profile));
+    }
+
+    /// On a terminal too short for the card as it is drawn with room, the
+    /// card gives up the bio's extra rows, then its blank rows, and keeps
+    /// every row there is to open: all of them are on screen, each still
+    /// where the cursor can be seen on it.
+    #[test]
+    fn a_short_terminal_gives_up_the_air_before_a_row() {
+        let mut profile = with_a_bio("one\ntwo\nthree\nfour");
+        profile.stories = Visibility::Shown(vec![story()]);
+        let rows = card_rows(&profile);
+        let media = Media::of(&profile);
+        let draw = |height: u16, row: usize| {
+            let mut state = at_the_card();
+            state.row = row;
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_card(
+                        frame,
+                        &profile,
+                        &media,
+                        &state,
+                        &rows,
+                        false,
+                        &tui::me(),
+                        "",
+                        false,
+                    );
+                })
+                .unwrap();
+            screen_of(&terminal)
+        };
+        let every_row = |screen: &str| {
+            for part in [
+                "actions on this account",
+                "1 story up",
+                "followed by 33 you follow",
+                "followers",
+                "1,234",
+                "Highlights",
+            ] {
+                assert!(screen.contains(part), "{part} is missing: {screen}");
+            }
+        };
+
+        // With room: the whole bio, and air between the bands.
+        let area = Rect::new(0, 0, 80, 29);
+        assert_eq!(fitted(&profile, &rows, area), Fit::WHOLE);
+        let screen = draw(30, 0);
+        every_row(&screen);
+        assert!(screen.contains("four"), "{screen}");
+
+        // The card is 20 rows here: borders and padding 4, the name and the
+        // four lines of bio 5, the rows 6, the blank rows 5. A row short,
+        // the bio gives up one of its own, and the air stays; two short,
+        // another, down to the second.
+        assert_eq!(fitted(&profile, &rows, Rect::new(0, 0, 80, 20)), Fit::WHOLE);
+        let fit = fitted(&profile, &rows, Rect::new(0, 0, 80, 19));
+        assert_eq!((fit.bio, fit.gaps, fit.padded), (3, true, true));
+        let fit = fitted(&profile, &rows, Rect::new(0, 0, 80, 18));
+        assert_eq!((fit.bio, fit.gaps, fit.padded), (2, true, true));
+
+        // 14 rows, where the highlights used to fall off the bottom: the
+        // blank rows go, and every row is there.
+        let fit = fitted(&profile, &rows, Rect::new(0, 0, 80, 13));
+        assert_eq!((fit.bio, fit.gaps), (2, false));
+        let screen = draw(14, rows.len() - 1);
+        every_row(&screen);
+        assert!(screen.contains("two…"), "{screen}");
+        assert!(screen.contains(">trip"), "the cursor shows: {screen}");
+
+        // Shorter still: the padding, then the bio's second row.
+        let fit = fitted(&profile, &rows, Rect::new(0, 0, 80, 10));
+        assert_eq!((fit.bio, fit.gaps, fit.padded), (1, false, false));
+        let screen = draw(11, rows.len() - 1);
+        every_row(&screen);
+        assert!(screen.contains("one…"), "{screen}");
+    }
+
+    /// The tile under the cursor is reverse video, and its label is not
+    /// also dim; the other tiles' labels are.
+    #[test]
+    fn the_focused_tile_keeps_its_label_bright() {
+        let profile = bare_profile();
+        let mut terminal = Terminal::new(TestBackend::new(60, 2)).unwrap();
+        terminal
+            .draw(|frame| draw_counts(frame, frame.area(), &profile, true, 1, true))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = tui::row_text(&terminal, 0);
+        // Every character of the row is one column wide, so a byte offset
+        // into it is a column.
+        let cell_of = |label: &str| {
+            let at = row.find(label).unwrap_or_else(|| panic!("{row}")) as u16;
+            &buffer[(at, 0)]
+        };
+        let focused = cell_of("followers");
+        assert!(focused.modifier.contains(Modifier::REVERSED), "{focused:?}");
+        assert!(!focused.modifier.contains(Modifier::DIM), "{focused:?}");
+        let other = cell_of("posts");
+        assert!(other.modifier.contains(Modifier::DIM), "{other:?}");
+        assert!(!other.modifier.contains(Modifier::REVERSED), "{other:?}");
     }
 }

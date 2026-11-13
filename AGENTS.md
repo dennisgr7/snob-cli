@@ -1006,7 +1006,9 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   no role. Full-screen views use the alternate screen and print receipts
   after leaving it; the menu draws inline. From the profile card, never call
   `ui::stories::browse` or `ui::highlights::browse` (a second `Tui` and a
-  second scratch directory on the same path). A frame leaves in one write,
+  second scratch directory on the same path); for the same reason a view
+  entered from another is lent its guard and its scratch directory
+  (`ui::people::browse_in`, `ui::profile::peek`). A frame leaves in one write,
   inside one synchronized update, and a frame with nothing changed writes
   nothing (`ui::tui::Screen`). **A fetch a key starts runs under a `Busy`**
   (`ui/browser/busy.rs`): the view stays up under a box that names what is
