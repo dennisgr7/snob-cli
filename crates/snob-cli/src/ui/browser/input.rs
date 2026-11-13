@@ -215,13 +215,20 @@ fn system_stop() -> KeyEvent {
 /// with a resize -- the view re-reads it when it paints -- and an unchanged
 /// frame writes nothing, so an idle view waiting for one sends no bytes.
 pub fn next(timeout: Duration) -> std::io::Result<Option<Action>> {
-    Ok(match read(timeout)? {
+    Ok(bound(read(timeout)?))
+}
+
+/// What a view with no text mode makes of what was read: [`next`]'s answer,
+/// for a view that waits some other way than through it (one whose wait
+/// also fetches a picture, `preview::Gallery::read`).
+pub fn bound(raw: Raw) -> Option<Action> {
+    match raw {
         Raw::Tick | Raw::Resized => None,
         // Swallowed whole, and that is the entire fix. Without mode 2004 the
         // same paste arrives as its characters and some of them are commands.
         Raw::Paste(_) => Some(Action::None),
         Raw::Key(key) => Some(action_of(key)),
-    })
+    }
 }
 
 /// The error a view leaves with when the keyboard cannot be read. Said on

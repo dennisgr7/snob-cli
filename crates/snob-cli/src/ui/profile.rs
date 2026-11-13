@@ -203,6 +203,63 @@ struct Media {
     /// small one it draws once that has arrived.
     pictured: bool,
     avatar: Option<preview::Pixels>,
+    /// Whether this run draws small pictures at all, and the one of the
+    /// story or the item under the cursor in a list of them, once it has
+    /// arrived ([`want_pictures`]).
+    pictures: bool,
+    side: Option<preview::Pixels>,
+}
+
+impl Media {
+    /// The story or the highlight item under the cursor, in the levels that
+    /// list them.
+    fn item_under_the_cursor(&self, state: &State) -> Option<&Story> {
+        match state.level {
+            Level::Stories => self.stories.get(state.stories_selected),
+            Level::Inside { index } => {
+                let folder = self.folders.get(index)?;
+                folder.items.as_deref()?.get(folder.selected)
+            }
+            Level::Card | Level::Actions { .. } => None,
+        }
+    }
+
+    /// What a list of stories or items draws beside itself.
+    fn beside(&self, state: &State) -> preview::Beside<'_> {
+        preview::Beside {
+            on: self.pictures,
+            picture: self.side.as_ref(),
+            cover: self
+                .item_under_the_cursor(state)
+                .is_some_and(|item| item.kind == crate::media::Kind::Video),
+        }
+    }
+}
+
+/// Tells the gallery what the card wants on screen now, every turn of its
+/// loop: the account's picture on the card itself, the small picture of the
+/// story or item under the cursor in a list of them, where `room` says the
+/// list has a place for one. And takes from the gallery what has arrived.
+fn want_pictures(
+    profile: &Profile,
+    media: &mut Media,
+    state: &State,
+    gallery: &mut preview::Gallery<'_>,
+    room: bool,
+) {
+    let side = media
+        .item_under_the_cursor(state)
+        .and_then(|item| item.thumb.clone());
+    media.side = side
+        .as_deref()
+        .and_then(|address| gallery.get(address))
+        .cloned();
+    let avatar = adopt_avatar(profile, media, gallery);
+    let wanted = match state.level {
+        Level::Card | Level::Actions { .. } => avatar,
+        Level::Stories | Level::Inside { .. } => side.as_deref().filter(|_| media.pictures && room),
+    };
+    gallery.want(wanted);
 }
 
 /// Takes the account's small picture from the gallery once it has arrived,
@@ -263,6 +320,8 @@ impl Media {
             pfp_is_a_request: false,
             pictured: false,
             avatar: None,
+            pictures: false,
+            side: None,
         }
     }
 }
@@ -312,6 +371,7 @@ pub async fn browse(
     };
     let mut media = Media::of(profile);
     media.pictured = pictured;
+    media.pictures = preview::Gallery::draws();
     // The account's small picture, fetched once the card has been up for a
     // moment and while the keys are read (`preview::Gallery`). Through a
     // client of its own to hold: the walks this card starts take the `App`
@@ -352,8 +412,8 @@ pub async fn browse(
     // Every way out passes the receipts: see `tui::print_receipts`.
     let outcome: Result<ExitCode> = async {
         loop {
-            let wanted = adopt_avatar(profile, &mut media, &gallery);
-            gallery.want(wanted);
+            let room = crate::ui::stories::room_for_a_picture(&tui, crate::ui::stories::STORY);
+            want_pictures(profile, &mut media, &state, &mut gallery, room);
             match state.level {
                 Level::Stories => list.select(Some(state.stories_selected)),
                 Level::Inside { index } => list.select(Some(media.folders[index].selected)),
@@ -1069,6 +1129,7 @@ fn draw_level(
             list,
             note,
             colors,
+            media.beside(state),
             page_rows,
         ),
         Level::Inside { index } => {
@@ -1089,6 +1150,7 @@ fn draw_level(
                 list,
                 note,
                 colors,
+                media.beside(state),
                 page_rows,
             );
         }
@@ -1734,6 +1796,7 @@ pub(crate) async fn peek(
     let mut media = Media::of(profile);
     media.pfp_is_a_request = picture_is_a_request(app, profile);
     media.pictured = pictured(profile);
+    media.pictures = preview::Gallery::draws();
     let mut gallery = preview::Gallery::new();
     let shared = app.client_shared();
     let mut state = State {
@@ -1770,8 +1833,8 @@ pub(crate) async fn peek(
     }
 
     loop {
-        let wanted = adopt_avatar(profile, &mut media, &gallery);
-        gallery.want(wanted);
+        let room = crate::ui::stories::room_for_a_picture(tui, crate::ui::stories::STORY);
+        want_pictures(profile, &mut media, &state, &mut gallery, room);
         if state.level == Level::Stories {
             list.select(Some(state.stories_selected));
         }
@@ -2016,6 +2079,7 @@ fn draw_peek(
             list,
             note,
             colors,
+            media.beside(state),
             page_rows,
         );
     } else {

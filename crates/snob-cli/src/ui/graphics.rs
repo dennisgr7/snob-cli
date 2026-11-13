@@ -428,7 +428,7 @@ fn bmp(picture: &Pixels) -> Vec<u8> {
     file.extend_from_slice(&[0; 8]);
     for y in (0..height).rev() {
         let line = &picture.rgb()[y * width * 3..(y + 1) * width * 3];
-        for pixel in line.chunks_exact(3) {
+        for pixel in line.as_chunks::<3>().0 {
             file.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
         }
         file.resize(file.len() + row - width * 3, 0);
@@ -456,7 +456,7 @@ fn quantized(picture: &Pixels) -> (Vec<[u8; 3]>, Vec<u8>) {
     // What the pixels of each bin add up to, so that a color the picture
     // has few of comes back as it was and not as the middle of its bin.
     let mut sums = vec![[0u64; 3]; 1 << 15];
-    for pixel in rgb.chunks_exact(3) {
+    for pixel in rgb.as_chunks::<3>().0 {
         let at = bin(pixel[0], pixel[1], pixel[2]);
         counts[at] += 1;
         for channel in 0..3 {

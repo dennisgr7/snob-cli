@@ -65,7 +65,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::Color;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType};
+use ratatui::widgets::{Block, BorderType, Paragraph};
 
 use crate::media::Kind;
 use crate::ui::browser::input::{self, Raw};
@@ -467,6 +467,41 @@ fn decode(bytes: &[u8]) -> std::result::Result<Pixels, String> {
         Pixels::of(0, 0, Vec::new()),
     );
     Err(String::new())
+}
+
+/// The small picture a frame draws beside its text ([`Gallery`]).
+#[derive(Clone, Copy, Default)]
+pub struct Beside<'a> {
+    /// Whether this run draws small pictures at all.
+    pub on: bool,
+    /// The one for what the cursor is on, once it has arrived.
+    pub picture: Option<&'a Pixels>,
+    /// Whether what it shows is a video, whose picture is its cover.
+    pub cover: bool,
+}
+
+impl Beside<'_> {
+    /// Draws the picture in `area`, from its top, with a row under a
+    /// video's that says it is the cover. An `area` kept for a picture that
+    /// has not arrived stays empty.
+    pub fn draw_in(self, frame: &mut Frame<'_>, area: Rect, colors: bool) {
+        let Some(pixels) = self.picture else {
+            return;
+        };
+        let rows = area.height.saturating_sub(u16::from(self.cover));
+        let taken = pixels.draw_in(frame, Rect::new(area.x, area.y, area.width, rows));
+        if self.cover {
+            let under = Rect::new(area.x, taken.y + taken.height, area.width, 1);
+            frame.render_widget(
+                Paragraph::new(
+                    Line::from("the video's cover")
+                        .style(tui::paint(colors, tui::DIM))
+                        .centered(),
+                ),
+                under,
+            );
+        }
+    }
 }
 
 /// How long the cursor rests on something before its small picture is

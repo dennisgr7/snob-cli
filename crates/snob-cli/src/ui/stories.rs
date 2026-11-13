@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use crossterm::event::KeyCode;
 use ratatui::Frame;
-use ratatui::layout::Constraint;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Cell, Row, TableState};
 use snob_core::model::printable;
@@ -28,7 +28,7 @@ use crate::media::{Stories, Story, bytes_of, default_name, extension_of, left_of
 use crate::output;
 use crate::ui::accounts::{self, Browsed, Picked};
 use crate::ui::browser::busy::Busy;
-use crate::ui::browser::input::{self, Action, next, page};
+use crate::ui::browser::input::{self, Action, page};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::help;
 use crate::ui::preview;
@@ -62,6 +62,10 @@ pub async fn browse(
     let mut receipts: Vec<String> = Vec::new();
     let mut page_rows = 1usize;
     let mut switch_to: Option<Viewer> = None;
+    // The small picture of the story under the cursor, drawn beside the
+    // list where there is room (`preview::Gallery`).
+    let pictures = preview::Gallery::draws();
+    let mut gallery = preview::Gallery::new();
 
     // Every way out passes the receipts: see `tui::print_receipts`.
     let outcome: Result<ExitCode> = async {
@@ -80,11 +84,23 @@ pub async fn browse(
                     &mut list,
                     &note,
                     colors,
+                    (pictures, &gallery),
                     &mut page_rows,
                 );
             })?;
 
-            let Some(action) = next(input::tick()).map_err(input::unreadable)? else {
+            gallery.want(
+                stories
+                    .items
+                    .get(selected)
+                    .and_then(|item| item.thumb.as_deref())
+                    .filter(|_| pictures && room_for_a_picture(&tui, STORY)),
+            );
+            let read = gallery
+                .read(|address| Box::pin(async move { client.download(&address).await.ok() }))
+                .await
+                .map_err(input::unreadable)?;
+            let Some(action) = input::bound(read) else {
                 continue;
             };
             // A note stays up until the user does something else, not until the
@@ -112,6 +128,7 @@ pub async fn browse(
                                 &mut list,
                                 &note,
                                 colors,
+                                (pictures, &gallery),
                                 &mut page_rows,
                             );
                         },
@@ -147,6 +164,7 @@ pub async fn browse(
                                 &mut list,
                                 &note,
                                 colors,
+                                (pictures, &gallery),
                                 &mut page_rows,
                             );
                         },
@@ -190,6 +208,7 @@ pub async fn browse(
                             &mut list,
                             &note,
                             colors,
+                            (pictures, &gallery),
                             &mut page_rows,
                         );
                     })
@@ -215,6 +234,7 @@ pub async fn browse(
                             &mut list,
                             &note,
                             colors,
+                            (pictures, &gallery),
                             &mut page_rows,
                         );
                     })?;
@@ -235,6 +255,7 @@ pub async fn browse(
                                 &mut list,
                                 &note,
                                 colors,
+                                (pictures, &gallery),
                                 &mut page_rows,
                             );
                         },
@@ -264,6 +285,7 @@ pub async fn browse(
                             &mut list,
                             &note,
                             colors,
+                            (pictures, &gallery),
                             &mut page_rows,
                         );
                     })?;
@@ -320,6 +342,7 @@ pub(crate) const FOLDER_KEYS: &[help::Key] = &[
 /// `page_rows` is written with how many rows the list got, which is what Page
 /// Up and Page Down move by -- the keyboard arms cannot see the layout, so the
 /// draw leaves the one number they need behind.
+#[expect(clippy::too_many_arguments, reason = "one frame's worth of state")]
 fn draw(
     frame: &mut Frame<'_>,
     stories: &Stories,
@@ -327,8 +350,10 @@ fn draw(
     list: &mut TableState,
     note: &str,
     colors: bool,
+    (pictures, gallery): (bool, &preview::Gallery<'_>),
     page_rows: &mut usize,
 ) {
+    let selected = list.selected().unwrap_or(0);
     draw_items_view(
         frame,
         format!(
@@ -343,6 +368,7 @@ fn draw(
         list,
         note,
         colors,
+        beside(pictures, &stories.items, selected, gallery),
         page_rows,
     );
 }
@@ -369,6 +395,7 @@ pub(crate) fn draw_items_view(
     list: &mut TableState,
     note: &str,
     colors: bool,
+    beside: preview::Beside<'_>,
     page_rows: &mut usize,
 ) {
     let total = items.len();
@@ -376,7 +403,13 @@ pub(crate) fn draw_items_view(
     let area = frame.area();
 
     let mut block = tui::view_block(title, colors, tui::list_padding(area));
-    let inner = block.inner(area);
+    let whole = block.inner(area);
+    // The item under the cursor, drawn to the right of the list where the
+    // run draws pictures and the terminal has the room.
+    let (inner, picture) = match picture_beside(whole, STORY).filter(|_| beside.on) {
+        Some((list, picture)) => (list, Some(picture)),
+        None => (whole, None),
+    };
     // One row of the interior belongs to the header.
     let viewport = (inner.height as usize).saturating_sub(1).max(1);
     *page_rows = viewport;
@@ -420,6 +453,72 @@ pub(crate) fn draw_items_view(
     );
     if !fits {
         tui::scrollbar(frame, area, total, selected, viewport as u16);
+    }
+    if let Some(picture) = picture {
+        beside.draw_in(frame, picture, colors);
+    }
+}
+
+/// The fewest columns a list of items keeps beside a picture: its own
+/// columns take under forty, mentions aside.
+const ITEMS_MIN_W: u16 = 50;
+
+/// The fewest columns a picture beside a list is drawn in.
+const PICTURE_MIN_W: u16 = 16;
+
+/// A story is nine wide to sixteen tall.
+pub(crate) const STORY: (u16, u16) = (9, 16);
+
+/// The interior of a list view split for a picture at its right, when it
+/// has the room: the list, and the picture's place. `shape` is the
+/// picture's, wide to tall: at a column a pixel and two pixels a row, the
+/// place of a story is nine columns wide for every eight rows. Never so
+/// wide that the list has under [`ITEMS_MIN_W`] left.
+pub(crate) fn picture_beside(inner: Rect, (wide, tall): (u16, u16)) -> Option<(Rect, Rect)> {
+    let wide = (inner.height * 2 * wide / tall).min(inner.width.saturating_sub(ITEMS_MIN_W + 2));
+    if wide < PICTURE_MIN_W {
+        return None;
+    }
+    let [list, _, picture] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(2),
+        Constraint::Length(wide),
+    ])
+    .areas(inner);
+    Some((list, picture))
+}
+
+/// Whether a list view on a terminal of this size draws a picture of this
+/// shape beside its list.
+fn has_room_for_a_picture(area: Rect, shape: (u16, u16)) -> bool {
+    let inner = tui::view_block(String::new(), false, tui::list_padding(area)).inner(area);
+    picture_beside(inner, shape).is_some()
+}
+
+/// Whether a list view on this terminal, as large as it is now, draws a
+/// picture of this shape beside its list: what a view's loop asks before it
+/// has one fetched, so that none is fetched to be drawn nowhere.
+pub(crate) fn room_for_a_picture(tui: &tui::Tui, shape: (u16, u16)) -> bool {
+    tui.terminal
+        .size()
+        .is_ok_and(|size| has_room_for_a_picture(Rect::new(0, 0, size.width, size.height), shape))
+}
+
+/// What an items view draws beside item `selected` of `items`: the picture
+/// fetched for it, if any has arrived, and whether it is a video's cover.
+pub(crate) fn beside<'a>(
+    on: bool,
+    items: &[Story],
+    selected: usize,
+    gallery: &'a preview::Gallery<'_>,
+) -> preview::Beside<'a> {
+    let item = items.get(selected);
+    preview::Beside {
+        on,
+        picture: item
+            .and_then(|item| item.thumb.as_deref())
+            .and_then(|address| gallery.get(address)),
+        cover: item.is_some_and(|item| item.kind == crate::media::Kind::Video),
     }
 }
 
@@ -635,6 +734,7 @@ mod tests {
                     &mut list,
                     note,
                     colors,
+                    (false, &preview::Gallery::new()),
                     &mut page_rows,
                 );
             })
@@ -744,5 +844,104 @@ mod tests {
         for key in KEYS.iter().chain(FOLDER_KEYS) {
             assert_ne!(input::action_of(key.press), Action::None, "{}", key.keys);
         }
+    }
+
+    /// A list of items is split for a picture at its right where it has the
+    /// room, the picture's place shaped like the picture, and the list
+    /// keeping its columns first.
+    #[test]
+    fn a_list_makes_room_for_a_picture_of_its_shape() {
+        // 30 rows: a story's place is nine columns to every eight rows.
+        let (list, picture) = picture_beside(Rect::new(1, 1, 118, 30), STORY).unwrap();
+        assert_eq!((picture.width, picture.height), (33, 30));
+        assert_eq!(list.width, 118 - 2 - 33);
+        assert_eq!(picture.x, 1 + 118 - 33);
+        // A square one is two columns to a row.
+        let (_, cover) = picture_beside(Rect::new(0, 0, 200, 30), (1, 1)).unwrap();
+        assert_eq!(cover.width, 60);
+        // The list keeps its columns: the picture takes what is left.
+        let (list, picture) = picture_beside(Rect::new(0, 0, 76, 30), STORY).unwrap();
+        assert_eq!((list.width, picture.width), (50, 24));
+        assert!(picture_beside(Rect::new(0, 0, 60, 30), STORY).is_none());
+        assert!(picture_beside(Rect::new(0, 0, 120, 10), STORY).is_none());
+        assert!(has_room_for_a_picture(Rect::new(0, 0, 120, 30), STORY));
+        assert!(!has_room_for_a_picture(Rect::new(0, 0, 60, 30), STORY));
+    }
+
+    /// The story under the cursor is drawn beside the list once its picture
+    /// has arrived, a video's saying it is its cover; a run that draws no
+    /// pictures has the list at its whole width, as before.
+    #[test]
+    fn the_item_under_the_cursor_is_drawn_beside_the_list() {
+        let picture = preview::Pixels::plain(360, 640, (20, 30, 200));
+        let mut stories = listing(3);
+        stories.items[1].kind = Kind::Video;
+        let draw = |selected: usize, beside: preview::Beside<'_>| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            let mut list = TableState::default();
+            list.select(Some(selected));
+            let mut page_rows = 0usize;
+            terminal
+                .draw(|frame| {
+                    draw_items_view(
+                        frame,
+                        "Stories".to_string(),
+                        "hint",
+                        &stories.items,
+                        true,
+                        &tui::me(),
+                        &mut list,
+                        "",
+                        true,
+                        beside,
+                        &mut page_rows,
+                    );
+                })
+                .unwrap();
+            let height = terminal.backend().buffer().area.height;
+            (0..height)
+                .map(|y| tui::row_text(&terminal, y) + "\n")
+                .collect::<String>()
+        };
+        let shown = preview::Beside {
+            on: true,
+            picture: Some(&picture),
+            cover: false,
+        };
+        let photo = draw(0, shown);
+        assert!(photo.matches('▀').count() > 100, "{photo}");
+        assert!(!photo.contains("the video's cover"), "{photo}");
+        // The picture is at the right: the first row of it starts past the
+        // middle of the screen.
+        let row = photo.lines().find(|line| line.contains('▀')).unwrap();
+        assert!(row.chars().position(|c| c == '▀').unwrap() > 60, "{photo}");
+
+        let video = draw(
+            1,
+            preview::Beside {
+                cover: true,
+                ..shown
+            },
+        );
+        assert!(video.contains("the video's cover"), "{video}");
+
+        let waiting = draw(
+            0,
+            preview::Beside {
+                picture: None,
+                ..shown
+            },
+        );
+        assert_eq!(waiting.matches('▀').count(), 0, "{waiting}");
+        let plain = draw(0, preview::Beside::default());
+        assert_eq!(plain.matches('▀').count(), 0, "{plain}");
+
+        // What a view asks for a row: its picture if it has arrived, and
+        // whether it is a video's.
+        let gallery = preview::Gallery::new();
+        let asked = beside(true, &stories.items, 1, &gallery);
+        assert!(asked.on && asked.cover && asked.picture.is_none());
+        assert!(!beside(true, &stories.items, 0, &gallery).cover);
+        assert!(!beside(true, &stories.items, 9, &gallery).cover);
     }
 }

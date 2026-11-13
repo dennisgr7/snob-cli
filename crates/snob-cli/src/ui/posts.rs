@@ -42,7 +42,7 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row, TableState};
 use snob_core::model::printable;
@@ -220,17 +220,6 @@ struct Seen {
     beside: bool,
 }
 
-/// The small picture a frame draws beside its text (`preview::Gallery`).
-#[derive(Clone, Copy, Default)]
-struct Beside<'a> {
-    /// Whether this run draws small pictures at all.
-    on: bool,
-    /// The one for what the cursor is on, once it has arrived.
-    picture: Option<&'a preview::Pixels>,
-    /// Whether what it shows is a video, whose picture is its cover.
-    cover: bool,
-}
-
 /// Browses `grid`, opening post `start` (zero-based) on the first frame when
 /// one was asked for.
 pub async fn browse_grid(
@@ -350,8 +339,8 @@ impl<'a> Session<'a> {
     }
 
     /// What this frame draws beside its text.
-    fn beside(&self) -> Beside<'_> {
-        Beside {
+    fn beside(&self) -> preview::Beside<'_> {
+        preview::Beside {
             on: self.pictures,
             picture: self.thumb().and_then(|address| self.gallery.get(address)),
             cover: self
@@ -1007,7 +996,7 @@ fn draw_grid(
     list: &mut TableState,
     note: &str,
     colors: bool,
-    beside: Beside<'_>,
+    beside: preview::Beside<'_>,
     seen: &mut Seen,
 ) {
     let total = grid.posts.len();
@@ -1290,7 +1279,7 @@ fn draw_post(
     viewer: &Viewer,
     note: &str,
     colors: bool,
-    beside: Beside<'_>,
+    beside: preview::Beside<'_>,
     seen: &mut Seen,
 ) {
     let post = &detail.post;
@@ -1367,21 +1356,8 @@ fn draw_post(
         // The bar's travel is the offsets there are, the first to the last.
         tui::scrollbar(frame, area, overflow + 1, scroll, inner.height);
     }
-    if let (Some(area), Some(pixels)) = (picture, beside.picture) {
-        // A row is kept under a video's picture to say that it is its cover.
-        let rows = area.height.saturating_sub(u16::from(beside.cover));
-        let taken = pixels.draw_in(frame, Rect::new(area.x, area.y, area.width, rows));
-        if beside.cover {
-            let under = Rect::new(area.x, taken.y + taken.height, area.width, 1);
-            frame.render_widget(
-                Paragraph::new(
-                    Line::from("the video's cover")
-                        .style(tui::paint(colors, tui::DIM))
-                        .centered(),
-                ),
-                under,
-            );
-        }
+    if let Some(area) = picture {
+        beside.draw_in(frame, area, colors);
     }
 }
 
@@ -1515,7 +1491,7 @@ mod tests {
                     &mut list,
                     "",
                     false,
-                    Beside::default(),
+                    preview::Beside::default(),
                     &mut seen,
                 );
             })
@@ -1567,7 +1543,7 @@ mod tests {
                     &mut list,
                     "",
                     false,
-                    Beside::default(),
+                    preview::Beside::default(),
                     &mut seen,
                 );
             })
@@ -1695,7 +1671,7 @@ mod tests {
                     &tui::me(),
                     "",
                     false,
-                    Beside::default(),
+                    preview::Beside::default(),
                     &mut seen,
                 );
             })
@@ -1722,7 +1698,7 @@ mod tests {
                         &tui::me(),
                         "",
                         false,
-                        Beside::default(),
+                        preview::Beside::default(),
                         seen,
                     );
                 })
@@ -1807,7 +1783,7 @@ mod tests {
                         &tui::me(),
                         "",
                         false,
-                        Beside::default(),
+                        preview::Beside::default(),
                         seen,
                     );
                 })
@@ -1901,7 +1877,7 @@ mod tests {
     #[test]
     fn a_wide_grid_draws_the_selected_posts_picture_over_what_it_says() {
         let picture = preview::Pixels::plain(320, 400, (200, 10, 10));
-        let draw = |width: u16, beside: Beside<'_>| {
+        let draw = |width: u16, beside: preview::Beside<'_>| {
             let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
             let mut list = TableState::default();
             list.select(Some(0));
@@ -1930,7 +1906,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{}", screen_of(terminal)))
         };
 
-        let on = Beside {
+        let on = preview::Beside {
             on: true,
             picture: None,
             cover: false,
@@ -1940,7 +1916,7 @@ mod tests {
         assert_eq!(blocks(&waiting), 0, "and none has arrived");
         let (arrived, _) = draw(
             120,
-            Beside {
+            preview::Beside {
                 picture: Some(&picture),
                 ..on
             },
@@ -1952,7 +1928,7 @@ mod tests {
             "the text does not move when the picture arrives"
         );
 
-        let (plain, room) = draw(120, Beside::default());
+        let (plain, room) = draw(120, preview::Beside::default());
         assert!(!room);
         assert_eq!(blocks(&plain), 0);
         assert!(
@@ -1972,7 +1948,7 @@ mod tests {
     fn a_post_draws_the_item_on_screen_beside_its_text() {
         let picture = preview::Pixels::plain(320, 400, (10, 200, 10));
         let mut detail = Detail::new(post(), None);
-        let draw = |detail: &Detail, width: u16, beside: Beside<'_>| {
+        let draw = |detail: &Detail, width: u16, beside: preview::Beside<'_>| {
             let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
             let mut seen = Seen::default();
             terminal
@@ -1991,7 +1967,7 @@ mod tests {
                 .unwrap();
             (terminal, seen)
         };
-        let shown = Beside {
+        let shown = preview::Beside {
             on: true,
             picture: Some(&picture),
             cover: false,
@@ -2008,7 +1984,7 @@ mod tests {
         let (video, _) = draw(
             &detail,
             160,
-            Beside {
+            preview::Beside {
                 cover: true,
                 ..shown
             },
@@ -2023,7 +1999,7 @@ mod tests {
         assert!(!seen.beside, "the text keeps its columns first");
         assert_eq!(blocks(&narrow), 0);
         assert_eq!(seen.text_width, 74);
-        let (plain, seen) = draw(&detail, 160, Beside::default());
+        let (plain, seen) = draw(&detail, 160, preview::Beside::default());
         assert!(!seen.beside);
         assert_eq!(blocks(&plain), 0);
         assert_eq!(seen.text_width, 154);

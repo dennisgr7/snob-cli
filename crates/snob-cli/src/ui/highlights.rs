@@ -45,6 +45,7 @@ use crate::ui::browser::input::{self, Action, Raw, page, watching_cancel_keys};
 use crate::ui::browser::scratch::{ABANDONED_AFTER, Scratch};
 use crate::ui::help;
 use crate::ui::preview;
+use crate::ui::stories;
 use crate::ui::tui::{self, Tui};
 
 /// Where the browser is, and what the arrow keys therefore move.
@@ -103,6 +104,9 @@ pub async fn browse(
     let mut list = TableState::default();
     let mut page_rows = 1usize;
     let mut switch_to: Option<Viewer> = None;
+    // The small picture drawn beside the list (`preview::Gallery`).
+    let pictures = preview::Gallery::draws();
+    let mut gallery = preview::Gallery::new();
 
     // `-i` on a numbered entry opens it before the first frame, and a folder
     // that cannot be opened leaves the user at the tray with the reason in
@@ -141,6 +145,7 @@ pub async fn browse(
                         &mut list,
                         &note,
                         colors,
+                        (pictures, &gallery),
                         &mut page_rows,
                     );
                 }
@@ -154,12 +159,33 @@ pub async fn browse(
                         &mut list,
                         &note,
                         colors,
+                        (pictures, &gallery),
                         &mut page_rows,
                     );
                 }
             })?;
 
-            let Some(action) = next_at(level).map_err(input::unreadable)? else {
+            // The small picture of what the cursor is on: a highlight's
+            // cover at the tray, an item's own inside one.
+            let wanted = match level {
+                Level::Tray => tray
+                    .entries
+                    .get(selected)
+                    .and_then(|entry| entry.cover.as_deref())
+                    .filter(|_| stories::room_for_a_picture(&tui, COVER)),
+                Level::Inside(index) => folders[index]
+                    .items
+                    .as_deref()
+                    .and_then(|items| items.get(selected))
+                    .and_then(|item| item.thumb.as_deref())
+                    .filter(|_| stories::room_for_a_picture(&tui, stories::STORY)),
+            };
+            gallery.want(wanted.filter(|_| pictures));
+            let read = gallery
+                .read(|address| Box::pin(async move { client.download(&address).await.ok() }))
+                .await
+                .map_err(input::unreadable)?;
+            let Some(action) = bound_from(level, read) else {
                 continue;
             };
             note.clear();
@@ -188,6 +214,7 @@ pub async fn browse(
                                     &mut list,
                                     &note,
                                     colors,
+                                    (pictures, &gallery),
                                     &mut page_rows,
                                 );
                             },
@@ -222,6 +249,7 @@ pub async fn browse(
                                     &mut list,
                                     &note,
                                     colors,
+                                    (pictures, &gallery),
                                     &mut page_rows,
                                 );
                             },
@@ -282,6 +310,7 @@ pub async fn browse(
                                     &mut list,
                                     &note,
                                     colors,
+                                    (pictures, &gallery),
                                     &mut page_rows,
                                 );
                             },
@@ -328,6 +357,7 @@ pub async fn browse(
                                 &mut list,
                                 &note,
                                 colors,
+                                (pictures, &gallery),
                                 &mut page_rows,
                             ),
                             Level::Inside(index) => draw_items(
@@ -339,6 +369,7 @@ pub async fn browse(
                                 &mut list,
                                 &note,
                                 colors,
+                                (pictures, &gallery),
                                 &mut page_rows,
                             ),
                         })
@@ -372,6 +403,7 @@ pub async fn browse(
                             &mut list,
                             &note,
                             colors,
+                            (pictures, &gallery),
                             &mut page_rows,
                         ),
                         Level::Inside(index) => draw_items(
@@ -383,6 +415,7 @@ pub async fn browse(
                             &mut list,
                             &note,
                             colors,
+                            (pictures, &gallery),
                             &mut page_rows,
                         ),
                     })?;
@@ -412,6 +445,7 @@ pub async fn browse(
                                         &mut list,
                                         &note,
                                         colors,
+                                        (pictures, &gallery),
                                         &mut page_rows,
                                     );
                                 },
@@ -445,6 +479,7 @@ pub async fn browse(
                                     &mut list,
                                     &note,
                                     colors,
+                                    (pictures, &gallery),
                                     &mut page_rows,
                                 );
                             })?;
@@ -478,14 +513,17 @@ pub async fn browse(
 /// inside a folder Esc walks back out to the tray, as it does from the same
 /// folder opened from the profile card and from a post to its grid. At the
 /// tray, the top level, it leaves.
-fn next_at(level: Level) -> std::io::Result<Option<Action>> {
-    Ok(match input::read(input::tick())? {
+fn bound_from(level: Level, read: Raw) -> Option<Action> {
+    match read {
         Raw::Tick | Raw::Resized => None,
         // Swallowed whole, as `input::next` does: a paste is no command.
         Raw::Paste(_) => Some(Action::None),
         Raw::Key(key) => Some(bound_at(level, key)),
-    })
+    }
 }
+
+/// A highlight's cover is a square crop.
+const COVER: (u16, u16) = (1, 1);
 
 /// One key at `level`. See [`next_at`].
 fn bound_at(level: Level, key: KeyEvent) -> Action {
@@ -661,6 +699,7 @@ fn draw_tray(
     list: &mut TableState,
     note: &str,
     colors: bool,
+    (pictures, gallery): (bool, &preview::Gallery<'_>),
     page_rows: &mut usize,
 ) {
     let total = tray.entries.len();
@@ -672,7 +711,13 @@ fn draw_tray(
         colors,
         tui::list_padding(area),
     );
-    let inner = block.inner(area);
+    let whole = block.inner(area);
+    // The cover of the highlight under the cursor, to the right of the
+    // list where the run draws pictures and there is room.
+    let (inner, cover) = match stories::picture_beside(whole, COVER).filter(|_| pictures) {
+        Some((list, cover)) => (list, Some(cover)),
+        None => (whole, None),
+    };
     // One row of the interior belongs to the header.
     let viewport = (inner.height as usize).saturating_sub(1).max(1);
     *page_rows = viewport;
@@ -722,6 +767,18 @@ fn draw_tray(
     if !fits {
         tui::scrollbar(frame, area, total, selected, viewport as u16);
     }
+    if let Some(place) = cover {
+        preview::Beside {
+            on: pictures,
+            picture: tray
+                .entries
+                .get(selected)
+                .and_then(|entry| entry.cover.as_deref())
+                .and_then(|address| gallery.get(address)),
+            cover: false,
+        }
+        .draw_in(frame, place, colors);
+    }
 }
 
 /// Draws one folder's items, under the folder's own name, through the one
@@ -737,9 +794,11 @@ fn draw_items(
     list: &mut TableState,
     note: &str,
     colors: bool,
+    (pictures, gallery): (bool, &preview::Gallery<'_>),
     page_rows: &mut usize,
 ) {
     let items = folder.items.as_deref().unwrap_or_default();
+    let selected = list.selected().unwrap_or(0);
     crate::ui::stories::draw_items_view(
         frame,
         folder_title(&tray.username, &tray.entries[index], index, items.len()),
@@ -750,6 +809,7 @@ fn draw_items(
         list,
         note,
         colors,
+        stories::beside(pictures, items, selected, gallery),
         page_rows,
     );
 }
@@ -862,6 +922,7 @@ mod tests {
                     &mut list,
                     "",
                     false,
+                    (false, &preview::Gallery::new()),
                     &mut page_rows,
                 );
             })
@@ -935,6 +996,7 @@ mod tests {
                     &mut list,
                     "",
                     false,
+                    (false, &preview::Gallery::new()),
                     &mut page_rows,
                 );
             })
