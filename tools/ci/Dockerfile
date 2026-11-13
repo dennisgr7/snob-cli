@@ -9,7 +9,7 @@
 #
 # The image pins the same compiler rust-toolchain.toml pins, so what is
 # tested here is what ships. Bump the two together.
-FROM rust:1.97.1-bookworm
+FROM rust:1.100.0-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         musl-tools gnome-keyring dbus-x11 libdbus-1-3 file \

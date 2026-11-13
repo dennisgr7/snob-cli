@@ -84,9 +84,9 @@ Layering rules inside `snob-cli`:
 
 ## Build, lint, test: what CI runs
 
-The toolchain is pinned in `rust-toolchain.toml` (`1.97.1`, with rustfmt and
+The toolchain is pinned in `rust-toolchain.toml` (`1.100.0`, with rustfmt and
 clippy); `rust-version = "1.95"` is the floor for `cargo install --git`. Bump
-the toolchain together with `tools/ci/Dockerfile` (`FROM rust:1.97.1-...`).
+the toolchain together with `tools/ci/Dockerfile` (`FROM rust:1.100.0-...`).
 Every command that resolves dependencies takes `--locked`.
 
 `.github/workflows/ci.yml`, job **lint** (Ubuntu):
@@ -120,7 +120,7 @@ dbus-run-session -- bash -c '
 Job **build** (pushes only, not pull requests): `cargo build --release --locked
 --target <triple> -p snob-cli` for the five release targets, runs `--version`,
 checks the musl binaries are static, and builds the `.deb` with
-`cargo-deb@3.7.0`.
+`cargo-deb@3.8.0`.
 
 `.github/workflows/supply-chain.yml` (also weekly): `cargo deny check
 advisories sources licenses`. Not a bare `cargo deny check`: `bans` is off on

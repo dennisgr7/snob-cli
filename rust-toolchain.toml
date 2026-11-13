@@ -11,5 +11,5 @@
 # toolchain upgrade becomes a commit somebody reviewed rather than something
 # that happened on a Thursday.
 [toolchain]
-channel = "1.97.1"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]

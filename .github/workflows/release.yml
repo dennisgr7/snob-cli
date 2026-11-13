@@ -228,7 +228,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           # Pinned to the version ci.yml checks the package with.
-          cargo install cargo-deb@3.7.0 --locked
+          cargo install cargo-deb@3.8.0 --locked
           cargo deb --no-build --no-strip -p snob-cli \
             --target "$TARGET" \
             --output "snob-v$VERSION-$TARGET.deb"

@@ -209,7 +209,7 @@ jobs:
       # SHA onto its `stable` branch, where `toolchain` is a required input
       # defaulting to the literal `stable` -- so `targets:` installed the
       # standard library into whatever stable is today, while every cargo
-      # invocation used the 1.97.1 that `rust-toolchain.toml` pins. On the host
+      # invocation used the version `rust-toolchain.toml` pins. On the host
       # target nothing notices, because its standard library is already there;
       # on a cross target the build fails with "can't find crate for `core`",
       # which reads like a broken runner and is not.
@@ -217,7 +217,7 @@ jobs:
       # Run from the checkout, `rustup` honors the override file, so the target
       # lands on the toolchain that will compile it. Emptying the input instead
       # does not work on this pin -- the action refuses with "'toolchain' is a
-      # required input" -- and naming 1.97.1 here would put the pin in six
+      # required input" -- and naming the version here would put the pin in six
       # places, which is the drift that caused this.
       - name: The target, on the toolchain this repository pins
         run: rustup target add ${{ matrix.target }}
@@ -255,7 +255,7 @@ jobs:
           # and that is only true if both resolve the same tool: unpinned, CI
           # could pass on one version on Monday and the release build a .deb
           # with a different one on Wednesday.
-          cargo install cargo-deb@3.7.0 --locked
+          cargo install cargo-deb@3.8.0 --locked
           # Down to the --output, this is the line the release runs. A check
           # that invokes something other than what it is guarding is not
           # guarding it, and the difference would only show during a release.
