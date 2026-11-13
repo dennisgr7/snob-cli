@@ -170,6 +170,8 @@ mod tests {
             likes,
             replies_count: replies,
             replies: Vec::new(),
+            pk: None,
+            author_pk: None,
         }
     }
 

@@ -11,7 +11,7 @@ use serde::Deserialize;
 use snob_core::Epoch;
 
 use super::web::Connection;
-use super::{Candidates, PictureVersion, flexible_id, nullable};
+use super::{Candidates, PictureVersion, flexible_id, flexible_ids, nullable};
 use crate::shortcode::MediaPk;
 
 /// A post, a reel, or one item of a carousel.
@@ -47,9 +47,56 @@ pub struct Media {
     #[serde(default)]
     pub like_and_view_counts_disabled: Option<bool>,
     /// The accounts the app names under the post, "Liked by <name> and
-    /// others": the viewer's own contacts who liked it, as plain names.
+    /// others": the viewer's own contacts who liked it, as plain names. At
+    /// most one in the capture of 2026-11-13.
     #[serde(default, deserialize_with = "nullable")]
     pub top_likers: Vec<String>,
+    /// The same contacts as accounts, the faces the app draws beside that
+    /// line: none to three in the capture of 2026-11-13, `null` on some
+    /// posts, and a few entries with no name at all.
+    #[serde(default, deserialize_with = "nullable")]
+    pub facepile_top_likers: Vec<Account>,
+    /// How many accounts reposted it.
+    #[serde(default)]
+    pub media_repost_count: Option<u64>,
+    /// How many times it was shared: a reel's count, absent when the owner
+    /// turned it off ([`Self::share_count_disabled`]).
+    #[serde(default)]
+    pub reshare_count: Option<u64>,
+    #[serde(default)]
+    pub share_count_disabled: Option<bool>,
+    /// A reel's plays on Facebook, beside [`Self::ig_play_count`]; the two
+    /// make [`Self::play_count`] where it is on both.
+    #[serde(default)]
+    pub fb_play_count: Option<u64>,
+    /// A video's length in seconds.
+    #[serde(default)]
+    pub video_duration: Option<f64>,
+    #[serde(default)]
+    pub has_audio: Option<bool>,
+    /// The DASH manifest of a video, an MPD as text: its renditions, the
+    /// widest of them wider than [`Self::video_versions`] on most videos.
+    #[serde(default)]
+    pub video_dash_manifest: Option<String>,
+    /// The picture's description, written by its owner or made by
+    /// Instagram: per item on a carousel.
+    #[serde(default)]
+    pub accessibility_caption: Option<String>,
+    /// The accounts whose grid it is pinned to the top of, by pk: its
+    /// owner's or a co-author's when it is pinned (20 lists of 20 in the
+    /// capture of 2026-11-13).
+    #[serde(default, deserialize_with = "flexible_ids")]
+    pub timeline_pinned_user_ids: Vec<String>,
+    #[serde(default)]
+    pub is_paid_partnership: Option<bool>,
+    #[serde(default)]
+    pub caption_is_edited: Option<bool>,
+    /// A reel's sound: licensed music, or the original sound of a video.
+    #[serde(default)]
+    pub clips_metadata: Option<ClipsMetadata>,
+    /// The music of a photo or a carousel; `null` on a reel.
+    #[serde(default)]
+    pub music_metadata: Option<MusicMetadata>,
     #[serde(default)]
     pub usertags: Option<Usertags>,
     /// The accounts it is posted with, a collaboration's other authors.
@@ -97,21 +144,105 @@ pub struct Usertag {
     pub user: Option<Account>,
 }
 
-/// An account named on a post: its owner, a tagged account, a co-author or
-/// a commenter. Only the name is read.
+/// An account named on a post: its owner, a tagged account, a co-author, a
+/// liker the viewer knows, or a commenter.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Account {
+    /// Text in most answers, a number in some nested ones (a reply's
+    /// parent's author in the capture of 2026-11-13): read as either.
+    #[serde(default, deserialize_with = "flexible_id")]
+    pub pk: Option<String>,
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
     pub full_name: Option<String>,
+    #[serde(default)]
+    pub is_private: Option<bool>,
+    #[serde(default)]
+    pub is_verified: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Location {
+    #[serde(default, deserialize_with = "flexible_id")]
+    pub pk: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub lat: Option<f64>,
+    #[serde(default)]
+    pub lng: Option<f64>,
 }
+
+/// What a reel says of its sound.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClipsMetadata {
+    /// `licensed_music` or `original_sounds`, and absent on some reels,
+    /// which are then told apart by which of the two below is filled.
+    #[serde(default)]
+    pub audio_type: Option<String>,
+    #[serde(default)]
+    pub music_info: Option<MusicInfo>,
+    #[serde(default)]
+    pub original_sound_info: Option<OriginalSound>,
+}
+
+/// What a photo or a carousel says of its music.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MusicMetadata {
+    #[serde(default)]
+    pub audio_type: Option<String>,
+    #[serde(default)]
+    pub music_info: Option<MusicInfo>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MusicInfo {
+    #[serde(default)]
+    pub music_asset_info: Option<MusicAsset>,
+}
+
+/// A licensed song.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MusicAsset {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub display_artist: Option<String>,
+    #[serde(default)]
+    pub ig_username: Option<String>,
+}
+
+/// A video's own sound, and the account it came from.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OriginalSound {
+    #[serde(default)]
+    pub original_audio_title: Option<String>,
+    #[serde(default)]
+    pub ig_artist: Option<Account>,
+}
+
+/// What a post plays, whichever of the two places said it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Music {
+    /// `true` for a licensed song, `false` for a video's own sound.
+    pub licensed: bool,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    /// The artist's account on Instagram, when it has one.
+    pub artist_username: Option<String>,
+}
+
+/// An account a post names, by pk and name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Named {
+    pub pk: Option<String>,
+    pub username: String,
+}
+
+/// The most likers the app names under a post, and so the most snob does:
+/// three faces in the capture of 2026-11-13, never more.
+pub const FACEPILE_SHOWN: usize = 3;
 
 impl Media {
     /// What a person sees as the post's items: a carousel's, or the post
@@ -174,6 +305,97 @@ impl Media {
         mentions_in(self.caption_text())
     }
 
+    /// The accounts tagged on it or on any of its items, with their pks,
+    /// each once, in the order [`Self::tagged`] gives their names.
+    pub fn tagged_accounts(&self) -> Vec<Named> {
+        let mut found: Vec<Named> = Vec::new();
+        let all = std::iter::once(self).chain(self.carousel_media.iter());
+        for media in all {
+            let tags = media.usertags.iter().flat_map(|t| t.tagged.iter());
+            for account in tags.filter_map(|t| named(t.user.as_ref()?)) {
+                if !found
+                    .iter()
+                    .any(|n| n.username.eq_ignore_ascii_case(&account.username))
+                {
+                    found.push(account);
+                }
+            }
+        }
+        found
+    }
+
+    /// The accounts it is posted with, with their pks.
+    pub fn with_accounts(&self) -> Vec<Named> {
+        self.coauthor_producers.iter().filter_map(named).collect()
+    }
+
+    /// The likers the viewer knows that the app names under the post, at
+    /// most [`FACEPILE_SHOWN`]: the faces it draws, by pk and name, or the
+    /// one name of [`Self::top_likers`] when it drew none.
+    pub fn known_likers(&self) -> Vec<Named> {
+        let faces: Vec<Named> = self
+            .facepile_top_likers
+            .iter()
+            .filter_map(named)
+            .take(FACEPILE_SHOWN)
+            .collect();
+        if !faces.is_empty() {
+            return faces;
+        }
+        self.top_likers
+            .iter()
+            .take(FACEPILE_SHOWN)
+            .map(|name| Named {
+                pk: None,
+                username: name.clone(),
+            })
+            .collect()
+    }
+
+    /// What it plays: a reel's song or its own sound, or a photo's song.
+    pub fn music(&self) -> Option<Music> {
+        let clips = self.clips_metadata.as_ref();
+        let song = clips
+            .and_then(|c| c.music_info.as_ref())
+            .or_else(|| {
+                self.music_metadata
+                    .as_ref()
+                    .and_then(|m| m.music_info.as_ref())
+            })
+            .and_then(|m| m.music_asset_info.as_ref())
+            .filter(|song| song.title.is_some() || song.display_artist.is_some());
+        if let Some(song) = song {
+            return Some(Music {
+                licensed: true,
+                title: song.title.clone(),
+                artist: song.display_artist.clone(),
+                artist_username: song.ig_username.clone(),
+            });
+        }
+        let sound = clips.and_then(|c| c.original_sound_info.as_ref())?;
+        let artist = sound.ig_artist.as_ref().and_then(|a| a.username.clone());
+        (sound.original_audio_title.is_some() || artist.is_some()).then(|| Music {
+            licensed: false,
+            title: sound.original_audio_title.clone(),
+            artist: artist.clone(),
+            artist_username: artist,
+        })
+    }
+
+    /// Whether it is pinned to the top of its owner's grid, or of a
+    /// co-author's: the list of accounts it is pinned for names one of them.
+    pub fn pinned(&self) -> bool {
+        let owner = self.user.as_ref().and_then(|u| u.pk.as_deref());
+        let coauthors = self
+            .coauthor_producers
+            .iter()
+            .filter_map(|a| a.pk.as_deref());
+        owner
+            .into_iter()
+            .chain(coauthors)
+            .any(|pk| self.timeline_pinned_user_ids.iter().any(|id| id == pk))
+    }
+
     /// The accounts it is posted with.
     pub fn with(&self) -> Vec<String> {
         self.coauthor_producers
@@ -200,6 +422,14 @@ impl Media {
         };
         Some(LikedBy { name, others })
     }
+}
+
+/// `account` by pk and name, when it has a name.
+fn named(account: &Account) -> Option<Named> {
+    Some(Named {
+        pk: account.pk.clone(),
+        username: account.username.clone()?,
+    })
 }
 
 /// The widest of `versions`, the tallest among equals, the first among
@@ -352,6 +582,117 @@ pub struct Comment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn media(json: &str) -> Media {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// The faces the app draws are the known likers, at most three, by pk
+    /// and name; one with no name is skipped, a `null` list is an empty one,
+    /// and with no faces the one name of `top_likers` stands in.
+    #[test]
+    fn a_facepile_entry_with_no_name_is_skipped() {
+        let faces = media(
+            r#"{"pk":"1","top_likers":["first"],"facepile_top_likers":[
+              {"pk":"11","username":"first"},
+              {"id":"12","profile_pic_url":"https://x.cdninstagram.com/p.jpg"},
+              {"pk":13,"username":"second"},
+              {"pk":"14","username":"third"},
+              {"pk":"15","username":"fourth"}]}"#,
+        );
+        let names: Vec<_> = faces
+            .known_likers()
+            .into_iter()
+            .map(|n| (n.pk, n.username))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (Some("11".into()), "first".into()),
+                (Some("13".into()), "second".into()),
+                (Some("14".into()), "third".into()),
+            ]
+        );
+        let none = media(r#"{"pk":"1","top_likers":["first"],"facepile_top_likers":null}"#);
+        assert!(none.facepile_top_likers.is_empty());
+        assert_eq!(
+            none.known_likers(),
+            [Named {
+                pk: None,
+                username: "first".into()
+            }]
+        );
+        assert!(media(r#"{"pk":"1"}"#).known_likers().is_empty());
+    }
+
+    /// An account's pk reads from text and from a number alike, as both
+    /// occur; so do the ids a post is pinned for.
+    #[test]
+    fn an_account_pk_is_read_as_text_or_as_a_number() {
+        let text: Account = serde_json::from_str(r#"{"pk":"42","username":"a"}"#).unwrap();
+        let number: Account = serde_json::from_str(r#"{"pk":42,"username":"a"}"#).unwrap();
+        assert_eq!(text.pk.as_deref(), Some("42"));
+        assert_eq!(number.pk.as_deref(), Some("42"));
+        let pinned = media(r#"{"pk":"1","timeline_pinned_user_ids":[42,"43"]}"#);
+        assert_eq!(pinned.timeline_pinned_user_ids, ["42", "43"]);
+        let none = media(r#"{"pk":"1","timeline_pinned_user_ids":null}"#);
+        assert!(none.timeline_pinned_user_ids.is_empty());
+    }
+
+    /// Pinned is the owner's or a co-author's pk among the accounts it is
+    /// pinned for, never another's.
+    #[test]
+    fn a_post_is_pinned_for_its_owner_or_a_coauthor() {
+        let owners = media(r#"{"pk":"1","user":{"pk":"42"},"timeline_pinned_user_ids":[42]}"#);
+        assert!(owners.pinned());
+        let coauthors = media(
+            r#"{"pk":"1","user":{"pk":"42"},"coauthor_producers":[{"pk":"7","username":"b"}],
+            "timeline_pinned_user_ids":["7"]}"#,
+        );
+        assert!(coauthors.pinned());
+        let anothers = media(r#"{"pk":"1","user":{"pk":"42"},"timeline_pinned_user_ids":["9"]}"#);
+        assert!(!anothers.pinned());
+        assert!(!media(r#"{"pk":"1"}"#).pinned());
+    }
+
+    /// A reel's song, a reel's own sound, and a photo's song, each read from
+    /// where its kind of post says it; a sound that names nothing is none.
+    #[test]
+    fn music_is_read_from_a_reel_or_a_photo() {
+        let song = media(
+            r#"{"pk":"1","clips_metadata":{"audio_type":"licensed_music","music_info":
+              {"music_asset_info":{"title":"A Song","display_artist":"Singer","ig_username":"singer"}}}}"#,
+        );
+        assert_eq!(
+            song.music(),
+            Some(Music {
+                licensed: true,
+                title: Some("A Song".into()),
+                artist: Some("Singer".into()),
+                artist_username: Some("singer".into()),
+            })
+        );
+        let sound = media(
+            r#"{"pk":"1","clips_metadata":{"audio_type":"original_sounds","music_info":null,
+              "original_sound_info":{"original_audio_title":"Original audio","ig_artist":{"pk":"2","username":"maker"}}}}"#,
+        );
+        assert_eq!(
+            sound.music(),
+            Some(Music {
+                licensed: false,
+                title: Some("Original audio".into()),
+                artist: Some("maker".into()),
+                artist_username: Some("maker".into()),
+            })
+        );
+        let photo = media(
+            r#"{"pk":"1","clips_metadata":null,"music_metadata":{"audio_type":"licensed_music",
+              "music_info":{"music_asset_info":{"title":"Tune","display_artist":"Band","ig_username":null}}}}"#,
+        );
+        assert_eq!(photo.music().and_then(|m| m.title), Some("Tune".into()));
+        let silent = media(r#"{"pk":"1","clips_metadata":{"original_sound_info":{}}}"#);
+        assert_eq!(silent.music(), None);
+    }
 
     /// A grid page as the capture shapes it: a carousel of two photos, a
     /// reel with its three progressive files, and the cursor.

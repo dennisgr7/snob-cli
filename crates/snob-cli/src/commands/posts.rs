@@ -254,13 +254,31 @@ pub fn about(post: &Post) -> Vec<String> {
     if !post.with.is_empty() {
         whose.push_str(&format!(" with {}", names(&post.with)));
     }
-    lines.push(format!("{whose} · {}", post.kind.label()));
+    let mut what = format!("{whose} · {}", post.kind.label());
+    if let Some(length) = post.duration.map(posts::length) {
+        what.push_str(&format!(" · {length}"));
+    }
+    lines.push(what);
     let mut when = report::dated(post.taken_at);
     if let Some(place) = &post.location {
         when.push_str(&format!(" · {place}"));
     }
     lines.push(when);
     lines.push(post.link());
+    let marks: Vec<&str> = [
+        (post.pinned, "Pinned"),
+        (post.paid_partnership, "Paid partnership"),
+        (post.caption_edited, "Caption edited"),
+    ]
+    .into_iter()
+    .filter_map(|(on, mark)| on.then_some(mark))
+    .collect();
+    if !marks.is_empty() {
+        lines.push(marks.join(" · "));
+    }
+    if let Some(music) = post.music.as_ref().and_then(posts::music_line) {
+        lines.push(music);
+    }
     if !post.caption.is_empty() {
         lines.push(String::new());
         lines.extend(post.caption.iter().cloned());
@@ -283,9 +301,31 @@ pub fn about(post: &Post) -> Vec<String> {
         });
     }
     if let Some(n) = post.plays {
-        counts.push(match n {
-            1 => "1 play".into(),
+        let mut plays = match n {
+            1 => "1 play".to_string(),
             n => format!("{} plays", posts::grouped(n)),
+        };
+        if let (Some(instagram), Some(facebook)) = (post.plays_instagram, post.plays_facebook)
+            && facebook > 0
+        {
+            plays.push_str(&format!(
+                " ({} on Instagram, {} on Facebook)",
+                posts::grouped(instagram),
+                posts::grouped(facebook)
+            ));
+        }
+        counts.push(plays);
+    }
+    if let Some(n) = post.reposts.filter(|n| *n > 0) {
+        counts.push(match n {
+            1 => "1 repost".into(),
+            n => format!("{} reposts", posts::grouped(n)),
+        });
+    }
+    if let Some(n) = post.shares {
+        counts.push(match n {
+            1 => "1 share".into(),
+            n => format!("{} shares", posts::grouped(n)),
         });
     }
     if !counts.is_empty() {
@@ -393,6 +433,37 @@ mod tests {
         assert_eq!(
             lines.last().unwrap(),
             "Liked by close and 79 others · 8 comments"
+        );
+    }
+
+    /// A reel says its length, its marks, its sound, and its plays by
+    /// network beside its reposts and shares.
+    #[test]
+    fn a_reel_says_its_length_marks_sound_and_counts() {
+        let reel = post(
+            r#"{"pk":"5","product_type":"clips","media_type":2,"taken_at":1790510400,
+            "like_count":10,"comment_count":2,"user":{"pk":"42","username":"someone"},
+            "media_repost_count":4,"reshare_count":6,
+            "play_count":100,"ig_play_count":90,"fb_play_count":10,"video_duration":42.7,
+            "clips_metadata":{"original_sound_info":{"original_audio_title":"Original audio",
+              "ig_artist":{"username":"someone"}}},
+            "timeline_pinned_user_ids":["42"],"is_paid_partnership":true}"#,
+        );
+        let lines = about(&reel);
+        assert_eq!(lines[0], "@someone · reel · 0:42");
+        assert!(
+            lines.contains(&"Pinned · Paid partnership".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"Sound: Original audio · someone".to_string()),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(
+                "10 likes · 2 comments · 100 plays (90 on Instagram, 10 on Facebook) · 4 reposts · 6 shares"
+            )
         );
     }
 

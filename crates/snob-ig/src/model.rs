@@ -410,6 +410,22 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// A list of ids that arrive as numbers or as text, kept as text; `null` is
+/// an empty list.
+fn flexible_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Vec<NumberOrText>>::deserialize(deserializer)?.unwrap_or_default();
+    Ok(raw
+        .into_iter()
+        .map(|raw| match raw {
+            NumberOrText::Number(n) => n.to_string(),
+            NumberOrText::Text(s) => s,
+        })
+        .collect())
+}
+
 /// An id that arrives as a number or as text, kept as text.
 fn flexible_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where

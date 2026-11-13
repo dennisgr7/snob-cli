@@ -1656,6 +1656,12 @@ impl State {
                     "comment_count": COMMENTS,
                     "like_and_view_counts_disabled": false,
                     "top_likers": ["user2"],
+                    // The faces under a post, one of them with no name, as
+                    // some were in the capture of 2026-11-13.
+                    "facepile_top_likers": [
+                        { "pk": "1002", "username": "user2" },
+                        { "id": "1003", "profile_pic_url": self.media("face") },
+                    ],
                     "usertags": null,
                     "coauthor_producers": [],
                     "user": { "pk": pk.to_string(), "username": person.username },
@@ -1692,10 +1698,16 @@ impl State {
                         post["media_type"] = json!(2);
                         post["product_type"] = json!("clips");
                         post["play_count"] = json!(1234);
+                        post["facepile_top_likers"] = Value::Null;
                         post["video_versions"] = json!([
                             { "type": 101, "width": 720, "height": 1280, "url": self.video(&media.to_string()) },
                             { "type": 102, "width": 720, "height": 1280, "url": self.video(&media.to_string()) },
                         ]);
+                    }
+                    // Hidden counts, whose like count is the placeholder 3.
+                    2 => {
+                        post["like_count"] = json!(3);
+                        post["like_and_view_counts_disabled"] = json!(true);
                     }
                     _ => {}
                 }

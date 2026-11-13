@@ -94,12 +94,28 @@ const PK_CHARS: usize = 11;
 /// code past this is not one Instagram hands out.
 const LONGEST: usize = 64;
 
+/// Whether `tail`, what follows a post's code in its link, is one the app
+/// links to and so one a person may paste: nothing, the likers
+/// (`liked_by/`), a comment (`c/<pk>/`) or a reply (`c/<pk>/r/<pk>/`), all
+/// seen in the capture of 2026-11-13. Only the code is read of any of
+/// them; anything else is not a post's link.
+fn known_tail(tail: &[&str]) -> bool {
+    let digits = |pk: &str| !pk.is_empty() && pk.bytes().all(|b| b.is_ascii_digit());
+    match tail {
+        [] | ["liked_by"] => true,
+        ["c", comment] => digits(comment),
+        ["c", comment, "r", reply] => digits(comment) && digits(reply),
+        _ => false,
+    }
+}
+
 impl Shortcode {
     /// The code `input` names: a link to a post or a reel, with or without
     /// its scheme, or the bare code. The links the app gives out are
     /// `instagram.com/p/<code>/`, `/reel/<code>/` and `/reels/<code>/`, and a
-    /// post opened from a profile's grid is `/<name>/p/<code>/`. The query and
-    /// the fragment are dropped unread.
+    /// post opened from a profile's grid is `/<name>/p/<code>/`; the links
+    /// the app makes under a post ([`known_tail`]) are read for its code. The
+    /// query and the fragment are dropped unread.
     pub fn parse(input: &str) -> Result<Self, NotALink> {
         let input = input.trim();
         if !input.contains('/') && !input.contains('.') {
@@ -121,19 +137,31 @@ impl Shortcode {
             .path_segments()
             .map(|s| s.filter(|s| !s.is_empty()).collect())
             .unwrap_or_default();
-        let (kind, code) = match segments.as_slice() {
-            [kind, code] | [_, kind, code] => (*kind, *code),
+        let opens_of = |kind: &str| match kind {
+            "p" | "tv" => Some(Opens::Post),
+            "reel" | "reels" => Some(Opens::Reel),
+            _ => None,
+        };
+        let (opens, code) = match segments.as_slice() {
+            [kind, code, tail @ ..] if opens_of(kind).is_some() && known_tail(tail) => {
+                (opens_of(kind), *code)
+            }
+            [_, kind, code, tail @ ..] if opens_of(kind).is_some() && known_tail(tail) => {
+                (opens_of(kind), *code)
+            }
             _ => return Err(NotALink::Path),
         };
-        let opens = match kind {
-            "p" | "tv" => Opens::Post,
-            "reel" | "reels" => Opens::Reel,
-            _ => return Err(NotALink::Path),
-        };
-        Self::of(code, opens)
+        Self::of(code, opens.unwrap_or(Opens::Post))
     }
 
     fn of(code: &str, opens: Opens) -> Result<Self, NotALink> {
+        // A code is never a dash first: eleven characters hold 66 bits and a
+        // pk 64, so its first is one of `A` to `P`, which `pk_of` holds to;
+        // said here too, since a code is handed to a child process as one of
+        // its arguments.
+        if code.starts_with('-') {
+            return Err(NotALink::Code);
+        }
         let valid = (PK_CHARS..=LONGEST).contains(&code.len())
             && code
                 .bytes()
@@ -273,6 +301,22 @@ mod tests {
         assert_eq!(post.page(), "/p/DTYHCKvDNxy/");
     }
 
+    /// The links the app makes under a post, to its likers, a comment and a
+    /// reply, are read for the post's code alone.
+    #[test]
+    fn a_likers_link_is_read_for_its_code() {
+        for link in [
+            "https://www.instagram.com/p/DTYHCKvDNxy/liked_by/",
+            "https://www.instagram.com/p/DTYHCKvDNxy/c/18000000000000001/",
+            "https://www.instagram.com/p/DTYHCKvDNxy/c/18000000000000001/r/18000000000000002/",
+            "https://www.instagram.com/someone/p/DTYHCKvDNxy/liked_by/",
+        ] {
+            let parsed = Shortcode::parse(link).unwrap();
+            assert_eq!(parsed.code(), "DTYHCKvDNxy", "{link}");
+            assert_eq!(parsed.page(), "/p/DTYHCKvDNxy/", "{link}");
+        }
+    }
+
     #[test]
     fn anything_else_names_no_post() {
         for (link, why) in [
@@ -291,7 +335,25 @@ mod tests {
                 "https://www.instagram.com/p/DTYHCKvDNxy/a/b/",
                 NotALink::Path,
             ),
+            (
+                "https://www.instagram.com/p/DTYHCKvDNxy/liked_by/more/",
+                NotALink::Path,
+            ),
+            (
+                "https://www.instagram.com/p/DTYHCKvDNxy/c/abc/",
+                NotALink::Path,
+            ),
+            (
+                "https://www.instagram.com/p/DTYHCKvDNxy/c/1/r/",
+                NotALink::Path,
+            ),
+            (
+                "https://www.instagram.com/p/DTYHCKvDNxy/permalink/",
+                NotALink::Path,
+            ),
             ("https://www.instagram.com/p/short/", NotALink::Code),
+            ("-TYHCKvDNxy", NotALink::Code),
+            ("https://www.instagram.com/p/-TYHCKvDNxy/", NotALink::Code),
             ("https://www.instagram.com/p/DTYHCKv%2FNxy/", NotALink::Code),
             ("DTYHCK", NotALink::Code),
             ("AAAAAAAAAAA", NotALink::Code),

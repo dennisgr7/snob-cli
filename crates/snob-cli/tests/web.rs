@@ -1552,6 +1552,25 @@ async fn a_grid_is_the_posts_query_and_then_its_next_page() {
     assert!(carousel.items[1].url.as_deref().unwrap().ends_with(".mp4"));
     assert_eq!(grid.posts[1].kind, PostKind::Reel);
     assert_eq!(grid.posts[1].plays, Some(1234));
+    // The faces under a post name the likers the viewer knows; a face with
+    // no name is skipped, and with no faces the app's one name stands in.
+    let known = |n: usize| -> Vec<String> {
+        grid.posts[n]
+            .likers_known
+            .iter()
+            .map(|a| a.username.clone())
+            .collect()
+    };
+    assert_eq!(known(0), ["user2"]);
+    assert_eq!(grid.posts[0].likers_known[0].pk.as_deref(), Some("1002"));
+    assert_eq!(known(1), ["user2"]);
+    assert_eq!(grid.posts[1].likers_known[0].pk, None);
+    // Hidden counts are never said, the placeholder least of all.
+    assert!(grid.posts[2].likes_hidden);
+    assert_eq!(
+        grid.posts[2].liked_line().as_deref(),
+        Some("Liked by user2 and others")
+    );
 
     let since = common::requests(&server).await;
     assert!(more(app.client(), &mut grid).await.unwrap());

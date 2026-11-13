@@ -30,10 +30,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use snob_core::Epoch;
-use snob_core::model::post as document;
+use snob_core::model::post::{self as document, AccountRef, Place};
 use snob_core::model::printable;
 use snob_ig::client::IgClient;
-use snob_ig::model::post::{Comment, CommentsPage, LikedBy, Media};
+use snob_ig::model::post::{Comment, CommentsPage, LikedBy, Media, Named as NamedAccount};
 use snob_ig::pace::{PAGES_PER_SITTING, Pace};
 use snob_ig::shortcode::{self, MediaPk, Opens, Shortcode};
 
@@ -101,6 +101,12 @@ pub struct Item {
     pub url: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// The item's own media id.
+    pub pk: Option<String>,
+    /// The picture's description.
+    pub alt: Option<String>,
+    /// A video's length in seconds.
+    pub duration: Option<f64>,
 }
 
 /// One post or reel, reduced to what a listing, a view and a download need.
@@ -135,6 +141,24 @@ pub struct Post {
     pub with: Vec<String>,
     pub liked_by: Option<LikedBy>,
     pub items: Vec<Item>,
+    pub owner_pk: Option<String>,
+    pub tagged_accounts: Vec<AccountRef>,
+    pub with_accounts: Vec<AccountRef>,
+    /// The likers the viewer knows that the app names under it, at most
+    /// three ([`snob_ig::model::post::FACEPILE_SHOWN`]).
+    pub likers_known: Vec<AccountRef>,
+    pub reposts: Option<u64>,
+    /// `None` for a photo, and when the owner turned the count off.
+    pub shares: Option<u64>,
+    pub plays_instagram: Option<u64>,
+    pub plays_facebook: Option<u64>,
+    /// A video's length in seconds.
+    pub duration: Option<f64>,
+    pub music: Option<document::Music>,
+    pub place: Option<Place>,
+    pub pinned: bool,
+    pub paid_partnership: bool,
+    pub caption_edited: bool,
 }
 
 impl Post {
@@ -174,6 +198,13 @@ impl Post {
                     url: item.best_url().map(str::to_string),
                     width,
                     height,
+                    pk: digits(&item.pk.to_string()),
+                    alt: item
+                        .accessibility_caption
+                        .as_deref()
+                        .map(printable)
+                        .filter(|alt| !alt.trim().is_empty()),
+                    duration: seconds(item.video_duration),
                 }
             })
             .collect();
@@ -218,6 +249,36 @@ impl Post {
                 others: l.others,
             }),
             items,
+            owner_pk: media
+                .user
+                .as_ref()
+                .and_then(|u| u.pk.as_deref())
+                .and_then(digits),
+            tagged_accounts: media.tagged_accounts().iter().map(account).collect(),
+            with_accounts: media.with_accounts().iter().map(account).collect(),
+            likers_known: media.known_likers().iter().map(account).collect(),
+            reposts: media.media_repost_count,
+            shares: media
+                .reshare_count
+                .filter(|_| media.share_count_disabled != Some(true)),
+            plays_instagram: media.ig_play_count,
+            plays_facebook: media.fb_play_count,
+            duration: seconds(media.video_duration),
+            music: media.music().map(|music| document::Music {
+                kind: if music.licensed { "song" } else { "original" }.to_string(),
+                title: music.title.as_deref().map(printable),
+                artist: music.artist.as_deref().map(printable),
+                artist_username: music.artist_username.as_deref().map(printable),
+            }),
+            place: media.location.as_ref().map(|l| Place {
+                pk: l.pk.as_deref().and_then(digits),
+                name: l.name.as_deref().map(printable),
+                lat: l.lat.filter(|lat| lat.is_finite()),
+                lng: l.lng.filter(|lng| lng.is_finite()),
+            }),
+            pinned: media.pinned(),
+            paid_partnership: media.is_paid_partnership == Some(true),
+            caption_edited: media.caption_is_edited == Some(true),
         }
     }
 
@@ -240,19 +301,34 @@ impl Post {
     /// "N likes" when nobody the viewer knows liked it. Nothing when the
     /// owner hid the count and nobody is named.
     pub fn liked_line(&self) -> Option<String> {
-        match &self.liked_by {
-            Some(LikedBy { name, others }) => Some(match others {
-                Some(0) => format!("Liked by {name}"),
-                Some(1) => format!("Liked by {name} and 1 other"),
-                Some(n) => format!("Liked by {name} and {} others", grouped(*n)),
-                None => format!("Liked by {name} and others"),
-            }),
-            None if self.likes_hidden => None,
-            None => self.likes.map(|n| match n {
+        let names: Vec<&str> = self
+            .likers_known
+            .iter()
+            .map(|a| a.username.as_str())
+            .collect();
+        let Some((last, first)) = names.split_last() else {
+            if self.likes_hidden {
+                return None;
+            }
+            return self.likes.map(|n| match n {
                 1 => "1 like".to_string(),
                 n => format!("{} likes", grouped(n)),
-            }),
-        }
+            });
+        };
+        let listed = names.join(", ");
+        // Never read under hidden counts: the number is then a placeholder.
+        let others = if self.likes_hidden {
+            None
+        } else {
+            self.likes.map(|n| n.saturating_sub(names.len() as u64))
+        };
+        Some(match others {
+            Some(0) if first.is_empty() => format!("Liked by {last}"),
+            Some(0) => format!("Liked by {} and {last}", first.join(", ")),
+            Some(1) => format!("Liked by {listed} and 1 other"),
+            Some(n) => format!("Liked by {listed} and {} others", grouped(n)),
+            None => format!("Liked by {listed} and others"),
+        })
     }
 
     /// The name every file of item `index` (zero-based) is saved under:
@@ -298,6 +374,36 @@ pub fn grouped(n: u64) -> String {
     out
 }
 
+/// A video's length, `0:42` or `1:02:03`, from seconds; a part of a second
+/// is dropped, as the app's player shows it.
+pub fn length(seconds: f64) -> String {
+    // Saturates on anything past u64, which `seconds` from a post is not.
+    let whole = seconds.max(0.0) as u64;
+    let (hours, minutes, seconds) = (whole / 3600, whole / 60 % 60, whole % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// The line that says what a post plays: "Music: <title> · <artist>" for a
+/// song, "Sound: <title> · <artist>" for a video's own; `None` when it says
+/// neither.
+pub fn music_line(music: &document::Music) -> Option<String> {
+    let what = if music.kind == "song" {
+        "Music"
+    } else {
+        "Sound"
+    };
+    let parts: Vec<&str> = [music.title.as_deref(), music.artist.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.trim().is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| format!("{what}: {}", parts.join(" · ")))
+}
+
 /// One comment, or a reply shown under one, filtered for a terminal.
 #[derive(Debug, Clone)]
 pub struct CommentLine {
@@ -308,6 +414,8 @@ pub struct CommentLine {
     /// How many replies it has; only the ones in `replies` are shown.
     pub replies_count: u64,
     pub replies: Vec<CommentLine>,
+    pub pk: Option<String>,
+    pub author_pk: Option<String>,
 }
 
 impl CommentLine {
@@ -329,7 +437,32 @@ impl CommentLine {
                 .iter()
                 .map(Self::from)
                 .collect(),
+            pk: comment.pk.as_deref().and_then(digits),
+            author_pk: comment
+                .user
+                .as_ref()
+                .and_then(|u| u.pk.as_deref())
+                .and_then(digits),
         }
+    }
+}
+
+/// `pk` when it is one: digits, and nothing else Instagram might put there.
+fn digits(pk: &str) -> Option<String> {
+    (!pk.is_empty() && pk.bytes().all(|b| b.is_ascii_digit())).then(|| pk.to_string())
+}
+
+/// A length in seconds, when it is one.
+fn seconds(duration: Option<f64>) -> Option<f64> {
+    duration.filter(|d| d.is_finite() && *d >= 0.0)
+}
+
+/// An account a post names, ready for a terminal: its name filtered, its pk
+/// held to digits.
+fn account(named: &NamedAccount) -> AccountRef {
+    AccountRef {
+        pk: named.pk.as_deref().and_then(digits),
+        username: printable(&named.username),
     }
 }
 
@@ -621,6 +754,9 @@ pub fn post_document(post: &Post, number: Option<usize>) -> document::Post {
             width: item.width,
             height: item.height,
             url: item.url.clone(),
+            pk: item.pk.clone(),
+            alt: item.alt.clone(),
+            duration: item.duration,
         })
         .collect();
     document::Post {
@@ -644,6 +780,21 @@ pub fn post_document(post: &Post, number: Option<usize>) -> document::Post {
         with: post.with.clone(),
         items,
         number,
+        owner_pk: post.owner_pk.clone(),
+        tagged_accounts: post.tagged_accounts.clone(),
+        with_accounts: post.with_accounts.clone(),
+        likers_known: post.likers_known.clone(),
+        likes_hidden: post.likes_hidden,
+        reposts: post.reposts,
+        shares: post.shares,
+        plays_instagram: post.plays_instagram,
+        plays_facebook: post.plays_facebook,
+        duration: post.duration,
+        music: post.music.clone(),
+        place: post.place.clone(),
+        pinned: post.pinned,
+        paid_partnership: post.paid_partnership,
+        caption_edited: post.caption_edited,
     }
 }
 
@@ -656,6 +807,8 @@ pub fn comment_document(comment: &CommentLine) -> document::PostComment {
         likes: comment.likes,
         replies: comment.replies_count,
         shown_replies: comment.replies.iter().map(comment_document).collect(),
+        pk: comment.pk.clone(),
+        author_pk: comment.author_pk.clone(),
     }
 }
 
@@ -879,9 +1032,34 @@ mod tests {
         ]
     }
 
+    /// `printed` with only the keys `golden` has, at every depth: what the
+    /// keys a document always had say, whatever keys were added beside them.
+    fn only_the_keys_of(printed: &Value, golden: &Value) -> Value {
+        match (printed, golden) {
+            (Value::Object(printed), Value::Object(golden)) => Value::Object(
+                golden
+                    .iter()
+                    .map(|(key, old)| {
+                        let new = printed.get(key).cloned().unwrap_or(Value::Null);
+                        (key.clone(), only_the_keys_of(&new, old))
+                    })
+                    .collect(),
+            ),
+            (Value::Array(printed), Value::Array(golden)) => Value::Array(
+                printed
+                    .iter()
+                    .zip(golden.iter().chain(std::iter::repeat(&Value::Null)))
+                    .map(|(new, old)| only_the_keys_of(new, old))
+                    .collect(),
+            ),
+            (printed, _) => printed.clone(),
+        }
+    }
+
     /// The keys a post's JSON has always had, byte for byte: the contract
-    /// of `snob posts` and `snob post`, which a move to typed documents must
-    /// not change. Taken from the output of 2026-11-13, before that move.
+    /// of `snob posts` and `snob post`, which typed documents and the keys
+    /// added since must not change. Taken from the output of 2026-11-13,
+    /// before either.
     #[test]
     fn a_post_serializes_to_the_keys_it_always_had() {
         let golden = [
@@ -891,8 +1069,9 @@ mod tests {
             r#"{"caption":"","code":"AAAAAAAAAAE","comments":null,"items":[{"height":null,"kind":"photo","number":1,"url":null,"width":null}],"kind":"photo","liked_by":null,"likes":null,"location":null,"mentions":[],"owner":"owner.four","pk":"4","plays":null,"tagged":[],"taken_at":0,"url":"https://www.instagram.com/p/AAAAAAAAAAE/","with":[]}"#,
         ];
         for ((post, number), golden) in golden_posts().into_iter().zip(golden) {
-            let printed = serde_json::to_string(&post_json(&post, number)).unwrap();
-            assert_eq!(printed, golden);
+            let old: Value = serde_json::from_str(golden).unwrap();
+            let kept = only_the_keys_of(&post_json(&post, number), &old);
+            assert_eq!(serde_json::to_string(&kept).unwrap(), golden);
         }
     }
 
@@ -906,6 +1085,8 @@ mod tests {
             likes: 0,
             replies_count: 0,
             replies: Vec::new(),
+            pk: Some("18000000000000002".into()),
+            author_pk: Some("2".into()),
         };
         let comment = CommentLine {
             author: "commenter".into(),
@@ -914,15 +1095,170 @@ mod tests {
             likes: 7,
             replies_count: 3,
             replies: vec![reply],
+            pk: Some("18000000000000001".into()),
+            author_pk: None,
+        };
+        let golden = concat!(
+            r#"{"author":"commenter","created_at":1790000005,"likes":7,"replies":3,"#,
+            r#""shown_replies":[{"author":"replier","created_at":1790000010,"likes":0,"#,
+            r#""replies":0,"shown_replies":[],"text":"a reply"}],"text":"a comment"}"#
+        );
+        let printed = comment_json(&comment);
+        let old: Value = serde_json::from_str(golden).unwrap();
+        assert_eq!(
+            serde_json::to_string(&only_the_keys_of(&printed, &old)).unwrap(),
+            golden
+        );
+        // And the keys added beside them.
+        assert_eq!(printed["pk"], "18000000000000001");
+        assert_eq!(printed["author_pk"], Value::Null);
+        assert_eq!(printed["shown_replies"][0]["author_pk"], "2");
+    }
+
+    /// The line under a post names the likers the viewer knows, up to three,
+    /// and counts the rest from the likes.
+    #[test]
+    fn the_liked_line_names_up_to_three_and_counts_the_rest() {
+        let liked = |likes: u64, faces: &str| {
+            Post::from_media(
+                &media(&format!(
+                    r#"{{"pk":"1","like_count":{likes},"facepile_top_likers":[{faces}]}}"#
+                )),
+                "x",
+            )
+            .liked_line()
+        };
+        let three =
+            r#"{"pk":"1","username":"a"},{"pk":"2","username":"b"},{"pk":"3","username":"c"}"#;
+        assert_eq!(
+            liked(1_003, three).as_deref(),
+            Some("Liked by a, b, c and 1,000 others")
+        );
+        assert_eq!(
+            liked(4, three).as_deref(),
+            Some("Liked by a, b, c and 1 other")
+        );
+        assert_eq!(liked(3, three).as_deref(), Some("Liked by a, b and c"));
+        assert_eq!(
+            liked(1, r#"{"pk":"1","username":"a"}"#).as_deref(),
+            Some("Liked by a")
+        );
+        assert_eq!(liked(5, "").as_deref(), Some("5 likes"));
+    }
+
+    /// Under hidden counts the like count is a placeholder, 3 on every one
+    /// of 21 such posts in the capture of 2026-11-13: never said, in a line
+    /// or in the JSON.
+    #[test]
+    fn a_hidden_like_count_is_never_read_as_three() {
+        let post = Post::from_media(
+            &media(
+                r#"{"pk":"1","like_count":3,"like_and_view_counts_disabled":true,
+                "facepile_top_likers":[{"pk":"2","username":"a"}]}"#,
+            ),
+            "x",
+        );
+        assert_eq!(post.liked_line().as_deref(), Some("Liked by a and others"));
+        let json = post_json(&post, None);
+        assert_eq!(json["likes"], Value::Null);
+        assert_eq!(json["likes_hidden"], true);
+        assert!(!json.to_string().contains(":3"), "{json}");
+    }
+
+    /// What a post says beyond its counts goes into its JSON beside the keys
+    /// it always had: the accounts by pk, the reposts and shares, the plays
+    /// by network, the length, the music, the place with where it is, and
+    /// its marks; and per item its own id and description.
+    #[test]
+    fn a_post_carries_what_its_answer_says_beside_the_old_keys() {
+        let post = Post::from_media(
+            &media(
+                r#"{"pk":"5","product_type":"clips","media_type":2,"like_count":10,
+                "user":{"pk":"42","username":"owner"},
+                "coauthor_producers":[{"pk":"7","username":"with.one"}],
+                "usertags":{"in":[{"user":{"pk":8,"username":"tagged.one"}}]},
+                "facepile_top_likers":[{"pk":"9","username":"liker"}],
+                "media_repost_count":4,"reshare_count":6,"share_count_disabled":false,
+                "play_count":100,"ig_play_count":90,"fb_play_count":10,"video_duration":42.7,
+                "clips_metadata":{"original_sound_info":{"original_audio_title":"Original audio",
+                  "ig_artist":{"username":"owner"}}},
+                "location":{"pk":"77","name":"Somewhere","lat":28.1,"lng":-15.4},
+                "timeline_pinned_user_ids":[42],"is_paid_partnership":true,"caption_is_edited":true,
+                "accessibility_caption":"A view",
+                "video_versions":[{"url":"https://x.cdninstagram.com/r.mp4","width":720,"height":1280}]}"#,
+            ),
+            "",
+        );
+        let json = post_json(&post, None);
+        assert_eq!(json["owner_pk"], "42");
+        assert_eq!(
+            json["with_accounts"],
+            serde_json::json!([{"pk": "7", "username": "with.one"}])
+        );
+        assert_eq!(
+            json["tagged_accounts"],
+            serde_json::json!([{"pk": "8", "username": "tagged.one"}])
+        );
+        assert_eq!(
+            json["likers_known"],
+            serde_json::json!([{"pk": "9", "username": "liker"}])
+        );
+        assert_eq!(json["reposts"], 4);
+        assert_eq!(json["shares"], 6);
+        assert_eq!(json["plays"], 100);
+        assert_eq!(json["plays_instagram"], 90);
+        assert_eq!(json["plays_facebook"], 10);
+        assert_eq!(json["duration"], 42.7);
+        assert_eq!(json["music"]["kind"], "original");
+        assert_eq!(json["music"]["title"], "Original audio");
+        assert_eq!(json["place"]["pk"], "77");
+        assert_eq!(json["place"]["lat"], 28.1);
+        assert_eq!(json["location"], "Somewhere");
+        assert_eq!(json["pinned"], true);
+        assert_eq!(json["paid_partnership"], true);
+        assert_eq!(json["caption_edited"], true);
+        assert_eq!(json["items"][0]["pk"], "5");
+        assert_eq!(json["items"][0]["alt"], "A view");
+        assert_eq!(json["items"][0]["duration"], 42.7);
+        assert_eq!(json["likes_hidden"], false);
+
+        // Shares turned off are no count, and a photo says none.
+        let off = Post::from_media(
+            &media(r#"{"pk":"6","reshare_count":6,"share_count_disabled":true}"#),
+            "x",
+        );
+        assert_eq!(post_json(&off, None)["shares"], Value::Null);
+        // A pk that is not digits is not passed on.
+        let odd = Post::from_media(&media(r#"{"pk":"6","user":{"pk":"4a2"}}"#), "x");
+        assert_eq!(post_json(&odd, None)["owner_pk"], Value::Null);
+    }
+
+    #[test]
+    fn a_length_reads_as_the_player_shows_it() {
+        assert_eq!(length(0.0), "0:00");
+        assert_eq!(length(42.7), "0:42");
+        assert_eq!(length(62.0), "1:02");
+        assert_eq!(length(3_723.0), "1:02:03");
+        assert_eq!(length(-5.0), "0:00");
+    }
+
+    #[test]
+    fn a_music_line_says_what_plays() {
+        let music = |kind: &str, title: Option<&str>, artist: Option<&str>| document::Music {
+            kind: kind.into(),
+            title: title.map(str::to_string),
+            artist: artist.map(str::to_string),
+            artist_username: None,
         };
         assert_eq!(
-            serde_json::to_string(&comment_json(&comment)).unwrap(),
-            concat!(
-                r#"{"author":"commenter","created_at":1790000005,"likes":7,"replies":3,"#,
-                r#""shown_replies":[{"author":"replier","created_at":1790000010,"likes":0,"#,
-                r#""replies":0,"shown_replies":[],"text":"a reply"}],"text":"a comment"}"#
-            )
+            music_line(&music("song", Some("A Song"), Some("Singer"))).as_deref(),
+            Some("Music: A Song · Singer")
         );
+        assert_eq!(
+            music_line(&music("original", Some("Original audio"), None)).as_deref(),
+            Some("Sound: Original audio")
+        );
+        assert_eq!(music_line(&music("song", None, Some(" "))), None);
     }
 
     #[test]

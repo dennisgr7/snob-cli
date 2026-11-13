@@ -883,6 +883,8 @@ mod tests {
                     likes: 0,
                     replies_count: 0,
                     replies: Vec::new(),
+                    pk: None,
+                    author_pk: None,
                 }],
                 next: None,
                 total: Some(1),
