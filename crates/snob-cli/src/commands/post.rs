@@ -89,7 +89,17 @@ pub async fn run(args: PostArgs, store: SecretStore, paths: &AccountPaths) -> Re
     else {
         return Ok(ExitCode::Interrupted);
     };
-    list_post(&post, Some(&comments), args.list.format, destination)
+    let pictures = match args.list.small_pictures {
+        true => Some(media::small_pictures(app.client(), post.thumbs()).await?),
+        false => None,
+    };
+    list_post(
+        &post,
+        Some(&comments),
+        pictures,
+        args.list.format,
+        destination,
+    )
 }
 
 /// `-d --json`: the items `selection` names saved into `destination`, a
@@ -127,6 +137,7 @@ async fn save_telling(
 fn list_post(
     post: &Post,
     comments: Option<&Comments>,
+    pictures: Option<Vec<serde_json::Value>>,
     format: Option<StoryFormat>,
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -137,7 +148,7 @@ fn list_post(
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            media::rows_or_envelope(rows, format, |_| {
+            let listed = media::rows_or_envelope(rows, format, |_| {
                 let mut document = serde_json::json!({ "post": post_json(post, None) });
                 if let Some(comments) = comments {
                     document["comments"] = serde_json::json!(
@@ -146,7 +157,8 @@ fn list_post(
                     document["more_comments"] = serde_json::json!(comments.next.is_some());
                 }
                 document
-            })?
+            })?;
+            media::with_pictures(listed, pictures)?
         }
         _ => {
             let mut text = post_text(post, Presentation::detect(destination));

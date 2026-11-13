@@ -48,8 +48,21 @@ pub struct Held {
     lists: Mutex<VecDeque<List>>,
 }
 
+/// A small picture a call hands back for the model to look at
+/// (`answer::take_pictures`), or the word that there is none.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Picture {
+    /// The number, in the call's listing, of what it is a picture of.
+    pub of: u64,
+    /// What the answer says of it beside the JSON: `{of, mime, bytes}`, or
+    /// `{of, missing}`.
+    pub said: Value,
+    /// Its kind and its bytes in base64, when there is a picture.
+    pub image: Option<(String, String)>,
+}
+
 /// A whole list as a call read it.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Whole {
     /// Each item as its compact JSON, which is how pages are measured
     /// (`answer::page`).
@@ -58,6 +71,9 @@ pub struct Whole {
     /// where it came from and when, and whether it is all of it, which every
     /// later page says again.
     pub about: Map<String, Value>,
+    /// The small pictures the call read with it, each handed back with the
+    /// page that holds what it is of.
+    pub pictures: Vec<Picture>,
 }
 
 struct List {
@@ -82,7 +98,12 @@ impl Held {
     }
 
     fn keep_at(&self, of: String, whole: Whole, now: Instant) {
+        let pictures = whole
+            .pictures
+            .iter()
+            .map(|picture| picture.image.as_ref().map_or(0, |(_, data)| data.len()));
         let bytes = whole.items.iter().map(String::len).sum::<usize>()
+            + pictures.sum::<usize>()
             + Value::Object(whole.about.clone()).to_string().len();
         let mut lists = self.lock();
         lists.retain(|list| list.of != of && !expired(list, now));
@@ -132,6 +153,7 @@ mod tests {
         Whole {
             items: (0..n).map(|n| format!(r#"{{"pk":{n}}}"#)).collect(),
             about: Map::new(),
+            pictures: Vec::new(),
         }
     }
 
@@ -178,6 +200,7 @@ mod tests {
         let big = |n: usize| Whole {
             items: vec!["x".repeat(n)],
             about: Map::new(),
+            pictures: Vec::new(),
         };
         held.keep_at("too big".into(), big(HELD_BYTES + 1), now);
         assert!(held.get_at("too big", now).is_none());

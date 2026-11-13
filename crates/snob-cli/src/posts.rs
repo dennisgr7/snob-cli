@@ -364,6 +364,16 @@ impl Post {
         }
     }
 
+    /// Each item by its number and the address of its small picture, for
+    /// `media::small_pictures`.
+    pub(crate) fn thumbs(&self) -> Vec<(usize, Option<String>)> {
+        self.items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (index + 1, item.thumb.clone()))
+            .collect()
+    }
+
     /// Item `index` (zero-based) as a file to download.
     pub(crate) fn file(&self, index: usize) -> Named {
         Named {

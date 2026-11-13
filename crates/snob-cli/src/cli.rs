@@ -356,7 +356,9 @@ macro_rules! mcp_after_help {
         "Started by the agent's client, not typed: \"snob mcp config <client>\" \
                       prints what to add to its configuration. Each tool call runs one snob \
                       command, so the budget, the cooldown and consent hold exactly as they do \
-                      in a terminal. It offers the status, the lists, profiles and posts; \
+                      in a terminal. It offers the status, the lists, profiles, posts, \
+                      stories and highlights, with a small picture of each for an agent \
+                      that asks to look; \
                       with --allow-writes, follow and unfollow too; with --downloads-dir, \
                       saving a post's photos and videos into that directory, under names \
                       snob gives them. Each write, and walking \
@@ -2161,6 +2163,14 @@ pub struct MediaListArgs {
     /// Output format. Defaults to a table on a terminal and JSON in a pipe.
     #[arg(long, value_enum, conflicts_with_all = ["download", "all", "interactive"])]
     pub format: Option<StoryFormat>,
+
+    /// Put a small picture of each thing listed in the JSON listing, in
+    /// base64
+    // Hidden: plumbing for `snob mcp`, which hands them to a model as
+    // images, so that an agent can look at what it lists
+    // (`media::small_pictures`). A video's is its cover.
+    #[arg(long, hide = true, conflicts_with_all = ["download", "all", "interactive"])]
+    pub small_pictures: bool,
 }
 
 #[derive(Args, Debug)]

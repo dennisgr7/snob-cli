@@ -268,7 +268,25 @@ async fn at_the_tray(app: &App, tray: &Tray, args: &HighlightsArgs) -> Result<Ex
         return download_entries(app, tray, selection, args.action.output.as_deref()).await;
     }
 
-    list_tray(tray, args.list.format, args.action.output.as_deref())
+    // A highlight's picture is its cover, the one the profile shows.
+    let pictures = match args.list.small_pictures {
+        true => {
+            let covers = tray
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (index + 1, entry.cover.clone()))
+                .collect();
+            Some(media::small_pictures(app.client(), covers).await?)
+        }
+        false => None,
+    };
+    list_tray(
+        tray,
+        pictures,
+        args.list.format,
+        args.action.output.as_deref(),
+    )
 }
 
 /// The commands that act inside one entry, named by its tray number, which
@@ -308,10 +326,18 @@ async fn inside_one(
         .await;
     }
 
+    let pictures = match args.list.small_pictures {
+        true => {
+            let thumbs = crate::commands::stories::thumbs(&items);
+            Some(media::small_pictures(app.client(), thumbs).await?)
+        }
+        false => None,
+    };
     list_items(
         tray,
         number,
         &items,
+        pictures,
         args.list.format,
         args.action.output.as_deref(),
     )
@@ -563,12 +589,13 @@ fn no_such_item(tray: &Tray, number: usize, items: &[Story], asked: usize) -> an
 /// tray-level `-d` take.
 fn list_tray(
     tray: &Tray,
+    pictures: Option<Vec<serde_json::Value>>,
     format: Option<StoryFormat>,
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
     let format = common::checked_format(format, destination, "a highlight listing")?;
     let text = match format {
-        Format::Json | Format::Ndjson => tray_json(tray, format)?,
+        Format::Json | Format::Ndjson => media::with_pictures(tray_json(tray, format)?, pictures)?,
         _ => tray_table(tray, Presentation::detect(destination)),
     };
     let hint = format!(
@@ -584,12 +611,15 @@ fn list_items(
     tray: &Tray,
     number: usize,
     items: &[Story],
+    pictures: Option<Vec<serde_json::Value>>,
     format: Option<StoryFormat>,
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
     let format = common::checked_format(format, destination, "a highlight's listing")?;
     let text = match format {
-        Format::Json | Format::Ndjson => items_json(tray, number, items, format)?,
+        Format::Json | Format::Ndjson => {
+            media::with_pictures(items_json(tray, number, items, format)?, pictures)?
+        }
         _ => items_table(items, Presentation::detect(destination)),
     };
     media::print_listing(

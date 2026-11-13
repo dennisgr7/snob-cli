@@ -6386,6 +6386,165 @@ async fn an_agent_saves_a_posts_files_where_the_server_was_told() {
     assert!(!missing.exists());
 }
 
+/// The image blocks of a tool result, each as its kind and its bytes.
+#[cfg(feature = "mcp")]
+fn images(result: &serde_json::Value) -> Vec<(String, Vec<u8>)> {
+    use base64::Engine as _;
+    result["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block["type"] == "image")
+                .map(|block| {
+                    let data = block["data"].as_str().expect("an image's data");
+                    (
+                        block["mimeType"].as_str().unwrap_or_default().to_string(),
+                        base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .expect("base64"),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// An agent that asks to see a post or the stories an account has up is
+/// handed a small picture of each as an image, never as text or as an
+/// address; a video has none but its cover, and the item says so. Nothing
+/// it reads this way marks anything as seen.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn an_agent_is_shown_small_pictures_as_images() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_post(&instagram).await;
+    with_downloadable_stories(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let picture = b"\xff\xd8\xff\xe0 a picture".to_vec();
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let post = client
+        .call(
+            "snob_post",
+            serde_json::json!({ "link": POST_CODE, "pictures": true }),
+        )
+        .await;
+    assert_eq!(post["isError"], false, "{post}");
+    assert_eq!(
+        images(&post),
+        [("image/jpeg".to_string(), picture.clone())],
+        "the photo's, and nothing for the clip"
+    );
+    let told = &post["structuredContent"];
+    assert_eq!(
+        told["pictures"],
+        serde_json::json!([
+            { "of": 1, "mime": "image/jpeg", "bytes": 14 },
+            { "of": 2, "missing": "none is offered" },
+        ]),
+        "{post}"
+    );
+    assert_eq!(told["post"]["code"], POST_CODE, "{post}");
+    // The picture is in the image and nowhere in the text, and no address
+    // of a file is anywhere.
+    let text = told.to_string();
+    assert!(
+        !text.contains("/9j/") && !text.contains("/big.jpg") && !text.contains("/clip.mp4"),
+        "{text}"
+    );
+    let labels: Vec<&str> = post["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .filter(|text| text.starts_with("The small picture"))
+        .collect();
+    assert_eq!(labels, ["The small picture of number 1 in this answer:"]);
+
+    // Not asked for, no picture is fetched or handed back.
+    let before = fetched(&instagram, "/big.jpg").await;
+    let plain = client
+        .call("snob_post", serde_json::json!({ "link": POST_CODE }))
+        .await;
+    assert!(images(&plain).is_empty(), "{plain}");
+    assert!(plain["structuredContent"].get("pictures").is_none());
+    assert_eq!(fetched(&instagram, "/big.jpg").await, before);
+
+    let stories = client
+        .call("snob_stories", serde_json::json!({ "pictures": true }))
+        .await;
+    assert_eq!(stories["isError"], false, "{stories}");
+    assert_eq!(images(&stories), [("image/jpeg".to_string(), picture)]);
+    let told = &stories["structuredContent"];
+    assert_eq!(
+        told["stories"].as_array().map(Vec::len),
+        Some(2),
+        "{stories}"
+    );
+    assert_eq!(told["stories"][1]["kind"], "video", "{stories}");
+    assert_eq!(told["stories"][0]["url"], serde_json::Value::Null);
+    assert_eq!(told["pictures"][1]["missing"], "none is offered");
+    let text = stories.to_string();
+    assert!(
+        !text.contains("/big.jpg") && !text.contains("/clip.mp4"),
+        "{text}"
+    );
+
+    assert_nothing_marks_seen(&instagram, "a post and stories through the MCP server").await;
+}
+
+/// An agent reads the tray of highlights and what one holds, with their
+/// pictures when it asks, and marks nothing as seen.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn an_agent_reads_highlights_and_what_one_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_downloadable_highlights(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let mut client = McpClient::start(tmp.path(), &instagram, &[]).await;
+
+    let tray = client.call("snob_highlights", serde_json::json!({})).await;
+    assert_eq!(tray["isError"], false, "{tray}");
+    let listed = &tray["structuredContent"]["highlights"];
+    assert_eq!(listed.as_array().map(Vec::len), Some(2), "{tray}");
+    assert_eq!(listed[0]["id"], "highlight:100", "{tray}");
+    assert_eq!(listed[0]["title"], "trip", "{tray}");
+
+    // A number alone would be read as a name: refused before anything runs.
+    let alone = client
+        .call("snob_highlights", serde_json::json!({ "highlight": 1 }))
+        .await;
+    assert_eq!(
+        alone["structuredContent"]["error"]["code"], "invalid_arguments",
+        "{alone}"
+    );
+
+    let one = client
+        .call(
+            "snob_highlights",
+            serde_json::json!({ "account": "me", "highlight": 1, "pictures": true }),
+        )
+        .await;
+    assert_eq!(one["isError"], false, "{one}");
+    let told = &one["structuredContent"];
+    assert_eq!(told["highlight"]["id"], "highlight:100", "{one}");
+    assert_eq!(told["items"].as_array().map(Vec::len), Some(2), "{one}");
+    assert_eq!(told["items"][0]["url"], serde_json::Value::Null, "{one}");
+    assert_eq!(
+        images(&one),
+        [(
+            "image/jpeg".to_string(),
+            b"\xff\xd8\xff\xe0 a picture".to_vec()
+        )]
+    );
+    assert_eq!(told["pictures"][1]["missing"], "none is offered", "{one}");
+
+    assert_nothing_marks_seen(&instagram, "highlights through the MCP server").await;
+}
+
 /// The acts recorded in the sandbox account's database, of any age.
 #[cfg(feature = "mcp")]
 fn acts_recorded(root: &Path) -> i64 {

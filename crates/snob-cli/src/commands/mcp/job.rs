@@ -226,6 +226,7 @@ pub fn standing(doc: &Value, cancel: bool) -> (Answer, String) {
                 failed: true,
                 body: answer::cleaned(body),
                 whole: None,
+                pictures: Vec::new(),
             },
             said,
         );
@@ -280,6 +281,7 @@ pub fn standing(doc: &Value, cancel: bool) -> (Answer, String) {
             failed: false,
             body: answer::cleaned(body),
             whole: None,
+            pictures: Vec::new(),
         },
         snob_core::model::printable(&said),
     )

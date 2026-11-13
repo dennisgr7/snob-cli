@@ -144,6 +144,103 @@ pub(crate) fn listing_table(headers: &[&str], presentation: Presentation) -> Tab
     table
 }
 
+/// The most one small picture may weigh ([`small_pictures`]): half a
+/// megabyte. A thumbnail is the narrowest picture at least [`THUMB_WIDTH`]
+/// wide, some tens of kilobytes; where Instagram offered nothing that
+/// narrow it is the widest, and one past this is left out, not cut.
+pub(crate) const MAX_SMALL_PICTURE: usize = 512 * 1024;
+
+/// The most the small pictures of one listing weigh together: four
+/// megabytes, three pages of a grid at a hundred kilobytes a picture. They
+/// travel in the listing's JSON and from there into a model's context,
+/// which is no place for more.
+pub(crate) const MOST_SMALL_PICTURES: usize = 4 * 1024 * 1024;
+
+/// A small picture of each of `wanted`, a listing's things by their number
+/// in it and the address of each one's thumbnail (a video's is its cover),
+/// for a reader that looks rather than saves: `snob mcp`, which hands them
+/// to a model as images (`--small-pictures`). Each is `{of, mime, bytes,
+/// data}`, `data` the picture in base64, or `{of, missing}` saying why
+/// there is none: nothing was offered, it was past a ceiling, it could not
+/// be fetched, or what came is no picture.
+///
+/// **In the JSON, never on standard output as bytes**, and never an
+/// address: what is handed on is the picture, which names nobody and
+/// expires nowhere. Fetched from the CDN as every thumbnail a view draws
+/// is, one after another; nothing here is a request to Instagram, and
+/// nothing tells anybody what was looked at.
+pub(crate) async fn small_pictures(
+    client: &IgClient,
+    wanted: Vec<(usize, Option<String>)>,
+) -> Result<Vec<serde_json::Value>> {
+    use base64::Engine as _;
+
+    let mut pictures = Vec::with_capacity(wanted.len());
+    let mut total = 0usize;
+    for (of, address) in wanted {
+        let missing = |why: &str| serde_json::json!({ "of": of, "missing": why });
+        let Some(address) = address else {
+            pictures.push(missing("none is offered"));
+            continue;
+        };
+        if total >= MOST_SMALL_PICTURES {
+            pictures.push(missing("past what one answer carries"));
+            continue;
+        }
+        match client.download_capped(&address, MAX_SMALL_PICTURE).await {
+            Ok(bytes) => match picture_type(&bytes) {
+                Some(mime) => {
+                    total += bytes.len();
+                    pictures.push(serde_json::json!({
+                        "of": of,
+                        "mime": mime,
+                        "bytes": bytes.len(),
+                        "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    }));
+                }
+                None => pictures.push(missing("what came is not a picture")),
+            },
+            Err(IgError::Canceled) => {
+                return Err(ExitError::new(ExitCode::Interrupted, "stopped").into());
+            }
+            // Not the error's own words: they can hold the address.
+            Err(_) => pictures.push(missing("it could not be fetched")),
+        }
+    }
+    Ok(pictures)
+}
+
+/// What kind of picture `bytes` are, by how they start: the three kinds
+/// Instagram serves. `None` for anything else, a video among them.
+fn picture_type(bytes: &[u8]) -> Option<&'static str> {
+    let webp = bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP");
+    match bytes {
+        [0xff, 0xd8, 0xff, ..] => Some("image/jpeg"),
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        _ if webp => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// A listing's JSON document with `pictures` beside what it lists
+/// ([`small_pictures`]). Without any, and for NDJSON, whose lines are the
+/// rows alone, the listing as it came.
+pub(crate) fn with_pictures(
+    text: String,
+    pictures: Option<Vec<serde_json::Value>>,
+) -> Result<String> {
+    let Some(pictures) = pictures else {
+        return Ok(text);
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Object(mut document)) => {
+            document.insert("pictures".into(), serde_json::Value::Array(pictures));
+            Ok(serde_json::to_string_pretty(&document)?)
+        }
+        _ => Ok(text),
+    }
+}
+
 /// A listing's rows as JSON: NDJSON is the rows alone, one to a line, and
 /// JSON is the document `envelope` wraps them in.
 pub(crate) fn rows_or_envelope(

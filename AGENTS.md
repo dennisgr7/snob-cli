@@ -494,7 +494,8 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   closing after it would be a second stop, which exits at once.
   `SNOB_IGNORE_COOLDOWN` is removed from a child's environment.
 - **Reads only, unless `--allow-writes`**: status, lists, profiles, posts
-  (`snob_posts`, `snob_post`, `snob_post_likers`). One tool
+  (`snob_posts`, `snob_post`, `snob_post_likers`), stories and highlights
+  (`snob_stories`, `snob_highlights`). One tool
   list for every client, from the server's flags alone. Walking another
   account's lists, a post's likers, and every follow or unfollow, needs a yes for that one
   call, asked in this order (`mod.rs`, `Server::consent`): a form the client
@@ -539,6 +540,35 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   (`readOnlyHint: false`). Over `--listen` the files are saved on snob's
   machine all the same and nothing of them travels in an answer; startup
   warns that whoever holds the key can have them saved.
+- **A picture is shown as a picture, and small** (`pictures: true` on
+  `snob_posts`, `snob_post`, `snob_stories` and `snob_highlights`; the
+  hidden `--small-pictures` of those commands, `media::small_pictures`).
+  The child fetches the thumbnail of each thing it lists from the CDN (the
+  narrowest picture at least 640 wide, a video's cover, a highlight's
+  cover: the `thumb` and `cover` the views draw, in no JSON contract), at
+  most `media::MAX_SMALL_PICTURE` (512 KiB) each and
+  `media::MOST_SMALL_PICTURES` (4 MiB) a listing, and prints them in its
+  JSON under `pictures`, in base64. The server takes them out before
+  anything else reads the document (`answer::take_pictures`: only
+  `image/jpeg`, `png` and `webp`, only base64, anything else said as
+  `missing`) and hands each back as MCP image content after a line saying
+  which number in the answer it is of, with the page that holds it when
+  the listing is paged (`pages::Whole::pictures`). **Never an address, and
+  never a video**: a video is saved, not shown, and the descriptions say
+  so. It adds no request to Instagram. **A picture cannot go through
+  `printable`**: the descriptions say that what one shows or says is data,
+  as a caption is.
+- **Stories and highlights are read, and nothing marks them seen**
+  (`snob_stories`, `snob_highlights`): the children are `snob stories` and
+  `snob highlights` themselves, so what keeps a view from being registered
+  for an agent is what keeps it for a person: the allowlist names no such
+  call, the tab's guard lets through no POST the allowlist refuses, and
+  `no_seen.rs` keeps every spelling of one out of the source. They ask no
+  yes, as the commands ask none. **Their files are not saved for an agent
+  yet**: a story's file is named by its place in the tray (`<name>-<n>`),
+  which another day's story takes, and a download that never fetches a
+  name twice would then skip the new one; that wants an id in the name
+  first.
 - **The yes comes from the client, not provably from the person.** The
   client declares what it can show, and an agent can type a yes in the chat
   itself (or be steered to by a bio it read). The tickets keep a yes to the

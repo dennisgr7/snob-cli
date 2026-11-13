@@ -141,7 +141,25 @@ pub async fn run(args: PostsArgs, store: SecretStore, paths: &AccountPaths) -> R
             let files = videos.prepare(files_of(&chosen));
             posts::download(app.client_shared(), files, destination).await
         }
-        (None, None) => list_grid(&grid, &asked, args.list.format, destination),
+        (None, None) => {
+            // A post's picture is its first item's: what its square on the
+            // grid shows.
+            let pictures = match args.list.small_pictures {
+                true => {
+                    let firsts = grid
+                        .posts
+                        .iter()
+                        .enumerate()
+                        .map(|(index, post)| {
+                            (index + 1, post.items.first().and_then(|i| i.thumb.clone()))
+                        })
+                        .collect();
+                    Some(media::small_pictures(app.client(), firsts).await?)
+                }
+                false => None,
+            };
+            list_grid(&grid, &asked, pictures, args.list.format, destination)
+        }
         (Some(number), selection) => {
             let post = &grid.posts[number as usize - 1];
             match selection {
@@ -263,12 +281,15 @@ impl Asked {
 fn list_grid(
     grid: &Grid,
     asked: &Asked,
+    pictures: Option<Vec<serde_json::Value>>,
     format: Option<StoryFormat>,
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
     let format = common::checked_format(format, destination, "a grid")?;
     let text = match format {
-        Format::Json | Format::Ndjson => grid_json(grid, asked, format)?,
+        Format::Json | Format::Ndjson => {
+            media::with_pictures(grid_json(grid, asked, format)?, pictures)?
+        }
         _ => grid_table(grid, Presentation::detect(destination)),
     };
     asked.say(grid);

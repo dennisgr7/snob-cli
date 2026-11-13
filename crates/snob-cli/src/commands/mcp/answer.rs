@@ -21,11 +21,18 @@
 //! (`complete: false`, [`incomplete`]), since both are a success to the
 //! command, whose warnings a person reads on standard error and an agent
 //! never sees.
+//!
+//! **A picture is handed back as a picture** ([`take_pictures`]): a listing
+//! asked for with its small pictures carries them in its JSON, in base64,
+//! and they leave it here, to go out as image content beside the answer
+//! (`mod.rs`, `saying`) rather than as text a model would read letter by
+//! letter. A picture cannot be filtered as a string is: the descriptions
+//! say that what one shows or says is data.
 
 use serde_json::{Value, json};
 
 use super::child::Finished;
-use super::pages::Whole;
+use super::pages::{Picture, Whole};
 use super::tools::Plan;
 use crate::exit::ExitCode;
 
@@ -38,6 +45,9 @@ pub struct Answer {
     /// of a longer one: for the server to hold for the pages after it, with
     /// what the page said about the list ([`ABOUT`]).
     pub whole: Option<Whole>,
+    /// The small pictures that go with `body`, to hand back as images: all
+    /// the call read, or for a page of a list, those of what the page holds.
+    pub pictures: Vec<Picture>,
 }
 
 /// The fields of a list's answer that are about the whole list rather than
@@ -131,6 +141,12 @@ pub const PUSHED_BACK: &str = "Instagram pushed back and a cooldown has started 
 
 /// Reads a finished child against what its plan counts as an answer.
 pub fn from(plan: &Plan, mut finished: Finished) -> Answer {
+    // First, so that no picture's bytes are walked as text by what follows.
+    let pictures = finished
+        .json
+        .as_mut()
+        .map(take_pictures)
+        .unwrap_or_default();
     if shows_media(plan) {
         finished.json = finished.json.take().map(without_media_addresses);
     }
@@ -263,6 +279,7 @@ pub fn from(plan: &Plan, mut finished: Finished) -> Answer {
             failed: true,
             body: cleaned(json!({ "exit": exit.as_str(), "error": failure })),
             whole: None,
+            pictures: Vec::new(),
         };
     };
     // Where the list came from, as its walk said it (`Progress::served`), and
@@ -328,6 +345,7 @@ pub fn from(plan: &Plan, mut finished: Finished) -> Answer {
             None => body["hint"] = json!(SIGN_IN),
         }
     }
+    let shown = on_this_page(&mut body, &pictures);
     let whole = whole_items.map(|items| Whole {
         items,
         about: ABOUT
@@ -336,12 +354,115 @@ pub fn from(plan: &Plan, mut finished: Finished) -> Answer {
             .chain(beside.iter().map(String::as_str))
             .filter_map(|key| Some((key.to_string(), body.get(key)?.clone())))
             .collect(),
+        pictures,
     });
     Answer {
         failed: false,
         body: cleaned(body),
         whole,
+        pictures: shown,
     }
+}
+
+/// The kinds of picture handed on as images: what `media::small_pictures`
+/// says a picture is, and nothing a child could make up besides.
+const PICTURES: [&str; 3] = ["image/jpeg", "image/png", "image/webp"];
+
+/// The most one picture may weigh in base64 to be handed on: what
+/// `media::MAX_SMALL_PICTURE` comes to, and a third over.
+const MOST_PICTURE: usize = 700 * 1024;
+
+/// Takes the small pictures out of the document a child printed
+/// (`media::small_pictures`, under `pictures`): each as what the answer
+/// says of it, and its bytes when it has them, **which are no longer in
+/// the document**, so nothing after this reads a picture as text.
+///
+/// Read without assuming its shape, for the reason [`from`] gives: an entry
+/// that is no object or has no number is dropped, and bytes that are not
+/// base64, weigh too much or come under a kind that is no picture are
+/// said as missing, never handed on.
+pub fn take_pictures(document: &mut Value) -> Vec<Picture> {
+    let Some(Value::Array(entries)) = document
+        .as_object_mut()
+        .and_then(|fields| fields.remove("pictures"))
+    else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let Value::Object(mut entry) = entry else {
+                return None;
+            };
+            let of = entry.get("of")?.as_u64()?;
+            let data = match entry.remove("data") {
+                Some(Value::String(data)) => Some(data),
+                _ => None,
+            };
+            let mime = entry
+                .get("mime")
+                .and_then(Value::as_str)
+                .filter(|mime| PICTURES.contains(mime))
+                .map(str::to_string);
+            let sound = |data: &String| {
+                data.len() <= MOST_PICTURE
+                    && !data.is_empty()
+                    && data
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+            };
+            let image = match (mime, data) {
+                (Some(mime), Some(data)) if sound(&data) => Some((mime, data)),
+                _ => None,
+            };
+            let said = match &image {
+                Some(_) => json!({
+                    "of": of,
+                    "mime": entry.get("mime"),
+                    "bytes": entry.get("bytes"),
+                }),
+                None => json!({
+                    "of": of,
+                    "missing": entry
+                        .get("missing")
+                        .and_then(Value::as_str)
+                        .unwrap_or("it could not be read"),
+                }),
+            };
+            Some(Picture { of, said, image })
+        })
+        .collect()
+}
+
+/// The pictures of `pictures` that go with `body`, which is told of them
+/// under `pictures`: for a page of a list (`offset` and `items`), those of
+/// what the page holds, numbered from one as the listing numbers them, and
+/// for any other answer all of them.
+fn on_this_page(body: &mut Value, pictures: &[Picture]) -> Vec<Picture> {
+    if pictures.is_empty() {
+        return Vec::new();
+    }
+    let page = body
+        .get("offset")
+        .and_then(Value::as_u64)
+        .zip(body.get("items").and_then(Value::as_array).map(Vec::len));
+    let shown: Vec<Picture> = pictures
+        .iter()
+        .filter(|picture| match page {
+            Some((offset, items)) => {
+                picture.of > offset && picture.of <= offset.saturating_add(items as u64)
+            }
+            None => true,
+        })
+        .cloned()
+        .collect();
+    if let Some(fields) = body.as_object_mut() {
+        fields.insert(
+            "pictures".into(),
+            Value::Array(shown.iter().map(|picture| picture.said.clone()).collect()),
+        );
+    }
+    shown
 }
 
 /// The page at `offset` of a list the server holds (`pages.rs`), as the
@@ -358,10 +479,12 @@ pub fn held(whole: &Whole, offset: usize, limit: Option<usize>, brief: bool) -> 
     if let Some(fields) = body.as_object_mut() {
         fields.extend(whole.about.clone());
     }
+    let shown = on_this_page(&mut body, &whole.pictures);
     Answer {
         failed: false,
         body: cleaned(body),
         whole: None,
+        pictures: shown,
     }
 }
 
@@ -406,6 +529,7 @@ fn past_the_end(total: usize, offset: usize, limit: Option<usize>) -> Option<Ans
             },
         })),
         whole: None,
+        pictures: Vec::new(),
     })
 }
 
@@ -739,13 +863,14 @@ fn last_lines(said: &str) -> String {
     lines[lines.len().saturating_sub(6)..].join("\n")
 }
 
-/// Whether `plan` is one of the commands about posts (`snob_posts`,
-/// `snob_post`, `snob_post_likers`), whose answers lose their media
-/// addresses ([`without_media_addresses`]).
+/// Whether `plan` is one of the commands about posts, stories or
+/// highlights (`snob_posts`, `snob_post`, `snob_post_likers`,
+/// `snob_post_download`, `snob_stories`, `snob_highlights`), whose answers
+/// lose their media addresses ([`without_media_addresses`]).
 fn shows_media(plan: &Plan) -> bool {
     matches!(
         plan.args.first().map(String::as_str),
-        Some("posts" | "post" | "likers")
+        Some("posts" | "post" | "likers" | "stories" | "highlights")
     )
 }
 
@@ -831,6 +956,93 @@ mod tests {
             }),
             ..plan(&[ExitCode::Ok])
         }
+    }
+
+    /// A listing's small pictures leave its JSON as images, each with the
+    /// page that holds what it is of; what is no sound picture is said as
+    /// missing and never handed on.
+    #[test]
+    fn pictures_leave_the_json_and_go_with_their_page() {
+        let caption = "x".repeat(4_000);
+        let posts: Vec<Value> = (1..=20)
+            .map(|n| json!({ "number": n, "caption": caption }))
+            .collect();
+        let mut pictures: Vec<Value> = (1..=20)
+            .map(|n| json!({ "of": n, "mime": "image/jpeg", "bytes": 3, "data": "QUJD" }))
+            .collect();
+        pictures[1] = json!({ "of": 2, "missing": "none is offered" });
+        pictures[2] = json!({ "of": 3, "mime": "text/html", "bytes": 3, "data": "QUJD" });
+        pictures[3] = json!({ "of": 4, "mime": "image/png", "bytes": 3, "data": "<script>" });
+        pictures.push(json!("not an entry"));
+        pictures.push(json!({ "mime": "image/png", "data": "QUJD" }));
+        let told = from(
+            &grid_at(0),
+            finished(
+                ExitCode::Ok,
+                Some(json!({ "username": "someone", "posts": posts, "pictures": pictures })),
+                None,
+            ),
+        );
+        let next = told.body["next_offset"].as_u64().expect("another page") as usize;
+        assert!((4..20).contains(&next), "{next}");
+        // The first page's pictures and no other's, the bytes out of the body.
+        let shown: Vec<u64> = told.pictures.iter().map(|picture| picture.of).collect();
+        assert_eq!(shown, (1..=next as u64).collect::<Vec<_>>());
+        assert_eq!(
+            told.pictures[0].image,
+            Some(("image/jpeg".to_string(), "QUJD".to_string()))
+        );
+        for unsound in &told.pictures[1..=3] {
+            assert_eq!(unsound.image, None, "{}", unsound.of);
+        }
+        assert_eq!(
+            told.body["pictures"][0],
+            json!({ "of": 1, "mime": "image/jpeg", "bytes": 3 })
+        );
+        assert_eq!(told.body["pictures"][1]["missing"], "none is offered");
+        assert_eq!(told.body["pictures"][2]["missing"], "it could not be read");
+        assert!(!told.body.to_string().contains("QUJD"));
+        assert_eq!(
+            told.body["pictures"].as_array().map(Vec::len),
+            Some(next),
+            "the page's alone"
+        );
+
+        // The next page, from what is held, has its own.
+        let whole = told.whole.expect("held with its pictures");
+        assert_eq!(whole.pictures.len(), 20);
+        let later = held(&whole, next, None, false);
+        assert_eq!(later.pictures.first().map(|p| p.of), Some(next as u64 + 1));
+        assert_eq!(later.body["pictures"][0]["of"], next as u64 + 1);
+
+        // A document that is no list hands back every picture.
+        let post = from(
+            &Plan {
+                args: vec!["post".into()],
+                ..plan(&[ExitCode::Ok])
+            },
+            finished(
+                ExitCode::Ok,
+                Some(json!({
+                    "post": { "items": [{ "number": 1 }, { "number": 2 }] },
+                    "pictures": [
+                        { "of": 1, "mime": "image/webp", "bytes": 3, "data": "QUJD" },
+                        { "of": 2, "missing": "none is offered" },
+                    ],
+                })),
+                None,
+            ),
+        );
+        assert_eq!(post.pictures.len(), 2);
+        assert!(post.pictures[0].image.is_some());
+        assert_eq!(post.body["pictures"][1]["missing"], "none is offered");
+        // And one that printed none says nothing of pictures.
+        let plain = from(
+            &plan(&[ExitCode::Ok]),
+            finished(ExitCode::Ok, Some(json!({ "ok": true })), None),
+        );
+        assert!(plain.pictures.is_empty());
+        assert!(plain.body.get("pictures").is_none());
     }
 
     /// A brief page holds what tells its posts apart and nothing else, and
@@ -1239,6 +1451,7 @@ mod tests {
             let none = Whole {
                 items: vec![],
                 about: serde_json::Map::new(),
+                pictures: Vec::new(),
             };
             assert!(held(&none, offset, None, false).failed, "{offset}");
         }

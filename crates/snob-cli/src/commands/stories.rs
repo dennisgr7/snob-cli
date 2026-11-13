@@ -89,7 +89,26 @@ pub async fn run(args: StoriesArgs, store: SecretStore, paths: &AccountPaths) ->
         .await;
     }
 
-    list(&stories, args.list.format, args.action.output.as_deref())
+    let pictures = match args.list.small_pictures {
+        true => Some(media::small_pictures(app.client(), thumbs(&stories.items)).await?),
+        false => None,
+    };
+    list(
+        &stories,
+        pictures,
+        args.list.format,
+        args.action.output.as_deref(),
+    )
+}
+
+/// Each story by its number and the address of its small picture, for
+/// `media::small_pictures`.
+pub(crate) fn thumbs(items: &[Story]) -> Vec<(usize, Option<String>)> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, story)| (index + 1, story.thumb.clone()))
+        .collect()
 }
 
 /// The list, as the account the command runs as and then as each account the
@@ -205,12 +224,13 @@ pub(crate) fn story_from(item: &ReelItem) -> Story {
 /// Prints the listing. The numbers here are what `--download` takes.
 fn list(
     stories: &Stories,
+    pictures: Option<Vec<serde_json::Value>>,
     format: Option<StoryFormat>,
     destination: Option<&Path>,
 ) -> Result<ExitCode> {
     let format = common::checked_format(format, destination, "a story listing")?;
     let text = match format {
-        Format::Json | Format::Ndjson => as_json(stories, format)?,
+        Format::Json | Format::Ndjson => media::with_pictures(as_json(stories, format)?, pictures)?,
         _ => as_table(stories, Presentation::detect(destination)),
     };
     media::print_listing(
