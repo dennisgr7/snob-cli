@@ -76,6 +76,20 @@ const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 /// the frame would be written as it always was, and that test would say so.
 const UNCHANGED_FRAME: &[u8] = b"\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[?25l";
 
+/// The same frame where `NO_COLOR` is set: crossterm then writes no color
+/// at all, the reset of one included, and what is left of each of the three
+/// is an SGR with no parameter (crossterm 0.29.0, `Colored`'s `Display`,
+/// which reads the variable once). Held by the same two tests, with
+/// crossterm's switch thrown both ways.
+const UNCHANGED_FRAME_NO_COLOR: &[u8] = b"\x1b[m\x1b[m\x1b[m\x1b[0m\x1b[?25l";
+
+/// Whether these bytes are all of a frame in which no cell changed. Either
+/// spelling counts whatever the environment says: each only resets what the
+/// frame before it left reset.
+fn says_nothing(frame: &[u8]) -> bool {
+    frame == UNCHANGED_FRAME || frame == UNCHANGED_FRAME_NO_COLOR
+}
+
 /// Where the frames are written: standard error, a whole frame at a time.
 ///
 /// Standard error has no buffer, so written to directly a frame is a write
@@ -125,7 +139,7 @@ impl<W: Write> Write for Screen<W> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        if self.cursor_hidden.load(Ordering::Relaxed) && self.pending == UNCHANGED_FRAME {
+        if self.cursor_hidden.load(Ordering::Relaxed) && says_nothing(&self.pending) {
             self.pending.clear();
             return Ok(());
         }
@@ -669,14 +683,17 @@ mod tests {
     /// a flush with nothing collected sends no empty update.
     #[test]
     fn an_unchanged_frame_writes_nothing() {
-        let mut screen = Screen::new(Writes::default());
-        frame(&mut screen, &[b"x", UNCHANGED_FRAME]);
-        assert_eq!(screen.out.0.len(), 1, "the first frame is written");
-        for _ in 0..3 {
-            frame(&mut screen, &[UNCHANGED_FRAME]);
-            screen.flush().unwrap();
+        // As crossterm spells it, and as it does where `NO_COLOR` is set.
+        for unchanged in [UNCHANGED_FRAME, UNCHANGED_FRAME_NO_COLOR] {
+            let mut screen = Screen::new(Writes::default());
+            frame(&mut screen, &[b"x", unchanged]);
+            assert_eq!(screen.out.0.len(), 1, "the first frame is written");
+            for _ in 0..3 {
+                frame(&mut screen, &[unchanged]);
+                screen.flush().unwrap();
+            }
+            assert_eq!(screen.out.0.len(), 1, "nothing after it");
         }
-        assert_eq!(screen.out.0.len(), 1, "nothing after it");
     }
 
     /// After a frame that showed the cursor, or after somebody else had the
@@ -699,29 +716,58 @@ mod tests {
         assert_eq!(screen.out.0.len(), 5, "the frame after a suspension");
     }
 
+    /// crossterm's `NO_COLOR` switch is one for the process, read from the
+    /// environment once, and two tests here throw it: one at a time.
+    static COLOR_SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Runs `check` with crossterm writing colors and then writing none,
+    /// whatever the environment of the test run says, and leaves the switch
+    /// as it was found. `check` is told whether colors are off.
+    fn with_colors_and_without(mut check: impl FnMut(bool)) {
+        use crossterm::style::Colored;
+
+        let _alone = COLOR_SWITCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = Colored::ansi_color_disabled_memoized();
+        for off in [false, true] {
+            Colored::set_ansi_color_disabled(off);
+            check(off);
+        }
+        Colored::set_ansi_color_disabled(found);
+    }
+
     /// The bytes dropped are the ones crossterm writes for what a frame with
-    /// no changed cell still sends, and the cursor's two are crossterm's.
+    /// no changed cell still sends, with `NO_COLOR` and without it, and the
+    /// cursor's two are crossterm's.
     #[test]
     fn the_unchanged_frame_is_what_crossterm_writes_for_it() {
         use crossterm::Command;
         use crossterm::style::{Attribute, Color, SetAttribute, SetUnderlineColor};
         use crossterm::style::{SetBackgroundColor, SetForegroundColor};
 
-        let mut written = String::new();
-        SetForegroundColor(Color::Reset)
-            .write_ansi(&mut written)
-            .unwrap();
-        SetBackgroundColor(Color::Reset)
-            .write_ansi(&mut written)
-            .unwrap();
-        SetUnderlineColor(Color::Reset)
-            .write_ansi(&mut written)
-            .unwrap();
-        SetAttribute(Attribute::Reset)
-            .write_ansi(&mut written)
-            .unwrap();
-        Hide.write_ansi(&mut written).unwrap();
-        assert_eq!(written.as_bytes(), UNCHANGED_FRAME);
+        with_colors_and_without(|off| {
+            let mut written = String::new();
+            SetForegroundColor(Color::Reset)
+                .write_ansi(&mut written)
+                .unwrap();
+            SetBackgroundColor(Color::Reset)
+                .write_ansi(&mut written)
+                .unwrap();
+            SetUnderlineColor(Color::Reset)
+                .write_ansi(&mut written)
+                .unwrap();
+            SetAttribute(Attribute::Reset)
+                .write_ansi(&mut written)
+                .unwrap();
+            Hide.write_ansi(&mut written).unwrap();
+            let unchanged = if off {
+                UNCHANGED_FRAME_NO_COLOR
+            } else {
+                UNCHANGED_FRAME
+            };
+            assert_eq!(written.as_bytes(), unchanged, "colors off: {off}");
+        });
 
         let mut hide = String::new();
         Hide.write_ansi(&mut hide).unwrap();
@@ -732,11 +778,16 @@ mod tests {
     }
 
     /// The renderer itself, through the backend the views use: the second of
-    /// two frames that are the same reaches the terminal as nothing. This is
-    /// what holds [`UNCHANGED_FRAME`] to the ratatui in the tree, where the
-    /// test above holds it only to crossterm.
+    /// two frames that are the same reaches the terminal as nothing, with
+    /// `NO_COLOR` and without it. This is what holds [`UNCHANGED_FRAME`] and
+    /// its twin to the ratatui in the tree, where the test above holds them
+    /// only to crossterm.
     #[test]
     fn the_renderer_writes_nothing_for_a_frame_it_already_drew() {
+        with_colors_and_without(the_same_frame_again_is_no_write);
+    }
+
+    fn the_same_frame_again_is_no_write(off: bool) {
         /// Keeps the writes that get past the screen, each apart.
         #[derive(Clone, Default)]
         struct Kept(Arc<std::sync::Mutex<Vec<String>>>);
@@ -779,7 +830,11 @@ mod tests {
         // Copied out first: the terminal writes once more as it is dropped,
         // and must not find the lock held by a failing assertion.
         let all = out.0.lock().unwrap().clone();
-        assert_eq!(all.len(), 1, "and no write for either: {all:?}");
+        assert_eq!(
+            all.len(),
+            1,
+            "and no write for either, colors off {off}: {all:?}"
+        );
     }
 
     /// Walking the selection from end to end keeps two rows of margin
