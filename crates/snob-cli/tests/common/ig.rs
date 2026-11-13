@@ -135,8 +135,12 @@ pub struct Person {
     /// Its profile query names its full-size picture.
     pub full_size_picture: bool,
     pub posts: u64,
-    /// The posts it pinned, each by its number counted from its newest (0):
-    /// its grid serves them first, in this order, however old they are.
+    /// How many posts it has published since those: each newer than every
+    /// one before it, and **no post changes its pk as these arrive**, which
+    /// is what lets a test come back another day ([`newer_post`]).
+    pub newer: u64,
+    /// The posts it pinned, each by its place in its grid counted from its
+    /// newest (0): its grid serves them first, in this order, however old.
     pub pinned: Vec<u64>,
 }
 
@@ -155,6 +159,7 @@ impl Person {
             anonymous_picture: false,
             full_size_picture: true,
             posts: 3,
+            newer: 0,
             pinned: Vec::new(),
         }
     }
@@ -1619,7 +1624,7 @@ impl State {
             "category": null,
             "follower_count": self.followers(pk).len(),
             "following_count": self.following(pk).len(),
-            "media_count": person.posts,
+            "media_count": person.posts + person.newer,
             "profile_pic_url": self.media(&format!("{pk}-small")),
             "hd_profile_pic_url_info": person
                 .full_size_picture
@@ -1638,7 +1643,11 @@ impl State {
     /// photos. Each is liked by `user2` among others, and mentions `user3`.
     fn posts_of(&self, pk: u64) -> Vec<Value> {
         let person = self.account(pk);
-        (0..person.posts)
+        // The posts published since come first, the last of them first.
+        (0..person.newer)
+            .rev()
+            .map(|k| NEWER_FROM + k)
+            .chain(0..person.posts)
             .map(|n| {
                 let media = post_pk(pk, n);
                 let code = code_of(media);
@@ -1652,7 +1661,11 @@ impl State {
                     "pk": media.to_string(),
                     "id": format!("{media}_{pk}"),
                     "code": code,
-                    "taken_at": 1_790_000_000 - (n as i64) * 86_400,
+                    "taken_at": if n >= NEWER_FROM {
+                        1_790_000_000 + ((n - NEWER_FROM + 1) as i64) * 86_400
+                    } else {
+                        1_790_000_000 - (n as i64) * 86_400
+                    },
                     "media_type": 1,
                     "product_type": "feed",
                     "caption": { "text": format!("post {n} with @user3"), "pk": "1" },
@@ -1743,7 +1756,11 @@ impl State {
         if !self.people.contains_key(&owner) || !self.may_see(viewer, owner) {
             return None;
         }
-        self.posts_of(owner).into_iter().nth(n as usize)
+        let _ = n;
+        let pk = media.to_string();
+        self.posts_of(owner)
+            .into_iter()
+            .find(|post| post["pk"] == pk.as_str())
     }
 
     /// A video's address on the fake: an MP4, as the CDN serves one.
@@ -2073,6 +2090,16 @@ pub fn post_pk(owner: u64, n: u64) -> u64 {
     FIRST_POST + owner * POST_STRIDE + n
 }
 
+/// Where the posts an account published later are numbered from
+/// (`Person::newer`), past any number its first posts take.
+const NEWER_FROM: u64 = 500;
+
+/// The pk of the `k`-th post account `owner` published since its first
+/// ones, counted from 0.
+pub fn newer_post(owner: u64, k: u64) -> u64 {
+    post_pk(owner, NEWER_FROM + k)
+}
+
 /// The code a post's address carries: its pk in base64url, eleven
 /// characters, as Instagram writes it.
 pub fn code_of(pk: u64) -> String {
@@ -2293,7 +2320,7 @@ impl State {
             "profile_pic_url_hd": self.media(&format!("{pk}-hd")),
             "edge_followed_by": { "count": followers.len() },
             "edge_follow": { "count": self.following(pk).len() },
-            "edge_owner_to_timeline_media": { "count": person.posts },
+            "edge_owner_to_timeline_media": { "count": person.posts + person.newer },
             "edge_mutual_followed_by": {
                 "count": mutual.len(),
                 "edges": mutual.iter().take(3).map(|pk| json!({ "node": { "username": self.account(*pk).username } })).collect::<Vec<_>>(),

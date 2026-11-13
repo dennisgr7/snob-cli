@@ -2979,3 +2979,307 @@ async fn a_login_through_the_relay_is_stored() {
         );
     }
 }
+
+/// One `snob mcp` over its standard input and output, through the browser,
+/// spoken to as a client that can ask nothing: the agent of the tests below.
+#[cfg(feature = "mcp")]
+struct Agent {
+    _child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    next: u64,
+}
+
+#[cfg(feature = "mcp")]
+impl Agent {
+    async fn start(root: &Path, instagram: &MockServer, args: &[&str]) -> Self {
+        use tokio::io::AsyncBufReadExt;
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_snob"))
+            .arg("--sandbox-root")
+            .arg(root)
+            .arg("--ig-base-url")
+            .arg(instagram.uri())
+            .arg("--through-the-browser")
+            .arg("mcp")
+            .args(args)
+            .env("NO_COLOR", "1")
+            .env("SNOB_FFMPEG", root.join("no-ffmpeg-here"))
+            .env_remove("SNOB_NO_BROWSER")
+            .env_remove("SNOB_NO_OWNER")
+            .env_remove("SNOB_ACCOUNT")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("the binary runs");
+        let stdin = child.stdin.take().unwrap();
+        let lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut agent = Self {
+            _child: child,
+            stdin,
+            lines,
+            next: 0,
+        };
+        let hello = agent
+            .ask(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "an agent", "version": "0" }
+                }),
+            )
+            .await;
+        assert_eq!(hello["result"]["serverInfo"]["name"], "snob", "{hello}");
+        agent
+            .send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        agent
+    }
+
+    async fn send(&mut self, message: serde_json::Value) {
+        use tokio::io::AsyncWriteExt;
+        let mut line = message.to_string();
+        line.push('\n');
+        self.stdin.write_all(line.as_bytes()).await.unwrap();
+        self.stdin.flush().await.unwrap();
+    }
+
+    async fn ask(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        self.next += 1;
+        let id = self.next;
+        self.send(
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+        )
+        .await;
+        let answer = async {
+            while let Some(line) = self.lines.next_line().await.unwrap() {
+                let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if message["id"] == id {
+                    return message;
+                }
+            }
+            panic!("the server went away before answering {method}");
+        };
+        // A browser starts for the first call, on a machine that may be busy.
+        tokio::time::timeout(std::time::Duration::from_secs(180), answer)
+            .await
+            .expect("an answer within three minutes")
+    }
+
+    /// A tool call's result, which has to be a success.
+    async fn call(&mut self, tool: &str, arguments: serde_json::Value) -> serde_json::Value {
+        let answer = self
+            .ask(
+                "tools/call",
+                serde_json::json!({ "name": tool, "arguments": arguments }),
+            )
+            .await;
+        let result = answer["result"].clone();
+        assert_eq!(result["isError"], false, "{tool}: {answer}");
+        result
+    }
+}
+
+/// How many pages of a grid snob has asked the fake Instagram for.
+#[cfg(feature = "mcp")]
+async fn grid_pages_asked(instagram: &MockServer) -> usize {
+    snobs_requests(instagram)
+        .await
+        .iter()
+        .filter(|r| {
+            url::form_urlencoded::parse(&r.body)
+                .any(|(n, v)| n == "fb_api_req_friendly_name" && v.contains("ProfilePosts"))
+        })
+        .count()
+}
+
+/// The task an agent is given, end to end, through the MCP server and the
+/// browser: keep an account's posts in a directory, and come back the next
+/// day for the new ones. The first day it reads the grid and tells the
+/// posts apart by their codes; it looks at them, saves the ones it wants,
+/// and the files are named after their posts. The next day it names the
+/// newest posts it has: the grid is read as far as the first of them and no
+/// further, what is new is what comes before it, and saving those fetches
+/// nothing it already had. The second day costs fewer requests than the
+/// first, and nothing on either marks anything as seen.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn an_agent_keeps_an_accounts_new_posts_and_reads_less_the_next_day() {
+    let Some(_alone) = a_browser_alone().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let world = World::new();
+    world.person(ig::SOMEONE, |p| p.posts = 14);
+    let instagram = world.serve_web().await;
+    logged_in(tmp.path(), &instagram, SESSIONID, "the login failed: ");
+    let kept = tmp.path().join("kept");
+    std::fs::create_dir(&kept).unwrap();
+    let files = || {
+        let mut names: Vec<String> = std::fs::read_dir(&kept)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let mut agent = Agent::start(
+        tmp.path(),
+        &instagram,
+        &["--downloads-dir", kept.to_str().unwrap()],
+    )
+    .await;
+
+    // Day one: the grid, two pages of it, as what tells its posts apart.
+    let before = requests_so_far(&instagram).await;
+    let grid = agent
+        .call(
+            "snob_posts",
+            serde_json::json!({ "account": "someone", "pages": 2, "brief": true }),
+        )
+        .await;
+    let listed = &grid["structuredContent"];
+    assert_eq!(listed["count"], 14, "{grid}");
+    assert_eq!(listed["pages_read"], 2, "{grid}");
+    assert_eq!(listed["until"], serde_json::Value::Null, "{grid}");
+    assert_eq!(grid_pages_asked(&instagram).await, 2);
+    let day_one = requests_so_far(&instagram).await - before;
+    let posts = listed["items"].as_array().expect("the posts").clone();
+    assert_eq!(posts.len(), 14, "all of them fit a brief page: {grid}");
+    let code_of = |post: &serde_json::Value| post["code"].as_str().unwrap().to_string();
+    assert_eq!(code_of(&posts[0]), ig::code_of(ig::post_pk(ig::SOMEONE, 0)));
+    assert_eq!(
+        posts[0]["pk"],
+        ig::post_pk(ig::SOMEONE, 0).to_string().as_str()
+    );
+    assert!(posts[0].get("caption").is_none(), "brief: {grid}");
+    assert_eq!(posts[0]["item_count"], 2, "{grid}");
+
+    // It looks at the first page before deciding: a picture of each post.
+    let seen = agent
+        .call(
+            "snob_posts",
+            serde_json::json!({ "account": "someone", "pictures": true }),
+        )
+        .await;
+    let pictures = seen["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|block| block["type"] == "image")
+        .count();
+    assert_eq!(pictures, 12, "one of each post on the page: {seen}");
+    assert!(!seen["structuredContent"].to_string().contains("/media/"));
+
+    // It keeps the first post, a carousel of a photo and a video, and the
+    // third, a photo: the files say which posts they are of.
+    for post in [&posts[0], &posts[2]] {
+        let saved = agent
+            .call(
+                "snob_post_download",
+                serde_json::json!({ "link": post["url"] }),
+            )
+            .await;
+        let told = &saved["structuredContent"];
+        assert_eq!(told["post"]["code"], post["code"], "{saved}");
+        assert_eq!(told["failed"], serde_json::json!([]), "{saved}");
+        assert_eq!(told["left"], serde_json::json!([]), "{saved}");
+    }
+    let (first, third) = (code_of(&posts[0]), code_of(&posts[2]));
+    assert_eq!(
+        files(),
+        [
+            format!("someone-{first}-1.jpg"),
+            format!("someone-{first}-2.mp4"),
+            format!("someone-{third}.jpg"),
+        ]
+    );
+
+    // The next day the account has posted twice more. The agent names the
+    // newest posts it knew of, and the grid is read as far as the first.
+    world.person(ig::SOMEONE, |p| p.newer = 2);
+    let known: Vec<String> = posts.iter().take(3).map(code_of).collect();
+    let before = requests_so_far(&instagram).await;
+    let pages_before = grid_pages_asked(&instagram).await;
+    let again = agent
+        .call(
+            "snob_posts",
+            serde_json::json!({ "account": "someone", "until": known, "brief": true }),
+        )
+        .await;
+    let listed = &again["structuredContent"];
+    assert_eq!(listed["pages_read"], 1, "{again}");
+    assert_eq!(listed["until"]["reached"], true, "{again}");
+    assert_eq!(listed["until"]["code"], first.as_str(), "{again}");
+    assert_eq!(
+        grid_pages_asked(&instagram).await - pages_before,
+        1,
+        "one page, not the three it may read"
+    );
+    let day_two = requests_so_far(&instagram).await - before;
+    assert!(
+        day_two < day_one,
+        "the second day cost {day_two} requests and the first {day_one}"
+    );
+
+    // What is new is what comes before the post it reached, by code.
+    let now = listed["items"].as_array().expect("the posts");
+    let new: Vec<&serde_json::Value> = now
+        .iter()
+        .take_while(|post| post["code"] != first.as_str())
+        .collect();
+    let new_codes: Vec<String> = new.iter().map(|post| code_of(post)).collect();
+    assert_eq!(
+        new_codes,
+        [
+            ig::code_of(ig::newer_post(ig::SOMEONE, 1)),
+            ig::code_of(ig::newer_post(ig::SOMEONE, 0)),
+        ],
+        "{again}"
+    );
+    assert!(
+        new_codes
+            .iter()
+            .all(|code| !posts.iter().any(|p| &code_of(p) == code))
+    );
+    // The posts it had kept their pk and their code.
+    assert!(now.iter().any(|post| post["code"] == third.as_str()));
+
+    for post in &new {
+        agent
+            .call(
+                "snob_post_download",
+                serde_json::json!({ "link": post["url"] }),
+            )
+            .await;
+    }
+    // Asked again for one it has, nothing is fetched twice.
+    let twice = agent
+        .call("snob_post_download", serde_json::json!({ "link": third }))
+        .await;
+    assert_eq!(
+        twice["structuredContent"]["saved"][0]["already"], true,
+        "{twice}"
+    );
+    assert_eq!(files(), {
+        let mut names = vec![
+            format!("someone-{first}-1.jpg"),
+            format!("someone-{first}-2.mp4"),
+            format!("someone-{third}.jpg"),
+            format!("someone-{}.jpg", new_codes[0]),
+            format!("someone-{}.jpg", new_codes[1]),
+        ];
+        names.sort();
+        names
+    });
+
+    // Nothing but reads left for Instagram, and none of them a view.
+    for request in snobs_requests(&instagram).await {
+        let path = request.url.path();
+        assert!(!path.contains("seen"), "a request went to {path}");
+    }
+    let found = world.audit(&instagram, &["/api/v1/feed/user/*/"]).await;
+    assert!(found.is_empty(), "{found:?}");
+}
