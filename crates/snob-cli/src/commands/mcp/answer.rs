@@ -93,6 +93,10 @@ fn agent_hint(reason: &str) -> Option<&'static str> {
              it has ended"
         }
         "no_such_job" => "snob_jobs lists this account's jobs and their ids",
+        "no_such_snapshot" => {
+            "snob_snapshots lists the captures stored for the account and their ids; only \
+             one whose walk completed can be compared"
+        }
         "job_stopping" => {
             "the account's job was asked to stop and is stopping: snob_job tells when it has \
              stopped (its id is in the message); call this again then"
@@ -670,10 +674,10 @@ pub fn next_page(body: &Value, tool: &str) -> Option<String> {
         ""
     };
     // What a page is of: a grid's are posts.
-    let what = if tool == "snob_posts" {
-        "Posts"
-    } else {
-        "Accounts"
+    let what = match tool {
+        "snob_posts" => "Posts",
+        "snob_snapshots" => "Captures",
+        _ => "Accounts",
     };
     Some(format!(
         "{what} {first} to {next} of {of}. For the next ones, call {tool} again with \
@@ -878,10 +882,11 @@ fn shows_media(plan: &Plan) -> bool {
 /// null, wherever it is: the pictures and videos a post's answer names, its
 /// best tracks', and the profile pictures of the accounts in it.
 ///
-/// **No tool downloads** (AGENTS.md, the MCP server), so an agent has no use
-/// for them, and each is a signed address of a few hundred bytes that
-/// tokenizes at about three bytes a token: a page of posts would be mostly
-/// query strings. Made null rather than removed, so every key the command
+/// **An address is a download under another name**, which is the server's
+/// to make, into its own directory and within its bounds (AGENTS.md, the
+/// MCP server), so no agent is handed one, and each is a signed address of
+/// a few hundred bytes that tokenizes at about three bytes a token: a page
+/// of posts would be mostly query strings. Made null rather than removed, so every key the command
 /// prints is still there. Judged by host, so a test's own server counts as a
 /// CDN as Instagram's does, and the post's own link stays.
 pub fn without_media_addresses(value: Value) -> Value {

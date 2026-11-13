@@ -495,7 +495,8 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   `SNOB_IGNORE_COOLDOWN` is removed from a child's environment.
 - **Reads only, unless `--allow-writes`**: status, lists, profiles, posts
   (`snob_posts`, `snob_post`, `snob_post_likers`), stories and highlights
-  (`snob_stories`, `snob_highlights`). One tool
+  (`snob_stories`, `snob_highlights`), and what earlier walks stored
+  (`snob_snapshots`, `snob_changes`). One tool
   list for every client, from the server's flags alone. Walking another
   account's lists, a post's likers, and every follow or unfollow, needs a yes for that one
   call, asked in this order (`mod.rs`, `Server::consent`): a form the client
@@ -570,6 +571,16 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   which another day's story takes, and a download that never fetches a
   name twice would then skip the new one; that wants an id in the name
   first.
+- **What was stored is read for nothing** (`snob_snapshots`,
+  `snob_changes`): the children are `snapshots` and `changes`, which send
+  nothing, write nothing and move no mark (`Store::read_existing`), so they
+  ask nothing, another account's captures included, as its stored list asks
+  nothing; asking twice gives one answer, and they answer in a cooldown.
+  They are what an agent that comes back each day compares with. **The
+  monitor itself stays out**: `watch once` moves the one receipt per
+  account that the person's own webhook is owed from, and `watch.toml` is
+  where standing consent to walk another account's lists and the address
+  its reports go to are kept, neither of which is an agent's to write.
 - **One account a server, unless the person says any** (`tools::Offer`).
   Not told otherwise, a server acts as the account its children resolve:
   the one `--account` or `SNOB_ACCOUNT` names (`Offer::pinned`), else the
@@ -647,7 +658,8 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   failure: exit 3 is what it was asked, as exit 5 is in a cooldown. **Every
   hint that is advice to the person at a terminal is replaced the same
   way**, by the failure's `reason` (`answer::agent_hint`: `too_many_jobs`,
-  `no_such_job`, `job_stopping`, `nothing_stored`, `stored_moments`,
+  `no_such_job`, `no_such_snapshot`, `job_stopping`, `nothing_stored`,
+  `stored_moments`,
   `budget_wait`, `busy`, `mcp_write_cap`, `walked_elsewhere`), with the
   tools that do it instead,
   and a push-back the call met itself, whose cooldown the failure does not
@@ -665,16 +677,27 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   leaves a sitting ten pages cannot fill), which its description says and
   `mcp::longest_call` counts.
   `openWorldHint` is per tool (`tools::Spec::open_world`): false for the
-  tools whose every plan spends nothing (`snob_status` and the three job
-  tools).
+  tools whose every plan spends nothing (`snob_status`, the three job
+  tools, `snob_snapshots`, `snob_changes`, `snob_accounts` and
+  `snob_logout`).
 - **Posts are read inline, and handed back without a media address**
   (`answer::without_media_addresses`: every `http` address not on
-  instagram.com becomes null, wherever it is), since no tool downloads and
-  a signed address is hundreds of bytes of query string. `snob_posts`
+  instagram.com becomes null, wherever it is): an address is a download
+  under another name, which is the server's to make and bound (below), and
+  a signed one is hundreds of bytes of query string. `snob_posts`
   reads at most three pages of a grid (`tools::MOST_GRID_PAGES`), its
   posts paged out of the document (`tools::Page::rows`), and a later page
   only from what the server holds (`held_only`: nothing of a grid is
-  stored). `snob_post` and `snob_post_likers` take a link and hand the
+  stored). **A post is told from every other by its `pk` and its `code`,
+  which are one number and never change**, so a reader that comes back
+  names the newest posts it has (`until`, at most `tools::MOST_UNTIL`,
+  each as its code, part of the command) and the grid is read no further
+  than the first page that holds one (`posts::reached`, which a pinned
+  post never satisfies: those come first however old); the answer says
+  how many pages were asked for (`pages_read`) and whether it got there
+  (`until.reached`). `brief` hands back only what tells posts apart
+  (`answer::BRIEF`): how the answer is shaped, so no part of the command
+  or of what the read is held under. `snob_post` and `snob_post_likers` take a link and hand the
   child the post's address alone (`tools::link`), never the share token;
   the likers ask, as a walk does, with a question of our words and the
   code, are checked first with `likers --check-ahead` (`busy`, the

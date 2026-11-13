@@ -6623,6 +6623,77 @@ async fn an_agent_signs_an_account_out_only_after_a_yes_that_names_it() {
     assert!(other.session_file().exists());
 }
 
+/// An agent that has a list walked on two days is told what moved between
+/// the two captures, and which captures there are, for no request at all.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn an_agent_is_told_what_changed_between_two_walks_for_no_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first = fake_instagram(3, 2).await;
+    log_in(tmp.path(), &first);
+    let out = snob(tmp.path(), Some(&first), &["followers", "--format", "json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    a_day_passes(tmp.path());
+    // A day later user2 is gone and user0 goes by another name.
+    let second = fake_instagram(2, 2).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/friendships/\d+/followers/$"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"users":[{"pk":1000,"username":"renamed0"},{"pk":1001,"username":"user1"}]}"#,
+        ))
+        .with_priority(1)
+        .mount(&second)
+        .await;
+    let out = snob(
+        tmp.path(),
+        Some(&second),
+        &["followers", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let sent = second.received_requests().await.unwrap_or_default().len();
+
+    let mut client = McpClient::start(tmp.path(), &second, &[]).await;
+    let captures = client
+        .call("snob_snapshots", serde_json::json!({ "list": "followers" }))
+        .await;
+    assert_eq!(captures["isError"], false, "{captures}");
+    let listed = &captures["structuredContent"]["items"];
+    assert_eq!(listed.as_array().map(Vec::len), Some(2), "{captures}");
+    assert_eq!(listed[0]["accounts"], 2, "newest first: {captures}");
+    let (newer, older) = (listed[0]["id"].clone(), listed[1]["id"].clone());
+
+    for asked in [
+        serde_json::json!({ "list": "followers" }),
+        serde_json::json!({ "from": older, "to": newer }),
+    ] {
+        let changes = client.call("snob_changes", asked.clone()).await;
+        assert_eq!(changes["isError"], false, "{asked}: {changes}");
+        let list = &changes["structuredContent"]["lists"][0];
+        assert_eq!(list["list"], "followers", "{changes}");
+        assert_eq!(list["lost"][0]["username"], "user2", "{changes}");
+        assert_eq!(list["renamed"][0]["from"], "user0", "{changes}");
+        assert_eq!(list["renamed"][0]["to"], "renamed0", "{changes}");
+    }
+
+    // A capture that is none is said so, with the tool that lists them.
+    let none = client
+        .call("snob_changes", serde_json::json!({ "from": 9999 }))
+        .await;
+    assert_eq!(none["isError"], true, "{none}");
+    let error = &none["structuredContent"]["error"];
+    assert_eq!(error["code"], "no_such_snapshot", "{none}");
+    assert!(
+        error["hint"].as_str().unwrap().contains("snob_snapshots"),
+        "{none}"
+    );
+
+    assert_eq!(
+        second.received_requests().await.unwrap_or_default().len(),
+        sent,
+        "none of it sent anything"
+    );
+}
+
 /// The image blocks of a tool result, each as its kind and its bytes.
 #[cfg(feature = "mcp")]
 fn images(result: &serde_json::Value) -> Vec<(String, Vec<u8>)> {

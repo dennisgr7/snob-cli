@@ -364,9 +364,10 @@ macro_rules! mcp_after_help {
         "Started by the agent's client, not typed: \"snob mcp config <client>\" \
                       prints what to add to its configuration. Each tool call runs one snob \
                       command, so the budget, the cooldown and consent hold exactly as they do \
-                      in a terminal. It offers the status, the lists, profiles, posts, \
-                      stories and highlights, with a small picture of each for an agent \
-                      that asks to look; \
+                      in a terminal. It offers the status, the lists, what changed \
+                      between two stored captures of one, profiles, posts, stories and \
+                      highlights, with a small picture of each for an agent that asks to \
+                      look; \
                       with --allow-writes, follow and unfollow too; with --downloads-dir, \
                       saving a post's photos and videos into that directory, under names \
                       snob gives them. Each write, and walking \

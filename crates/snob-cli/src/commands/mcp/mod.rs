@@ -513,7 +513,9 @@ impl ServerHandler for Server {
                  answers with status running and a job_id. Ask snob_job how it is going, \
                  and for its result once it has ended, rather than starting the walk again; \
                  snob_jobs lists the jobs and snob_job_cancel stops one, keeping what it \
-                 read. One job runs at a time for the account. A client that supports MCP \
+                 read. One job runs at a time for the account. Every walk that completes \
+                 is kept as a capture: to follow a list over days, walk it each day and \
+                 ask snob_changes what moved between two captures, which sends nothing. A client that supports MCP \
                  Tasks is answered with a task for such a walk instead, whose id is the \
                  job's: poll it with tasks/get at the interval it gives. \
                  Signing in is the person's: they run \"snob login\" in their own terminal. \

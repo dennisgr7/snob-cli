@@ -3219,6 +3219,7 @@ async fn an_agent_keeps_an_accounts_new_posts_and_reads_less_the_next_day() {
         "one page, not the three it may read"
     );
     let day_two = requests_so_far(&instagram).await - before;
+    eprintln!("listing the grid cost {day_one} requests the first day and {day_two} the second");
     assert!(
         day_two < day_one,
         "the second day cost {day_two} requests and the first {day_one}"

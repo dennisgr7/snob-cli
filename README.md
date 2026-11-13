@@ -159,7 +159,8 @@ can read:
 - `snob mcp` is an MCP server for AI agents, on standard input and output:
   the status, the lists, profiles, posts, stories and highlights (without
   their picture and video addresses; an agent that asks is handed a small
-  picture of each to look at, a video's cover for a video), with
+  picture of each to look at, a video's cover for a video), the captures
+  earlier walks stored and what changed between two of them, with
   `--allow-writes` follow and unfollow, and with
   `--downloads-dir <dir>` saving a post's photos and videos into that
   directory: the agent names the post, never a path, the files get the
