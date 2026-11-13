@@ -13,7 +13,10 @@
 //! runs when the number is opened, a followers or following walk is an
 //! inline y/n question naming the size, and on somebody else's account that
 //! question is the consent question, carried into the engine as
-//! `ListQuery.yes` with the answer recorded on the [`App`].
+//! `ListQuery.yes` with the answer recorded on the [`App`]. The posts tile
+//! asks nothing, being no list of people: it reads what `snob posts` opens
+//! with, the profile and the first page of the grid, under a box that says
+//! so.
 //!
 //! **Never call `ui::stories::browse` or `ui::highlights::browse` from
 //! here.** Each makes a [`Tui`] of its own — a second claim on the one
@@ -21,7 +24,8 @@
 //! same `story_scratch()` path, which deletes the live session's files. The
 //! shared internals (`walk_in`, `keep_folder`, `open`, `keep`) are the
 //! supported way in. `ui::people` is entered only through its `browse_in`,
-//! which borrows this card's guard and its scratch directory instead of
+//! and `ui::posts` through its `browse_grid_in`, never `browse_grid`. Both
+//! borrow this card's guard and its scratch directory instead of
 //! building either: the card a list opens for one of its accounts ([`peek`])
 //! opens that account's picture and stories into the same directory.
 //!
@@ -61,6 +65,7 @@ use crate::commands::profile::{Highlight, Profile, Visibility, badges};
 use crate::engine;
 use crate::exit::ExitCode;
 use crate::media::Story;
+use crate::posts::Fetched;
 use crate::report;
 use crate::ui::accounts::{self, Browsed, Picked};
 use crate::ui::browser::busy::Busy;
@@ -485,16 +490,65 @@ pub async fn browse(
                                 }
                             }
                             CardRow::Counts => match state.counts_col {
-                                // The grid is a view of its own, with a
-                                // `Tui` of its own, which a card must not
-                                // open over itself (AGENTS.md, "Terminal
-                                // UI"): the command that opens it, without
-                                // an at sign, as every command handed over.
+                                // The grid, as `snob posts` opens it: the
+                                // profile and the grid's first page, under a
+                                // box and with no question, since it is no
+                                // list of people. A count of zero is an
+                                // answer the card already has.
+                                0 if profile.posts == Some(0) => {
+                                    note = "No posts".to_string();
+                                }
                                 0 => {
-                                    note = format!(
-                                        "Posts open with \"snob posts {}\"",
-                                        snob_core::model::printable(&profile.username)
-                                    )
+                                    let busy = Busy::begin(
+                                        &mut tui,
+                                        "Reading the posts...",
+                                        level_frame!(),
+                                    )?;
+                                    let (read, stopped) = busy
+                                        .run(
+                                            &mut tui,
+                                            app.client().pacer().cancel_token(),
+                                            crate::posts::fetch_grid(
+                                                app.client(),
+                                                &profile.username,
+                                                viewer.pk,
+                                                Some(profile.pk),
+                                                1,
+                                                0,
+                                            ),
+                                        )
+                                        .await;
+                                    if let Some(code) = stopped.leave() {
+                                        break Ok(code);
+                                    }
+                                    match read {
+                                        Err(e) => note = format!("Could not read the posts: {e}"),
+                                        Ok(Fetched::Hidden { .. }) => {
+                                            note = "The posts are for followers only".to_string();
+                                        }
+                                        Ok(Fetched::Grid(grid)) if grid.posts.is_empty() => {
+                                            note = "No posts".to_string();
+                                        }
+                                        Ok(Fetched::Grid(grid)) => {
+                                            // On the heap, as the card a list
+                                            // opens is (`people::run`).
+                                            let left = Box::pin(crate::ui::posts::browse_grid_in(
+                                                &mut tui,
+                                                &scratch,
+                                                app.client(),
+                                                grid,
+                                                &viewer,
+                                                &mut receipts,
+                                            ))
+                                            .await?;
+                                            if let Some(code) = left {
+                                                break Ok(code);
+                                            }
+                                            // The grid's frame is what the
+                                            // terminal believes is on screen.
+                                            tui.terminal.clear()?;
+                                        }
+                                    }
                                 }
                                 col => {
                                     let kind = if col == 1 {

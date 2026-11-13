@@ -1008,7 +1008,8 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   `ui::stories::browse` or `ui::highlights::browse` (a second `Tui` and a
   second scratch directory on the same path); for the same reason a view
   entered from another is lent its guard and its scratch directory
-  (`ui::people::browse_in`, `ui::profile::peek`). A frame leaves in one write,
+  (`ui::people::browse_in`, `ui::profile::peek`, `ui::posts::browse_grid_in`).
+  A frame leaves in one write,
   inside one synchronized update, and a frame with nothing changed writes
   nothing (`ui::tui::Screen`). **A fetch a key starts runs under a `Busy`**
   (`ui/browser/busy.rs`): the view stays up under a box that names what is
