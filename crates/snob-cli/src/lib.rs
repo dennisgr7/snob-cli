@@ -21,6 +21,7 @@ pub mod engine;
 /// The path to this binary a printed configuration names.
 pub(crate) mod exe;
 pub mod exit;
+pub mod ffmpeg;
 pub mod headless;
 pub(crate) mod interrupt;
 /// A list walk that outlives the call that started it, and `snob jobs`.

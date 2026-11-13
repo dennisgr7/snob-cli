@@ -186,6 +186,11 @@ depends = "$auto"
 # would pull a browser onto a server whose owner chose that. Debian's and
 # Ubuntu's Chromium names first, then the vendors' own repositories.
 recommends = "chromium | chromium-browser | google-chrome-stable | microsoft-edge-stable | brave-browser"
+# Suggested, not recommended: apt installs Recommends by default, and ffmpeg
+# is a large tree for one thing it does here, joining a post's best video
+# and its sound (`snob_cli::ffmpeg`); without it a video is saved as the
+# app's 720-wide file, and snob says how to get it.
+suggests = "ffmpeg"
 # **This paragraph makes a claim three other places make**: `packaging/render.sh`
 # renders it into the winget manifest, `crates/snob-ig/src/lib.rs` states the
 # rule for a reader of the code, and `README.md` says it in prose. There is no

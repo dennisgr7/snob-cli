@@ -136,6 +136,23 @@ pub struct PostItem {
     pub alt: Option<String>,
     /// A video's length in seconds.
     pub duration: Option<f64>,
+    /// A video's widest rendition and its sound, when wider than `url`'s
+    /// file: what a download saves when ffmpeg is installed.
+    pub best: Option<BestTracks>,
+}
+
+/// A video's widest rendition, a video track and a sound track apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BestTracks {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// The video track's codec, `vp09...` as a rule.
+    pub codec: Option<String>,
+    /// Both tracks' size, as stated before any byte is fetched.
+    pub bytes: Option<u64>,
+    pub video_url: String,
+    /// `null` for a video with no sound.
+    pub audio_url: Option<String>,
 }
 
 /// One comment, with the replies shown under it.

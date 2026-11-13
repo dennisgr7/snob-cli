@@ -386,7 +386,13 @@ impl Session<'_> {
                             ),
                         )
                         .await;
-                        self.note = tui::saved_note(result, &mut self.receipts);
+                        let said = result.as_ref().ok().and_then(|kept| kept.said.clone());
+                        self.note =
+                            tui::saved_note(result.map(|kept| kept.path), &mut self.receipts);
+                        if let Some(said) = said {
+                            self.note = format!("{}; {said}", self.note);
+                            self.receipts.push(said);
+                        }
                         if let Some(code) = stopped.leave() {
                             return Ok(Some(code));
                         }

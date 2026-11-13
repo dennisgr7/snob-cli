@@ -110,6 +110,23 @@ impl IgClient {
         self.cdn()?.download_to(url, cap, sink).await
     }
 
+    /// A track of a video's DASH manifest (`model::dash`), written to `sink`:
+    /// always by the `CdnClient`, never by the tab. **A track is a video
+    /// whatever its address ends in**, and the tab lets a video no further
+    /// than it lets a play (`headless::guard`); today's tracks end in `.mp4`
+    /// (1,612 of 1,612 addresses of the capture of 2026-11-13), which
+    /// [`Self::download_to`] would route the same way, but by its name alone.
+    /// Held to the same rule as every download before anything is asked.
+    pub async fn download_track_to(
+        &self,
+        url: &str,
+        cap: usize,
+        sink: &mut (impl std::io::Write + Send),
+    ) -> Result<Downloaded, IgError> {
+        super::cdn::check_downloadable(&self.base, &Url::parse(url)?)?;
+        self.cdn()?.download_to(url, cap, sink).await
+    }
+
     /// The file at `url`, fetched by the tab, when the tab is to fetch it:
     /// `None` leaves it to the `CdnClient` (no browser, a video, a file past
     /// [`PAGE_ASSET_BYTES`], or an answer the tab could not read).
@@ -470,6 +487,33 @@ mod tests {
             assert!(request.headers.get("x-ig-app-id").is_none());
             assert!(request.headers.get("x-csrftoken").is_none());
         }
+    }
+
+    /// A DASH track is never fetched by the tab, whatever its address ends
+    /// in, and costs the account nothing, as a reel's file does.
+    #[tokio::test]
+    async fn a_track_is_never_fetched_by_the_tab() {
+        let server = MockServer::start().await;
+        let body: Vec<u8> = (0..100u8).collect();
+        Mock::given(method("GET"))
+            .and(path("/track"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        // No `.mp4` at its end: a track is a video by what it is.
+        let url = format!("{}/track?efg=x", server.uri());
+        let (client, budget) = crate::client::harness::counting_client_of(&server);
+        let page = Scripted::telling(|call| panic!("the tab was asked: {:?}", call.ask));
+        let client = client.through(page.clone());
+        let mut file = Vec::new();
+        let got = client
+            .download_track_to(&url, 4096, &mut file)
+            .await
+            .unwrap();
+        assert_eq!((file.as_slice(), got.len), (body.as_slice(), 100));
+        assert!(page.asks().is_empty());
+        assert!(page.asked().is_empty());
+        assert_eq!(budget.reserved(), (0, 0), "a track was paid for");
     }
 
     /// Without a browser, a download is the other path's alone.

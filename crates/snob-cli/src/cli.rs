@@ -336,6 +336,8 @@ Environment:
                     a machine with none; Instagram can tell the difference
   SNOB_NO_OWNER     run this command's browser itself instead of sharing the
                     one background process, e.g. from a systemd timer
+  SNOB_FFMPEG       the ffmpeg that joins a video saved at its best, an
+                    absolute path, in place of the one on PATH
   SNOB_CSRFTOKEN, SNOB_SIGNING_KEY
                     the two secrets a command line would otherwise carry;
                     see \"snob login --help\" and \"snob watch --help\"",
@@ -566,6 +568,7 @@ pub enum Command {
                       listing read. --pages reads more than the first page; the view reads the \
                       next one as you scroll to it. Each page is one request, and opening a post \
                       in the view is two more: the post and its comments, as the app asks them. \
+                      Videos are saved at their best when ffmpeg is installed, as \"post\" says. \
                       Listing and downloading a post does not tell the account you looked."
     )]
     Posts(PostsArgs),
@@ -577,8 +580,12 @@ pub enum Command {
                       it, or the code in it; only the code is read, and nothing else in the \
                       address is sent. Two requests read the post and its first page of \
                       comments, as the app opens one, from the page it opens on, which is never \
-                      loaded; each further page of comments is one more. Videos are saved as the app plays them, 720 pixels wide at \
-                      most. Listing and downloading a post does not tell the account you looked."
+                      loaded; each further page of comments is one more. A video is saved at \
+                      its best, usually 1080 wide, when ffmpeg is installed, which joins its \
+                      picture and its sound into one MP4 without re-encoding (VP9, which \
+                      QuickTime does not play); without it, or with --quality compat, as the \
+                      app's 720-wide MP4. Listing and downloading a post does not tell the \
+                      account you looked."
     )]
     Post(PostArgs),
 
@@ -2199,6 +2206,9 @@ pub struct PostsArgs {
 
     #[command(flatten)]
     pub list: MediaListArgs,
+
+    #[command(flatten)]
+    pub video: VideoArgs,
 }
 
 #[derive(Args, Debug)]
@@ -2212,6 +2222,32 @@ pub struct PostArgs {
 
     #[command(flatten)]
     pub list: MediaListArgs,
+
+    #[command(flatten)]
+    pub video: VideoArgs,
+}
+
+/// How a post's videos are saved.
+#[derive(Args, Debug, Default)]
+pub struct VideoArgs {
+    /// best: the widest video Instagram has, usually 1080, joined with its
+    /// sound by ffmpeg, which must be installed. compat: the app's 720-wide
+    /// MP4, which plays anywhere. Unset: best when ffmpeg is found, compat
+    /// otherwise
+    #[arg(long, value_enum, value_name = "QUALITY")]
+    pub quality: Option<Quality>,
+
+    /// The ffmpeg to join a video's tracks with, an absolute path, in place
+    /// of SNOB_FFMPEG and the one on PATH
+    #[arg(long, value_name = "PATH")]
+    pub ffmpeg: Option<std::path::PathBuf>,
+}
+
+/// What a video is saved as ([`VideoArgs::quality`]).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quality {
+    Best,
+    Compat,
 }
 
 #[derive(Args, Debug)]

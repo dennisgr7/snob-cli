@@ -7,6 +7,7 @@
 use serde::Deserialize;
 use snob_core::{Epoch, Pk};
 
+pub mod dash;
 pub mod post;
 pub mod web;
 

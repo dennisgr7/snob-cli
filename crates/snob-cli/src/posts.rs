@@ -33,12 +33,17 @@ use snob_core::Epoch;
 use snob_core::model::post::{self as document, AccountRef, Place};
 use snob_core::model::printable;
 use snob_ig::client::IgClient;
+use snob_ig::model::dash;
 use snob_ig::model::post::{Comment, CommentsPage, LikedBy, Media, Named as NamedAccount};
 use snob_ig::pace::{PAGES_PER_SITTING, Pace};
 use snob_ig::shortcode::{self, MediaPk, Opens, Shortcode};
 
+use crate::cli::Quality;
 use crate::exit::{ExitCode, ExitError};
-use crate::media::{Kind, Named, Saved, download_named, save_named};
+use crate::ffmpeg::{self, Ffmpeg};
+use crate::media::{
+    Best, Kind, Named, Saved, download_named, save_file, save_file_saying, save_file_to, save_named,
+};
 use crate::output;
 use crate::ui;
 
@@ -107,6 +112,9 @@ pub struct Item {
     pub alt: Option<String>,
     /// A video's length in seconds.
     pub duration: Option<f64>,
+    /// A video's widest track and its sound, when they are wider than
+    /// [`Self::url`]'s file.
+    pub best: Option<Best>,
 }
 
 /// One post or reel, reduced to what a listing, a view and a download need.
@@ -205,6 +213,7 @@ impl Post {
                         .map(printable)
                         .filter(|alt| !alt.trim().is_empty()),
                     duration: seconds(item.video_duration),
+                    best: best_of(item, width),
                 }
             })
             .collect();
@@ -357,7 +366,85 @@ impl Post {
             url: self.items[index].url.clone(),
             what: format!("item {}", index + 1),
             cap: MAX_POST_BYTES,
+            best: self.items[index].best.clone(),
+            ffmpeg: None,
         }
+    }
+}
+
+/// `item`'s best tracks, read from its DASH manifest, when its widest video
+/// is wider than its progressive file (`width`), as it is on 165 of 180
+/// post videos of the capture of 2026-11-13.
+fn best_of(item: &Media, width: Option<u32>) -> Option<Best> {
+    let tracks = dash::tracks(item.video_dash_manifest.as_deref()?)?;
+    let wider = tracks.video.width.unwrap_or(0) > width.unwrap_or(0);
+    wider.then_some(Best {
+        video: tracks.video,
+        audio: tracks.audio,
+    })
+}
+
+/// What a run saves a post's videos as ([`crate::cli::Quality`]).
+#[derive(Debug, Clone)]
+pub enum Videos {
+    /// The progressive file; `say_how` when it is so because no ffmpeg was
+    /// found, which a run that would have saved better says once.
+    Compat { say_how: bool },
+    /// The best tracks, joined by this ffmpeg.
+    Best(std::sync::Arc<Ffmpeg>),
+}
+
+impl Videos {
+    /// What `asked` and `named` (`--ffmpeg`) make of this run: best when
+    /// ffmpeg is found and nothing else was asked, and `--quality best`
+    /// with no ffmpeg refused before anything is asked of Instagram.
+    pub fn resolve(asked: Option<Quality>, named: Option<&Path>) -> Result<Self> {
+        let found = Ffmpeg::find(named).map(std::sync::Arc::new);
+        match (asked, found) {
+            (Some(Quality::Compat), _) => Ok(Self::Compat { say_how: false }),
+            (_, Some(ffmpeg)) => Ok(Self::Best(ffmpeg)),
+            (None, None) => Ok(Self::Compat { say_how: true }),
+            (Some(Quality::Best), None) => Err(ExitError::new(
+                ExitCode::Error,
+                "--quality best joins a video's tracks with ffmpeg, and none was found",
+            )
+            .with_hint(format!(
+                "install it ({}), or name it with --ffmpeg or {}",
+                ffmpeg::how_to_install(),
+                ffmpeg::ENV
+            ))
+            .into()),
+        }
+    }
+
+    /// What the full-screen view keeps a video as: the run's default, which
+    /// never fails.
+    pub fn for_the_view() -> Self {
+        Self::resolve(None, None).unwrap_or(Self::Compat { say_how: false })
+    }
+
+    /// `files` made ready to save as this says: each video's best tracks
+    /// kept, with the ffmpeg that joins them, or dropped. Without ffmpeg, a
+    /// run that would have saved a better video says once how to get it.
+    pub(crate) fn prepare(&self, files: Vec<Named>) -> Vec<Named> {
+        if matches!(self, Self::Compat { say_how: true }) && files.iter().any(|f| f.best.is_some())
+        {
+            ui::info(&format!(
+                "Videos are saved as the app's 720-wide file: with ffmpeg installed ({}), \
+                 snob saves them at their best, joined into one MP4",
+                ffmpeg::how_to_install()
+            ));
+        }
+        files
+            .into_iter()
+            .map(|file| match self {
+                Self::Best(ffmpeg) => Named {
+                    ffmpeg: Some(std::sync::Arc::clone(ffmpeg)),
+                    ..file
+                },
+                Self::Compat { .. } => Named { best: None, ..file },
+            })
+            .collect()
     }
 }
 
@@ -640,7 +727,9 @@ pub async fn first_comments(client: &IgClient, post: &Post) -> Result<Comments> 
     Ok(comments)
 }
 
-/// Saves item `index` (zero-based) of `post` into `dir` under its own name.
+/// Saves item `index` (zero-based) of `post` into `dir` under its own name,
+/// as its progressive file: what the view hands the system viewer, which
+/// starts at once and plays anywhere (QuickTime plays no VP9).
 pub(crate) async fn save_item(
     client: &IgClient,
     post: &Post,
@@ -657,6 +746,35 @@ pub(crate) async fn save_item(
         dir,
     )
     .await
+}
+
+/// Item `index` of `post` as the view keeps one: at its best when ffmpeg
+/// is found ([`Videos::for_the_view`]).
+fn kept_file(post: &Post, index: usize) -> Result<Named> {
+    Videos::for_the_view()
+        .prepare(vec![post.file(index)])
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("item {} is not in the post", index + 1))
+}
+
+/// Saves item `index` of `post` into `dir` as the view keeps one, with the
+/// sentence to show when it was saved as the app's smaller file after all.
+async fn keep_one(
+    client: &IgClient,
+    post: &Post,
+    index: usize,
+    dir: &Path,
+) -> Result<(Saved, Option<String>)> {
+    save_file_saying(client, &kept_file(post, index)?, dir).await
+}
+
+/// What [`keep_item`] saved: where, and the sentence to show beside it
+/// when the video was saved as the app's smaller file after all.
+#[derive(Debug)]
+pub struct Kept {
+    pub path: PathBuf,
+    pub said: Option<String>,
 }
 
 /// Downloads `files` the way `-d` does: one file and `-o` names it; several,
@@ -682,22 +800,13 @@ pub(crate) async fn download(
     if let ([file], Some(path)) = (files.as_slice(), destination)
         && !path.is_dir()
     {
-        save_to(&client, file, path).await?;
+        save_file_to(&client, file, path).await?;
         ui::info(&format!("Saved {}", path.display()));
         return Ok(ExitCode::Ok);
     }
     if files.len() == 1 && destination.is_none() {
         let file = &files[0];
-        return match save_named(
-            &client,
-            &file.stem,
-            file.url.as_deref(),
-            &file.what,
-            file.cap,
-            Path::new("."),
-        )
-        .await?
-        {
+        return match save_file(&client, file, Path::new(".")).await? {
             Saved::Now(path) => {
                 ui::info(&format!("Saved {}", path.display()));
                 Ok(ExitCode::Ok)
@@ -709,19 +818,6 @@ pub(crate) async fn download(
         };
     }
     download_named(client, files, destination, "files").await
-}
-
-/// One file into the path the user named, streamed: replaced if it is
-/// there, as `-o` always replaces, but only by a file that arrived whole
-/// (`output::Replacing`); a download that fails halfway leaves it as it was.
-async fn save_to(client: &IgClient, file: &Named, path: &Path) -> Result<()> {
-    let url = file
-        .url
-        .as_deref()
-        .ok_or_else(|| anyhow!("{} has no downloadable version", file.what))?;
-    let mut out = output::Replacing::open(path)?;
-    client.download_to(url, file.cap, out.file()).await?;
-    out.commit()
 }
 
 /// The files of every item of `posts`, in order.
@@ -757,6 +853,17 @@ pub fn post_document(post: &Post, number: Option<usize>) -> document::Post {
             pk: item.pk.clone(),
             alt: item.alt.clone(),
             duration: item.duration,
+            best: item.best.as_ref().map(|best| document::BestTracks {
+                width: best.video.width,
+                height: best.video.height,
+                codec: best.video.codecs.as_deref().map(printable),
+                bytes: best.video.bytes.map(|video| {
+                    let audio = best.audio.as_ref().and_then(|a| a.bytes).unwrap_or(0);
+                    video.saturating_add(audio)
+                }),
+                video_url: best.video.url.clone(),
+                audio_url: best.audio.as_ref().map(|a| a.url.clone()),
+            }),
         })
         .collect();
     document::Post {
@@ -854,14 +961,18 @@ pub async fn open_item(
 }
 
 /// Saves item `index` of `post` where the user works: the copy already
-/// fetched to look at, when there is one, and otherwise the CDN's.
+/// fetched to look at, when there is one and it is what would be saved, and
+/// otherwise the CDN's. A video to be saved at its best is not the copy the
+/// view opened, which is the app's file.
 pub async fn keep_item(
     client: &IgClient,
     post: &Post,
     index: usize,
     opened: &Opened,
-) -> Result<PathBuf> {
-    if let Some(seen) = opened.get(index).cloned().flatten()
+) -> Result<Kept> {
+    let at_its_best = kept_file(post, index)?.best.is_some();
+    if !at_its_best
+        && let Some(seen) = opened.get(index).cloned().flatten()
         && seen.is_file()
         && let Some(name) = seen.file_name()
     {
@@ -869,11 +980,14 @@ pub async fn keep_item(
         let mut out = output::create_new(&target)?;
         let mut from = std::fs::File::open(&seen)?;
         std::io::copy(&mut from, &mut out)?;
-        return Ok(target);
+        return Ok(Kept {
+            path: target,
+            said: None,
+        });
     }
-    match save_item(client, post, index, Path::new(".")).await? {
-        Saved::Now(path) => Ok(path),
-        Saved::Already(path) => Err(anyhow!("{} is already here", path.display())),
+    match keep_one(client, post, index, Path::new(".")).await? {
+        (Saved::Now(path), said) => Ok(Kept { path, said }),
+        (Saved::Already(path), _) => Err(anyhow!("{} is already here", path.display())),
     }
 }
 
@@ -881,17 +995,20 @@ pub async fn keep_item(
 /// sentence for the note line, and whether anything was saved.
 pub async fn keep_post(client: &IgClient, post: &Post) -> (String, bool) {
     let total = post.items.len();
-    let (mut kept, mut failed) = (0usize, 0usize);
+    let (mut kept, mut failed, mut smaller) = (0usize, 0usize, 0usize);
     for index in 0..total {
         if client.pacer().cancel_token().is_canceled() {
             return (format!("Stopped after {kept} of {total}"), kept > 0);
         }
-        match save_item(client, post, index, Path::new(".")).await {
-            Ok(_) => kept += 1,
+        match keep_one(client, post, index, Path::new(".")).await {
+            Ok((_, said)) => {
+                kept += 1;
+                smaller += usize::from(said.is_some());
+            }
             Err(_) => failed += 1,
         }
     }
-    let note = if failed == 0 {
+    let mut note = if failed == 0 {
         format!("Saved {kept} of {total} from {} here", post.code)
     } else {
         format!(
@@ -899,6 +1016,9 @@ pub async fn keep_post(client: &IgClient, post: &Post) -> (String, bool) {
             post.code
         )
     };
+    if smaller > 0 {
+        note.push_str(&format!("; {smaller} as the app's smaller file"));
+    }
     (note, kept > 0)
 }
 
@@ -1259,6 +1379,52 @@ mod tests {
             Some("Sound: Original audio")
         );
         assert_eq!(music_line(&music("song", None, Some(" "))), None);
+    }
+
+    /// A video's best tracks are read from its manifest only when wider than
+    /// its progressive file; compat drops them, best keeps them with the
+    /// ffmpeg that joins them.
+    #[test]
+    fn a_video_is_saved_at_its_best_only_when_asked_and_wider() {
+        let manifest = |width: u32| {
+            format!(
+                concat!(
+                    r#"<MPD><Representation bandwidth="1" mimeType="video/mp4" width="{w}" height="1920">"#,
+                    r#"<BaseURL>https://x.fbcdn.net/v</BaseURL></Representation>"#,
+                    r#"<Representation bandwidth="1" mimeType="audio/mp4">"#,
+                    r#"<BaseURL>https://x.fbcdn.net/a</BaseURL></Representation></MPD>"#
+                ),
+                w = width
+            )
+        };
+        let reel = |width: u32| {
+            Post::from_media(
+                &media(
+                    &serde_json::json!({
+                        "pk": "5", "media_type": 2,
+                        "video_versions": [{"url": "https://x.cdninstagram.com/r.mp4", "width": 720, "height": 1280}],
+                        "video_dash_manifest": manifest(width),
+                    })
+                    .to_string(),
+                ),
+                "x",
+            )
+        };
+        let wider = reel(1080);
+        let best = wider.items[0].best.as_ref().expect("wider than 720");
+        assert_eq!(best.video.url, "https://x.fbcdn.net/v");
+        assert_eq!(
+            best.audio.as_ref().map(|a| a.url.as_str()),
+            Some("https://x.fbcdn.net/a")
+        );
+        assert!(reel(720).items[0].best.is_none(), "not wider");
+
+        let compat = Videos::Compat { say_how: false }.prepare(vec![wider.file(0)]);
+        assert!(compat[0].best.is_none() && compat[0].ffmpeg.is_none());
+        let ffmpeg =
+            std::sync::Arc::new(Ffmpeg::find(Some(&std::env::current_exe().unwrap())).unwrap());
+        let at_best = Videos::Best(ffmpeg).prepare(vec![wider.file(0)]);
+        assert!(at_best[0].best.is_some() && at_best[0].ffmpeg.is_some());
     }
 
     #[test]

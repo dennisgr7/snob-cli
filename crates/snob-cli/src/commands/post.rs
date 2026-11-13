@@ -22,7 +22,7 @@ use snob_store::secrets::SecretStore;
 
 use crate::cli::{Format, PostArgs, StoryFormat};
 use crate::commands::common;
-use crate::commands::posts::{download_items, post_text};
+use crate::commands::posts::{download_items, post_text, videos_of};
 use crate::exit::{ExitCode, ExitError};
 use crate::media;
 use crate::output::Presentation;
@@ -41,6 +41,7 @@ pub async fn run(args: PostArgs, store: SecretStore, paths: &AccountPaths) -> Re
         )
     })?;
     args.action.refuse_stdout_download_early()?;
+    let videos = videos_of(&args.video, &args.action)?;
     let app = common::reader(&store, paths, args.action.interactive, false)?;
     let browses = args.action.browses(
         args.list.format.is_some(),
@@ -60,7 +61,7 @@ pub async fn run(args: PostArgs, store: SecretStore, paths: &AccountPaths) -> Re
     let comments = posts::first_comments(app.client(), &post).await?;
     let destination = args.action.output.as_deref();
     if let Some(selection) = args.action.selection() {
-        return download_items(&app, &post, selection, destination).await;
+        return download_items(&app, &post, selection, destination, &videos).await;
     }
     list_post(&post, Some(&comments), args.list.format, destination)
 }

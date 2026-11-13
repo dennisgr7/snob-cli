@@ -78,6 +78,9 @@ fn command_of(program: &Path, root: &Path, instagram: Option<&MockServer>) -> Co
     // A run that inherits a terminal would try to draw a progress bar and, in
     // the wizard's case, ask a question. Neither is what is under test here.
     command.env("NO_COLOR", "1");
+    // No ffmpeg unless a test names one: whether the machine running the
+    // tests has one must not change what a download saves.
+    command.env("SNOB_FFMPEG", root.join("no-ffmpeg-here"));
     for inherited in [
         "SNOB_ACCOUNT",
         "SNOB_CSRFTOKEN",
@@ -1877,6 +1880,277 @@ async fn a_link_that_names_no_post_costs_nothing() {
         .unwrap_or_default()
         .len();
     assert_eq!(before, after, "nothing was asked");
+}
+
+/// The bytes of the reel's three files: its progressive MP4, and the video
+/// and sound tracks its manifest names.
+const PROGRESSIVE: &[u8] = b"\x00\x00\x00\x18ftypisom a clip";
+const BEST_VIDEO: &[u8] = b"\x00\x00\x00\x18ftypdash the picture";
+const BEST_AUDIO: &[u8] = b"\x00\x00\x00\x18ftypdash the sound";
+
+/// A reel of `me` whose manifest holds a 1080-wide video track and a sound
+/// track, wider than its 720-wide progressive file, all three served by the
+/// fake Instagram itself; the addresses carry `&amp;`, as the app's do.
+async fn with_a_reel_at_its_best(server: &MockServer) {
+    let base = server.uri();
+    let manifest = format!(
+        concat!(
+            r#"<?xml version="1.0"?><MPD><Period><AdaptationSet contentType="video">"#,
+            r#"<Representation bandwidth="900" mimeType="video/mp4" width="720" height="1280" FBContentLength="9">"#,
+            r#"<BaseURL>{base}/low-video?a=1&amp;b=2</BaseURL></Representation>"#,
+            r#"<Representation bandwidth="3000" codecs="vp09.00.40.08" mimeType="video/mp4" width="1080" height="1920" FBContentLength="30">"#,
+            r#"<BaseURL>{base}/best-video?a=1&amp;b=2</BaseURL></Representation></AdaptationSet>"#,
+            r#"<AdaptationSet contentType="audio"><Representation bandwidth="64" mimeType="audio/mp4" FBContentLength="20">"#,
+            r#"<BaseURL>{base}/best-audio?a=1&amp;b=2</BaseURL></Representation></AdaptationSet></Period></MPD>"#
+        ),
+        base = base
+    );
+    let info = serde_json::json!({
+        "items": [{
+            "pk": POST_PK, "code": POST_CODE, "media_type": 2, "product_type": "clips",
+            "taken_at": 1_790_000_000, "user": { "username": "me" },
+            "video_versions": [{ "url": format!("{base}/clip.mp4"), "width": 720, "height": 1280 }],
+            "video_dash_manifest": manifest,
+        }],
+        "status": "ok",
+    });
+    Mock::given(method("GET"))
+        .and(url_path(format!("/api/v1/media/{POST_PK}/info/")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(info.to_string()))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(url_path(format!("/api/v1/media/{POST_PK}/comments/")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"comments":[],"comment_count":0,"has_more_comments":false,
+               "has_more_headload_comments":false,"status":"ok"}"#,
+        ))
+        .mount(server)
+        .await;
+    for (path, body) in [
+        ("/clip.mp4", PROGRESSIVE),
+        ("/best-video", BEST_VIDEO),
+        ("/best-audio", BEST_AUDIO),
+    ] {
+        Mock::given(method("GET"))
+            .and(url_path(path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(server)
+            .await;
+    }
+}
+
+/// An ffmpeg of the test's own in `dir`: one that writes its two inputs,
+/// one after the other, where its last argument says, as a join would put
+/// both into one file; or, `failing`, one that says why and exits 1.
+fn fake_ffmpeg(dir: &Path, failing: bool) -> std::path::PathBuf {
+    if cfg!(windows) {
+        let path = dir.join("ffmpeg.cmd");
+        // The output is the twentieth argument; cmd reaches past the ninth
+        // only by shifting.
+        let script = if failing {
+            "@echo off\r\necho the input is not a video 1>&2\r\nexit /b 1\r\n".to_string()
+        } else {
+            format!(
+                "@echo off\r\nsetlocal\r\nset \"V=%~7\"\r\nset \"A=%~9\"\r\n{}copy /b \"%V%\"+\"%A%\" \"%~9\" >NUL\r\n",
+                "shift\r\n".repeat(11)
+            )
+        };
+        std::fs::write(&path, script).unwrap();
+        path
+    } else {
+        let path = dir.join("ffmpeg");
+        let script = if failing {
+            "#!/bin/sh\necho the input is not a video >&2\nexit 1\n"
+        } else {
+            "#!/bin/sh\ncat \"$7\" \"$9\" > \"${20}\"\n"
+        };
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+}
+
+/// What `dir` holds whose name ends in `.part`: nothing, once a run ended.
+fn parts_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".part"))
+        .collect()
+}
+
+/// With ffmpeg, a reel is saved from its widest track and its sound, joined
+/// into one MP4 under its usual name, and no part of either is left behind.
+#[tokio::test]
+async fn a_reel_is_saved_from_its_best_tracks_as_one_mp4() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_reel_at_its_best(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = here(&tmp);
+    let ffmpeg = fake_ffmpeg(tmp.path(), false);
+
+    let out = command(tmp.path(), Some(&instagram))
+        .args(["reel", POST_CODE, "-d", "1"])
+        .env("SNOB_FFMPEG", &ffmpeg)
+        .current_dir(&here)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let saved = std::fs::read(here.join(format!("me-{POST_CODE}.mp4"))).expect("the reel, here");
+    assert_eq!(saved, [BEST_VIDEO, BEST_AUDIO].concat());
+    assert!(parts_in(&here).is_empty(), "{:?}", parts_in(&here));
+    let fetched: Vec<String> = instagram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .filter(|p| p.contains("video") || p.contains("audio") || p.ends_with(".mp4"))
+        .collect();
+    assert_eq!(fetched, ["/best-video", "/best-audio"], "{fetched:?}");
+    // The JSON says what the best tracks are, beside the file it lists.
+    let listed = command(tmp.path(), Some(&instagram))
+        .args(["reel", POST_CODE, "--format", "json"])
+        .output()
+        .unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let best = &listed["post"]["items"][0]["best"];
+    assert_eq!(best["width"], 1080, "{listed}");
+    assert_eq!(best["bytes"], 50);
+    assert!(
+        best["video_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/best-video?a=1&b=2"),
+        "{best}"
+    );
+}
+
+/// Without ffmpeg, the reel is saved as the app's 720-wide file, and the run
+/// says once how to save it at its best.
+#[tokio::test]
+async fn without_ffmpeg_the_progressive_file_is_saved_and_the_hint_said_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_reel_at_its_best(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = here(&tmp);
+
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["reel", POST_CODE, "-d", "1"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let saved = std::fs::read(here.join(format!("me-{POST_CODE}.mp4"))).unwrap();
+    assert_eq!(saved, PROGRESSIVE);
+    assert_eq!(
+        stderr(&out).matches("ffmpeg installed").count(),
+        1,
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// `--quality best` with no ffmpeg is refused before Instagram is asked
+/// anything; `--quality compat` asks for no ffmpeg and says nothing of it.
+#[tokio::test]
+async fn quality_best_without_ffmpeg_fails_before_any_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_reel_at_its_best(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = here(&tmp);
+
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["reel", POST_CODE, "-d", "1", "--quality", "best"],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("ffmpeg"), "{}", stderr(&out));
+    assert!(asked_about_the_post(&instagram).await.is_empty());
+
+    let out = snob_from(
+        &here,
+        tmp.path(),
+        &instagram,
+        &["reel", POST_CODE, "-d", "1", "--quality", "compat"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("ffmpeg"), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read(here.join(format!("me-{POST_CODE}.mp4"))).unwrap(),
+        PROGRESSIVE
+    );
+}
+
+/// One file to standard output is the progressive one even with ffmpeg,
+/// since a join cannot be streamed; asked for at its best there, it is
+/// refused before anything is asked.
+#[tokio::test]
+async fn standard_output_gets_the_progressive_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_reel_at_its_best(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let ffmpeg = fake_ffmpeg(tmp.path(), false);
+
+    let out = command(tmp.path(), Some(&instagram))
+        .args(["reel", POST_CODE, "-d", "1", "-o", "-"])
+        .env("SNOB_FFMPEG", &ffmpeg)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, PROGRESSIVE);
+
+    let refused = command(tmp.path(), Some(&instagram))
+        .args(["reel", POST_CODE, "-d", "1", "-o", "-", "--quality", "best"])
+        .env("SNOB_FFMPEG", &ffmpeg)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(refused.stdout.is_empty());
+}
+
+/// A join that fails leaves no part of it, and the reel is saved as the
+/// app's file, which the run says.
+#[tokio::test]
+async fn a_join_that_fails_leaves_no_part_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_reel_at_its_best(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let here = here(&tmp);
+    let ffmpeg = fake_ffmpeg(tmp.path(), true);
+
+    let out = command(tmp.path(), Some(&instagram))
+        .args(["reel", POST_CODE, "-d", "1"])
+        .env("SNOB_FFMPEG", &ffmpeg)
+        .current_dir(&here)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(
+        std::fs::read(here.join(format!("me-{POST_CODE}.mp4"))).unwrap(),
+        PROGRESSIVE
+    );
+    assert!(stderr(&out).contains("smaller file"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("the input is not a video"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(parts_in(&here).is_empty(), "{:?}", parts_in(&here));
 }
 
 /// The binary, run from a directory of the test's choosing -- which is where a

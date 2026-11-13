@@ -10,9 +10,11 @@ use snob_core::Epoch;
 use snob_core::model::printable;
 use snob_ig::client::IgClient;
 use snob_ig::error::IgError;
+use snob_ig::model::dash::Track;
 
 use crate::cli::{DownloadSelection, Format};
 use crate::exit::{ExitCode, ExitError};
+use crate::ffmpeg::Ffmpeg;
 use crate::output::{self, Presentation, Rendered};
 use crate::report;
 use crate::ui;
@@ -479,6 +481,8 @@ pub(crate) async fn download_many(
             url: items[number - 1].url.clone(),
             what: format!("story {number}"),
             cap: MAX_STORY_BYTES,
+            best: None,
+            ffmpeg: None,
         })
         .collect();
     download_named(client, files, destination, "stories").await
@@ -486,7 +490,9 @@ pub(crate) async fn download_many(
 
 /// One file of a [`download_named`]: the number it is reported under, the
 /// name it is saved as (filtered, without its extension), where it is, what
-/// a sentence calls it, and the ceiling on its size.
+/// a sentence calls it, and the ceiling on its size; and for a post's video,
+/// its best tracks and the ffmpeg that joins them, when it is to be saved
+/// from those ([`save_file`]).
 #[derive(Debug, Clone)]
 pub(crate) struct Named {
     pub number: usize,
@@ -494,6 +500,203 @@ pub(crate) struct Named {
     pub url: Option<String>,
     pub what: String,
     pub cap: usize,
+    pub best: Option<Best>,
+    pub ffmpeg: Option<std::sync::Arc<Ffmpeg>>,
+}
+
+/// A video's widest track and its sound, from its DASH manifest, when they
+/// are wider than its progressive file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Best {
+    pub video: Track,
+    pub audio: Option<Track>,
+}
+
+/// The ceiling on a video saved from its best tracks, the two together. The
+/// largest best track of the capture of 2026-11-13 was 210.6 MB, past
+/// [`crate::posts::MAX_POST_BYTES`]; both stream to disk, so the ceiling is
+/// only there so that something endless cannot fill it. A pair past it is
+/// saved from the progressive file, said before a byte is fetched.
+pub const MAX_BEST_BYTES: u64 = 512 * 1024 * 1024;
+
+impl Best {
+    /// What the two tracks say they weigh, together.
+    fn bytes(&self) -> u64 {
+        let video = self.video.bytes.unwrap_or(0);
+        let audio = self.audio.as_ref().and_then(|a| a.bytes).unwrap_or(0);
+        video.saturating_add(audio)
+    }
+}
+
+/// `file` saved into `dir`: from its best tracks, joined by ffmpeg, when it
+/// has them and an ffmpeg to join them; from its progressive file otherwise,
+/// and when the join fails, which is said on standard error. Ctrl+C stops
+/// either.
+pub(crate) async fn save_file(client: &IgClient, file: &Named, dir: &Path) -> Result<Saved> {
+    let (saved, said) = save_file_saying(client, file, dir).await?;
+    if let Some(said) = said {
+        ui::warn(&said);
+    }
+    Ok(saved)
+}
+
+/// [`save_file`], with what it would have said handed back rather than
+/// written: a full-screen view draws on standard error, where a line written
+/// in the middle of a frame breaks it, and shows the sentence in its own
+/// note line instead.
+pub(crate) async fn save_file_saying(
+    client: &IgClient,
+    file: &Named,
+    dir: &Path,
+) -> Result<(Saved, Option<String>)> {
+    let (best, mut said) = joinable(file);
+    if let Some(best) = best {
+        if let Some(existing) = already_saved(dir, &file.stem) {
+            return Ok((Saved::Already(existing), None));
+        }
+        sweep_stale_parts(dir, &file.stem);
+        match joined(client, &file.stem, best, file.ffmpeg.as_deref(), dir).await {
+            Ok(part) => return Ok((place(&part, dir, &file.stem)?, None)),
+            Err(e) if was_canceled(&e) => return Err(e),
+            Err(e) => said = Some(smaller(file, &format!("{e:#}"))),
+        }
+    }
+    let saved = save_named(
+        client,
+        &file.stem,
+        file.url.as_deref(),
+        &file.what,
+        file.cap,
+        dir,
+    )
+    .await?;
+    Ok((saved, said))
+}
+
+/// [`save_file`] into `path`, replacing it as `-o` does, but only with a
+/// file that arrived whole.
+pub(crate) async fn save_file_to(client: &IgClient, file: &Named, path: &Path) -> Result<()> {
+    let (best, said) = joinable(file);
+    if let Some(said) = said {
+        ui::warn(&said);
+    }
+    if let Some(best) = best {
+        let dir = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        match joined(client, &file.stem, best, file.ffmpeg.as_deref(), dir).await {
+            Ok(part) => {
+                return std::fs::rename(&part, path).map_err(|e| {
+                    let _ = std::fs::remove_file(&part);
+                    anyhow::Error::new(e).context(format!("could not replace {}", path.display()))
+                });
+            }
+            Err(e) if was_canceled(&e) => return Err(e),
+            Err(e) => ui::warn(&smaller(file, &format!("{e:#}"))),
+        }
+    }
+    let url = file
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow!("{} has no downloadable version", file.what))?;
+    let mut out = output::Replacing::open(path)?;
+    client.download_to(url, file.cap, out.file()).await?;
+    out.commit()
+}
+
+/// The sentence for a video saved as the app's file because `why`.
+fn smaller(file: &Named, why: &str) -> String {
+    format!("{} is saved as the app's smaller file: {why}", file.what)
+}
+
+/// `file`'s best tracks, when they are to be what is saved: there are some,
+/// the sound can be joined (or there is none to join), and they weigh no
+/// more than [`MAX_BEST_BYTES`]; with the sentence that says so when they
+/// do not, for the caller to say where it can.
+fn joinable(file: &Named) -> (Option<&Best>, Option<String>) {
+    let Some(best) = file.best.as_ref() else {
+        return (None, None);
+    };
+    if best.audio.is_some() && file.ffmpeg.is_none() {
+        return (None, None);
+    }
+    if best.bytes() > MAX_BEST_BYTES {
+        let why = format!(
+            "its best tracks weigh {} MB, past {} MB",
+            best.bytes() / 1_000_000,
+            MAX_BEST_BYTES / 1_000_000
+        );
+        return (None, Some(smaller(file, &why)));
+    }
+    (Some(best), None)
+}
+
+/// The best tracks of `stem` fetched into `dir` and joined into one MP4,
+/// answered as the finished `.part` the caller moves into place. Every part
+/// is the process's own (its id in the name) and removed on any failure.
+async fn joined(
+    client: &IgClient,
+    stem: &str,
+    best: &Best,
+    ffmpeg: Option<&Ffmpeg>,
+    dir: &Path,
+) -> Result<PathBuf> {
+    let pid = std::process::id();
+    let video = dir.join(format!("{stem}.{pid}.v.part"));
+    let audio = dir.join(format!("{stem}.{pid}.a.part"));
+    let out = dir.join(format!("{stem}.{pid}.part"));
+    let cap = usize::try_from(MAX_BEST_BYTES).unwrap_or(usize::MAX);
+    let result = async {
+        fetch_track(client, &best.video.url, cap, &video).await?;
+        let (Some(track), Some(ffmpeg)) = (best.audio.as_ref(), ffmpeg) else {
+            // A video with no sound is its video track alone.
+            std::fs::rename(&video, &out)
+                .with_context(|| format!("could not move {}", video.display()))?;
+            return Ok(());
+        };
+        fetch_track(client, &track.url, cap, &audio).await?;
+        ffmpeg
+            .join(&video, &audio, &out, client.pacer().cancel_token())
+            .await
+    }
+    .await;
+    let _ = std::fs::remove_file(&video);
+    let _ = std::fs::remove_file(&audio);
+    match result {
+        Ok(()) => Ok(out),
+        Err(e) => {
+            let _ = std::fs::remove_file(&out);
+            Err(e)
+        }
+    }
+}
+
+/// One track from `url` into `part`, a file this creates, synced.
+async fn fetch_track(client: &IgClient, url: &str, cap: usize, part: &Path) -> Result<()> {
+    let mut file = output::create_new(part)?;
+    client.download_track_to(url, cap, &mut file).await?;
+    file.sync_all()
+        .with_context(|| format!("could not finish writing {}", part.display()))
+}
+
+/// `part` moved into `dir` as `<stem>.mp4`.
+fn place(part: &Path, dir: &Path, stem: &str) -> Result<Saved> {
+    let name = match output::default_path(dir, stem, "mp4") {
+        Ok(name) => name,
+        Err(e) => {
+            let _ = std::fs::remove_file(part);
+            return Err(e);
+        }
+    };
+    let path = dir.join(name);
+    if let Err(e) = std::fs::rename(part, &path) {
+        let _ = std::fs::remove_file(part);
+        return Err(
+            anyhow::Error::new(e).context(format!("could not move into place {}", path.display()))
+        );
+    }
+    Ok(Saved::Now(path))
 }
 
 /// [`download_many`] for any set of files of the CDN, each under the name it
@@ -533,15 +736,7 @@ pub(crate) async fn download_named(
             // so the only way this fails is the runtime shutting down, and
             // then there is nobody to report to.
             let _slot = slots.acquire_owned().await.ok()?;
-            let saved = save_named(
-                &client,
-                &file.stem,
-                file.url.as_deref(),
-                &file.what,
-                file.cap,
-                &dir,
-            )
-            .await;
+            let saved = save_file(&client, &file, &dir).await;
             Some((file.number, saved))
         });
     }
@@ -643,6 +838,56 @@ pub(crate) fn default_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn track(url: &str, bytes: Option<u64>) -> Track {
+        Track {
+            url: url.into(),
+            width: Some(1080),
+            height: Some(1920),
+            bandwidth: None,
+            codecs: None,
+            bytes,
+        }
+    }
+
+    fn file(best: Option<Best>, ffmpeg: bool) -> Named {
+        Named {
+            number: 1,
+            stem: "a-b".into(),
+            url: Some("https://x.cdninstagram.com/p.mp4".into()),
+            what: "item 1".into(),
+            cap: 1,
+            best,
+            ffmpeg: ffmpeg.then(|| {
+                std::sync::Arc::new(Ffmpeg::find(Some(&std::env::current_exe().unwrap())).unwrap())
+            }),
+        }
+    }
+
+    /// Best tracks are what is saved only when their sound can be joined
+    /// (or there is none) and they weigh no more than the ceiling, which is
+    /// known before a byte is fetched.
+    #[test]
+    fn a_track_past_the_ceiling_falls_back_before_a_byte_is_fetched() {
+        let pair = |video: u64, audio: u64| Best {
+            video: track("https://x.fbcdn.net/v", Some(video)),
+            audio: Some(track("https://x.fbcdn.net/a", Some(audio))),
+        };
+        assert!(joinable(&file(Some(pair(30, 20)), true)).0.is_some());
+        let heavy = file(Some(pair(MAX_BEST_BYTES, 1)), true);
+        let (best, said) = joinable(&heavy);
+        assert!(best.is_none());
+        assert!(said.is_some_and(|s| s.contains("past 536 MB")), "said why");
+        // A sound with nothing to join it.
+        assert!(joinable(&file(Some(pair(30, 20)), false)).0.is_none());
+        // No sound needs no ffmpeg.
+        let silent = Best {
+            video: track("https://x.fbcdn.net/v", None),
+            audio: None,
+        };
+        assert!(joinable(&file(Some(silent), false)).0.is_some());
+        assert_eq!(joinable(&file(None, true)), (None, None));
+    }
 
     #[test]
     fn the_extension_comes_from_the_bytes() {

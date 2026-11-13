@@ -24,17 +24,21 @@ use snob_core::model::printable;
 use snob_store::paths::AccountPaths;
 use snob_store::secrets::SecretStore;
 
-use crate::cli::{DownloadSelection, Format, PostsArgs, StoryFormat};
+use crate::cli::{
+    DownloadSelection, Format, MediaActionArgs, PostsArgs, Quality, StoryFormat, VideoArgs,
+};
 use crate::commands::common;
 use crate::exit::ExitCode;
 use crate::media::{self, empty_document};
+use crate::output;
 use crate::output::Presentation;
-use crate::posts::{self, Fetched, Grid, Post, fetch_grid, files_of, post_json};
+use crate::posts::{self, Fetched, Grid, Post, Videos, fetch_grid, files_of, post_json};
 use crate::report;
 use crate::ui;
 
 pub async fn run(args: PostsArgs, store: SecretStore, paths: &AccountPaths) -> Result<ExitCode> {
     args.action.refuse_stdout_download_early()?;
+    let videos = videos_of(&args.video, &args.action)?;
     let app = common::reader(&store, paths, args.action.interactive, false)?;
     let typed = common::target_or_own(&app, args.target.as_deref()).await?;
     let known = crate::engine::target::known_pk_of(&app, args.target.as_deref(), &typed)?;
@@ -113,13 +117,16 @@ pub async fn run(args: PostsArgs, store: SecretStore, paths: &AccountPaths) -> R
             let numbers =
                 media::numbers_of(selection, grid.posts.len(), |n| no_such_post(&grid, n))?;
             let chosen: Vec<&Post> = numbers.iter().map(|n| &grid.posts[n - 1]).collect();
-            posts::download(app.client_shared(), files_of(&chosen), destination).await
+            let files = videos.prepare(files_of(&chosen));
+            posts::download(app.client_shared(), files, destination).await
         }
         (None, None) => list_grid(&grid, args.list.format, destination),
         (Some(number), selection) => {
             let post = &grid.posts[number as usize - 1];
             match selection {
-                Some(selection) => download_items(&app, post, selection, destination).await,
+                Some(selection) => {
+                    download_items(&app, post, selection, destination, &videos).await
+                }
                 None => list_items(
                     &grid.username,
                     number as usize,
@@ -138,10 +145,30 @@ pub(crate) async fn download_items(
     post: &Post,
     selection: DownloadSelection,
     destination: Option<&Path>,
+    videos: &Videos,
 ) -> Result<ExitCode> {
     let numbers = media::numbers_of(selection, post.items.len(), |n| no_such_item(post, n))?;
-    let files = numbers.iter().map(|n| post.file(n - 1)).collect();
+    let files = videos.prepare(numbers.iter().map(|n| post.file(n - 1)).collect());
     posts::download(app.client_shared(), files, destination).await
+}
+
+/// What `-d` saves a video as, decided before anything is asked of
+/// Instagram, so a `--quality best` with no ffmpeg costs nothing. One file
+/// to standard output is the progressive one: a join cannot be streamed.
+pub(crate) fn videos_of(video: &VideoArgs, action: &MediaActionArgs) -> Result<Videos> {
+    if action.selection().is_none() {
+        return Ok(Videos::Compat { say_how: false });
+    }
+    if action.output.as_deref().is_some_and(output::is_stdout) {
+        if video.quality == Some(Quality::Best) {
+            anyhow::bail!(
+                "-o - streams one file as it arrives, and a video at its best is two \
+                 joined once both are whole; save it to a file, or leave out --quality best"
+            );
+        }
+        return Ok(Videos::Compat { say_how: false });
+    }
+    Videos::resolve(video.quality, video.ffmpeg.as_deref())
 }
 
 /// The sentence for a post number the grid does not hold.

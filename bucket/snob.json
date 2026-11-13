@@ -16,6 +16,9 @@
         }
     },
     "bin": "snob.exe",
+    "suggest": {
+        "ffmpeg": "ffmpeg"
+    },
     "notes": [
         "snob keeps a session, a database and browser profiles outside this",
         "directory, which uninstalling cannot reach. Run \"snob purge\" before",

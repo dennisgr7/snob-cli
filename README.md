@@ -123,7 +123,15 @@ can read:
   24 hours. When the latest of them are slow, snob waits longer between pages
   (at least twice their median, at most a minute); it never goes faster.
 - `-o -` is standard output: a list as with no `-o`, and a single downloaded
-  file, as in `snob reel <link> -d 1 -o - | ffmpeg -i - ...`.
+  file, as in `snob reel <link> -d 1 -o - | ffmpeg -i - ...`, which is the
+  app's 720-wide MP4.
+- A post's or a reel's video is saved at its best, usually 1080 wide, when
+  [ffmpeg](https://ffmpeg.org/) is installed (`winget install Gyan.FFmpeg`,
+  `scoop install ffmpeg`, `brew install ffmpeg`, or your package manager):
+  snob joins its picture and its sound into one MP4 without re-encoding. The
+  picture is VP9, which QuickTime does not play; `--quality compat` saves the
+  app's 720-wide MP4, as snob does when ffmpeg is not there. `--ffmpeg <path>`
+  or `SNOB_FFMPEG` names another ffmpeg.
 - `--no-interactive` always prints. Down a pipe this is the default, and the
   default format is JSON.
 - `-y` answers the one confirmation a command may ask, in advance.

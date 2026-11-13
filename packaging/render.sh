@@ -93,6 +93,9 @@ class Snob < Formula
       snob keeps a session, a database and browser profiles outside this
       prefix, which uninstalling cannot reach. Run "snob purge" before
       removing it to take those off the machine too.
+
+      With ffmpeg installed ("brew install ffmpeg"), a post's video is saved
+      at its best, usually 1080 wide, rather than the app's 720-wide file.
     CAVEATS
   end
 
@@ -126,6 +129,9 @@ cat > bucket/snob.json <<EOF
         }
     },
     "bin": "snob.exe",
+    "suggest": {
+        "ffmpeg": "ffmpeg"
+    },
     "notes": [
         "snob keeps a session, a database and browser profiles outside this",
         "directory, which uninstalling cannot reach. Run \\"snob purge\\" before",
