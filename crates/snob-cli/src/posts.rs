@@ -28,8 +28,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
-use serde_json::{Value, json};
+use serde_json::Value;
 use snob_core::Epoch;
+use snob_core::model::post as document;
 use snob_core::model::printable;
 use snob_ig::client::IgClient;
 use snob_ig::model::post::{Comment, CommentsPage, LikedBy, Media};
@@ -606,57 +607,67 @@ pub(crate) fn files_of(posts: &[&Post]) -> Vec<Named> {
     files
 }
 
-/// A post as JSON: everything a listing shows, its items with their
-/// addresses, and its number in the listing when it has one.
-pub fn post_json(post: &Post, number: Option<usize>) -> Value {
-    let items: Vec<Value> = post
+/// `post` as the JSON contract has it ([`document::Post`]): everything a
+/// listing shows, its items with their addresses, and its number in the
+/// listing when it has one.
+pub fn post_document(post: &Post, number: Option<usize>) -> document::Post {
+    let items = post
         .items
         .iter()
         .enumerate()
-        .map(|(i, item)| {
-            json!({
-                "number": i + 1,
-                "kind": item.kind.label(),
-                "width": item.width,
-                "height": item.height,
-                "url": item.url,
-            })
+        .map(|(i, item)| document::PostItem {
+            number: i + 1,
+            kind: item.kind.label().to_string(),
+            width: item.width,
+            height: item.height,
+            url: item.url.clone(),
         })
         .collect();
-    let mut value = json!({
-        "pk": post.pk.to_string(),
-        "code": post.code,
-        "url": post.link(),
-        "owner": post.owner,
-        "kind": post.kind.word(),
-        "taken_at": post.taken_at.get(),
-        "caption": post.caption.join("\n"),
-        "location": post.location,
-        "likes": (!post.likes_hidden).then_some(post.likes).flatten(),
-        "liked_by": post.liked_by.as_ref().map(|l| json!({ "name": l.name, "others": l.others })),
-        "comments": post.comments,
-        "plays": post.plays,
-        "tagged": post.tagged,
-        "mentions": post.mentions,
-        "with": post.with,
-        "items": items,
-    });
-    if let Some(number) = number {
-        value["number"] = json!(number);
+    document::Post {
+        pk: post.pk.to_string(),
+        code: post.code.clone(),
+        url: post.link(),
+        owner: post.owner.clone(),
+        kind: post.kind.word().to_string(),
+        taken_at: post.taken_at.get(),
+        caption: post.caption.join("\n"),
+        location: post.location.clone(),
+        likes: (!post.likes_hidden).then_some(post.likes).flatten(),
+        liked_by: post.liked_by.as_ref().map(|l| document::LikedBy {
+            name: l.name.clone(),
+            others: l.others,
+        }),
+        comments: post.comments,
+        plays: post.plays,
+        tagged: post.tagged.clone(),
+        mentions: post.mentions.clone(),
+        with: post.with.clone(),
+        items,
+        number,
     }
-    value
 }
 
-/// A comment as JSON, its shown replies under it.
+/// `comment` as the JSON contract has it, its shown replies under it.
+pub fn comment_document(comment: &CommentLine) -> document::PostComment {
+    document::PostComment {
+        author: comment.author.clone(),
+        text: comment.text.clone(),
+        created_at: comment.at.get(),
+        likes: comment.likes,
+        replies: comment.replies_count,
+        shown_replies: comment.replies.iter().map(comment_document).collect(),
+    }
+}
+
+/// A post as JSON ([`post_document`]), for the listings that put rows
+/// together as values. A document of these types always serializes.
+pub fn post_json(post: &Post, number: Option<usize>) -> Value {
+    serde_json::to_value(post_document(post, number)).unwrap_or_default()
+}
+
+/// A comment as JSON ([`comment_document`]).
 pub fn comment_json(comment: &CommentLine) -> Value {
-    json!({
-        "author": comment.author,
-        "text": comment.text,
-        "created_at": comment.at.get(),
-        "likes": comment.likes,
-        "replies": comment.replies_count,
-        "shown_replies": comment.replies.iter().map(comment_json).collect::<Vec<_>>(),
-    })
+    serde_json::to_value(comment_document(comment)).unwrap_or_default()
 }
 
 /// Where a post shown by a view was saved into the scratch directory to be
@@ -820,6 +831,98 @@ mod tests {
         );
         assert_eq!(named.liked_line().as_deref(), Some("Liked by a and others"));
         assert_eq!(post_json(&post, None)["likes"], Value::Null);
+    }
+
+    /// The four shapes a post's JSON takes, made of invented accounts: a
+    /// photo with a place and a liker, a carousel with a video, a reel with
+    /// plays and hidden counts, and a post with no caption and no counts.
+    fn golden_posts() -> [(Post, Option<usize>); 4] {
+        let photo = Post::from_media(
+            &media(
+                r#"{"pk":"3995556159532654737","code":"DdzEShhEWCR","media_type":1,"taken_at":1790000000,
+                "caption":{"text":"a line\nwith @friend"},"like_count":80,"comment_count":4,
+                "top_likers":["close"],"location":{"name":"Somewhere"},
+                "user":{"username":"owner.one"},
+                "usertags":{"in":[{"user":{"username":"tagged.one"}}]},
+                "coauthor_producers":[{"username":"with.one"}],
+                "original_width":1080,"original_height":1350,
+                "image_versions2":{"candidates":[{"url":"https://x.cdninstagram.com/a.jpg","width":1080,"height":1350}]}}"#,
+            ),
+            "",
+        );
+        let carousel = Post::from_media(
+            &media(
+                r#"{"pk":"2","media_type":8,"taken_at":1790000001,"like_count":5,
+                "carousel_media":[
+                  {"pk":"21","media_type":1,"original_width":1080,"original_height":1080,
+                   "image_versions2":{"candidates":[{"url":"https://x.cdninstagram.com/c.jpg","width":1080,"height":1080}]}},
+                  {"pk":"22","media_type":2,"video_versions":[{"url":"https://x.cdninstagram.com/d.mp4","width":720,"height":1280}]}
+                ]}"#,
+            ),
+            "owner.two",
+        );
+        let reel = Post::from_media(
+            &media(
+                r#"{"pk":"3","product_type":"clips","media_type":2,"taken_at":1790000002,"like_count":3,
+                "like_and_view_counts_disabled":true,"play_count":1234,"comment_count":0,
+                "top_likers":["close"],
+                "video_versions":[{"url":"https://x.cdninstagram.com/r.mp4","width":720,"height":1280}]}"#,
+            ),
+            "owner.three",
+        );
+        let bare = Post::from_media(&media(r#"{"pk":"4"}"#), "owner.four");
+        [
+            (photo, Some(1)),
+            (carousel, Some(2)),
+            (reel, None),
+            (bare, None),
+        ]
+    }
+
+    /// The keys a post's JSON has always had, byte for byte: the contract
+    /// of `snob posts` and `snob post`, which a move to typed documents must
+    /// not change. Taken from the output of 2026-11-13, before that move.
+    #[test]
+    fn a_post_serializes_to_the_keys_it_always_had() {
+        let golden = [
+            r#"{"caption":"a line\nwith @friend","code":"DdzEShhEWCR","comments":4,"items":[{"height":1350,"kind":"photo","number":1,"url":"https://x.cdninstagram.com/a.jpg","width":1080}],"kind":"photo","liked_by":{"name":"close","others":79},"likes":80,"location":"Somewhere","mentions":["friend"],"number":1,"owner":"owner.one","pk":"3995556159532654737","plays":null,"tagged":["tagged.one"],"taken_at":1790000000,"url":"https://www.instagram.com/p/DdzEShhEWCR/","with":["with.one"]}"#,
+            r#"{"caption":"","code":"AAAAAAAAAAC","comments":null,"items":[{"height":1080,"kind":"photo","number":1,"url":"https://x.cdninstagram.com/c.jpg","width":1080},{"height":1280,"kind":"video","number":2,"url":"https://x.cdninstagram.com/d.mp4","width":720}],"kind":"carousel","liked_by":null,"likes":5,"location":null,"mentions":[],"number":2,"owner":"owner.two","pk":"2","plays":null,"tagged":[],"taken_at":1790000001,"url":"https://www.instagram.com/p/AAAAAAAAAAC/","with":[]}"#,
+            r#"{"caption":"","code":"AAAAAAAAAAD","comments":0,"items":[{"height":1280,"kind":"video","number":1,"url":"https://x.cdninstagram.com/r.mp4","width":720}],"kind":"reel","liked_by":{"name":"close","others":null},"likes":null,"location":null,"mentions":[],"owner":"owner.three","pk":"3","plays":1234,"tagged":[],"taken_at":1790000002,"url":"https://www.instagram.com/reel/AAAAAAAAAAD/","with":[]}"#,
+            r#"{"caption":"","code":"AAAAAAAAAAE","comments":null,"items":[{"height":null,"kind":"photo","number":1,"url":null,"width":null}],"kind":"photo","liked_by":null,"likes":null,"location":null,"mentions":[],"owner":"owner.four","pk":"4","plays":null,"tagged":[],"taken_at":0,"url":"https://www.instagram.com/p/AAAAAAAAAAE/","with":[]}"#,
+        ];
+        for ((post, number), golden) in golden_posts().into_iter().zip(golden) {
+            let printed = serde_json::to_string(&post_json(&post, number)).unwrap();
+            assert_eq!(printed, golden);
+        }
+    }
+
+    /// A comment's keys, byte for byte, its shown replies under it.
+    #[test]
+    fn a_comment_serializes_to_the_keys_it_always_had() {
+        let reply = CommentLine {
+            author: "replier".into(),
+            text: "a reply".into(),
+            at: Epoch::new(1_790_000_010),
+            likes: 0,
+            replies_count: 0,
+            replies: Vec::new(),
+        };
+        let comment = CommentLine {
+            author: "commenter".into(),
+            text: "a comment".into(),
+            at: Epoch::new(1_790_000_005),
+            likes: 7,
+            replies_count: 3,
+            replies: vec![reply],
+        };
+        assert_eq!(
+            serde_json::to_string(&comment_json(&comment)).unwrap(),
+            concat!(
+                r#"{"author":"commenter","created_at":1790000005,"likes":7,"replies":3,"#,
+                r#""shown_replies":[{"author":"replier","created_at":1790000010,"likes":0,"#,
+                r#""replies":0,"shown_replies":[],"text":"a reply"}],"text":"a comment"}"#
+            )
+        );
     }
 
     #[test]

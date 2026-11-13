@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::Pk;
 
+pub mod post;
+
 /// An Instagram account as we store it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct User {
