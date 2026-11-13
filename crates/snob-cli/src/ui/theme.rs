@@ -12,8 +12,8 @@
 //! the prompt, the word a title is about, a link, the keys in the help.
 //!
 //! **`SNOB_THEME=brand` draws the accent in the site's own pink**,
-//! `#f472b6`, and only on a terminal whose `COLORTERM` says it shows 24-bit
-//! color. An option and not the default, because it is one fixed color for a
+//! `#f472b6`, and only on a terminal that says it shows 24-bit color
+//! ([`truecolor`]). An option and not the default, because it is one fixed color for a
 //! background it knows nothing about: it is the site's accent on its dark
 //! page, above 6:1 there, and on a light terminal it is hard to read. The
 //! four states stay the terminal's own whatever the theme.
@@ -54,15 +54,39 @@ enum Palette {
 /// The site's accent on its dark page (`--accent`, `web/DESIGN.md`).
 const BRAND_ACCENT: (u8, u8, u8) = (0xf4, 0x72, 0xb6);
 
-/// The palette `SNOB_THEME` and `COLORTERM` ask for. `brand` is honored only
-/// where the terminal says it shows 24-bit color: a terminal that does not
-/// would draw an escape sequence it half understands, or the nearest of 256
-/// colors, which is nobody's accent.
-fn palette_of(theme: Option<&str>, colorterm: Option<&str>) -> Palette {
-    let brand = theme.is_some_and(|theme| theme.eq_ignore_ascii_case("brand"));
-    let truecolor = colorterm.is_some_and(|said| {
+/// Whether the environment says the terminal shows 24-bit color.
+///
+/// `COLORTERM` set to `truecolor` or `24bit` is how a terminal says so, and
+/// most do. **Windows Terminal does not set it**, and has shown 24-bit color
+/// since its first release; it is known by `WT_SESSION`, which is how
+/// `ui/notify.rs` knows it too, and how termenv decides the same question
+/// (muesli/termenv#141). Inside tmux or screen that variable is the outer
+/// terminal's and says nothing of what the multiplexer passes on, so there
+/// `COLORTERM` alone decides.
+///
+/// `var` is `std::env::var` outside the tests.
+fn says_truecolor(var: impl Fn(&str) -> Option<String>) -> bool {
+    if var("COLORTERM").is_some_and(|said| {
         said.eq_ignore_ascii_case("truecolor") || said.eq_ignore_ascii_case("24bit")
-    });
+    }) {
+        return true;
+    }
+    let multiplexed = var("TMUX").is_some() || var("STY").is_some();
+    !multiplexed && var("WT_SESSION").is_some()
+}
+
+/// Whether this run's terminal says it shows 24-bit color, read once.
+pub fn truecolor() -> bool {
+    static SAYS: OnceLock<bool> = OnceLock::new();
+    *SAYS.get_or_init(|| says_truecolor(|name| std::env::var(name).ok()))
+}
+
+/// The palette `SNOB_THEME` asks for. `brand` is honored only where the
+/// terminal says it shows 24-bit color: a terminal that does not would draw
+/// an escape sequence it half understands, or the nearest of 256 colors,
+/// which is nobody's accent.
+fn palette_of(theme: Option<&str>, truecolor: bool) -> Palette {
+    let brand = theme.is_some_and(|theme| theme.eq_ignore_ascii_case("brand"));
     if brand && truecolor {
         Palette::Brand
     } else {
@@ -73,12 +97,7 @@ fn palette_of(theme: Option<&str>, colorterm: Option<&str>) -> Palette {
 /// The palette of this run, read from the environment once.
 fn palette() -> Palette {
     static PALETTE: OnceLock<Palette> = OnceLock::new();
-    *PALETTE.get_or_init(|| {
-        palette_of(
-            std::env::var("SNOB_THEME").ok().as_deref(),
-            std::env::var("COLORTERM").ok().as_deref(),
-        )
-    })
+    *PALETTE.get_or_init(|| palette_of(std::env::var("SNOB_THEME").ok().as_deref(), truecolor()))
 }
 
 impl Role {
@@ -177,13 +196,41 @@ mod tests {
     /// terminal's magenta.
     #[test]
     fn the_brand_accent_needs_a_terminal_that_says_truecolor() {
-        assert_eq!(palette_of(Some("brand"), Some("truecolor")), Palette::Brand);
-        assert_eq!(palette_of(Some("BRAND"), Some("24bit")), Palette::Brand);
-        assert_eq!(palette_of(Some("brand"), None), Palette::Ansi);
-        assert_eq!(palette_of(Some("brand"), Some("")), Palette::Ansi);
-        assert_eq!(palette_of(Some("brand"), Some("256color")), Palette::Ansi);
-        assert_eq!(palette_of(None, Some("truecolor")), Palette::Ansi);
-        assert_eq!(palette_of(Some("dark"), Some("truecolor")), Palette::Ansi);
+        assert_eq!(palette_of(Some("brand"), true), Palette::Brand);
+        assert_eq!(palette_of(Some("BRAND"), true), Palette::Brand);
+        assert_eq!(palette_of(Some("brand"), false), Palette::Ansi);
+        assert_eq!(palette_of(None, true), Palette::Ansi);
+        assert_eq!(palette_of(Some("dark"), true), Palette::Ansi);
+    }
+
+    /// A terminal says it shows 24-bit color with `COLORTERM`, and Windows
+    /// Terminal, which sets none, by being Windows Terminal; under tmux or
+    /// screen only `COLORTERM` is believed.
+    #[test]
+    fn a_terminal_says_truecolor_with_colorterm_or_by_being_windows_terminal() {
+        let says = |set: &[(&str, &str)]| {
+            says_truecolor(|name| {
+                set.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+            })
+        };
+        assert!(says(&[("COLORTERM", "truecolor")]));
+        assert!(says(&[("COLORTERM", "24BIT")]));
+        assert!(!says(&[]));
+        assert!(!says(&[("COLORTERM", "")]));
+        assert!(!says(&[("COLORTERM", "256color")]));
+        assert!(says(&[("WT_SESSION", "0a1b")]));
+        assert!(!says(&[
+            ("WT_SESSION", "0a1b"),
+            ("TMUX", "/tmp/tmux-1/default,1,0")
+        ]));
+        assert!(!says(&[("WT_SESSION", "0a1b"), ("STY", "1.pts-0.host")]));
+        assert!(says(&[
+            ("WT_SESSION", "0a1b"),
+            ("TMUX", "/tmp/tmux-1/default,1,0"),
+            ("COLORTERM", "truecolor")
+        ]));
     }
 
     /// A printed line in the brand accent carries the 24-bit sequence for

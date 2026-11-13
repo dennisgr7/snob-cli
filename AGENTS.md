@@ -1002,7 +1002,7 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   the site's terminal blocks), never as a color: each is one of the 16 ANSI
   colors, so the user's theme decides the shade, and the one exception is
   asked for, `SNOB_THEME=brand`, which draws the accent alone in the site's
-  pink where `COLORTERM` says truecolor. The selection is reverse video and
+  pink where the terminal says 24-bit color. The selection is reverse video and
   no role. Full-screen views use the alternate screen and print receipts
   after leaving it; the menu draws inline. From the profile card, never call
   `ui::stories::browse` or `ui::highlights::browse` (a second `Tui` and a

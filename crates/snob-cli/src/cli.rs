@@ -339,7 +339,7 @@ Environment:
   SNOB_FFMPEG       the ffmpeg that joins a video saved at its best, an
                     absolute path, in place of the one on PATH
   SNOB_THEME        \"brand\" draws the accent in snob's own pink rather than
-                    your terminal's magenta, where COLORTERM says truecolor
+                    your terminal's magenta, where it shows 24-bit color
   SNOB_CSRFTOKEN, SNOB_SIGNING_KEY
                     the two secrets a command line would otherwise carry;
                     see \"snob login --help\" and \"snob watch --help\"",
