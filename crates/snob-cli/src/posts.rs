@@ -33,8 +33,8 @@ use snob_core::Epoch;
 use snob_core::model::post::{self as document, AccountRef, Place};
 use snob_core::model::printable;
 use snob_ig::client::IgClient;
-use snob_ig::model::dash;
 use snob_ig::model::post::{Comment, CommentsPage, LikedBy, Media, Named as NamedAccount};
+use snob_ig::model::{PictureVersion, dash};
 use snob_ig::pace::{PAGES_PER_SITTING, Pace};
 use snob_ig::shortcode::{self, MediaPk, Opens, Shortcode};
 
@@ -115,6 +115,9 @@ pub struct Item {
     /// A video's widest track and its sound, when they are wider than
     /// [`Self::url`]'s file.
     pub best: Option<Best>,
+    /// A small picture of it for a view to draw: a photo's own, a video's
+    /// cover ([`thumb_of`]). Not in the JSON contract.
+    pub thumb: Option<String>,
 }
 
 /// One post or reel, reduced to what a listing, a view and a download need.
@@ -214,6 +217,9 @@ impl Post {
                         .filter(|alt| !alt.trim().is_empty()),
                     duration: seconds(item.video_duration),
                     best: best_of(item, width),
+                    // A carousel the grid handed over without its items is
+                    // one item, the post itself, and so its own pictures.
+                    thumb: thumb_of(item),
                 }
             })
             .collect();
@@ -370,6 +376,25 @@ impl Post {
             ffmpeg: None,
         }
     }
+}
+
+/// The narrowest picture at least this wide is a thumbnail: wide enough for
+/// a cell of the view's grid on a large terminal, and a few tens of
+/// kilobytes where the full picture is hundreds.
+const THUMB_WIDTH: u32 = 320;
+
+/// The picture of `item` a view draws small: of its candidates (a video's
+/// are its cover), the narrowest at least [`THUMB_WIDTH`] wide, and when none
+/// is, the widest; on a tie, the one listed first.
+fn thumb_of(item: &Media) -> Option<String> {
+    let candidates = &item.image_versions2.as_ref()?.candidates;
+    let width = |v: &&PictureVersion| v.width.unwrap_or(0);
+    candidates
+        .iter()
+        .filter(|v| width(v) >= THUMB_WIDTH)
+        .min_by_key(width)
+        .or_else(|| candidates.iter().rev().max_by_key(width))
+        .map(|v| v.url.clone())
 }
 
 /// `item`'s best tracks, read from its DASH manifest, when its widest video
@@ -1044,6 +1069,107 @@ mod tests {
 
     fn media(json: &str) -> Media {
         serde_json::from_str(json).unwrap()
+    }
+
+    /// A one-item post whose pictures are `candidates`, a JSON array.
+    fn thumb_among(candidates: &str) -> Option<String> {
+        let json = format!(
+            r#"{{"pk":"9","media_type":1,"image_versions2":{{"candidates":{candidates}}}}}"#
+        );
+        Post::from_media(&media(&json), "x").items[0].thumb.clone()
+    }
+
+    #[test]
+    fn the_thumbnail_is_the_narrowest_picture_wide_enough() {
+        let picked = thumb_among(
+            r#"[{"url":"https://x.cdninstagram.com/1440.jpg","width":1440},
+                {"url":"https://x.cdninstagram.com/640.jpg","width":640},
+                {"url":"https://x.cdninstagram.com/320.jpg","width":320},
+                {"url":"https://x.cdninstagram.com/150.jpg","width":150}]"#,
+        );
+        assert_eq!(
+            picked.as_deref(),
+            Some("https://x.cdninstagram.com/320.jpg")
+        );
+    }
+
+    #[test]
+    fn with_none_wide_enough_the_thumbnail_is_the_widest() {
+        let picked = thumb_among(
+            r#"[{"url":"https://x.cdninstagram.com/150.jpg","width":150},
+                {"url":"https://x.cdninstagram.com/240.jpg","width":240}]"#,
+        );
+        assert_eq!(
+            picked.as_deref(),
+            Some("https://x.cdninstagram.com/240.jpg")
+        );
+    }
+
+    #[test]
+    fn of_two_thumbnails_alike_the_first_listed_is_taken() {
+        let wide = thumb_among(
+            r#"[{"url":"https://x.cdninstagram.com/a.jpg","width":480},
+                {"url":"https://x.cdninstagram.com/b.jpg","width":480}]"#,
+        );
+        assert_eq!(wide.as_deref(), Some("https://x.cdninstagram.com/a.jpg"));
+        let narrow = thumb_among(
+            r#"[{"url":"https://x.cdninstagram.com/c.jpg","width":200},
+                {"url":"https://x.cdninstagram.com/d.jpg","width":200}]"#,
+        );
+        assert_eq!(narrow.as_deref(), Some("https://x.cdninstagram.com/c.jpg"));
+    }
+
+    #[test]
+    fn a_carousel_handed_over_without_its_items_is_drawn_from_its_own_pictures() {
+        let post = Post::from_media(
+            &media(
+                r#"{"pk":"6","media_type":8,"carousel_media_count":3,
+                "image_versions2":{"candidates":[{"url":"https://x.cdninstagram.com/post.jpg","width":640}]}}"#,
+            ),
+            "x",
+        );
+        assert_eq!(post.items.len(), 1);
+        assert_eq!(
+            post.items[0].thumb.as_deref(),
+            Some("https://x.cdninstagram.com/post.jpg")
+        );
+    }
+
+    #[test]
+    fn a_videos_thumbnail_is_its_cover_and_each_item_has_its_own() {
+        let post = Post::from_media(
+            &media(
+                r#"{"pk":"5","media_type":8,
+                "image_versions2":{"candidates":[{"url":"https://x.cdninstagram.com/post.jpg","width":640}]},
+                "carousel_media":[
+                  {"pk":"51","media_type":1,
+                   "image_versions2":{"candidates":[{"url":"https://x.cdninstagram.com/one.jpg","width":640}]}},
+                  {"pk":"52","media_type":2,
+                   "video_versions":[{"url":"https://x.cdninstagram.com/two.mp4","width":720}],
+                   "image_versions2":{"candidates":[{"url":"https://x.cdninstagram.com/cover.jpg","width":640}]}},
+                  {"pk":"53","media_type":1}
+                ]}"#,
+            ),
+            "x",
+        );
+        let thumbs: Vec<Option<&str>> = post.items.iter().map(|i| i.thumb.as_deref()).collect();
+        assert_eq!(
+            thumbs,
+            [
+                Some("https://x.cdninstagram.com/one.jpg"),
+                Some("https://x.cdninstagram.com/cover.jpg"),
+                // Never another item's picture, the post's cover included.
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_thumbnail_stays_out_of_the_json() {
+        for (post, number) in golden_posts() {
+            let json = serde_json::to_string(&post_json(&post, number)).unwrap();
+            assert!(!json.contains("thumb"));
+        }
     }
 
     #[test]
