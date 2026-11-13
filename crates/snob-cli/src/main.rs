@@ -46,7 +46,10 @@ async fn main() -> std::process::ExitCode {
     restore_terminal_on_panic();
 
     let wording = wording_for(&cli);
-    let code = match run(cli).await {
+    // Awaited in place, the future of `run` would be part of this function's
+    // own, which a debug build copies from frame to frame on its way into
+    // the runtime (`boxed`, below, has the numbers).
+    let code = match boxed(|| run(cli)).await {
         Ok(code) => code,
         Err(e) => {
             snob_cli::report::print_error(&e, wording);
@@ -54,6 +57,42 @@ async fn main() -> std::process::ExitCode {
         }
     };
     std::process::ExitCode::from(snob_cli::exit::code(code))
+}
+
+/// Makes a future in a frame of its own and hands it back on the heap, so
+/// that whoever awaits it holds a pointer.
+///
+/// **Every future `main`, `run` and `dispatch` await is made through this,
+/// and a new command's must be.** `dispatch` awaits a different command in
+/// each arm of one `match`, and a build that does not optimize gives every
+/// one of those futures a place of its own in `dispatch`'s frame, all of
+/// them at once, whichever arm runs. That frame was about 290 KiB, on a main
+/// thread Windows gives 1 MiB, and it grew with any command's future: the
+/// interactive views' waits adding 9 KiB to ten commands at once was enough
+/// for `snob status --jobs --json`, which draws nothing, to end in "thread
+/// 'main' has overflowed its stack".
+///
+/// Measured on that command with a job running, the deepest found, in a
+/// debug build with `testing` on Windows, November 2026. Where it starts to
+/// read the job's command line back (`jobs::argv::check`) it stood 402 KiB
+/// down with only `run`'s future boxed, and stands 60 KiB down with every
+/// future made here. What it has to spare, found by eating the stack ahead
+/// of `main` until the sandbox test
+/// `a_job_polled_to_its_end_gives_the_walks_answer` overflowed: between 96
+/// and 112 KiB with nothing boxed, between 160 and 176 with `run`'s alone,
+/// between 480 and 512 now.
+///
+/// **A closure and not the future**, because an argument is made in the
+/// caller's frame before the call, wherever it ends up: `boxed(run(cli))`
+/// would leave the place for it exactly where it was. `#[inline(never)]`
+/// says the same to a build that does optimize.
+///
+/// What is left is not a frame of these three. From that point the command
+/// needs between 440 and 472 KiB more, and the first thing it does there is
+/// have clap read a command line; nothing here changes what that costs.
+#[inline(never)]
+fn boxed<F: Future>(make: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(make())
 }
 
 /// The list command and its arguments, when it was given `--background`.
@@ -334,7 +373,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // supervisor counts and does nothing more.
     match &cli.command {
         Command::Updater(snob_cli::cli::UpdaterCommand::Fetch) => {
-            snob_cli::update::fetch(&paths).await?;
+            boxed(|| snob_cli::update::fetch(&paths)).await?;
             return Ok(ExitCode::Ok);
         }
         Command::Updater(snob_cli::cli::UpdaterCommand::Apply(apply)) => {
@@ -344,7 +383,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         _ => {}
     }
     if let Command::Update(args) = cli.command {
-        return commands::update::run(args, &paths, sandboxed).await;
+        return boxed(|| commands::update::run(args, &paths, sandboxed)).await;
     }
     let role = match &cli.command {
         Command::BrowserOwner | Command::Updater(_) | Command::Update(_) => None,
@@ -431,9 +470,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                         public: args.public_url.clone(),
                         data_dir: paths.data_dir().to_path_buf(),
                     };
-                    return commands::mcp::http::serve(launch, settings, listen, &store).await;
+                    return boxed(|| commands::mcp::http::serve(launch, settings, listen, &store))
+                        .await;
                 }
-                commands::mcp::serve(launch, settings).await
+                boxed(|| commands::mcp::serve(launch, settings)).await
             }
         };
     }
@@ -443,7 +483,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         } else {
             snob_cli::owner::Linger::for_people()
         };
-        snob_cli::owner::serve(&paths, linger).await?;
+        boxed(|| snob_cli::owner::serve(&paths, linger)).await?;
         return Ok(ExitCode::Ok);
     }
     let store = SecretStore::new(paths.clone(), no_keyring);
@@ -461,7 +501,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Purge(_) | Command::Import(_) | Command::Fetch(_)
     ) && snob_store::layout::pending(&paths)
     {
-        snob_cli::owner::quit(&paths).await;
+        boxed(|| snob_cli::owner::quit(&paths)).await;
         let settled = snob_store::layout::settle(&paths, &store)?;
         if let Some(parked) = settled.parked {
             snob_cli::ui::warn(&format!(
@@ -482,7 +522,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // The jobs send nothing themselves and use no browser: a walk a job runs
     // is a process of its own, which comes through here again.
     if matches!(cli.command, Command::Job(_) | Command::Jobs(_)) {
-        return snob_cli::jobs::dispatch(&cli, &store, &paths).await;
+        return boxed(|| snob_cli::jobs::dispatch(&cli, &store, &paths)).await;
     }
 
     // Every request to Instagram goes out from a browser from here on, unless
@@ -501,10 +541,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     snob_cli::owner::attended(somebody_waits(&cli));
     // A copy for the command, which consumes its store; the write-back needs
     // the same store, on the same keyring service, once it is done.
-    let outcome = dispatch(cli, store.clone(), &paths, sandboxed).await;
+    let for_the_command = store.clone();
+    let outcome = boxed(|| dispatch(cli, for_the_command, &paths, sandboxed)).await;
     // Whatever the command came to: the browser kept the session current
     // while it ran, and the stored copy learns what it kept.
-    snob_cli::owner::finish(&store, &paths).await;
+    boxed(|| snob_cli::owner::finish(&store, &paths)).await;
     outcome
 }
 
@@ -556,7 +597,8 @@ async fn dispatch(
     // the whole command line (`jobs::argv::globals`), which the match below
     // takes apart.
     if let Some((command, args)) = in_the_background(&cli.command) {
-        return commands::background::run(&cli, command, args, &store, &required()?).await;
+        let account = required()?;
+        return boxed(|| commands::background::run(&cli, command, args, &store, &account)).await;
     }
 
     match cli.command {
@@ -577,20 +619,25 @@ async fn dispatch(
                     Err(refused) => return Err(refused.into_error()),
                 }
             };
-            commands::login::run(args, store, paths, renewing, named).await
+            boxed(|| commands::login::run(args, store, paths, renewing, named)).await
         }
-        Command::Whoami(args) => commands::whoami::run(args, store, resolved()?).await,
+        Command::Whoami(args) => {
+            let account = resolved()?;
+            boxed(|| commands::whoami::run(args, store, account)).await
+        }
         Command::Status(args) => commands::status::run(args, &store, paths, resolved()?, sandboxed),
         Command::Logout(args) => {
             let account = if args.all { None } else { resolved()? };
-            commands::logout::run(args, store, paths, account).await
+            boxed(|| commands::logout::run(args, store, paths, account)).await
         }
         Command::Purge(args) => match cli.account.as_deref() {
-            Some(name) => commands::purge::run_for_account(args, store, paths, name).await,
+            Some(name) => {
+                boxed(|| commands::purge::run_for_account(args, store, paths, name)).await
+            }
             // The whole data directory goes, the owner's log with it, so the
             // owner is asked to leave, not only to close its browsers, once
             // the jobs that would start it again have stopped.
-            None => commands::purge::run_everything(args, store, paths).await,
+            None => boxed(|| commands::purge::run_everything(args, store, paths)).await,
         },
         Command::Account(command) => commands::account::run(
             command,
@@ -600,39 +647,75 @@ async fn dispatch(
             env.as_deref(),
         ),
         Command::Followers(args) => {
-            commands::lists::run(args, store, &required()?, ListKind::Followers).await
+            let account = required()?;
+            boxed(|| commands::lists::run(args, store, &account, ListKind::Followers)).await
         }
         Command::Following(args) => {
-            commands::lists::run(args, store, &required()?, ListKind::Following).await
+            let account = required()?;
+            boxed(|| commands::lists::run(args, store, &account, ListKind::Following)).await
         }
-        Command::Profile(args) => commands::profile::run(args, store, &required()?).await,
-        Command::Scan(args) => commands::scan::run(args, store, &required()?).await,
+        Command::Profile(args) => {
+            let account = required()?;
+            boxed(|| commands::profile::run(args, store, &account)).await
+        }
+        Command::Scan(args) => {
+            let account = required()?;
+            boxed(|| commands::scan::run(args, store, &account)).await
+        }
         Command::Snapshots(args) => commands::snapshots::run(args, &required()?),
         Command::Changes(args) => commands::changes::run(args, &required()?),
         Command::Unfollowers(args) => {
-            commands::sets::run(args, store, &required()?, SetOp::Unfollowers).await
+            let account = required()?;
+            boxed(|| commands::sets::run(args, store, &account, SetOp::Unfollowers)).await
         }
-        Command::Fans(args) => commands::sets::run(args, store, &required()?, SetOp::Fans).await,
+        Command::Fans(args) => {
+            let account = required()?;
+            boxed(|| commands::sets::run(args, store, &account, SetOp::Fans)).await
+        }
         Command::Friends(args) => {
-            commands::sets::run(args, store, &required()?, SetOp::Friends).await
+            let account = required()?;
+            boxed(|| commands::sets::run(args, store, &account, SetOp::Friends)).await
         }
-        Command::Pfp(args) => commands::pfp::run(args, store, &required()?).await,
-        Command::Stories(args) => commands::stories::run(args, store, &required()?).await,
-        Command::Highlights(args) => commands::highlights::run(args, store, &required()?).await,
-        Command::Posts(args) => commands::posts::run(args, store, &required()?).await,
-        Command::Post(args) => commands::post::run(args, store, &required()?).await,
-        Command::Likers(args) => commands::likers::run(args, store, &required()?).await,
+        Command::Pfp(args) => {
+            let account = required()?;
+            boxed(|| commands::pfp::run(args, store, &account)).await
+        }
+        Command::Stories(args) => {
+            let account = required()?;
+            boxed(|| commands::stories::run(args, store, &account)).await
+        }
+        Command::Highlights(args) => {
+            let account = required()?;
+            boxed(|| commands::highlights::run(args, store, &account)).await
+        }
+        Command::Posts(args) => {
+            let account = required()?;
+            boxed(|| commands::posts::run(args, store, &account)).await
+        }
+        Command::Post(args) => {
+            let account = required()?;
+            boxed(|| commands::post::run(args, store, &account)).await
+        }
+        Command::Likers(args) => {
+            let account = required()?;
+            boxed(|| commands::likers::run(args, store, &account)).await
+        }
         Command::Follow(args) => {
             let account = required()?;
             let verb = commands::follow::Verb::Follow;
-            commands::follow::run(args, verb, session(&account), &account).await
+            let secrets = session(&account);
+            boxed(|| commands::follow::run(args, verb, secrets, &account)).await
         }
         Command::Unfollow(args) => {
             let account = required()?;
             let verb = commands::follow::Verb::Unfollow;
-            commands::follow::run(args, verb, session(&account), &account).await
+            let secrets = session(&account);
+            boxed(|| commands::follow::run(args, verb, secrets, &account)).await
         }
-        Command::Watch(args) => commands::watch::run(args, store, paths, resolved()?).await,
+        Command::Watch(args) => {
+            let account = resolved()?;
+            boxed(|| commands::watch::run(args, store, paths, account)).await
+        }
         Command::Import(command) => commands::import::run(command),
         Command::Fetch(args) => {
             // Only the User-Agent is read off the account, and only when one
@@ -653,7 +736,7 @@ async fn dispatch(
                     .flatten()
                     .map(|session| session.user_agent))
             };
-            commands::fetch::run(args, account_ua).await
+            boxed(|| commands::fetch::run(args, account_ua)).await
         }
         // Answered at the top, and in `run`.
         Command::BrowserOwner

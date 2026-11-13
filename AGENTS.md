@@ -988,6 +988,12 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   dispatcher) never panics.
 - The runtime is `tokio` multi-thread with exactly two workers (`main.rs`):
   one worker would let a blocked task starve the Ctrl+C handler.
+- **Every future `main`, `run` and `dispatch` await is made through `boxed`**
+  (`main.rs`), on the heap, and a new command's arm does the same. Awaited in
+  place, a debug build gives each command's future a place of its own in
+  `dispatch`'s frame, all at once, and on Windows the main thread has 1 MiB:
+  a command's future growing a few KiB then overflows the stack of another
+  command altogether, in the sandbox tests. The numbers are on `boxed`.
 - Terminal UI: `ratatui` for drawing, keys read through
   `ui/browser/input.rs` (crossterm, bracketed paste) and never
   `console::Term::read_key`; `ui::tui::Tui` is the one claim on the terminal
