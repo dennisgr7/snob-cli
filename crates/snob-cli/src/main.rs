@@ -142,6 +142,7 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
         Command::Post(args) => {
             document(args.list.format.map(Format::from), args.action.listing_to())
         }
+        Command::Likers(args) => document(args.output.format, args.output.path.as_deref()),
         Command::Profile(args) => matches!(
             effective_format(args.format.map(Format::from), args.output.as_deref()),
             Format::Json
@@ -620,6 +621,7 @@ async fn dispatch(
         Command::Highlights(args) => commands::highlights::run(args, store, &required()?).await,
         Command::Posts(args) => commands::posts::run(args, store, &required()?).await,
         Command::Post(args) => commands::post::run(args, store, &required()?).await,
+        Command::Likers(args) => commands::likers::run(args, store, &required()?).await,
         Command::Follow(args) => {
             let account = required()?;
             let verb = commands::follow::Verb::Follow;

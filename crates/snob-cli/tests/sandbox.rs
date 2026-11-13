@@ -1882,6 +1882,159 @@ async fn a_link_that_names_no_post_costs_nothing() {
     assert_eq!(before, after, "nothing was asked");
 }
 
+/// The likers of the post [`with_a_post`] serves: a sample of three of its
+/// twelve, the first followed by the viewer, as the answer of the capture of
+/// 2026-11-13 is shaped, with no cursor. Matched with no query at all.
+async fn with_its_likers(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(url_path(format!("/api/v1/media/{POST_PK}/likers/")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"users":[
+                {"pk":"5001","username":"close","full_name":"Close","is_private":false,
+                 "friendship_status":{"following":true,"followed_by":true}},
+                {"pk":5002,"username":"other","friendship_status":{"following":false,"followed_by":false}},
+                {"pk":"5003","username":"third\u200b"}],
+               "user_count":12,"follow_ranking_token":"x","status":"ok"}"#,
+        ))
+        .mount(server)
+        .await;
+}
+
+/// Without a terminal and without -y the likers are not read, and nothing
+/// is sent finding that out: the post included.
+#[tokio::test]
+async fn likers_without_a_terminal_or_y_exit_130_and_send_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_post(&instagram).await;
+    with_its_likers(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let before = instagram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .len();
+    let out = snob(tmp.path(), Some(&instagram), &["likers", POST_CODE]);
+    assert_eq!(out.status.code(), Some(130), "{}", stderr(&out));
+    assert!(stderr(&out).contains("Pass -y"), "{}", stderr(&out));
+    let after = instagram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .len();
+    assert_eq!(before, after, "nothing was asked");
+}
+
+/// With -y the likers are the post and then its likers, from the post's
+/// page, and nothing after them; each comes with how the viewer stands with
+/// it, the answer is said to be a sample of the count, and its accounts are
+/// charged to the day's.
+#[tokio::test]
+async fn the_likers_are_the_post_then_its_likers_and_charged_to_the_day() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    with_a_post(&instagram).await;
+    with_its_likers(&instagram).await;
+    log_in(tmp.path(), &instagram);
+    let before = instagram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .len();
+
+    let link = format!("https://www.instagram.com/p/{POST_CODE}/liked_by/?igsh=x");
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["likers", &link, "-y", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = json(&out);
+    assert_eq!(said["code"], POST_CODE);
+    assert_eq!(said["likes"], 12);
+    assert_eq!(said["shown"], 3);
+    assert_eq!(said["complete"], false);
+    let accounts = said["accounts"].as_array().unwrap();
+    assert_eq!(accounts[0]["username"], "close");
+    assert_eq!(accounts[0]["you_follow"], true);
+    assert_eq!(accounts[1]["pk"], 5002);
+    assert_eq!(accounts[1]["follows_you"], false);
+    assert_eq!(accounts[2]["username"], "third", "{said}");
+    assert_eq!(accounts[2]["you_follow"], serde_json::Value::Null);
+    assert!(
+        stderr(&out).contains("3 of the 12 accounts that liked it"),
+        "{}",
+        stderr(&out)
+    );
+
+    let sent: Vec<String> = instagram.received_requests().await.unwrap_or_default()[before..]
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            format!("/api/v1/media/{POST_PK}/info/"),
+            format!("/api/v1/media/{POST_PK}/likers/"),
+        ]
+    );
+    let asked = asked_about_the_post(&instagram).await;
+    assert!(
+        asked.iter().all(|(_, query, referer)| query.is_empty()
+            && referer.ends_with(&format!("/p/{POST_CODE}/"))),
+        "{asked:?}"
+    );
+
+    let status = snob(tmp.path(), Some(&instagram), &["status", "--json"]);
+    assert_eq!(json(&status)["budget"]["accounts_left"], 2_000 - 3);
+
+    let table = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["likers", POST_CODE, "-y", "--format", "csv"],
+    );
+    assert!(table.status.success(), "{}", stderr(&table));
+    assert!(
+        stdout(&table).starts_with("pk,username,"),
+        "{}",
+        stdout(&table)
+    );
+}
+
+/// A post whose owner hid the counts has its likers listed without a total,
+/// whatever the likers' own answer counts.
+#[tokio::test]
+async fn hidden_counts_withhold_the_likers_total() {
+    let tmp = tempfile::tempdir().unwrap();
+    let instagram = fake_instagram(3, 2).await;
+    Mock::given(method("GET"))
+        .and(url_path(format!("/api/v1/media/{POST_PK}/info/")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"items":[{{"pk":"{POST_PK}","code":"{POST_CODE}","media_type":1,
+                "user":{{"username":"me"}},"like_count":3,
+                "like_and_view_counts_disabled":true}}],"status":"ok"}}"#
+        )))
+        .with_priority(1)
+        .mount(&instagram)
+        .await;
+    with_a_post(&instagram).await;
+    with_its_likers(&instagram).await;
+    log_in(tmp.path(), &instagram);
+
+    let out = snob(
+        tmp.path(),
+        Some(&instagram),
+        &["likers", POST_CODE, "-y", "--format", "json"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = json(&out);
+    assert_eq!(said["likes"], serde_json::Value::Null, "{said}");
+    assert_eq!(said["complete"], false);
+    let line = stderr(&out);
+    assert!(line.contains("the owner hid how many there are"), "{line}");
+    assert!(!line.contains(" of the "), "{line}");
+}
+
 /// The bytes of the reel's three files: its progressive MP4, and the video
 /// and sound tracks its manifest names.
 const PROGRESSIVE: &[u8] = b"\x00\x00\x00\x18ftypisom a clip";

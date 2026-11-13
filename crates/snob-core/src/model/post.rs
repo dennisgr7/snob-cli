@@ -171,3 +171,35 @@ pub struct PostComment {
     /// The author's pk; the name is `author`.
     pub author_pk: Option<String>,
 }
+
+/// One account that liked a post, as `snob likers` hands it out: a list's
+/// account, and how the viewer stands with it when the answer said.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Liker {
+    #[serde(flatten)]
+    pub account: super::User,
+    /// Whether the viewer follows it.
+    pub you_follow: Option<bool>,
+    /// Whether it follows the viewer.
+    pub follows_you: Option<bool>,
+}
+
+/// The JSON document of `snob likers`: the post, how many liked it, and the
+/// accounts Instagram showed of them, **a sample**: the web app is shown
+/// about a hundred, the viewer's contacts first, and is never handed more.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Likers {
+    /// As its address carries it.
+    pub code: String,
+    /// The post's address.
+    pub url: String,
+    /// How many accounts liked it. `None` when the owner hid the counts,
+    /// which the answer is not taken to override.
+    pub likes: Option<u64>,
+    /// How many of them `accounts` holds.
+    pub shown: usize,
+    /// Whether `accounts` is every account that liked it: only when the
+    /// count is known and they all came.
+    pub complete: bool,
+    pub accounts: Vec<Liker>,
+}

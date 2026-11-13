@@ -85,7 +85,11 @@ use common::{relative, repo_root, source_files};
 /// whoever opens it to the account that shared it, and the share sheet's
 /// reads. Reading a post or a reel needs neither, and `snob post` drops that
 /// token from a link it is given rather than send it.
-const SEEN: [&str; 21] = [
+///
+/// The last is the query behind "Copy link" in a post's menu, recorded on
+/// 2026-11-13 beside the `permalink/` read it precedes, which `share_to_app`
+/// above already catches: the same token, asked for by its Relay name.
+const SEEN: [&str; 22] = [
     "media/seen",
     "reels/seen",
     "mark_seen",
@@ -107,6 +111,7 @@ const SEEN: [&str; 21] = [
     "useIGDMarkThreadAsReadValidationMutation",
     "share_to_app",
     "ShareSheetV3",
+    "CopyLinkShareIds",
 ];
 
 /// This file, which names all of them.
@@ -214,6 +219,7 @@ fn the_guard_sees_what_the_web_client_sends_on_its_own() {
         r#"    Self::Unlike => "26510485515280697","#,
         r#"    Self::Read => "useIGDMarkThreadAsReadMutation","#,
         r#"    Self::Checked => "useIGDMarkThreadAsReadValidationMutation","#,
+        r#"    Self::CopyLink => "usePolarisPostFastOptionCopyLinkShareIdsQuery","#,
     ] {
         assert_eq!(
             mentions_in("crates/snob-ig/src/client/write.rs", planted).len(),

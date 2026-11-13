@@ -362,6 +362,12 @@ pub enum Rest {
     /// the post; the next ones as the comments are scrolled, by the
     /// `min_id` the page before handed out.
     Comments(MediaPk),
+    /// The accounts that liked a post, by its pk: what the app asks when
+    /// "N others" under a post is clicked, with no query, from the post's
+    /// page (twice in the capture of 2026-11-13). One answer, about a
+    /// hundred accounts with no cursor, the viewer's contacts first: a
+    /// sample, never the whole list.
+    Likers(MediaPk),
 }
 
 impl Rest {
@@ -372,6 +378,7 @@ impl Rest {
             Self::MutualFollowers(pk) => format!("/api/v1/friendships/{pk}/mutual_followers/"),
             Self::MediaInfo(pk) => format!("/api/v1/media/{pk}/info/"),
             Self::Comments(pk) => format!("/api/v1/media/{pk}/comments/"),
+            Self::Likers(pk) => format!("/api/v1/media/{pk}/likers/"),
         }
     }
 
@@ -386,7 +393,7 @@ impl Rest {
             ],
             Self::Following(_) => &[("count", None), ("max_id", None)],
             Self::MutualFollowers(_) => &[("page_size", None), ("max_id", None)],
-            Self::MediaInfo(_) => &[],
+            Self::MediaInfo(_) | Self::Likers(_) => &[],
             // The first page carries the first two, the next ones the first,
             // the cursor and the order, as the app sends them.
             Self::Comments(_) => &[
@@ -831,8 +838,16 @@ fn app_read(request: &PageRequest) -> bool {
 }
 
 /// Whether `path` is one of [`Rest`]'s: a friendship list of an account,
-/// or a post or its comments, by a pk of digits. Nothing else under a post:
-/// not its likers, and not the link the app makes for sharing it.
+/// or a post, its comments or its likers, by a pk of digits. Nothing else
+/// under a post: not a thread's replies, and not the link the app makes for
+/// sharing it, which ties a visit to whoever shared it.
+///
+/// **The likers were kept out on purpose until 2026-11-13**, being a list of
+/// other people's accounts. They are read since, once that capture showed
+/// them to be a plain GET the app sends on a click, as a list is read: asked
+/// first, charged to the day's accounts, and without the `show_many` the app
+/// sends after them, since their answer already says how the viewer stands
+/// with each (`snob_cli::commands::likers`).
 fn rest_read(path: &str) -> bool {
     let digits = |pk: &str| !pk.is_empty() && pk.bytes().all(|b| b.is_ascii_digit());
     let under = |prefix: &str, ends: &[&str]| {
@@ -843,7 +858,7 @@ fn rest_read(path: &str) -> bool {
     under(
         "/api/v1/friendships/",
         &["followers/", "following/", "mutual_followers/"],
-    ) || under("/api/v1/media/", &["info/", "comments/"])
+    ) || under("/api/v1/media/", &["info/", "comments/", "likers/"])
 }
 
 /// Whether `path` is the home page or a profile's: where the tab may go.
@@ -1032,6 +1047,10 @@ mod tests {
                 Rest::Comments(MediaPk::new(3_807_824_420_233_075_826)),
                 "/api/v1/media/3807824420233075826/comments/",
             ),
+            (
+                Rest::Likers(MediaPk::new(3_807_824_420_233_075_826)),
+                "/api/v1/media/3807824420233075826/likers/",
+            ),
         ];
         for (read, path) in rest {
             assert_eq!(read.path(), path);
@@ -1150,6 +1169,7 @@ mod tests {
             "/api/v1/friendships/2345678901/mutual_followers/?page_size=12",
             "/api/v1/media/3807824420233075826/info/",
             "/api/v1/media/3807824420233075826/comments/?can_support_threading=true&permalink_enabled=false",
+            "/api/v1/media/3807824420233075826/likers/",
         ] {
             assert_eq!(
                 refused(&request(Method::Get, path, &[], None)),
@@ -1170,7 +1190,8 @@ mod tests {
             "/api/v1/friendships/2345678901/following/extra/",
             "/api/v1/friendships//followers/",
             "/api/v1/media/3807824420233075826/permalink/",
-            "/api/v1/media/3807824420233075826/likers/",
+            "/api/v1/media/3807824420233075826/likers/extra/",
+            "/api/v1/media/DTYHCKvDNxy/likers/",
             "/api/v1/media/3807824420233075826/comments/18000000000000000/child_comments/",
             "/api/v1/media/DTYHCKvDNxy/info/",
             "/api/v1/media//info/",
@@ -1325,6 +1346,7 @@ mod tests {
                     ("sort_order", "popular"),
                 ],
             ),
+            rest(Rest::Likers(MediaPk::new(3_807_824_420_233_075_826)), &[]),
             Ask::Navigation { route: "/".into() },
             Ask::Navigation {
                 route: "/someone/followers/mutualOnly".into(),
@@ -1426,6 +1448,15 @@ mod tests {
                     &[("sort_order", "newest")],
                 ),
                 "GET /api/v1/media/3807824420233075826/comments/",
+            ),
+            // Asked with no query, as the app asks it: a cursor or a count
+            // would be a second page nobody has seen the app ask for.
+            (
+                rest(
+                    Rest::Likers(MediaPk::new(3_807_824_420_233_075_826)),
+                    &[("max_id", "1")],
+                ),
+                "GET /api/v1/media/3807824420233075826/likers/",
             ),
             (
                 Ask::Navigation {

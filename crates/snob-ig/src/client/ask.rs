@@ -610,6 +610,7 @@ fn ask_name(ask: &Ask) -> &'static str {
             crate::allowlist::Rest::MutualFollowers(_) => "mutual_followers",
             crate::allowlist::Rest::MediaInfo(_) => "media_info",
             crate::allowlist::Rest::Comments(_) => "comments",
+            crate::allowlist::Rest::Likers(_) => "likers",
         },
         Ask::Navigation { .. } => "navigation",
         Ask::Statuses { .. } => "show_many",

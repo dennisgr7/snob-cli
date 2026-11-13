@@ -16,6 +16,13 @@
 //!   and the next pages by the `min_id` each page hands out. A page of
 //!   comments is a list of the accounts that wrote them, so it is charged to
 //!   the day's accounts as a list page is.
+//! - **Its likers** are `media/<pk>/likers/`, what the app asks when "N
+//!   others" under a post is clicked, from the post's page, with no query:
+//!   one answer of about a hundred accounts, a sample, charged to the day's
+//!   accounts. The app sends `friendships/show_many` with all of them after
+//!   it; snob does not, since the answer already says how the viewer stands
+//!   with each, and that call is held to fifty accounts
+//!   (`allowlist::MOST_STATUSES`).
 //!
 //! **None of it tells anybody what was looked at.** The app reports the
 //! posts and reels it shows through separate calls (view counts, the reels
@@ -25,7 +32,7 @@
 
 use crate::allowlist::{Operation, Rest};
 use crate::error::IgError;
-use crate::model::post::{CommentsPage, Media, MediaInfo, TimelinePage};
+use crate::model::post::{CommentsPage, LikersPage, Media, MediaInfo, TimelinePage};
 use crate::shortcode::MediaPk;
 use crate::web::{Ask, Told};
 
@@ -129,6 +136,30 @@ impl IgClient {
             tracing::warn!(error = %e, "could not record the accounts a page of comments carried");
         }
         Ok(comments)
+    }
+}
+
+impl IgClient {
+    /// The accounts that liked post `pk`, as many as the app is shown, asked
+    /// from `page`, the post's own (the app's referrer was `/p/<code>/` both
+    /// times in the capture of 2026-11-13). One read, and the accounts it
+    /// names charged to the day's accounts as a list page's are.
+    ///
+    /// **Only after the caller asked**: a list of other people's accounts,
+    /// which `snob_cli::commands::likers` asks about before anything is
+    /// sent.
+    pub async fn media_likers(&self, pk: MediaPk, page: &str) -> Result<LikersPage, IgError> {
+        let read = Rest::Likers(pk);
+        let likers: LikersPage = if self.has_page() {
+            self.rest_read(read, &[], page).await?
+        } else {
+            self.get(&read.path(), &[], relative(page)).await?
+        };
+        let accounts = u32::try_from(likers.users.len()).unwrap_or(u32::MAX);
+        if let Err(e) = self.pacer.spend_accounts(accounts).await {
+            tracing::warn!(error = %e, "could not record the accounts a post's likers carried");
+        }
+        Ok(likers)
     }
 }
 
@@ -249,6 +280,35 @@ mod tests {
         );
         assert!(sent.iter().all(|r| r.referrer.ends_with(page)));
         assert_eq!(budget.reserved(), (3, 0));
+    }
+
+    /// The likers are one GET with no query, from the post's own page, paid
+    /// as one read and charged to the day's accounts; nothing follows it,
+    /// the app's `show_many` included.
+    #[tokio::test]
+    async fn the_likers_are_one_get_and_no_status_call_follows() {
+        let tab = Scripted::building(|_| {
+            Ok(page_said(
+                200,
+                r#"{"users":[{"pk":"11","username":"a"},{"pk":"12","username":"b"}],"user_count":900,"status":"ok"}"#,
+            ))
+        });
+        let (client, budget) = spending_client(Arc::clone(&tab) as Arc<dyn Page>);
+        let pk = MediaPk::new(3_947_056_156_557_494_178);
+        let likers = client.media_likers(pk, "/p/DbGwql4IMei/").await.unwrap();
+        assert_eq!(likers.accounts().len(), 2);
+        let sent = tab.asked();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0]
+                .url
+                .ends_with("/api/v1/media/3947056156557494178/likers/"),
+            "{}",
+            sent[0].url
+        );
+        assert!(sent[0].referrer.ends_with("/p/DbGwql4IMei/"));
+        assert_eq!(budget.reserved(), (1, 0));
+        assert_eq!(budget.accounts_spent(), 2);
     }
 
     /// Without a browser the grid is not read, and nothing is spent finding

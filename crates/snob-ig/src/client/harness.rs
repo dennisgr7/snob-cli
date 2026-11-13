@@ -355,6 +355,8 @@ impl Page for Scripted {
 pub(crate) struct Counting {
     reads: std::sync::atomic::AtomicU32,
     writes: std::sync::atomic::AtomicU32,
+    /// The accounts charged to the day's.
+    accounts: std::sync::atomic::AtomicU32,
     cooling: std::sync::atomic::AtomicBool,
     /// What it was asked, in order: `read`, `write`, and `write wait` for
     /// a write's wait asked without spending.
@@ -371,6 +373,11 @@ impl Counting {
     pub(super) fn reserved(&self) -> (u32, u32) {
         use std::sync::atomic::Ordering::Relaxed;
         (self.reads.load(Relaxed), self.writes.load(Relaxed))
+    }
+
+    /// The accounts charged to the day's.
+    pub(super) fn accounts_spent(&self) -> u32 {
+        self.accounts.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Puts the account in a cooldown from now on.
@@ -396,6 +403,11 @@ impl RateBudget for Counting {
     fn write_wait(&self) -> Result<std::time::Duration, RateBudgetError> {
         self.order.lock().unwrap().push("write wait");
         Ok(std::time::Duration::ZERO)
+    }
+    fn spend_accounts(&self, accounts: u32) -> Result<(), RateBudgetError> {
+        self.accounts
+            .fetch_add(accounts, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
     fn cooldown(&self) -> Result<Option<EpochMs>, RateBudgetError> {
         let cooling = self.cooling.load(std::sync::atomic::Ordering::Relaxed);

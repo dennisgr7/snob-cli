@@ -557,6 +557,65 @@ impl CommentsPage {
     }
 }
 
+/// `media/<pk>/likers/`: the accounts that liked a post, as many as the app
+/// is shown (105 of 603,328 in the capture of 2026-11-13, the same 105 both
+/// times), and how many there are. **No cursor**: the app asked for no
+/// second page, so there is none to read.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LikersPage {
+    #[serde(default, deserialize_with = "nullable")]
+    pub users: Vec<Liker>,
+    #[serde(default)]
+    pub user_count: Option<u64>,
+}
+
+impl LikersPage {
+    /// The likers that name an account, each with how the viewer stands
+    /// with it when the answer said. One with no pk or no name is skipped
+    /// rather than failing the rest.
+    pub fn accounts(&self) -> Vec<(snob_core::model::User, Option<super::FriendshipStatus>)> {
+        self.users
+            .iter()
+            .filter_map(|liker| {
+                let pk = liker.pk.as_deref()?.parse().ok()?;
+                let username = liker.username.clone().filter(|name| !name.is_empty())?;
+                Some((
+                    snob_core::model::User {
+                        pk,
+                        username,
+                        full_name: liker.full_name.clone(),
+                        is_private: liker.is_private,
+                        is_verified: liker.is_verified,
+                        pfp_url: liker.profile_pic_url.clone(),
+                    },
+                    liker.friendship_status.clone(),
+                ))
+            })
+            .collect()
+    }
+}
+
+/// One account in [`LikersPage`]: what a list's account carries, and how
+/// the viewer stands with it, which is why the app's `show_many` after the
+/// list is not needed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Liker {
+    #[serde(default, deserialize_with = "flexible_id")]
+    pub pk: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub full_name: Option<String>,
+    #[serde(default)]
+    pub is_private: Option<bool>,
+    #[serde(default)]
+    pub is_verified: Option<bool>,
+    #[serde(default)]
+    pub profile_pic_url: Option<String>,
+    #[serde(default)]
+    pub friendship_status: Option<super::FriendshipStatus>,
+}
+
 /// A comment, or a reply shown under one.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Comment {
@@ -582,6 +641,36 @@ pub struct Comment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The likers are read with their standing, a pk as text or as a
+    /// number; one with no name or no pk is skipped, not the whole answer.
+    #[test]
+    fn the_likers_are_read_with_how_the_viewer_stands_with_each() {
+        let page: LikersPage = serde_json::from_str(
+            r#"{"users":[
+              {"pk":"11","username":"first","is_private":true,
+               "friendship_status":{"following":true,"followed_by":false}},
+              {"pk":12,"username":"second"},
+              {"pk":"13"},
+              {"username":"nopk"}
+            ],"user_count":603328,"status":"ok"}"#,
+        )
+        .unwrap();
+        assert_eq!(page.user_count, Some(603_328));
+        let accounts = page.accounts();
+        let names: Vec<&str> = accounts.iter().map(|(u, _)| u.username.as_str()).collect();
+        assert_eq!(names, ["first", "second"]);
+        assert_eq!(accounts[0].0.pk, snob_core::Pk::new(11));
+        assert!(
+            accounts[0]
+                .1
+                .as_ref()
+                .is_some_and(|f| f.following && !f.followed_by)
+        );
+        assert!(accounts[1].1.is_none());
+        let empty: LikersPage = serde_json::from_str(r#"{"users":null}"#).unwrap();
+        assert!(empty.accounts().is_empty());
+    }
 
     fn media(json: &str) -> Media {
         serde_json::from_str(json).unwrap()

@@ -552,6 +552,11 @@ pub const READING_SOMEBODY_ELSES_LIST: &str = "this reads a list that belongs to
      in your local database. It is also a heavier request than reading your own, \
      and Instagram is readier to refuse it";
 
+/// Said before `snob likers` asks: what it reads, and that it is a list of
+/// other people's accounts as a followers list is.
+pub const READING_A_POSTS_LIKERS: &str = "this reads the accounts that liked a post, which belong \
+     to other people, and Instagram shows about a hundred of them, the ones you know first";
+
 /// The rest of a list is more than the day's accounts can cover.
 pub fn over_the_day(needed: u64, left: u64) -> String {
     format!(

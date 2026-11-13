@@ -1722,3 +1722,44 @@ async fn a_post_opens_with_its_info_and_comments_from_its_own_page() {
     let found = world.audit(&server, &[]).await;
     assert!(found.is_empty(), "{found:?}");
 }
+
+/// A post's likers are its info and then one GET with no query from its
+/// page, and nothing after them: not the `show_many` the app sends, whose
+/// answer the likers already hold.
+#[tokio::test]
+async fn a_posts_likers_are_one_get_from_its_page_and_nothing_follows() {
+    let world = World::new();
+    let server = world.serve_web().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app_on(&server, &world, tmp.path());
+    let media = ig::post_pk(ig::SOMEONE, 0);
+    let link = snob_ig::shortcode::Shortcode::parse(&ig::code_of(media)).unwrap();
+    let since = common::requests(&server).await;
+    let post = snob_cli::posts::fetch_link(app.client(), &link)
+        .await
+        .unwrap();
+    let likers = app
+        .client()
+        .media_likers(post.pk, &post.page())
+        .await
+        .unwrap();
+    assert_eq!(likers.accounts().len(), 4);
+    assert!(likers.accounts()[0].1.as_ref().is_some_and(|f| f.following));
+    assert_eq!(
+        sent_since(&server, since).await,
+        [
+            format!("/api/v1/media/{media}/info/"),
+            format!("/api/v1/media/{media}/likers/"),
+        ]
+    );
+    let page = format!("/p/{}/", ig::code_of(media));
+    let referers: Vec<String> = server.received_requests().await.unwrap_or_default()[since..]
+        .iter()
+        .filter(|r| !ig::is_the_apps(r))
+        .map(|r| ig::header(r, "referer").unwrap_or_default().to_string())
+        .collect();
+    assert!(referers.iter().all(|r| r.ends_with(&page)), "{referers:?}");
+
+    let found = world.audit(&server, &[]).await;
+    assert!(found.is_empty(), "{found:?}");
+}

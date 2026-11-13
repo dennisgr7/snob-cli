@@ -7,6 +7,7 @@ pub mod fetch;
 pub mod follow;
 pub mod highlights;
 pub mod import;
+pub mod likers;
 pub mod lists;
 pub mod login;
 pub mod logout;

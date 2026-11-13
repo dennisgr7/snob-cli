@@ -296,7 +296,13 @@ with a documented reason in the same place.
   `watch once` has no `-y`: the monitor takes consent from its configuration.
   `stories`, `highlights` and `profile` do not ask: consent covers walking
   somebody's followers or following, and the only list `profile` reads is the
-  viewer's own following.
+  viewer's own following. `likers` asks too, for every post, the viewer's own
+  included (the question comes before the post is read, so it cannot know
+  the owner): a post's likers are other people's accounts, read with
+  `media/<pk>/likers/`, one answer of about a hundred, charged to the day's
+  accounts, and refused before the question when the day has fewer than
+  `commands::likers::LIKERS_AT_MOST` left. The app's `show_many` after it is
+  not sent.
 - **Identity is the numeric `pk`, never the username.** `snob_core::Pk` is a
   newtype with no `Deref`, no arithmetic and no `ToSql`/`FromSql`; SQLite goes
   through `snob_store::store::pk_to_sql`/`pk_from_sql`. Crossings are by pk.

@@ -600,7 +600,7 @@ impl World {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path_regex(r"^/api/v1/media/\d+/(info|comments)/$"))
+            .and(path_regex(r"^/api/v1/media/\d+/(info|comments|likers)/$"))
             .respond_with(Posts(self.clone()))
             .mount(&server)
             .await;
@@ -2098,6 +2098,38 @@ impl Respond for Posts {
                 return wrong("the info read takes no query");
             }
             return json_answer(json!({ "items": [post], "num_results": 1, "status": "ok" }));
+        }
+        // A sample of four, the viewer following the first, and the count
+        // the post has, or a real one behind hidden counts: as the answer of
+        // the capture of 2026-11-13 is shaped, with no cursor.
+        if *kind == "likers" {
+            if !query.is_empty() {
+                return wrong("the likers read takes no query");
+            }
+            let count = if post["like_and_view_counts_disabled"] == json!(true) {
+                json!(40)
+            } else {
+                post["like_count"].clone()
+            };
+            let users: Vec<Value> = (0..4u64)
+                .map(|n| {
+                    json!({
+                        "pk": (FIRST_USER + n).to_string(),
+                        "username": format!("user{n}"),
+                        "full_name": format!("User {n}"),
+                        "is_private": false,
+                        "is_verified": false,
+                        "profile_pic_url": state.media(&format!("face{n}")),
+                        "friendship_status": { "following": n == 0, "followed_by": n == 1 },
+                    })
+                })
+                .collect();
+            return json_answer(json!({
+                "users": users,
+                "user_count": count,
+                "follow_ranking_token": "invented",
+                "status": "ok",
+            }));
         }
         let keys: Vec<&str> = query.iter().map(|(k, _)| k.as_str()).collect();
         let offset = match keys.as_slice() {

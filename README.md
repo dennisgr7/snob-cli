@@ -93,6 +93,7 @@ snob highlights someone 2 -d all # save everything in its second highlight
 snob posts someone               # the posts on its grid
 snob post <link> -d all          # one post by its link, every photo and video in it
 snob reel <link> -d all          # the same for a reel
+snob likers <link>               # who liked a post, as many as Instagram shows
 snob fetch <cdn-address>         # one file by its address, no account needed
 snob follow someone
 snob unfollow someone

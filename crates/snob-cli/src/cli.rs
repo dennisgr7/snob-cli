@@ -589,6 +589,19 @@ pub enum Command {
     )]
     Post(PostArgs),
 
+    /// List the accounts that liked a post, as many as Instagram shows
+    #[command(
+        after_help = "The link is read as \"post\" reads it: only the code. Two requests, as \
+                      the app makes them when a post opens and its \"others\" under the likes \
+                      is clicked: the post, then its likers. Instagram shows about a hundred \
+                      of them, the accounts you know first, and never the whole list; the \
+                      count says how many there are, unless the owner hid it. They are other \
+                      people's accounts, so snob asks first, as it asks before reading somebody \
+                      else's followers; -y answers in advance. They count toward the accounts \
+                      a day may read."
+    )]
+    Likers(LikersArgs),
+
     /// Download a picture or a video from Instagram's CDN by its address
     #[command(
         after_help = "For an address already known, such as one a listing's JSON gives: \
@@ -2225,6 +2238,22 @@ pub struct PostArgs {
 
     #[command(flatten)]
     pub video: VideoArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct LikersArgs {
+    /// A post's or a reel's link, or the code in it
+    #[arg(value_name = "LINK")]
+    pub link: String,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+
+    #[command(flatten)]
+    pub consent: ConsentArgs,
+
+    #[command(flatten)]
+    pub agent: AgentArgs,
 }
 
 /// How a post's videos are saved.
