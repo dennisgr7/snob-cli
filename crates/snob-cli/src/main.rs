@@ -205,11 +205,13 @@ fn wording_for(cli: &Cli) -> snob_cli::report::Wording {
         },
         Command::Account(AccountCommand::Use(_))
         | Command::Login(_)
-        | Command::Logout(_)
         | Command::Purge(_)
         | Command::Pfp(_)
         | Command::Fetch(_)
         | Command::BrowserOwner => false,
+        // Read by a program only as `snob mcp` runs it (`--only`), which
+        // tells its refusal apart by the reason.
+        Command::Logout(args) => args.only.is_some(),
         Command::Update(args) => args.json,
         // Detached, with nobody reading: their errors go to the log.
         Command::Updater(_) => false,
@@ -645,6 +647,26 @@ async fn dispatch(
         Command::Status(args) => commands::status::run(args, &store, paths, resolved()?, sandboxed),
         Command::Logout(args) => {
             let account = if args.all { None } else { resolved()? };
+            // `--only` (`snob_logout`): the account this run resolved has to
+            // be the one named, or nothing is signed out. With none resolved
+            // `logout` signs every account out, and with another resolved it
+            // would sign out an account nobody was asked about.
+            if let Some(only) = &args.only {
+                let registry = Registry::load(paths)?;
+                let named = snob_cli::account::named(only, &registry)
+                    .ok()
+                    .map(|named| named.pk);
+                let acting = account.as_ref().map(AccountPaths::pk);
+                if named.is_none() || named != acting {
+                    return Err(snob_cli::exit::ExitError::new(
+                        ExitCode::Error,
+                        "This run acts as another account than the one it was asked to sign \
+                         out, or the account is not one signed in here. Nothing was signed out.",
+                    )
+                    .with_reason("not_this_account")
+                    .into());
+                }
+            }
             boxed(|| commands::logout::run(args, store, paths, account)).await
         }
         Command::Purge(args) => match cli.account.as_deref() {

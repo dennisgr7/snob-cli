@@ -1138,6 +1138,14 @@ pub struct LogoutArgs {
     /// a script written for it still runs.
     #[arg(long, hide = true)]
     pub purge_profile: bool,
+
+    // Hidden: plumbing for `snob mcp` (`snob_logout`). The run signs out the
+    // account named here and no other: it is refused, with nothing signed
+    // out, unless the account it resolved is this one. `logout` with no
+    // account resolved signs every account out, which a call that named one
+    // must never come to, whatever the registry holds by then.
+    #[arg(long, hide = true, value_name = "USER", conflicts_with = "all")]
+    pub only: Option<String>,
 }
 
 #[derive(Args, Debug)]

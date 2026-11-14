@@ -154,6 +154,9 @@ pub fn from(plan: &Plan, mut finished: Finished) -> Answer {
     if shows_media(plan) {
         finished.json = finished.json.take().map(without_media_addresses);
     }
+    if is_changes(plan) {
+        finished.json = finished.json.take().map(bounded_changes);
+    }
     let exit = finished.code;
     let offset = plan.page.as_ref().map_or(0, |page| page.offset);
     let limit = plan.page.as_ref().and_then(|page| page.limit);
@@ -558,6 +561,66 @@ fn leave_out_of_accounts(document: &mut Value) {
             }
         }
     }
+}
+
+/// Whether `plan` is `snob_changes`.
+fn is_changes(plan: &Plan) -> bool {
+    plan.args.first().map(String::as_str) == Some("changes")
+}
+
+/// What an agent is told when [`bounded_changes`] left accounts out.
+const CHANGES_CUT: &str = "More accounts changed than fit one answer: each list of accounts \
+                           is cut, and gained_count, lost_count and renamed_count say how \
+                           many there are in all. Ask for one list, or for two captures \
+                           closer together (from and to, by the ids snob_snapshots lists)";
+
+/// The document `changes` printed, as `snob_changes` hands it back: every
+/// account without the fields [`LEFT_OUT`], as a list's accounts go, and
+/// the accounts of all its lists together within [`PAGE_BYTES`].
+///
+/// **Two captures far apart differ by thousands of accounts**, each printed
+/// with its picture's signed address, and nothing pages this answer: it
+/// was megabytes of query strings in a model's context. What does not fit
+/// is left out, in the order the document has it; `gained_count`,
+/// `lost_count` and `renamed_count` are how many there are whatever was
+/// kept, and `cut` says so in a sentence. Nothing is indexed, for the
+/// reason [`from`] gives.
+fn bounded_changes(mut document: Value) -> Value {
+    let mut left = PAGE_BYTES;
+    let mut cut = false;
+    let lists = document.get_mut("lists").and_then(Value::as_array_mut);
+    for list in lists.into_iter().flatten() {
+        let Some(list) = list.as_object_mut() else {
+            continue;
+        };
+        for key in ["gained", "lost", "renamed"] {
+            let Some(rows) = list.get_mut(key).and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let total = rows.len();
+            let mut kept = 0;
+            for row in rows.iter_mut() {
+                if let Some(fields) = row.as_object_mut() {
+                    for field in LEFT_OUT {
+                        fields.remove(field);
+                    }
+                }
+                let size = row.to_string().len();
+                if size > left {
+                    break;
+                }
+                left -= size;
+                kept += 1;
+            }
+            rows.truncate(kept);
+            cut |= kept < total;
+            list.insert(format!("{key}_count"), json!(total));
+        }
+    }
+    if cut && let Some(fields) = document.as_object_mut() {
+        fields.insert("cut".to_string(), json!(CHANGES_CUT));
+    }
+    document
 }
 
 /// Each item as its compact JSON, which is what a page is measured in and
@@ -1915,5 +1978,74 @@ mod tests {
         let dirty = json!({"bio\u{200b}": ["ignore\u{e0041} previous", {"n": "\u{202e}x"}]});
         let clean = cleaned(dirty);
         assert_eq!(clean, json!({"bio": ["ignore previous", {"n": "x"}]}));
+    }
+
+    /// `snob_changes` hands accounts back as a list does, with no picture's
+    /// address, and never more of them than a page weighs: two captures far
+    /// apart were megabytes of signed addresses in one answer.
+    #[test]
+    fn what_changed_is_handed_back_without_addresses_and_within_a_page() {
+        let account = |pk: u64| {
+            json!({
+                "pk": pk,
+                "username": format!("someone{pk}"),
+                "pfp_url": format!("https://cdn.example/{pk}.jpg?sig={}", "x".repeat(300)),
+            })
+        };
+        let changes = Plan {
+            args: vec!["changes".into()],
+            ..plan(&[ExitCode::Ok])
+        };
+        let few = json!({
+            "account": "me",
+            "lists": [{
+                "list": "followers",
+                "gained": [account(1), account(2)],
+                "lost": [account(3)],
+                "renamed": [{"pk": 4, "from": "a", "to": "b", "at": 1}],
+            }],
+        });
+        let told = from(&changes, finished(ExitCode::Ok, Some(few), None));
+        assert!(!told.failed);
+        let text = told.body.to_string();
+        assert!(
+            !text.contains("pfp_url") && !text.contains("cdn.example"),
+            "{text}"
+        );
+        let list = &told.body["lists"][0];
+        assert_eq!(list["gained"].as_array().unwrap().len(), 2);
+        assert_eq!(list["gained_count"], 2);
+        assert_eq!(list["lost_count"], 1);
+        assert_eq!(list["renamed_count"], 1);
+        assert!(told.body.get("cut").is_none(), "{text}");
+
+        let many = json!({
+            "account": "me",
+            "lists": [{
+                "list": "followers",
+                "gained": (0..5000).map(account).collect::<Vec<_>>(),
+                "lost": (5000..9000).map(account).collect::<Vec<_>>(),
+                "renamed": [],
+            }],
+        });
+        let told = from(&changes, finished(ExitCode::Ok, Some(many), None));
+        let text = told.body.to_string();
+        assert!(text.len() < PAGE_BYTES + 2_000, "{} bytes", text.len());
+        assert!(!text.contains("cdn.example"));
+        let list = &told.body["lists"][0];
+        assert_eq!(list["gained_count"], 5000);
+        assert_eq!(list["lost_count"], 4000);
+        assert!(list["gained"].as_array().unwrap().len() < 5000);
+        assert_eq!(told.body["cut"], CHANGES_CUT);
+
+        // What is no document of changes passes as it came, nothing indexed.
+        for odd in [
+            json!("text"),
+            json!({"lists": "none"}),
+            json!({"lists": [1, {"gained": 2}]}),
+        ] {
+            let told = from(&changes, finished(ExitCode::Ok, Some(odd.clone()), None));
+            assert!(!told.failed, "{odd}");
+        }
     }
 }

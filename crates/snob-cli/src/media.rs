@@ -203,6 +203,10 @@ pub(crate) async fn small_pictures(
             Err(IgError::Canceled) => {
                 return Err(ExitError::new(ExitCode::Interrupted, "stopped").into());
             }
+            // A push-back heard while a picture was fetched by the account's
+            // tab, or the cooldown one started: the run ends there, as any
+            // run does, and no further picture is asked for.
+            Err(e) if ends_the_run(&e) => return Err(e.into()),
             // Not the error's own words: they can hold the address.
             Err(_) => pictures.push(missing("it could not be fetched")),
         }
@@ -679,7 +683,9 @@ pub(crate) async fn save_file_saying(
         sweep_stale_parts(dir, &file.stem);
         match joined(client, &file.stem, best, file.ffmpeg.as_deref(), dir).await {
             Ok(part) => return Ok((place(&part, dir, &file.stem)?, None)),
-            Err(e) if was_canceled(&e) => return Err(e),
+            // A stop, and a push-back: neither is a reason to go on to the
+            // smaller file, which would be one more fetch after a refusal.
+            Err(e) if stopped_the_run(&e) => return Err(e),
             Err(e) => said = Some(smaller(file, &format!("{e:#}"))),
         }
     }
@@ -920,6 +926,63 @@ pub(crate) fn was_canceled(e: &anyhow::Error) -> bool {
         .any(|cause| matches!(cause.downcast_ref::<IgError>(), Some(IgError::Canceled)))
 }
 
+/// Whether `e` ends the run whatever it was fetching, rather than failing
+/// one file of several: the stop itself, a push-back of Instagram's, the
+/// cooldown one started, and a wait past `--max-wait`. They are the errors
+/// `IgClient::asset_from_the_page` hands on rather than trying the file
+/// another way, since a file fetched by the account's tab is a request
+/// Instagram can refuse.
+///
+/// **A loop over files that collects its failures asks this first.** A
+/// push-back counted as one file that failed lets the files after it be
+/// asked for, and the run end as a success, against "a hard stop on the
+/// first push-back" (AGENTS.md).
+pub(crate) fn ends_the_run(e: &IgError) -> bool {
+    matches!(
+        e,
+        IgError::Canceled
+            | IgError::WaitTooLong { .. }
+            | IgError::InCooldown { .. }
+            | IgError::RateLimited
+            | IgError::FeedbackRequired
+            | IgError::Challenge { .. }
+            | IgError::Checkpoint { .. }
+    )
+}
+
+/// [`ends_the_run`], for an error with its context around it.
+pub(crate) fn stopped_the_run(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| cause.downcast_ref::<IgError>().is_some_and(ends_the_run))
+}
+
+/// `text` with every address in it replaced by the word: a failure's
+/// sentence as a program is handed it (`post -d --json`, read by `snob
+/// mcp`). **An error of the network names the address it was fetching**
+/// (`reqwest` appends "for url (...)"), which for a file of the CDN is the
+/// signed address no agent is handed (`answer::without_media_addresses`
+/// makes null only a string that is an address as a whole).
+pub(crate) fn without_addresses(text: &str) -> String {
+    text.split(' ')
+        .map(|word| {
+            if word.contains("://") {
+                "(an address)"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What `file`'s best tracks are declared to weigh when they are what a
+/// save tries first ([`joinable`]), and 0 when it goes straight to the one
+/// file: what a save that ends with the smaller file, or with none, may
+/// have fetched and thrown away, for a caller that bounds what it fetches.
+pub(crate) fn best_weight(file: &Named) -> u64 {
+    joinable(file).0.map_or(0, Best::bytes)
+}
+
 /// The bytes of one story, from the CDN.
 pub(crate) async fn bytes_of(client: &IgClient, story: &Story) -> Result<Vec<u8>> {
     let url = story
@@ -1068,5 +1131,30 @@ mod tests {
             "something was made beside the directory: {left:?}"
         );
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    /// A push-back is not one file that failed: a loop that collects its
+    /// failures stops on it, and on nothing a single file can do.
+    #[test]
+    fn a_push_back_ends_the_run_and_a_file_that_failed_does_not() {
+        assert!(ends_the_run(&IgError::RateLimited));
+        assert!(ends_the_run(&IgError::FeedbackRequired));
+        assert!(ends_the_run(&IgError::Canceled));
+        let wrapped = anyhow::Error::new(IgError::RateLimited).context("could not save 3");
+        assert!(stopped_the_run(&wrapped));
+        assert!(!stopped_the_run(&anyhow::anyhow!("no space left")));
+    }
+
+    /// A failure's sentence handed to a program names no address: an error
+    /// of the network ends in the signed one it was fetching.
+    #[test]
+    fn a_failure_told_to_a_program_names_no_address() {
+        let said =
+            "error sending request for url (https://scontent.cdninstagram.com/v/a.mp4?sig=abc)";
+        assert_eq!(
+            without_addresses(said),
+            "error sending request for url (an address)"
+        );
+        assert_eq!(without_addresses("no space left"), "no space left");
     }
 }

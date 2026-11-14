@@ -6573,6 +6573,30 @@ async fn an_agent_signs_an_account_out_only_after_a_yes_that_names_it() {
     );
     assert!(me.session_file().exists() && other.session_file().exists());
 
+    // A server told nothing acts as the active account, `other`, and signs
+    // out no other, a yes or not: which account it may sign out is which it
+    // may act as.
+    let not_its_own = client
+        .call(
+            "snob_logout",
+            serde_json::json!({ "account": "me", "confirmation": asked["confirmation"] }),
+        )
+        .await;
+    assert_eq!(not_its_own["isError"], true, "{not_its_own}");
+    assert_eq!(
+        not_its_own["structuredContent"]["error"]["code"], "not_this_account",
+        "{not_its_own}"
+    );
+    assert!(me.session_file().exists() && other.session_file().exists());
+
+    // Where the person said any account, the one named, after its yes.
+    drop(client);
+    let mut client = McpClient::start(tmp.path(), &instagram, &["--any-account"]).await;
+    let asking = client
+        .call("snob_logout", serde_json::json!({ "account": "me" }))
+        .await;
+    let asked = &asking["structuredContent"];
+    assert_eq!(asked["status"], "confirmation_required", "{asking}");
     let done = client
         .call(
             "snob_logout",

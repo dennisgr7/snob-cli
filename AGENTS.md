@@ -536,7 +536,16 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   which the request budget does not count, so a call is bounded on its
   own: it starts no further file once it has fetched `tools::SAVE_AT_MOST`
   (1 GiB) or downloaded for `tools::SAVE_WITHIN` (2 min), says the rest
-  under `left`, and the same call again saves them. **It asks no yes**: a
+  under `left`, and the same call again saves them. Best tracks fetched
+  and given up for the smaller file, or lost with a file that failed,
+  count toward the bytes at what they were declared to weigh
+  (`media::best_weight`). **A file that failed is one entry of `failed`,
+  and a push-back is the end of the run**, for the pictures as for the
+  files (`media::ends_the_run`): a file the account's tab fetches is a
+  request Instagram can refuse, and the files after it are not asked for.
+  A failure's sentence names no address (`media::without_addresses`),
+  since an error of the network ends in the signed one it was fetching.
+  **It asks no yes**: a
   post's read reaches nobody and tells its owner nothing, the person's part
   is the flag, and the client's own prompt stands before the tool
   (`readOnlyHint: false`). Over `--listen` the files are saved on snob's
@@ -576,6 +585,11 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   nothing, write nothing and move no mark (`Store::read_existing`), so they
   ask nothing, another account's captures included, as its stored list asks
   nothing; asking twice gives one answer, and they answer in a cooldown.
+  `snob_changes` hands its accounts back as a list's go, without their
+  pictures' addresses, and all of them together within `answer::PAGE_BYTES`
+  (`answer::bounded_changes`): what does not fit is left out, with
+  `gained_count`, `lost_count` and `renamed_count` saying how many there
+  are and `cut` saying so.
   They are what an agent that comes back each day compares with. **The
   monitor itself stays out**: `watch once` moves the one receipt per
   account that the person's own webhook is owed from, and `watch.toml` is
@@ -611,12 +625,17 @@ reaches a server already listening: no command, no key, see "Over HTTP").
   with `--account`, or have its calls name theirs.
 - **Signing out, after a yes that names the account** (`snob_logout`, on
   every server). The call names the account, always, and the child is
-  `snob --account=<name> logout`, the command itself, so its order holds
+  `snob logout --only=<name>`, the command itself, so its order holds
   (the account's jobs stopped and their lock held until the session is
   gone, every other process refused its next request, the browser
-  released): never `logout` with no account resolved, which signs every
-  account out, and never `--all`. On a server started for one account it
-  is that account, as it was spelled to the server, or a refusal. Its
+  released). **`--only` (hidden) refuses, with nothing signed out, unless
+  the account the run resolved is the one named** (`not_this_account`):
+  never `logout` with no account resolved, which signs every account
+  out, a registry emptied meanwhile included, and never `--all`. **Which
+  account a server may sign out is which it may act as**: on a server
+  started for one account it is that account, as it was spelled to the
+  server, or a refusal; with `--any-account`, any, as the child's own
+  `--account`; with neither, the account its children act as. Its
   question (`About::SignOut`) is taken in the chat only where a write's is
   (`--confirm-in-chat all`), and counts once, for that account. It is not
   recorded in `mcp_acts`: `logout` takes none of the flags that record an

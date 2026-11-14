@@ -1006,6 +1006,9 @@ pub(crate) async fn save_telling(
             continue;
         }
         let item = post.items.get(file.number.wrapping_sub(1));
+        // What the best tracks weigh, when they are tried: fetched whether
+        // or not they end as the file kept, so counted when they do not.
+        let tried = crate::media::best_weight(&file);
         match crate::media::save_file_saying(client, &file, &directory).await {
             Ok((kept, note)) => {
                 let (path, already) = match kept {
@@ -1015,7 +1018,14 @@ pub(crate) async fn save_telling(
                 let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
                 if !already {
                     fetched = fetched.saturating_add(bytes);
+                    // A note is the best tracks given up for the smaller
+                    // file: both were fetched.
+                    if note.is_some() {
+                        fetched = fetched.saturating_add(tried);
+                    }
                 }
+                // To a program, without the address a failure's words name.
+                let note = note.map(|note| crate::media::without_addresses(&note));
                 saved.push(serde_json::json!({
                     "item": file.number,
                     "pk": item.and_then(|item| item.pk.clone()),
@@ -1029,7 +1039,17 @@ pub(crate) async fn save_telling(
             Err(e) if crate::media::was_canceled(&e) => {
                 return Err(ExitError::new(ExitCode::Interrupted, "stopped").into());
             }
-            Err(e) => failed.push(serde_json::json!({ "item": file.number, "why": e.to_string() })),
+            // A push-back, or the cooldown it started: the run ends, with
+            // no further file asked for.
+            Err(e) if crate::media::stopped_the_run(&e) => return Err(e),
+            Err(e) => {
+                // What it may have fetched before it failed counts too.
+                fetched = fetched.saturating_add(tried);
+                failed.push(serde_json::json!({
+                    "item": file.number,
+                    "why": crate::media::without_addresses(&e.to_string()),
+                }));
+            }
         }
     }
     let about = post_document(post, None);
